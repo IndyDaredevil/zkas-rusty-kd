@@ -644,6 +644,9 @@ from!(item: RpcResult<&kaspa_rpc_core::GetSeqCommitLaneProofResponse>, protowire
         payload_and_ctx_digest: item.payload_and_ctx_digest.as_bytes().to_vec(),
         parent_seq_commit: item.parent_seq_commit.as_bytes().to_vec(),
         inactivity_shortcut: item.inactivity_shortcut.as_bytes().to_vec(),
+        context_hash: item.context_hash.as_bytes().to_vec(),
+        lanes_root: item.lanes_root.as_bytes().to_vec(),
+        miner_payload_leaves: item.miner_payload_leaves.iter().map(|h| h.as_bytes().to_vec()).collect(),
         error: None,
     }
 });
@@ -1238,6 +1241,9 @@ try_from!(item: &protowire::GetSeqCommitLaneProofResponseMessage, RpcResult<kasp
         payload_and_ctx_digest: hash_from_bytes(&item.payload_and_ctx_digest)?,
         parent_seq_commit: hash_from_bytes(&item.parent_seq_commit)?,
         inactivity_shortcut: hash_from_bytes(&item.inactivity_shortcut)?,
+        context_hash: hash_from_bytes(&item.context_hash)?,
+        lanes_root: hash_from_bytes(&item.lanes_root)?,
+        miner_payload_leaves: item.miner_payload_leaves.iter().map(|b| hash_from_bytes(b)).collect::<RpcResult<Vec<_>>>()?,
     }
 });
 

@@ -49,7 +49,7 @@
 
 use kaspa_hashes::Hash;
 use kaspa_seq_commit::hashing::{
-    miner_payload_leaf, miner_payload_root, payload_and_context_digest, seq_commit, seq_state_root,
+    activity_root_hash, miner_payload_leaf, miner_payload_root, payload_and_context_digest, seq_commit, seq_state_root,
 };
 use kaspa_seq_commit::types::{MinerPayloadLeafInput, SeqCommitInput, SeqState};
 
@@ -146,9 +146,42 @@ pub enum WitnessError {
     NoCommitment,
     /// `leaf_index` is past the reconstructed leaf list.
     LeafIndexOutOfRange,
+    /// The merge-mined block's own leaf was not present in the node-provided mergeset leaves —
+    /// i.e. the named block is not actually a member of the chain block's mergeset.
+    TargetNotInMergeset,
 }
 
 impl SeqCommitWitness {
+    /// Assemble a witness from the fields a node exposes for the *chain block* `B` (via the
+    /// `GetSeqCommitLaneProof` RPC) plus the *mergeset block* `K` that carries `H_fc` (its own
+    /// coinbase payload, hash and blue-work — one `get_block(K)`).
+    ///
+    /// The node supplies `mergeset_leaves` in the exact consensus order (the fragile part). This
+    /// recomputes `K`'s own leaf, locates it by value, and splits the rest into `other_leaves` — so
+    /// the assembler never has to know Kaspa's mergeset-ordering rule. `activity_root` is folded
+    /// here from `inactivity_shortcut` + `lanes_root`.
+    ///
+    /// Returns [`WitnessError::TargetNotInMergeset`] if `K`'s leaf is absent from `B`'s mergeset.
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble(
+        block_hash: Hash,
+        blue_work_be: Vec<u8>,
+        kaspa_payload: Vec<u8>,
+        mergeset_leaves: &[Hash],
+        context_hash: Hash,
+        lanes_root: Hash,
+        inactivity_shortcut: Hash,
+        parent_seq_commit: Hash,
+    ) -> Result<Self, WitnessError> {
+        let our_leaf =
+            miner_payload_leaf(MinerPayloadLeafInput { block_hash: &block_hash, blue_work_be_bytes: &blue_work_be, payload: &kaspa_payload });
+        let leaf_index = mergeset_leaves.iter().position(|l| *l == our_leaf).ok_or(WitnessError::TargetNotInMergeset)?;
+        let mut other_leaves = mergeset_leaves.to_vec();
+        other_leaves.remove(leaf_index);
+        let activity_root = activity_root_hash(&inactivity_shortcut, &lanes_root);
+        Ok(Self { kaspa_payload, block_hash, blue_work_be, other_leaves, leaf_index, activity_root, context_hash, parent_seq_commit })
+    }
+
     /// The `H_fc` this witness's payload commits to.
     pub fn hfc(&self) -> Option<Hash> {
         extract_hfc(&self.kaspa_payload)

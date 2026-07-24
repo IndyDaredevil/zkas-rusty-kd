@@ -3993,28 +3993,52 @@ pub struct GetSeqCommitLaneProofResponse {
     pub payload_and_ctx_digest: RpcHash,
     pub parent_seq_commit: RpcHash,
     pub inactivity_shortcut: RpcHash,
+    /// Canonical-`R` witness support (added in v2): the raw mergeset context hash of this block.
+    pub context_hash: RpcHash,
+    /// Canonical-`R` witness support (added in v2): the active-lanes SMT root at this block's POV.
+    pub lanes_root: RpcHash,
+    /// Canonical-`R` witness support (added in v2): the ordered `miner_payload_leaf`s of this
+    /// block's mergeset (exactly as consensus feeds `miner_payload_root`).
+    pub miner_payload_leaves: Vec<RpcHash>,
 }
 
 impl Serializer for GetSeqCommitLaneProofResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
         store!(Vec<u8>, &self.smt_proof, writer)?;
         serialize!(Option<RpcLaneEntry>, &self.lane, writer)?;
         store!(RpcHash, &self.payload_and_ctx_digest, writer)?;
         store!(RpcHash, &self.parent_seq_commit, writer)?;
         store!(RpcHash, &self.inactivity_shortcut, writer)?;
+        store!(RpcHash, &self.context_hash, writer)?;
+        store!(RpcHash, &self.lanes_root, writer)?;
+        store!(Vec<RpcHash>, &self.miner_payload_leaves, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for GetSeqCommitLaneProofResponse {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let smt_proof = load!(Vec<u8>, reader)?;
         let lane = deserialize!(Option<RpcLaneEntry>, reader)?;
         let payload_and_ctx_digest = load!(RpcHash, reader)?;
         let parent_seq_commit = load!(RpcHash, reader)?;
         let inactivity_shortcut = load!(RpcHash, reader)?;
-        Ok(Self { smt_proof, lane, payload_and_ctx_digest, parent_seq_commit, inactivity_shortcut })
+        let (context_hash, lanes_root, miner_payload_leaves) = if version >= 2 {
+            (load!(RpcHash, reader)?, load!(RpcHash, reader)?, load!(Vec<RpcHash>, reader)?)
+        } else {
+            (RpcHash::default(), RpcHash::default(), Vec::new())
+        };
+        Ok(Self {
+            smt_proof,
+            lane,
+            payload_and_ctx_digest,
+            parent_seq_commit,
+            inactivity_shortcut,
+            context_hash,
+            lanes_root,
+            miner_payload_leaves,
+        })
     }
 }

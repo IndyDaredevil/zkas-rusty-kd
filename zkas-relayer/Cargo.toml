@@ -1,0 +1,28 @@
+[package]
+name = "zkas-relayer"
+description = "Canonical-R witness relayer: assembles a peg-out seq_commit witness from a live ZKas node"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "canonical-r-probe"
+path = "src/bin/canonical_r_probe.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# gRPC transport to a running kaspad (ZKas) node.
+kaspa-grpc-client.workspace = true
+kaspa-rpc-core.workspace = true
+kaspa-consensus-core.workspace = true
+kaspa-hashes.workspace = true
+# The host mirror of the guest's canonical-R witness recomputation.
+kaspa-shielded-core.workspace = true
+# Mergeset leaf hashing, shared with consensus and the guest.
+kaspa-seq-commit.workspace = true
+
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

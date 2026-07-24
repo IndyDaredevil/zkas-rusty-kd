@@ -155,6 +155,19 @@ pub struct SeqCommitLaneProof {
     pub payload_and_ctx_digest: Hash,
     pub parent_seq_commit: Hash,
     pub inactivity_shortcut: Hash,
+    /// Canonical-`R` witness support (KIP-21): the mergeset context hash of this block —
+    /// `H_mergeset_context(parent.timestamp, this.daa_score, this.blue_score)`. The guest folds
+    /// its self-computed `payload_root` with this via `payload_and_context_digest`, so it needs the
+    /// *raw* context hash, not the already-combined `payload_and_ctx_digest`.
+    pub context_hash: Hash,
+    /// Canonical-`R` witness support: the active-lanes SMT root at this block's POV. Combined with
+    /// `inactivity_shortcut` via `activity_root_hash` this yields the `activity_root`.
+    pub lanes_root: Hash,
+    /// Canonical-`R` witness support: the full ordered list of `miner_payload_leaf`s of this
+    /// block's mergeset (exactly as consensus feeds `miner_payload_root`). An external assembler
+    /// locates the merge-mined ZKas block's own leaf by value and splices the rest as `other_leaves`
+    /// — the fragile mergeset-ordering rule stays entirely node-side.
+    pub miner_payload_leaves: Vec<Hash>,
 }
 
 /// Abstracts the consensus external API

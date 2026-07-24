@@ -879,3 +879,107 @@ async fn inactivity_shortcut_advances_one_block_per_chain_step() {
         assert_eq!(ctx.consensus.smt_block_metadata(hash).inactivity_shortcut_block(), expected, "block index {i}");
     }
 }
+
+/// Canonical-`R`, host side, against a *real* mined DAG block.
+///
+/// This is the Tier-1 gap `zkbridge.md` §3 tracked: nothing assembled a real seq_commit witness
+/// from live chain data. Here the production `get_seq_commit_lane_proof` RPC builder emits the
+/// witness fields for a merging chain block `B` (context hash, active-lanes root, the ordered
+/// mergeset `miner_payload_leaves`), and the shielded-core host assembler
+/// [`SeqCommitWitness::assemble`] — the exact routine the peg-out relayer feeds the guest —
+/// reconstructs `B`'s on-chain `seq_commit` from them plus one `get_block(K)` for the merge-mined
+/// block `K`. Proving the reconstruction is byte-identical to the value the covenant reads via
+/// `OpChainblockSeqCommit` is what turns canonical-`R` from "green in dev mode" into "works on real
+/// blocks".
+#[tokio::test]
+async fn canonical_r_witness_reconstructs_seq_commit_from_mined_block() {
+    use kaspa_seq_commit::hashing::miner_payload_leaf;
+    use kaspa_seq_commit::types::MinerPayloadLeafInput;
+    use kaspa_shielded_core::witness_chain::SeqCommitWitness;
+
+    let config = inactivity_shortcut_config(); // toccata=always, finality_depth=2
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+
+    // Warm the chain a few linear blocks so we're comfortably past genesis/pruning point.
+    for _ in 0..3 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+
+    // Two sibling blocks off the same tips (both templates are built before either is inserted, so
+    // they share parents and both carry valid coinbases), then a block `B` that merges them.
+    ctx.build_block_template_row(0..2).validate_and_insert_row().await;
+    let siblings: Vec<Hash> = ctx.current_tips.iter().copied().collect();
+    assert_eq!(siblings.len(), 2, "expected two sibling tips to merge");
+    ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+
+    // `B` is the merging chain block (the new sink). One of the two siblings is its selected parent
+    // (excluded from the mergeset leaves); the other, `K`, is the sole mergeset-without-SP member,
+    // so exactly its leaf appears in the node-emitted `miner_payload_leaves`.
+    let b = ctx.consensus.get_sink();
+    let b_header = ctx.consensus.get_header(b).unwrap();
+    let proof = ctx.consensus.get_seq_commit_lane_proof(b, Hash::from_bytes([0u8; 32])).expect("lane proof for chain block B");
+    assert!(!proof.miner_payload_leaves.is_empty(), "B must merge at least one non-selected-parent block");
+
+    // Identify `K` as a sibling whose miner-payload leaf the node placed in B's mergeset (works
+    // whichever sibling ended up as the selected parent).
+    let k = siblings
+        .iter()
+        .copied()
+        .find(|s| {
+            let h = ctx.consensus.get_header(*s).unwrap();
+            let payload = ctx.consensus.get_block(*s).unwrap().transactions[0].payload.clone();
+            let leaf = miner_payload_leaf(MinerPayloadLeafInput {
+                block_hash: s,
+                blue_work_be_bytes: &h.blue_work.to_be_bytes(),
+                payload: &payload,
+            });
+            proof.miner_payload_leaves.contains(&leaf)
+        })
+        .expect("one sibling must be the merged (non-selected-parent) block K");
+
+    let k_header = ctx.consensus.get_header(k).unwrap();
+    let k_coinbase_payload = ctx.consensus.get_block(k).unwrap().transactions[0].payload.clone();
+
+    // Assemble the witness exactly as the peg-out relayer would: node-provided mergeset ordering +
+    // one get_block(K), no client-side mergeset reasoning.
+    let witness = SeqCommitWitness::assemble(
+        k,
+        k_header.blue_work.to_be_bytes().to_vec(),
+        k_coinbase_payload,
+        &proof.miner_payload_leaves,
+        proof.context_hash,
+        proof.lanes_root,
+        proof.inactivity_shortcut,
+        proof.parent_seq_commit,
+    )
+    .expect("K must be a member of B's mergeset");
+
+    // Post-Toccata, the header's accepted_id_merkle_root IS the block's seq_commit — the value the
+    // covenant reads on-chain. The host reconstruction must match it byte-for-byte.
+    assert_eq!(
+        witness.recompute_seq_commit().unwrap(),
+        b_header.accepted_id_merkle_root,
+        "host-assembled witness must reproduce B's on-chain seq_commit"
+    );
+
+    // Tightness: perturbing any carried field must break the reconstruction.
+    let mut bad = witness.clone();
+    bad.context_hash = Hash::from_bytes([0xab; 32]);
+    assert_ne!(bad.recompute_seq_commit().unwrap(), b_header.accepted_id_merkle_root, "context_hash must be load-bearing");
+    let mut bad = witness.clone();
+    bad.parent_seq_commit = Hash::from_bytes([0xcd; 32]);
+    assert_ne!(bad.recompute_seq_commit().unwrap(), b_header.accepted_id_merkle_root, "parent_seq_commit must be load-bearing");
+
+    // A block that is not in B's mergeset must be rejected by the assembler.
+    let outsider = SeqCommitWitness::assemble(
+        b, // B itself is never in its own mergeset
+        b_header.blue_work.to_be_bytes().to_vec(),
+        ctx.consensus.get_block(b).unwrap().transactions[0].payload.clone(),
+        &proof.miner_payload_leaves,
+        proof.context_hash,
+        proof.lanes_root,
+        proof.inactivity_shortcut,
+        proof.parent_seq_commit,
+    );
+    assert_eq!(outsider.err(), Some(kaspa_shielded_core::witness_chain::WitnessError::TargetNotInMergeset));
+}

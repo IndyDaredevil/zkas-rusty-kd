@@ -726,26 +726,42 @@ impl VirtualStateProcessor {
     // =========================================================================
 
     /// Collect per-lane activity leaves and miner payload leaves from the mergeset.
-    pub(super) fn collect_mergeset_seq_data(&self, ctx: &UtxoProcessingContext) -> MergesetSeqData {
-        use kaspa_seq_commit::hashing::{activity_leaf, miner_payload_leaf};
+    /// Build the ordered `miner_payload_leaves` of a mergeset from its acceptance data.
+    ///
+    /// This is the *single source of truth* for the mergeset leaf ordering that feeds
+    /// `miner_payload_root` (and thus `seq_commit`). Both the live seq_commit recomputation
+    /// ([`Self::collect_mergeset_seq_data`]) and the canonical-`R` witness RPC
+    /// (`get_seq_commit_lane_proof`) call it, so an external witness assembler can never drift
+    /// from the exact ordering/leaf convention consensus uses.
+    pub(crate) fn mergeset_miner_payload_leaves(&self, mergeset_acceptance_data: &[MergesetBlockAcceptanceData]) -> Vec<Hash> {
+        use kaspa_seq_commit::hashing::miner_payload_leaf;
         use kaspa_seq_commit::types::MinerPayloadLeafInput;
 
+        mergeset_acceptance_data
+            .iter()
+            .map(|block_acceptance| {
+                let merged_block = block_acceptance.block_hash;
+                let merged_header = self.headers_store.get_header(merged_block).unwrap();
+                let block_txs = self.block_transactions_store.get(merged_block).unwrap();
+                miner_payload_leaf(MinerPayloadLeafInput {
+                    block_hash: &merged_block,
+                    blue_work_be_bytes: &merged_header.blue_work.to_be_bytes(),
+                    payload: &block_txs[0].payload,
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn collect_mergeset_seq_data(&self, ctx: &UtxoProcessingContext) -> MergesetSeqData {
+        use kaspa_seq_commit::hashing::activity_leaf;
+
         let mut lane_activities: std::collections::BTreeMap<[u8; 20], Vec<Hash>> = std::collections::BTreeMap::new();
-        let mut miner_payload_leaves = Vec::new();
+        let miner_payload_leaves = self.mergeset_miner_payload_leaves(&ctx.mergeset_acceptance_data);
         let mut global_merge_idx: u32 = 0;
 
         for block_acceptance in ctx.mergeset_acceptance_data.iter() {
             let merged_block = block_acceptance.block_hash;
-            let merged_header = self.headers_store.get_header(merged_block).unwrap();
             let block_txs = self.block_transactions_store.get(merged_block).unwrap();
-
-            let coinbase_payload = &block_txs[0].payload;
-            let mpl = miner_payload_leaf(MinerPayloadLeafInput {
-                block_hash: &merged_block,
-                blue_work_be_bytes: &merged_header.blue_work.to_be_bytes(),
-                payload: coinbase_payload,
-            });
-            miner_payload_leaves.push(mpl);
 
             for accepted_tx in block_acceptance.accepted_transactions.iter() {
                 let tx = &block_txs[accepted_tx.index_within_block as usize];

@@ -1555,6 +1555,25 @@ impl ConsensusApi for Consensus {
 
         let parent_seq_commit = parent_header.accepted_id_merkle_root;
 
+        // Canonical-`R` witness support (KIP-21). Recompute the mergeset context hash exactly as
+        // `recompute_seq_commit` does (all three inputs come from stored headers), read the
+        // active-lanes SMT root, and re-derive the ordered mergeset miner-payload leaves from the
+        // block's acceptance data via the *same* consensus helper the live seq_commit uses.
+        let context_hash = {
+            use kaspa_seq_commit::{hashing::mergeset_context_hash, types::MergesetContext};
+            mergeset_context_hash(&MergesetContext {
+                timestamp: parent_header.timestamp,
+                daa_score: header.daa_score,
+                blue_score: header.blue_score,
+            })
+        };
+        let lanes_root = self.storage.smt_stores.get_lanes_root(current_bounds, is_canonical);
+        let mergeset_acceptance_data = self
+            .acceptance_data_store
+            .get(block_hash)
+            .map_err(|e| ConsensusError::GeneralOwned(format!("acceptance_data: {e}")))?;
+        let miner_payload_leaves = self.virtual_processor.mergeset_miner_payload_leaves(&mergeset_acceptance_data);
+
         // In debug builds, verify the proof is consistent with the stored lanes_root
         // and that metadata chains to the header's seq_commit.
         debug_assert!({
@@ -1564,7 +1583,6 @@ impl ConsensusApi for Consensus {
                 types::SmtLeafInput,
                 verify::{SmtMetadata, verify_smt_metadata},
             };
-            let lanes_root = self.storage.smt_stores.get_lanes_root(current_bounds, is_canonical);
             let leaf = lane.as_ref().map(|l| smt_leaf_hash(&SmtLeafInput { lane_tip: &l.tip, blue_score: l.blue_score }));
             let computed_root = smt_proof.as_proof().compute_root::<SeqCommitActiveNode>(&lane_key, leaf).unwrap();
             let payload_and_ctx_digest = metadata.payload_and_ctx_digest();
@@ -1583,6 +1601,9 @@ impl ConsensusApi for Consensus {
             payload_and_ctx_digest: metadata.payload_and_ctx_digest(),
             parent_seq_commit,
             inactivity_shortcut,
+            context_hash,
+            lanes_root,
+            miner_payload_leaves,
         })
     }
 

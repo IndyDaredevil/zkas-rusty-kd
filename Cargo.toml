@@ -28,6 +28,7 @@ members = [
     "shielded-pay",
     "zkas-api",
     "zkas-walletd",
+    "zkas-relayer",
     "miner",
     "consensus/wasm",
     "kaspad",

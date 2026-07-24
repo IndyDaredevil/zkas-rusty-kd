@@ -1212,6 +1212,13 @@ message GetSeqCommitLaneProofResponseMessage {
   // inactivity-shortcut block (32 bytes). Folded as
   // activity_root = H_activity_root(inactivityShortcut, lanes_root).
   bytes inactivityShortcut = 6;
+  // Canonical-R witness support: raw mergeset context hash (32 bytes).
+  bytes contextHash = 7;
+  // Canonical-R witness support: active-lanes SMT root at this block's POV (32 bytes).
+  bytes lanesRoot = 8;
+  // Canonical-R witness support: the ordered miner_payload_leaf list of this
+  // block's mergeset (each 32 bytes), exactly as consensus feeds miner_payload_root.
+  repeated bytes minerPayloadLeaves = 9;
 
   RPCError error = 1000;
 }
