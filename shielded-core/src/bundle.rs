@@ -57,6 +57,16 @@ pub mod sizes {
 /// 1–4 actions) while keeping worst-case per-tx proof work finite.
 pub const MAX_ACTIONS_PER_BUNDLE: usize = 512;
 
+/// Bundle flag bit marking a **bridge burn declaration** (`crate::burn`).
+///
+/// Bits 0/1 are Orchard's spends-enabled / outputs-enabled. Bit 2 says this bundle carries a
+/// trailing `(burn_value, kaspa_recipient)` peg-out declaration after the proof. Flag-gated so a
+/// bundle without a burn is byte-identical to the pre-bridge format.
+pub const BUNDLE_FLAG_BURN: u8 = 0b100;
+
+/// Serialized length of a burn declaration: `value(8) | kaspa_recipient(32)`.
+pub const BURN_DECL_LEN: usize = 8 + 32;
+
 /// A single Orchard action, as it appears on the wire.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionWire {
@@ -106,6 +116,11 @@ pub const fn expected_wire_len(n_actions: usize) -> usize {
     117 + n_actions * ActionWire::SERIALIZED_LEN + expected_proof_len(n_actions)
 }
 
+/// As [`expected_wire_len`], for a bundle that also carries a burn declaration.
+pub const fn expected_wire_len_with_burn(n_actions: usize) -> usize {
+    expected_wire_len(n_actions) + BURN_DECL_LEN
+}
+
 /// Cheaply read just the action count from a serialized bundle, without parsing
 /// (or allocating) the actions or the proof. The header reads mirror
 /// [`ShieldedBundle::from_bytes`] exactly, so the two can never disagree.
@@ -145,6 +160,26 @@ pub struct ShieldedBundle {
     pub proof: Vec<u8>,
     /// The binding signature tying the value commitments to `value_balance`.
     pub binding_sig: [u8; sizes::SIG],
+    /// Optional bridge peg-out declaration: `(burn_value, kaspa_recipient)`.
+    ///
+    /// Present iff [`BUNDLE_FLAG_BURN`] is set in `flags`. The declared value is carved out of
+    /// `value_balance` (see [`crate::state::ShieldedTx`]), so the binding signature already
+    /// constrains it — a burn cannot move value the bundle did not prove is leaving the pool.
+    pub burn: Option<(u64, [u8; sizes::FIELD])>,
+}
+
+/// Error attaching a burn declaration to a bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BurnDeclareError {
+    /// A zero-value burn would consume a nullifier and commit a leaf for nothing.
+    ZeroValue,
+    /// The burn exceeds what the bundle's binding signature proved is leaving the pool.
+    ExceedsValueBalance {
+        /// Requested burn amount.
+        burn: u64,
+        /// The bundle's proven `value_balance`.
+        value_balance: i64,
+    },
 }
 
 /// Error decoding a [`ShieldedBundle`] from bytes.
@@ -156,6 +191,10 @@ pub enum BundleDecodeError {
     LengthOverflow,
     /// Trailing bytes remained after decoding.
     TrailingBytes,
+    /// The burn flag was set but the trailing declaration was absent or malformed.
+    MalformedBurnDeclaration,
+    /// A burn declaration named zero value, which would consume a nullifier for nothing.
+    ZeroValueBurn,
     /// The bundle declared more actions than [`MAX_ACTIONS_PER_BUNDLE`]
     /// (anti-DoS: rejected before any parse/verification work is done).
     TooManyActions,
@@ -180,6 +219,9 @@ impl Writer {
         self.buf.extend_from_slice(&v.to_be_bytes());
     }
     fn i64(&mut self, v: i64) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+    }
+    fn u64(&mut self, v: u64) {
         self.buf.extend_from_slice(&v.to_be_bytes());
     }
     /// Length-prefixed variable bytes.
@@ -223,6 +265,9 @@ impl<'a> Reader<'a> {
     fn i64(&mut self) -> Result<i64, BundleDecodeError> {
         Ok(i64::from_be_bytes(self.array::<8>()?))
     }
+    fn u64(&mut self) -> Result<u64, BundleDecodeError> {
+        Ok(u64::from_be_bytes(self.array::<8>()?))
+    }
     fn var(&mut self) -> Result<Vec<u8>, BundleDecodeError> {
         let n = self.u32()? as usize;
         Ok(self.take(n)?.to_vec())
@@ -252,6 +297,11 @@ impl ShieldedBundle {
             w.bytes(&a.spend_auth_sig);
         }
         w.var(&self.proof);
+        // Trailing, flag-gated: keeps a burn-free bundle byte-identical to the pre-bridge format.
+        if let Some((value, recipient)) = &self.burn {
+            w.u64(*value);
+            w.bytes(recipient);
+        }
         w.buf
     }
 
@@ -285,10 +335,76 @@ impl ShieldedBundle {
             });
         }
         let proof = r.var()?;
+        // The burn declaration is part of the canonical encoding, so it must be consumed before
+        // the trailing-bytes check — otherwise every burn bundle would be rejected as malformed.
+        let burn = if flags & BUNDLE_FLAG_BURN != 0 {
+            let value = r.u64().map_err(|_| BundleDecodeError::MalformedBurnDeclaration)?;
+            let recipient = r.array::<{ sizes::FIELD }>().map_err(|_| BundleDecodeError::MalformedBurnDeclaration)?;
+            if value == 0 {
+                return Err(BundleDecodeError::ZeroValueBurn);
+            }
+            Some((value, recipient))
+        } else {
+            None
+        };
         if !r.finished() {
             return Err(BundleDecodeError::TrailingBytes);
         }
-        Ok(Self { actions, flags, value_balance, anchor, proof, binding_sig })
+
+        Ok(Self { actions, flags, value_balance, anchor, proof, binding_sig, burn })
+    }
+
+    /// Attach a bridge peg-out declaration to a proven bundle.
+    ///
+    /// **`value_balance` must already account for the burn.** A bundle's `value_balance` is what
+    /// the binding signature proves is leaving the shielded pool, and it is fixed at proving time;
+    /// consensus then splits it into `burn_value` + miner fee. So a wallet must decide the burn
+    /// amount *before* proving and build the bundle with `value_balance = fee + burn_value`. This
+    /// function only records the declaration — it cannot change what was proven.
+    ///
+    /// Rejects a burn larger than `value_balance` (consensus would reject the block) and a
+    /// zero-value burn (it would consume a nullifier for nothing). A bundle that spends nothing has
+    /// no nullifier to key the exit by and is rejected later by `ShieldedTx::from_bundle`.
+    pub fn declare_burn(&mut self, burn_value: u64, kaspa_recipient: [u8; sizes::FIELD]) -> Result<(), BurnDeclareError> {
+        if burn_value == 0 {
+            return Err(BurnDeclareError::ZeroValue);
+        }
+        if self.value_balance < 0 || burn_value > self.value_balance as u64 {
+            return Err(BurnDeclareError::ExceedsValueBalance { burn: burn_value, value_balance: self.value_balance });
+        }
+        self.flags |= BUNDLE_FLAG_BURN;
+        self.burn = Some((burn_value, kaspa_recipient));
+        Ok(())
+    }
+
+    /// A deterministic sample bundle with `n` actions, for tests in dependent modules.
+    #[cfg(test)]
+    pub fn sample_for_test(n: u8) -> Self {
+        Self {
+            actions: (0..n)
+                .map(|i| ActionWire {
+                    nullifier: [i.wrapping_add(1); sizes::FIELD],
+                    rk: [i; sizes::FIELD],
+                    // A small little-endian integer is always a canonical Pallas base element.
+                    cmx: {
+                        let mut c = [0u8; sizes::FIELD];
+                        c[0] = i;
+                        c
+                    },
+                    cv_net: [i; sizes::FIELD],
+                    ephemeral_key: [i; sizes::FIELD],
+                    enc_ciphertext: [i; sizes::ENC_CIPHERTEXT],
+                    out_ciphertext: [i; sizes::OUT_CIPHERTEXT],
+                    spend_auth_sig: [i; sizes::SIG],
+                })
+                .collect(),
+            flags: 0b11,
+            value_balance: 0,
+            anchor: [9u8; sizes::FIELD],
+            proof: vec![0xab; 32],
+            binding_sig: [0xcd; sizes::SIG],
+            burn: None,
+        }
     }
 
     /// The nullifiers revealed by this bundle, in action order (conflict keys).
@@ -322,6 +438,7 @@ mod tests {
             anchor: [9u8; sizes::FIELD],
             proof: vec![0xab; 1000],
             binding_sig: [0xcd; sizes::SIG],
+            burn: None,
         }
     }
 
@@ -408,8 +525,97 @@ mod tests {
             anchor: [0u8; sizes::FIELD],
             proof: vec![],
             binding_sig: [0u8; sizes::SIG],
+            burn: None,
         };
         assert_eq!(ShieldedBundle::from_bytes(&at_cap.to_bytes()).map(|b| b.actions.len()), Ok(MAX_ACTIONS_PER_BUNDLE));
+    }
+
+    /// `declare_burn` refuses anything consensus would reject, so a wallet cannot build an
+    /// unspendable transaction after paying for a proof.
+    #[test]
+    fn declare_burn_enforces_the_value_balance_bound() {
+        let mut b = sample_bundle(2);
+        b.value_balance = 30;
+
+        assert_eq!(b.declare_burn(0, [1; sizes::FIELD]), Err(BurnDeclareError::ZeroValue));
+        assert_eq!(
+            b.declare_burn(31, [1; sizes::FIELD]),
+            Err(BurnDeclareError::ExceedsValueBalance { burn: 31, value_balance: 30 }),
+        );
+        assert_eq!(b.burn, None, "a rejected declaration must not mutate the bundle");
+        assert_eq!(b.flags & BUNDLE_FLAG_BURN, 0);
+
+        // Burning the whole value_balance (zero miner fee) is legal.
+        b.declare_burn(30, [0xA1; sizes::FIELD]).unwrap();
+        assert_eq!(b.burn, Some((30, [0xA1; sizes::FIELD])));
+        assert_ne!(b.flags & BUNDLE_FLAG_BURN, 0, "the flag must be set so the declaration encodes");
+
+        // And it round-trips through the wire.
+        assert_eq!(ShieldedBundle::from_bytes(&b.to_bytes()).unwrap().burn, b.burn);
+    }
+
+    /// A coinbase-style bundle (value entering the pool) can never declare a burn.
+    #[test]
+    fn declare_burn_rejects_a_negative_value_balance() {
+        let mut b = sample_bundle(2);
+        b.value_balance = -100;
+        assert_eq!(
+            b.declare_burn(10, [1; sizes::FIELD]),
+            Err(BurnDeclareError::ExceedsValueBalance { burn: 10, value_balance: -100 }),
+        );
+    }
+
+    /// A burn declaration round-trips, and a burn-free bundle stays byte-identical to the
+    /// pre-bridge encoding (the flag gate must cost nothing when unused).
+    #[test]
+    fn burn_declaration_round_trips_and_is_flag_gated() {
+        let plain = sample_bundle(3);
+        let plain_bytes = plain.to_bytes();
+        assert_eq!(ShieldedBundle::from_bytes(&plain_bytes).unwrap().burn, None);
+
+        let mut burning = sample_bundle(3);
+        burning.flags |= BUNDLE_FLAG_BURN;
+        burning.burn = Some((7_500_000, [0xA1; sizes::FIELD]));
+        let bytes = burning.to_bytes();
+        // A burn costs exactly the declaration and nothing else.
+        assert_eq!(bytes.len(), plain_bytes.len() + BURN_DECL_LEN);
+        assert_eq!(expected_wire_len_with_burn(3), expected_wire_len(3) + BURN_DECL_LEN);
+
+        let decoded = ShieldedBundle::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.burn, Some((7_500_000, [0xA1; sizes::FIELD])));
+    }
+
+    /// The flag and the trailing bytes must agree in both directions, or a peer could smuggle
+    /// unparsed data past the trailing-bytes check.
+    #[test]
+    fn burn_flag_and_payload_must_agree() {
+        // Flag set, no declaration present.
+        let mut b = sample_bundle(2);
+        b.flags |= BUNDLE_FLAG_BURN;
+        b.burn = None;
+        assert_eq!(ShieldedBundle::from_bytes(&b.to_bytes()), Err(BundleDecodeError::MalformedBurnDeclaration));
+
+        // Declaration present, flag clear => the bytes are unconsumed trailing input.
+        let mut b = sample_bundle(2);
+        b.burn = Some((1, [0x01; sizes::FIELD]));
+        assert_eq!(ShieldedBundle::from_bytes(&b.to_bytes()), Err(BundleDecodeError::TrailingBytes));
+
+        // Truncated declaration.
+        let mut b = sample_bundle(2);
+        b.flags |= BUNDLE_FLAG_BURN;
+        b.burn = Some((1, [0x01; sizes::FIELD]));
+        let mut bytes = b.to_bytes();
+        bytes.truncate(bytes.len() - 4);
+        assert_eq!(ShieldedBundle::from_bytes(&bytes), Err(BundleDecodeError::MalformedBurnDeclaration));
+    }
+
+    /// A zero-value burn would consume a nullifier and commit a leaf for nothing.
+    #[test]
+    fn zero_value_burn_is_rejected() {
+        let mut b = sample_bundle(2);
+        b.flags |= BUNDLE_FLAG_BURN;
+        b.burn = Some((0, [0x01; sizes::FIELD]));
+        assert_eq!(ShieldedBundle::from_bytes(&b.to_bytes()), Err(BundleDecodeError::ZeroValueBurn));
     }
 
     /// `expected_wire_len` must track `to_bytes` exactly (a wallet sizes its

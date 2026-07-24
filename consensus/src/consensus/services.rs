@@ -130,6 +130,8 @@ impl ConsensusServices {
             params.pre_deflationary_phase_base_subsidy,
             params.bps_history(),
             params.toccata_activation,
+            params.dev_fee_permille,
+            params.dev_fee_recipient,
         );
 
         let mass_calculator =

@@ -18,7 +18,9 @@
 //! (PLAN §5, non-negotiable #4).
 
 pub mod account;
+pub mod attestation;
 pub mod bundle;
+pub mod burn;
 pub mod coinbase;
 pub mod commitment;
 pub mod message;
@@ -28,6 +30,7 @@ pub mod state;
 pub mod tree;
 pub mod turnstile;
 pub mod verify;
+pub mod witness_chain;
 pub mod wallet;
 pub mod walletdb;
 

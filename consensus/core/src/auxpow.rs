@@ -208,6 +208,32 @@ mod tests {
         Hash::from_bytes([0xABu8; 32])
     }
 
+    /// Drift guard for the canonical-`R` witness. `kaspa_shielded_core::witness_chain::extract_hfc`
+    /// replicates this module's `committed_hash` parse (it cannot depend on this crate — that would
+    /// be a cycle), so the guarantee is pinned here, where both crates are in scope. If the AuxPoW
+    /// commitment layout ever changes, this test fails instead of every peg-out silently losing its
+    /// Kaspa PoW binding.
+    #[test]
+    fn commitment_layout_matches_witness_extract() {
+        let commitment = hfc();
+        let payload = AuxPow::embed_commitment(&[1, 2, 3, 4, 5], commitment, &[9, 9]);
+
+        // The authoritative extractor (this crate) and the witness extractor must agree.
+        let cb = coinbase_committing(commitment);
+        let aux = AuxPow {
+            parent_header: crate::header::Header::from_precomputed_hash(Hash::default(), vec![]),
+            parent_coinbase: cb,
+            coinbase_merkle_branch: vec![],
+        };
+        assert_eq!(aux.committed_hash(), Some(commitment));
+        assert_eq!(kaspa_shielded_core::witness_chain::extract_hfc(&payload), Some(commitment));
+
+        // Two commitments: both must reject (anti-ambiguity).
+        let mut doubled = payload.clone();
+        doubled.extend_from_slice(&AuxPow::embed_commitment(&[], commitment, &[]));
+        assert_eq!(kaspa_shielded_core::witness_chain::extract_hfc(&doubled), None);
+    }
+
     /// A coinbase whose payload carries exactly one MAGIC||H_fc, plus surrounding
     /// bytes (mimicking blue_score/subsidy/script + extra_data).
     fn coinbase_committing(commitment: Hash) -> Transaction {

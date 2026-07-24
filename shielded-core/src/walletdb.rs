@@ -2543,6 +2543,7 @@ mod tests {
             anchor: [0u8; 32],
             proof: vec![],
             binding_sig: [0u8; sizes::SIG],
+            burn: None,
         };
 
         // First acceptance appends its commitment; the duplicate appends nothing.

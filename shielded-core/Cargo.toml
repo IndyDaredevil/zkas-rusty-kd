@@ -40,6 +40,20 @@ group = "=0.13.0"
 pasta_curves = "=0.5.1"
 # Shielded-transaction sighash.
 blake2b_simd = { workspace = true }
+# Bridge burn-accumulator hashing. SHA-256 rather than the chain's usual blake2b
+# because the verifier is the Kaspa-side risc0 peg-out guest, whose shared ABI
+# hashes with SHA-256; the two implementations must agree byte-for-byte.
+sha2 = { workspace = true }
+# Canonical-R witness chain (`witness_chain`): recompute a Kaspa block's KIP-21
+# `seq_commit` to prove a ZKas state root is committed by Kaspa's own PoW. The
+# SAME crate runs in the risc0 peg-out guest, so the two cannot drift. Pulled
+# `default-features = false` on purpose: the `std` feature depends on
+# kaspa-consensus-core, which depends back on kaspa-shielded-core — a cycle. The
+# no_std surface is exactly the hashing/types this module needs.
+kaspa-hashes = { workspace = true }
+# Specified by path (not `workspace = true`) so we can force `default-features = false`;
+# Cargo forbids overriding a workspace dependency's default-features on inherit.
+kaspa-seq-commit = { path = "../consensus/seq-commit", default-features = false }
 # Bundle reconstruction (batch verification) — enabled by the `circuit` feature.
 nonempty = { version = "0.11", default-features = false, optional = true }
 # RNG for RedPallas signing (message signatures + circuit proving). Non-optional:

@@ -150,7 +150,7 @@ mod tests {
             block.header.hash_merkle_root = calc_hash_merkle_root(block.transactions.iter());
 
             assert_match!(
-                consensus.validate_and_insert_block(block.clone().to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == 5000000000);
+                consensus.validate_and_insert_block(block.clone().to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == 50000000000);
 
             // The second time we send an invalid block we expect it to be a known invalid.
             assert_match!(
@@ -188,10 +188,10 @@ mod tests {
             let mut block = consensus.build_block_with_parents_and_transactions(7.into(), vec![6.into()], vec![]);
             block.transactions[0].payload[8..16].copy_from_slice(&(5_u64).to_le_bytes());
             block.header.hash_merkle_root = calc_hash_merkle_root(block.transactions.iter());
-            // ZKas divides Kaspa's emission table by BPS (=10): the deflationary
-            // initial subsidy is 44_000_000_000/10 = 4_400_000_000 per block (the value
-            // observed live in the mainnet coinbase).
-            assert_match!(consensus.validate_and_insert_block(block.to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == 4400000000);
+            // ZKas scales Kaspa's emission table by REWARD_SCALE (3/22) after the ÷BPS step:
+            // the deflationary initial subsidy is 44_000_000_000 × 3/22 = 6_000_000_000 per block
+            // (6 FC/block at 1 BPS — the value observed live in the mainnet coinbase).
+            assert_match!(consensus.validate_and_insert_block(block.to_immutable()).virtual_state_task.await, Err(RuleError::WrongSubsidy(expected,_)) if expected == 6000000000);
         }
 
         {

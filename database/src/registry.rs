@@ -108,6 +108,12 @@ pub enum DatabaseStorePrefixes {
     /// re-deriving it — and so history stays scannable after the full block body
     /// is pruned (PLAN §2.9 pruning). Written in the block-commit batch.
     ShieldedScanBlock = 87,
+    /// Per-chain-block snapshot of the **bridge burn accumulator**: the ordered
+    /// exit receipts burned out of the shielded pool, whose Merkle root the
+    /// shielded state root commits to. Snapshotted per chain block (like the
+    /// tree frontier and supply totals) so a reorg reloads the selected parent's
+    /// accumulator rather than replaying from genesis.
+    ShieldedBurns = 88,
 
     // ---- Separator ----
     /// Reserved as a separator

@@ -76,8 +76,8 @@ impl From<(&Header, &'static [u8])> for GenesisBlock {
 /// (see `SampledDifficultyManager`). This makes the chain mineable from block 1 on CPU.
 pub const GENESIS: GenesisBlock = GenesisBlock {
     hash: Hash::from_bytes([
-        0x4c, 0xe1, 0x7d, 0x36, 0x6f, 0x52, 0x8a, 0x40, 0x31, 0x1f, 0x78, 0x9e, 0xe4, 0xc7, 0x4e, 0x02, 0x47, 0x67, 0x66, 0xe5, 0x48,
-        0x63, 0x7a, 0xe4, 0x85, 0x8b, 0xd6, 0x17, 0x5a, 0x99, 0xd9, 0xbd,
+        0x4a, 0x5c, 0x32, 0x74, 0xb1, 0x1a, 0xfc, 0xc6, 0x5c, 0x39, 0x5a, 0xd3, 0xa6, 0x5f, 0x5a, 0x6c, 0x91, 0xe6, 0x4e, 0xd0, 0xbf,
+        0x5a, 0xe1, 0xc1, 0xc6, 0x61, 0x07, 0x0b, 0x68, 0xd6, 0xfe, 0x46,
     ]),
     version: 0,
     hash_merkle_root: Hash::from_bytes([
@@ -85,8 +85,11 @@ pub const GENESIS: GenesisBlock = GenesisBlock {
         0x67, 0x76, 0x78, 0x97, 0xb8, 0x35, 0xcd, 0x7f, 0x6f, 0x35, 0xad,
     ]),
     utxo_commitment: EMPTY_MUHASH,
-    // 2026-07-01 00:00:00 UTC — ZKas mainnet launch anchor.
-    timestamp: 1782864000000,
+    // 2026-07-24 11:00:00 UTC — ZKas FINAL-RESET mainnet launch anchor. Distinct from the
+    // prior chain's genesis so current-chain nodes cannot join the reset. Set to launch-day
+    // (<= wall-clock) so block-timestamp validation holds. Bundles Toccata=always (seq_commit
+    // + canonical-R from genesis) and the 5% dev fee. See RESET-CHECKLIST.md.
+    timestamp: 1784890800000,
     // Easy initial difficulty for the CPU low-difficulty start (same as testnet).
     bits: 0x1e7fffff,
     nonce: 0,

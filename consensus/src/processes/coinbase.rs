@@ -88,6 +88,11 @@ pub struct CoinbaseManager {
     bps_history: ForkedParam<u64>,
     toccata_activation: ForkActivation,
 
+    /// ZKas dev fee: permille (of subsidy) diverted to `dev_fee_recipient`. 0 disables.
+    dev_fee_permille: u64,
+    /// ZKas dev fee recipient: raw 43-byte Orchard address. None disables the dev fee.
+    dev_fee_recipient: Option<[u8; 43]>,
+
     /// Precomputed subsidy by month tables (for before and after the Crescendo hardfork)
     subsidy_by_month_table_before: SubsidyByMonthTable,
     subsidy_by_month_table_after: SubsidyByMonthTable,
@@ -124,6 +129,8 @@ impl CoinbaseManager {
         pre_deflationary_phase_base_subsidy: u64,
         bps_history: ForkedParam<u64>,
         toccata_activation: ForkActivation,
+        dev_fee_permille: u64,
+        dev_fee_recipient: Option<[u8; 43]>,
     ) -> Self {
         // Precomputed subsidy by month table for the actual block per second rate.
         // Values are rounded up per BPS (keeping the same number of rewarding months as the original
@@ -139,9 +146,22 @@ impl CoinbaseManager {
             pre_deflationary_phase_base_subsidy,
             bps_history,
             toccata_activation,
+            dev_fee_permille,
+            dev_fee_recipient,
             subsidy_by_month_table_before,
             subsidy_by_month_table_after,
             crescendo_activation_daa_score: bps_history.activation().daa_score(),
+        }
+    }
+
+    /// The dev fee skimmed from a single rewarded block's `subsidy` (permille of subsidy,
+    /// rounded down). `0` when the dev fee is disabled (`None` recipient or `0` permille).
+    #[inline]
+    fn dev_fee_cut(&self, subsidy: u64) -> u64 {
+        if self.dev_fee_recipient.is_some() && self.dev_fee_permille > 0 {
+            ((subsidy as u128 * self.dev_fee_permille as u128) / 1000) as u64
+        } else {
+            0
         }
     }
 
@@ -162,13 +182,21 @@ impl CoinbaseManager {
     ) -> CoinbaseResult<CoinbaseTransactionTemplate> {
         let mut outputs = Vec::with_capacity(ghostdag_data.mergeset_blues.len() + 1); // + 1 for possible red reward
 
+        // ZKas dev fee: skim `dev_fee_permille` of each rewarded block's subsidy (fees are
+        // never skimmed) and accumulate it into a single extra output paid to the dev fund
+        // (appended last). Value is conserved — the miner reward is reduced by exactly the
+        // skimmed amount — so emission accounting is unchanged.
+        let mut dev_fee_accum = 0u64;
+
         // Add an output for each mergeset blue block (∩ DAA window), paying to the script reported by the block.
         // Note that combinatorically it is nearly impossible for a blue block to be non-DAA
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             let reward_data = mergeset_rewards.get(blue).unwrap();
-            if reward_data.subsidy + reward_data.total_fees > 0 {
-                outputs
-                    .push(TransactionOutput::new(reward_data.subsidy + reward_data.total_fees, reward_data.script_public_key.clone()));
+            let dev_cut = self.dev_fee_cut(reward_data.subsidy);
+            dev_fee_accum += dev_cut;
+            let miner_reward = (reward_data.subsidy - dev_cut) + reward_data.total_fees;
+            if miner_reward > 0 {
+                outputs.push(TransactionOutput::new(miner_reward, reward_data.script_public_key.clone()));
             }
         }
 
@@ -181,12 +209,25 @@ impl CoinbaseManager {
             if mergeset_non_daa.contains(red) {
                 red_reward += reward_data.total_fees;
             } else {
-                red_reward += reward_data.subsidy + reward_data.total_fees;
+                let dev_cut = self.dev_fee_cut(reward_data.subsidy);
+                dev_fee_accum += dev_cut;
+                red_reward += (reward_data.subsidy - dev_cut) + reward_data.total_fees;
             }
         }
 
         if red_reward > 0 {
             outputs.push(TransactionOutput::new(red_reward, miner_data.script_public_key.clone()));
+        }
+
+        // Append the accumulated dev fee as a final coinbase output to the dev-fund Orchard
+        // recipient. On a shielded_coinbase network build_coinbase_mint mints it as a coinbase
+        // note (its script's first 43 bytes are the recipient); ordering is deterministic
+        // because this is always the last output.
+        if let Some(recipient) = self.dev_fee_recipient {
+            if dev_fee_accum > 0 {
+                let dev_spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&recipient));
+                outputs.push(TransactionOutput::new(dev_fee_accum, dev_spk));
+            }
         }
 
         // Build the current block's payload
@@ -726,6 +767,63 @@ mod tests {
         assert_eq!(post_activation.tx.version, constants::TX_VERSION_TOCCATA);
     }
 
+    #[test]
+    fn dev_fee_skims_subsidy_to_dev_recipient() {
+        use kaspa_consensus_core::config::params::ZKAS_DEV_FEE_RECIPIENT;
+        use kaspa_hashes::Hash;
+        use std::sync::Arc;
+
+        // MAINNET_PARAMS carries the 5% dev fee.
+        assert_eq!(MAINNET_PARAMS.dev_fee_permille, 50);
+        assert_eq!(MAINNET_PARAMS.dev_fee_recipient, Some(ZKAS_DEV_FEE_RECIPIENT));
+        let cbm = create_manager(&MAINNET_PARAMS);
+
+        let subsidy = 1_000_000_000u64;
+        let fees = 123_456u64;
+        let blue = Hash::from_bytes([7u8; 32]);
+        let blue_script = ScriptPublicKey::new(0, ScriptVec::from_slice(&[9u8, 9, 9]));
+
+        let mut ghostdag_data = GhostdagData::default();
+        ghostdag_data.mergeset_blues = Arc::new(vec![blue]);
+        ghostdag_data.blue_score = 1;
+
+        let mut mergeset_rewards: BlockHashMap<BlockRewardData> = Default::default();
+        mergeset_rewards.insert(blue, BlockRewardData::new(subsidy, fees, blue_script.clone()));
+        let non_daa: BlockHashSet = Default::default();
+
+        let miner_data = MinerData::new(ScriptPublicKey::new(0, scriptvec![1, 2, 3]), vec![]);
+        let tx = cbm
+            .expected_coinbase_transaction(0, miner_data, &ghostdag_data, &mergeset_rewards, &non_daa, [0u8; 32])
+            .unwrap()
+            .tx;
+
+        // Exactly two outputs: the reduced miner reward, then the dev fee (appended last).
+        assert_eq!(tx.outputs.len(), 2, "one miner output + one dev output");
+        let dev_cut = subsidy * 50 / 1000; // 5% of subsidy only
+        assert_eq!(tx.outputs[0].value, (subsidy - dev_cut) + fees, "miner reward reduced by dev cut; fees untouched");
+        assert_eq!(tx.outputs[0].script_public_key, blue_script);
+        assert_eq!(tx.outputs[1].value, dev_cut);
+        assert_eq!(tx.outputs[1].script_public_key, ScriptPublicKey::new(0, ScriptVec::from_slice(&ZKAS_DEV_FEE_RECIPIENT)));
+        // Value is conserved — the split neither mints nor burns.
+        assert_eq!(tx.outputs[0].value + tx.outputs[1].value, subsidy + fees);
+
+        // The dev recipient decodes as a canonical Orchard address and mints a valid coinbase note.
+        let recipient: [u8; 43] = tx.outputs[1].script_public_key.script()[..43].try_into().unwrap();
+        let mut seed = tx.id().as_bytes().to_vec();
+        seed.extend_from_slice(&1u32.to_le_bytes());
+        let desc = kaspa_shielded_core::coinbase::derive_coinbase_note_desc(recipient, &seed);
+        kaspa_shielded_core::coinbase::coinbase_note(&desc, dev_cut).expect("dev recipient must be a canonical Orchard address");
+
+        // With no recipient the manager produces no dev output and pays the full reward to the miner.
+        let no_fee = CoinbaseManager::new(150, 204, 0, 50_000_000_000, ForkedParam::new_const(1), ForkActivation::never(), 50, None);
+        let tx2 = no_fee
+            .expected_coinbase_transaction(0, MinerData::new(ScriptPublicKey::new(0, scriptvec![1, 2, 3]), vec![]), &ghostdag_data, &mergeset_rewards, &non_daa, [0u8; 32])
+            .unwrap()
+            .tx;
+        assert_eq!(tx2.outputs.len(), 1, "no dev recipient => no dev output");
+        assert_eq!(tx2.outputs[0].value, subsidy + fees, "full reward to miner when dev fee disabled");
+    }
+
     fn create_manager(params: &Params) -> CoinbaseManager {
         CoinbaseManager::new(
             params.coinbase_payload_script_public_key_max_len,
@@ -734,11 +832,13 @@ mod tests {
             params.pre_deflationary_phase_base_subsidy,
             params.bps_history(),
             params.toccata_activation,
+            params.dev_fee_permille,
+            params.dev_fee_recipient,
         )
     }
 
     /// Return a CoinbaseManager with legacy golang 1 BPS properties
     fn create_legacy_manager() -> CoinbaseManager {
-        CoinbaseManager::new(150, 204, 15778800 - 259200, 50000000000, ForkedParam::new_const(1), ForkActivation::never())
+        CoinbaseManager::new(150, 204, 15778800 - 259200, 50000000000, ForkedParam::new_const(1), ForkActivation::never(), 0, None)
     }
 }

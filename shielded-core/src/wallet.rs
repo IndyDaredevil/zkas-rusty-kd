@@ -346,6 +346,7 @@ pub mod build {
             anchor: bundle.anchor().to_bytes(),
             proof,
             binding_sig,
+            burn: None,
         }
     }
 

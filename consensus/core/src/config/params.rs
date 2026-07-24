@@ -423,6 +423,16 @@ pub struct Params {
     /// pure DAA governs, so post-launch blocks are **not** easily mined. `0` disables the
     /// entire launch schedule (upstream KIP-0004 behaviour).
     pub difficulty_ramp_blocks: u64,
+
+    /// ZKas dev fee: parts-per-1000 of each rewarded block's **subsidy** (not fees)
+    /// diverted to [`Self::dev_fee_recipient`] as an extra coinbase note. `0` disables.
+    /// Consensus-critical: it changes the coinbase every node reconstructs.
+    pub dev_fee_permille: u64,
+
+    /// ZKas dev fee recipient: raw 43-byte Orchard address the dev fee is minted to.
+    /// `None` disables the dev fee regardless of `dev_fee_permille`. Only meaningful on a
+    /// `shielded_coinbase` network (the recipient is a shielded address).
+    pub dev_fee_recipient: Option<[u8; 43]>,
 }
 
 impl Params {
@@ -689,6 +699,10 @@ impl Params {
             // Consensus-critical launch schedule; not exposed as a CLI override.
             low_difficulty_start_blocks: self.low_difficulty_start_blocks,
             difficulty_ramp_blocks: self.difficulty_ramp_blocks,
+
+            // Consensus-critical dev fee; not exposed as a CLI override.
+            dev_fee_permille: self.dev_fee_permille,
+            dev_fee_recipient: self.dev_fee_recipient,
         }
     }
 }
@@ -732,6 +746,20 @@ impl From<NetworkId> for Params {
         }
     }
 }
+
+/// ZKas dev-fund shielded recipient: the raw 43-byte Orchard address (version
+/// `ShieldedOrchard`) that the per-block dev fee is minted to as a coinbase note.
+/// Decoded from `zkas:p9d3qav2adcuvss6rgymm3nm334rlajxz0y6lzrec7rt32rymxnxlctjxyq862tffy88wgspyrn0d73`
+/// (checksum-verified). Kept as raw bytes so consensus needs no address/bech32 dep.
+pub const ZKAS_DEV_FEE_RECIPIENT: [u8; 43] = [
+    0x5b, 0x10, 0x75, 0x8a, 0xeb, 0x71, 0xc6, 0x42, 0x1a, 0x1a, 0x09, 0xbd, 0xc6, 0x7b, 0x8c, 0x6a, 0x3f, 0xf6, 0x46, 0x13, 0xc9,
+    0xaf, 0x88, 0x79, 0xc7, 0x86, 0xb8, 0xa8, 0x64, 0xd9, 0xa6, 0x6f, 0xe1, 0x72, 0x31, 0x00, 0x7d, 0x29, 0x69, 0x49, 0x0e, 0x77,
+    0x22,
+];
+
+/// ZKas dev fee: 50 permille (5%) of every block's subsidy is diverted to
+/// [`ZKAS_DEV_FEE_RECIPIENT`].
+pub const ZKAS_DEV_FEE_PERMILLE: u64 = 50;
 
 pub const MAINNET_PARAMS: Params = Params {
     // ZKas is a distinct network with its own genesis; it MUST NOT advertise or
@@ -796,8 +824,17 @@ pub const MAINNET_PARAMS: Params = Params {
 
     crescendo_activation: ForkActivation::always(),
 
-    // Roughly 2026-06-30 1615 UTC
-    toccata_activation: ForkActivation::new(474_165_565),
+    // RESET-BUNDLE VALUE: KIP-21 sequencing commitments (seq_commit) active from
+    // genesis. This is required for the *trustless* KAS<->ZKAS bridge: canonical-R
+    // proves a shielded state root R is committed by the chain's own PoW by having
+    // the covenant read a block's seq_commit on-chain (OpChainblockSeqCommit). That
+    // opcode only returns a value once seq_commit is being computed, and seq_commit
+    // is gated on this activation (see utxo_validation.rs `seq_commit_accessor`).
+    // The prior DAA-474_165_565 value (~2026-06-30 in *real* Kaspa DAA terms) is
+    // effectively "never" for this young 1-BPS chain (~15 years out), which left the
+    // bridge's trust root dormant. `always()` matches the neighboring crescendo /
+    // merged_mining launch values and must ride the genesis re-cut. CONSENSUS-BREAKING.
+    toccata_activation: ForkActivation::always(),
     // LAUNCH VALUE (decided 2026-07-22, reset bundle): merged mining active from
     // genesis. This is ZKas's production model — the chain merge-mines Kaspa from
     // block 0 (~20-25 KAS blocks/h in production), so aux-PoW acceptance is a launch
@@ -816,6 +853,12 @@ pub const MAINNET_PARAMS: Params = Params {
     //  - launch window ends at blue score 25_000 (~6.9 h at the 1 BPS target rate).
     low_difficulty_start_blocks: 5_000,
     difficulty_ramp_blocks: 20_000,
+
+    // ZKas dev fund: 5% of every block's subsidy is minted as a shielded coinbase note
+    // to ZKAS_DEV_FEE_RECIPIENT. Mainnet is shielded_coinbase, so the note is diverted
+    // into the shielded pool like any miner reward.
+    dev_fee_permille: ZKAS_DEV_FEE_PERMILLE,
+    dev_fee_recipient: Some(ZKAS_DEV_FEE_RECIPIENT),
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -884,6 +927,10 @@ pub const TESTNET_PARAMS: Params = Params {
     // Launch difficulty schedule disabled on testnet.
     low_difficulty_start_blocks: 0,
     difficulty_ramp_blocks: 0,
+
+    // No dev fee on this network.
+    dev_fee_permille: 0,
+    dev_fee_recipient: None,
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -935,6 +982,10 @@ pub const SIMNET_PARAMS: Params = Params {
     // Launch difficulty schedule disabled on simnet.
     low_difficulty_start_blocks: 0,
     difficulty_ramp_blocks: 0,
+
+    // No dev fee on this network.
+    dev_fee_permille: 0,
+    dev_fee_recipient: None,
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -995,6 +1046,10 @@ pub const DEVNET_PARAMS: Params = Params {
     // Launch window ends at blue score 250_000 (50k easy + 200k ramp), same as mainnet.
     low_difficulty_start_blocks: 50_000,
     difficulty_ramp_blocks: 200_000,
+
+    // No dev fee on devnet.
+    dev_fee_permille: 0,
+    dev_fee_recipient: None,
 };
 
 #[cfg(test)]

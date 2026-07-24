@@ -16,6 +16,7 @@ pub use kaspa_hashes::Hash;
 pub mod acceptance_data;
 pub mod api;
 pub mod auxpow;
+pub mod zkas_state_binding;
 pub mod block;
 pub mod blockhash;
 pub mod blockstatus;

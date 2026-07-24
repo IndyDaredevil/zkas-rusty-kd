@@ -343,6 +343,10 @@ async fn real_shielded_spend_through_mined_block() {
 
     let mut params = MAINNET_PARAMS.clone();
     params.shielded_coinbase = true;
+    // Isolate the shielded-spend mechanics from the dev fee: with the dev fee enabled, block 1's
+    // coinbase would mint two notes (miner + dev fund) and shift note positions/anchors. This test
+    // asserts a single-note coinbase, so disable the dev fee here (it is covered by the coinbase unit test).
+    params.dev_fee_recipient = None;
     // Real PoW at trivial difficulty; small finality so the coinbase note's anchor
     // finalizes within a short chain (spends must reference a finalized anchor).
     let config = ConfigBuilder::new(params)
@@ -442,6 +446,9 @@ async fn immature_shielded_anchor_spend_is_dropped_not_fatal() {
 
     let mut params = MAINNET_PARAMS.clone();
     params.shielded_coinbase = true;
+    // Isolate from the dev fee (block 1 would otherwise mint a second coinbase note, shifting the
+    // anchor this test pins). Dev fee is covered by the coinbase unit test.
+    params.dev_fee_recipient = None;
     // A *large* maturity so a short chain can never mature the anchor: the spend
     // is guaranteed immature no matter the exact blue score.
     let config = ConfigBuilder::new(params)

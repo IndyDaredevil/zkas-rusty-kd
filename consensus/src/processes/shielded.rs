@@ -26,15 +26,17 @@ use kaspa_shielded_core::state::CoinbaseNote;
 use kaspa_shielded_core::state::{BlockShieldedOutcome, CoinbaseMint, ShieldedStateError, ShieldedTx, apply_chain_block_to};
 use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree};
 use kaspa_shielded_core::turnstile::SupplyLedger;
+
 use rocksdb::WriteBatch;
 
 use kaspa_muhash::MuHash;
 
 use crate::model::stores::shielded::{
     AnchorBlockStoreReader, DbAnchorBlockStore, DbNullifierDiffStore, DbNullifierSetStore, DbShieldedNullifierMuHashStore,
-    DbShieldedScanBlockStore, DbShieldedSupplyStore, DbShieldedTreeStore, NullifierDiffStoreReader, NullifierSetStore,
-    NullifierSetStoreReader, ShieldedNullifierMuHashStoreReader, ShieldedScanBlockData, ShieldedScanBlockStoreReader,
-    ShieldedSupplyStoreReader, ShieldedTreeStoreReader, SupplyTotals,
+    BurnReceipts, DbShieldedBurnStore, DbShieldedScanBlockStore, DbShieldedSupplyStore, DbShieldedTreeStore,
+    NullifierDiffStoreReader, NullifierSetStore, NullifierSetStoreReader, ShieldedBurnStoreReader,
+    ShieldedNullifierMuHashStoreReader, ShieldedScanBlockData, ShieldedScanBlockStoreReader, ShieldedSupplyStoreReader,
+    ShieldedTreeStoreReader, SupplyTotals,
 };
 
 /// A computed (not-yet-persisted) shielded transition for one chain block.
@@ -51,6 +53,9 @@ pub struct ComputedBlockShielded {
     pub nullifier_muhash: MuHash,
     /// Conflict-resolution outcome: surviving txs, new nullifiers, new anchor.
     pub outcome: BlockShieldedOutcome,
+    /// The bridge burn accumulator after this block (selected parent's snapshot plus any exit
+    /// receipts this block recorded). Its root is committed by [`Self::state_root`].
+    pub burns: BurnReceipts,
     /// Compact scan record of this block's applied effects (PLAN §2.9), attached by
     /// the virtual processor from the block-time applied set. `None` on the template
     /// path (nothing to persist) or a shielded-inactive block; `persist` writes it in
@@ -79,6 +84,7 @@ impl ComputedBlockShielded {
             &self.nullifier_root(),
             self.supply_totals.cumulative_coinbase,
             self.supply_totals.cumulative_fees,
+            &self.burns.to_accumulator().root(),
         )
     }
 }
@@ -104,8 +110,13 @@ pub struct PruningPointShieldedMetadata {
     pub supply: SupplyTotals,
     /// MuHash accumulator over the whole spent-nullifier set at the pruning point.
     pub nullifier_muhash: MuHash,
+    /// Bridge burn accumulator at the pruning point. Transferred in full (not just its root)
+    /// because a fast-synced node must be able to serve Merkle branches for past peg-outs; without
+    /// it, receipts burned before the pruning point would become unprovable on Kaspa.
+    #[serde(default)]
+    pub burns: BurnReceipts,
     /// Declared shielded state root at the pruning point (anchor + nullifier-set
-    /// accumulator + turnstile totals), recomputed and cross-checked on import.
+    /// accumulator + turnstile totals + burn root), recomputed and cross-checked on import.
     pub state_root: [u8; 32],
 }
 
@@ -120,8 +131,13 @@ impl PruningPointShieldedMetadata {
         bincode::deserialize(bytes).map_err(|e| format!("malformed shielded pruning-point metadata: {e}"))
     }
 
-    /// The shielded state root implied by (frontier, supply, nullifier_muhash).
-    fn recompute_state_root(frontier: &FrontierState, supply: &SupplyTotals, nullifier_muhash: &MuHash) -> [u8; 32] {
+    /// The shielded state root implied by (frontier, supply, nullifier_muhash, burns).
+    fn recompute_state_root(
+        frontier: &FrontierState,
+        supply: &SupplyTotals,
+        nullifier_muhash: &MuHash,
+        burns: &BurnReceipts,
+    ) -> [u8; 32] {
         let anchor = GlobalTree::from_state(frontier).expect("frontier corrupt").anchor().to_bytes();
         let nullifier_root = nullifier_muhash.clone().finalize().as_bytes().to_owned();
         kaspa_shielded_core::commitment::shielded_state_root(
@@ -129,6 +145,7 @@ impl PruningPointShieldedMetadata {
             &nullifier_root,
             supply.cumulative_coinbase,
             supply.cumulative_fees,
+            &burns.to_accumulator().root(),
         )
     }
 }
@@ -216,6 +233,7 @@ pub struct ShieldedStateManager {
     nullifier_muhash: DbShieldedNullifierMuHashStore,
     anchor_block: DbAnchorBlockStore,
     scan_block: DbShieldedScanBlockStore,
+    burn_store: DbShieldedBurnStore,
 }
 
 impl ShieldedStateManager {
@@ -230,7 +248,8 @@ impl ShieldedStateManager {
             supply_store: DbShieldedSupplyStore::new(Arc::clone(&db), cache_policy),
             nullifier_muhash: DbShieldedNullifierMuHashStore::new(Arc::clone(&db), cache_policy),
             anchor_block: DbAnchorBlockStore::new(Arc::clone(&db), cache_policy),
-            scan_block: DbShieldedScanBlockStore::new(db, cache_policy),
+            scan_block: DbShieldedScanBlockStore::new(Arc::clone(&db), cache_policy),
+            burn_store: DbShieldedBurnStore::new(db, cache_policy),
         }
     }
 
@@ -276,6 +295,10 @@ impl ShieldedStateManager {
         Ok(SupplyLedger::from_totals(t.cumulative_coinbase, t.cumulative_fees))
     }
 
+    fn load_burns(&self, block: Hash) -> StoreResult<kaspa_shielded_core::burn::BurnAccumulator> {
+        Ok(self.burn_store.get(block)?.to_accumulator())
+    }
+
     /// The turnstile cumulative totals as of a given chain block (zero totals for
     /// blocks with no shielded state). Used by the pool-delta consensus check.
     pub fn supply_totals_at(&self, block: Hash) -> StoreResult<SupplyTotals> {
@@ -318,7 +341,14 @@ impl ShieldedStateManager {
         let mut m = self.load_nullifier_muhash(block)?;
         let nullifier_root = m.finalize().as_bytes().to_owned();
         let t = self.supply_store.get(block)?;
-        Ok(kaspa_shielded_core::commitment::shielded_state_root(&anchor, &nullifier_root, t.cumulative_coinbase, t.cumulative_fees))
+        let burn_root = self.burn_store.get(block)?.to_accumulator().root();
+        Ok(kaspa_shielded_core::commitment::shielded_state_root(
+            &anchor,
+            &nullifier_root,
+            t.cumulative_coinbase,
+            t.cumulative_fees,
+            &burn_root,
+        ))
     }
 
     /// Validate and compute one chain block's shielded transition against its
@@ -338,10 +368,13 @@ impl ShieldedStateManager {
         // transition against the selected parent's persisted state.
         let mut tree = self.load_tree(selected_parent)?;
         let mut supply = self.load_supply(selected_parent)?;
+        // Extend the selected parent's burn accumulator, so a reorg naturally rebuilds from the
+        // new selected parent rather than replaying every burn from genesis.
+        let mut burns = self.load_burns(selected_parent)?;
         let pending = MemNullifierSet::new();
         let outcome = {
             let finalized = LayeredNullifierSet { store: &self.nullifiers, pending: &pending };
-            apply_chain_block_to(&finalized, &mut tree, &mut supply, coinbase, txs)?
+            apply_chain_block_to(&finalized, &mut tree, &mut supply, coinbase, txs, &mut burns)?
         };
         // Advance the nullifier-set accumulator: the selected parent's snapshot
         // plus this block's newly spent nullifiers. MuHash is order-independent, so
@@ -358,6 +391,7 @@ impl ShieldedStateManager {
                 cumulative_fees: supply.cumulative_fees(),
             },
             nullifier_muhash,
+            burns: BurnReceipts::from_accumulator(&burns),
             outcome,
             // Attached by the virtual processor from the block-time applied set
             // (it has the original bundle ciphertexts + coinbase); `compute` sees
@@ -381,6 +415,11 @@ impl ShieldedStateManager {
         }
         if computed.supply_totals.cumulative_coinbase > 0 || computed.supply_totals.cumulative_fees > 0 {
             self.supply_store.set_batch(batch, block, computed.supply_totals)?;
+        }
+        // Only chains that have actually burned pay for this store; the empty accumulator is the
+        // default a missing key reads back as.
+        if !computed.burns.receipts.is_empty() {
+            self.burn_store.set_batch(batch, block, computed.burns.clone())?;
         }
         if !computed.outcome.new_nullifiers.is_empty() {
             self.nullifier_diffs.set_batch(batch, block, computed.outcome.new_nullifiers.clone())?;
@@ -441,8 +480,10 @@ impl ShieldedStateManager {
         }
         let supply = self.supply_store.get(block)?;
         let nullifier_muhash = self.nullifier_muhash.get(block)?;
-        let state_root = PruningPointShieldedMetadata::recompute_state_root(&frontier, &supply, &nullifier_muhash);
-        Ok(Some(PruningPointShieldedMetadata { frontier, supply, nullifier_muhash, state_root }))
+        let burns = self.burn_store.get(block)?;
+        let state_root =
+            PruningPointShieldedMetadata::recompute_state_root(&frontier, &supply, &nullifier_muhash, &burns);
+        Ok(Some(PruningPointShieldedMetadata { frontier, supply, nullifier_muhash, burns, state_root }))
     }
 
     /// Verify imported pruning-point shielded metadata against the streamed
@@ -467,9 +508,11 @@ impl ShieldedStateManager {
         }
         // 2. The declared state root must be consistent with the transferred parts.
         let recomputed =
-            PruningPointShieldedMetadata::recompute_state_root(&md.frontier, &md.supply, &md.nullifier_muhash);
+            PruningPointShieldedMetadata::recompute_state_root(&md.frontier, &md.supply, &md.nullifier_muhash, &md.burns);
         if recomputed != md.state_root {
-            return Err("declared shielded state root is inconsistent with (frontier, supply, nullifier_muhash)".to_string());
+            return Err(
+                "declared shielded state root is inconsistent with (frontier, supply, nullifier_muhash, burns)".to_string()
+            );
         }
         Ok(count)
     }
@@ -496,6 +539,9 @@ impl ShieldedStateManager {
         self.anchor_block.set_batch(batch, anchor, block)?;
         if md.supply.cumulative_coinbase > 0 || md.supply.cumulative_fees > 0 {
             self.supply_store.set_batch(batch, block, md.supply)?;
+        }
+        if !md.burns.receipts.is_empty() {
+            self.burn_store.set_batch(batch, block, md.burns.clone())?;
         }
         if md.nullifier_muhash.clone().finalize() != kaspa_muhash::EMPTY_MUHASH {
             self.nullifier_muhash.set_batch(batch, block, md.nullifier_muhash.clone())?;
@@ -534,6 +580,7 @@ mod tests {
 
     fn stx(nfs: &[u8], cmxs: &[u32], fee: u64) -> ShieldedTx {
         ShieldedTx {
+            burn: None,
             nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
             commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
             fee,
@@ -599,6 +646,62 @@ mod tests {
         // A later block reusing nf(1) is still caught against the persisted set.
         let c3 = mgr2.compute(b2, None, &[stx(&[1], &[300], 0)]).unwrap();
         assert!(c3.outcome.accepted.is_empty(), "double-spend caught across sessions");
+    }
+
+    fn burn_stx(nfs: &[u8], cmxs: &[u32], value_balance: u64, burn_v: u64, tag: u8) -> ShieldedTx {
+        ShieldedTx {
+            burn: Some(kaspa_shielded_core::burn::ExitReceipt {
+                v: burn_v,
+                recipient: [tag; 32],
+                n: [tag.wrapping_add(0x90); 32],
+            }),
+            nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
+            commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
+            fee: value_balance,
+            anchor: empty_anchor(),
+        }
+    }
+
+    /// A bridge burn must survive the round-trip through the stores: it moves the committed state
+    /// root, a fresh manager over the same DB reproduces that root, and the accumulator carries
+    /// forward to children so later peg-outs still prove against it.
+    #[test]
+    fn burn_persists_and_moves_the_committed_state_root() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = manager(&db);
+        let (b1, b2, b3) = (h(1), h(2), h(3));
+
+        // b1: coinbase only — no burns yet, so the burn root is the zero sentinel.
+        let c1 = commit_block(&mgr, &db, b1, h(0), Some(coinbase(100, 0)), vec![]);
+        assert!(c1.burns.receipts.is_empty());
+        assert_eq!(c1.state_root(), mgr.state_root_at(b1).unwrap());
+
+        // b2: a transaction burning 20 of its 30 value_balance.
+        let c2 = commit_block(&mgr, &db, b2, b1, Some(coinbase(100, 10)), vec![burn_stx(&[1], &[100], 30, 20, 0xAA)]);
+        assert_eq!(c2.burns.receipts.len(), 1, "the burn must be recorded");
+        assert_eq!(c2.burns.receipts[0].0, 20);
+        assert_ne!(c2.state_root(), c1.state_root(), "a burn must move the committed state root");
+        assert_eq!(c2.state_root(), mgr.state_root_at(b2).unwrap(), "persisted root must match compute-time root");
+
+        // The committed root really is a function of the burn: recomputing it with an empty
+        // accumulator gives a different value.
+        let without_burns = kaspa_shielded_core::commitment::shielded_state_root(
+            &c2.anchor(),
+            &c2.nullifier_root(),
+            c2.supply_totals.cumulative_coinbase,
+            c2.supply_totals.cumulative_fees,
+            &[0u8; 32],
+        );
+        assert_ne!(c2.state_root(), without_burns, "the burn root must be load-bearing in the commitment");
+
+        // A fresh manager over the same DB reproduces it bit-for-bit.
+        let mgr2 = ShieldedStateManager::new(Arc::clone(&db), CachePolicy::Count(64));
+        assert_eq!(mgr2.state_root_at(b2).unwrap(), c2.state_root());
+
+        // A child with no burns inherits the accumulator rather than resetting it.
+        let c3 = commit_block(&mgr, &db, b3, b2, Some(coinbase(100, 0)), vec![]);
+        assert_eq!(c3.burns.receipts.len(), 1, "accumulator must carry forward across a no-burn block");
+        assert_eq!(mgr.state_root_at(b3).unwrap(), c3.state_root());
     }
 
     /// The shielded state root (PLAN §2.10) is persisted per block, reproduces

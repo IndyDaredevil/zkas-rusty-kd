@@ -29,6 +29,7 @@ use kaspa_database::registry::DatabaseStorePrefixes;
 use kaspa_hashes::Hash;
 use kaspa_math::Uint3072;
 use kaspa_muhash::MuHash;
+use kaspa_shielded_core::burn::{BurnAccumulator, ExitReceipt};
 use kaspa_shielded_core::tree::FrontierState;
 use kaspa_utils::mem_size::MemSizeEstimator;
 use rocksdb::WriteBatch;
@@ -265,6 +266,79 @@ impl ShieldedSupplyStoreReader for DbShieldedSupplyStore {
         match self.access.read(block) {
             Ok(t) => Ok(t),
             Err(StoreError::KeyNotFound(_)) => Ok(SupplyTotals::default()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+// --------------------------- Bridge burn accumulator ---------------------------
+
+/// Persisted bridge burn accumulator at a chain block: the ordered exit receipts burned out of the
+/// shielded pool ([`kaspa_shielded_core::burn`]).
+///
+/// The receipt *sequence* is stored rather than just the root, because the relayer must be able to
+/// produce a Merkle branch for any receipt so the Kaspa-side peg-out guest can prove inclusion. A
+/// receipt is 72 bytes and burns are rare relative to blocks, so the sequence is cheap.
+///
+/// Snapshotted per chain block for the same reason as the tree frontier and supply totals: a reorg
+/// reloads the selected parent's accumulator instead of replaying from genesis.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BurnReceipts {
+    /// Exit receipts in acceptance order: `(value, kaspa_recipient, exit_nullifier)`.
+    pub receipts: Vec<(u64, [u8; 32], [u8; 32])>,
+}
+
+impl BurnReceipts {
+    /// Rebuild the accumulator this snapshot represents.
+    pub fn to_accumulator(&self) -> BurnAccumulator {
+        BurnAccumulator::from_receipts(
+            self.receipts.iter().map(|&(v, recipient, n)| ExitReceipt { v, recipient, n }),
+        )
+    }
+
+    /// Snapshot an accumulator for persistence.
+    pub fn from_accumulator(acc: &BurnAccumulator) -> Self {
+        Self { receipts: acc.receipts().iter().map(|r| (r.v, r.recipient, r.n)).collect() }
+    }
+}
+
+impl MemSizeEstimator for BurnReceipts {}
+
+pub trait ShieldedBurnStoreReader {
+    fn get(&self, block: Hash) -> StoreResult<BurnReceipts>;
+}
+
+/// Per-chain-block snapshots of the bridge burn accumulator.
+#[derive(Clone)]
+pub struct DbShieldedBurnStore {
+    db: Arc<DB>,
+    access: CachedDbAccess<Hash, BurnReceipts, BlockHasher>,
+}
+
+impl DbShieldedBurnStore {
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
+        Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedBurns.into()) }
+    }
+
+    pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
+        Self::new(Arc::clone(&self.db), cache_policy)
+    }
+
+    pub fn set_batch(&self, batch: &mut WriteBatch, block: Hash, receipts: BurnReceipts) -> StoreResult<()> {
+        self.access.write(BatchDbWriter::new(batch), block, receipts)
+    }
+
+    pub fn delete_batch(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
+        self.access.delete(BatchDbWriter::new(batch), block)
+    }
+}
+
+impl ShieldedBurnStoreReader for DbShieldedBurnStore {
+    fn get(&self, block: Hash) -> StoreResult<BurnReceipts> {
+        match self.access.read(block) {
+            Ok(r) => Ok(r),
+            // A block with no snapshot has never burned: the empty accumulator.
+            Err(StoreError::KeyNotFound(_)) => Ok(BurnReceipts::default()),
             Err(e) => Err(e),
         }
     }

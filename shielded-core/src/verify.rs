@@ -339,6 +339,7 @@ mod e2e {
             anchor: bundle.anchor().to_bytes(),
             proof,
             binding_sig,
+            burn: None,
         }
     }
 
@@ -433,6 +434,7 @@ mod tests {
             anchor: [1u8; 32],
             proof: vec![0u8; 100],
             binding_sig: [0u8; 64],
+            burn: None,
         }
     }
 

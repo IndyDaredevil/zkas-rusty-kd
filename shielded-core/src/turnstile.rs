@@ -67,6 +67,10 @@ pub enum TurnstileViolation {
 pub struct SupplyLedger {
     cumulative_coinbase: u128,
     cumulative_fees: u128,
+    /// Value burned out of the pool to be mirrored on another chain (the bridge
+    /// peg-out seam, [`crate::burn`]). Mechanically identical to a fee — an
+    /// amount leaving the pool — but with a recorded public destination.
+    cumulative_burns: u128,
 }
 
 impl SupplyLedger {
@@ -76,8 +80,17 @@ impl SupplyLedger {
     }
 
     /// Reconstruct a ledger from persisted cumulative totals.
+    ///
+    /// Pre-bridge callers that have no burn total should use
+    /// [`from_totals_with_burns`](Self::from_totals_with_burns) with `0`; a chain with no burns
+    /// has byte-identical behaviour to before the seam existed.
     pub fn from_totals(cumulative_coinbase: u128, cumulative_fees: u128) -> Self {
-        Self { cumulative_coinbase, cumulative_fees }
+        Self::from_totals_with_burns(cumulative_coinbase, cumulative_fees, 0)
+    }
+
+    /// Reconstruct a ledger from persisted cumulative totals, including burns.
+    pub fn from_totals_with_burns(cumulative_coinbase: u128, cumulative_fees: u128, cumulative_burns: u128) -> Self {
+        Self { cumulative_coinbase, cumulative_fees, cumulative_burns }
     }
 
     /// Mint a coinbase subsidy into the pool (§2.7). The subsidy is public and
@@ -103,12 +116,31 @@ impl SupplyLedger {
         self.cumulative_fees
     }
 
-    /// The current shielded-pool value, `coinbase − fees`. Errors with
-    /// [`TurnstileViolation::PoolUnderflow`] if fees exceed coinbase.
+    /// Burn value out of the pool for a bridge peg-out ([`crate::burn`]).
+    ///
+    /// Consensus must only call this for an amount the bundle's binding signature already proved
+    /// is leaving the pool (the declared `value_balance`, split into fee + burn). Given that, a
+    /// burn is exactly as safe as a fee: it cannot move value that was not authorised.
+    pub fn burn(&mut self, value: u64) -> Result<(), TurnstileViolation> {
+        self.cumulative_burns = self.cumulative_burns.checked_add(value as u128).ok_or(TurnstileViolation::Overflow)?;
+        Ok(())
+    }
+
+    /// Total value ever burned out of the pool to another chain.
+    pub fn cumulative_burns(&self) -> u128 {
+        self.cumulative_burns
+    }
+
+    /// The current shielded-pool value, `coinbase − fees − burns`. Errors with
+    /// [`TurnstileViolation::PoolUnderflow`] if the exits exceed what was ever issued.
     pub fn pool_value(&self) -> Result<u128, TurnstileViolation> {
         self.cumulative_coinbase
             .checked_sub(self.cumulative_fees)
-            .ok_or(TurnstileViolation::PoolUnderflow { coinbase: self.cumulative_coinbase, fees: self.cumulative_fees })
+            .and_then(|v| v.checked_sub(self.cumulative_burns))
+            .ok_or(TurnstileViolation::PoolUnderflow {
+                coinbase: self.cumulative_coinbase,
+                fees: self.cumulative_fees.saturating_add(self.cumulative_burns),
+            })
     }
 
     /// The hard consensus check (PLAN §2.6): the pool must be non-negative.
@@ -209,6 +241,49 @@ mod tests {
         l.collect_fees(30).unwrap();
         assert_eq!(l.pool_value().unwrap(), 70);
         assert!(l.check().is_ok());
+    }
+
+    /// A burn removes value from the pool exactly like a fee does.
+    #[test]
+    fn burns_leave_the_pool() {
+        let mut l = SupplyLedger::new();
+        l.mint_coinbase(100).unwrap();
+        l.collect_fees(10).unwrap();
+        l.burn(30).unwrap();
+        assert_eq!(l.pool_value().unwrap(), 60);
+        assert_eq!(l.cumulative_burns(), 30);
+        assert!(l.check().is_ok());
+    }
+
+    /// Burns are held to the same anti-inflation rule as fees: they cannot take out more than was
+    /// ever issued. This is what stops a buggy or malicious bridge from draining the pool.
+    #[test]
+    fn burns_cannot_exceed_issuance() {
+        let mut l = SupplyLedger::new();
+        l.mint_coinbase(100).unwrap();
+        l.burn(101).unwrap();
+        assert!(matches!(l.check(), Err(TurnstileViolation::PoolUnderflow { .. })));
+    }
+
+    /// Fees and burns are cumulative against the same issuance, so they cannot each be spent up to
+    /// the full pool.
+    #[test]
+    fn fees_and_burns_share_one_budget() {
+        let mut l = SupplyLedger::new();
+        l.mint_coinbase(100).unwrap();
+        l.collect_fees(60).unwrap();
+        l.burn(60).unwrap();
+        assert!(matches!(l.check(), Err(TurnstileViolation::PoolUnderflow { .. })));
+    }
+
+    /// A chain that never burns must behave exactly as it did before the seam existed.
+    #[test]
+    fn no_burns_is_backwards_compatible() {
+        let mut l = SupplyLedger::new();
+        l.mint_coinbase(100).unwrap();
+        l.collect_fees(30).unwrap();
+        assert_eq!(l.pool_value().unwrap(), 70);
+        assert_eq!(l, SupplyLedger::from_totals(100, 30));
     }
 
     #[test]

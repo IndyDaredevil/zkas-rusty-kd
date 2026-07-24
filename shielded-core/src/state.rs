@@ -42,6 +42,13 @@ pub struct ShieldedTx {
     /// The anchor the bundle's spends prove against. Must be a finalized anchor
     /// (PLAN §2.5); enforced by the consensus validation layer.
     pub anchor: [u8; 32],
+    /// An optional bridge peg-out declared by this transaction ([`crate::burn`]).
+    ///
+    /// `fee` is the total the binding signature proved is leaving the pool. When a burn is
+    /// present, that total is **split**: `burn.v` is destroyed and recorded as an exit receipt,
+    /// and the remaining `fee - burn.v` is paid to the miner as an ordinary fee. A burn may
+    /// therefore never exceed `fee` — otherwise it would move value the bundle never authorised.
+    pub burn: Option<crate::burn::ExitReceipt>,
 }
 
 /// Error extracting a [`ShieldedTx`] from an on-wire [`ShieldedBundle`].
@@ -49,6 +56,9 @@ pub struct ShieldedTx {
 pub enum BundleExtractError {
     /// A note commitment was not a canonical Pallas base-field encoding.
     NonCanonicalCommitment,
+    /// A bundle declared a burn but spends nothing, so it has no nullifier to key the exit by.
+    /// Without a unique exit key the peg-out could be replayed on Kaspa.
+    BurnWithoutSpend,
     /// A non-coinbase bundle declared a negative value balance, i.e. it claims to
     /// mint value into the pool — only the coinbase may do that (PLAN §2.7).
     MintingValueBalance,
@@ -73,7 +83,18 @@ impl ShieldedTx {
         if bundle.value_balance < 0 {
             return Err(BundleExtractError::MintingValueBalance);
         }
-        Ok(ShieldedTx { nullifiers, commitments, fee: bundle.value_balance as u64, anchor: bundle.anchor })
+        // A bridge peg-out, if the bundle declared one. The exit-nullifier is the bundle's FIRST
+        // action nullifier — a real spent-note nullifier, which ZKas consensus already guarantees
+        // can never appear twice on the selected chain. So the Kaspa-side replay key inherits this
+        // chain's own double-spend prevention rather than needing a separate uniqueness argument.
+        let burn = match bundle.burn {
+            Some((v, recipient)) => {
+                let n = *bundle.nullifiers().next().ok_or(BundleExtractError::BurnWithoutSpend)?;
+                Some(crate::burn::ExitReceipt { v, recipient, n })
+            }
+            None => None,
+        };
+        Ok(ShieldedTx { nullifiers, commitments, fee: bundle.value_balance as u64, anchor: bundle.anchor, burn })
     }
 }
 
@@ -125,6 +146,14 @@ pub enum ShieldedStateError {
     Turnstile(TurnstileViolation),
     /// The global note-commitment tree is full (2^32 leaves).
     TreeFull,
+    /// A transaction declared a burn larger than the value its bundle authorised to leave the
+    /// pool (`burn.v > fee`). Accepting it would move unauthorised value.
+    BurnExceedsValueBalance {
+        /// The declared burn amount.
+        burn: u64,
+        /// The total value the bundle proved is leaving the pool.
+        value_balance: u64,
+    },
 }
 
 impl From<TurnstileViolation> for ShieldedStateError {
@@ -150,6 +179,9 @@ pub struct BlockShieldedOutcome {
     pub subtree: ChainBlockSubtree,
     /// The anchor after appending this block's subtree to the global tree.
     pub anchor: Anchor,
+    /// Bridge exit receipts recorded by accepted transactions, in acceptance order. These are
+    /// appended to the burn accumulator, whose root the shielded state root commits to.
+    pub burn_receipts: Vec<crate::burn::ExitReceipt>,
 }
 
 /// The mutable shielded consensus state, advanced in GHOSTDAG accepted order.
@@ -165,12 +197,19 @@ pub struct ShieldedState {
     pub tree: GlobalTree,
     /// Turnstile supply ledger.
     pub supply: SupplyLedger,
+    /// Bridge burn accumulator; its root is folded into the shielded state root.
+    pub burns: crate::burn::BurnAccumulator,
 }
 
 impl ShieldedState {
     /// The genesis (empty) shielded state.
     pub fn new() -> Self {
-        Self { nullifiers: MemNullifierSet::new(), tree: GlobalTree::new(), supply: SupplyLedger::new() }
+        Self {
+            nullifiers: MemNullifierSet::new(),
+            tree: GlobalTree::new(),
+            supply: SupplyLedger::new(),
+            burns: crate::burn::BurnAccumulator::new(),
+        }
     }
 
     /// The current anchor (root of the global note-commitment tree).
@@ -194,7 +233,7 @@ impl ShieldedState {
         txs: &[ShieldedTx],
     ) -> Result<BlockShieldedOutcome, ShieldedStateError> {
         // Disjoint borrows of the three fields are permitted by direct field access.
-        let outcome = apply_chain_block_to(&self.nullifiers, &mut self.tree, &mut self.supply, coinbase, txs)?;
+        let outcome = apply_chain_block_to(&self.nullifiers, &mut self.tree, &mut self.supply, coinbase, txs, &mut self.burns)?;
         self.nullifiers.extend(outcome.new_nullifiers.iter().copied());
         Ok(outcome)
     }
@@ -215,6 +254,7 @@ pub fn apply_chain_block_to<S: NullifierSet + ?Sized>(
     supply: &mut SupplyLedger,
     coinbase: Option<&CoinbaseMint>,
     txs: &[ShieldedTx],
+    burns: &mut crate::burn::BurnAccumulator,
 ) -> Result<BlockShieldedOutcome, ShieldedStateError> {
     // ---- Phase 1: resolve conflicts & gather effects ----
     let mut resolver = NullifierConflictResolver::new(finalized);
@@ -236,16 +276,36 @@ pub fn apply_chain_block_to<S: NullifierSet + ?Sized>(
         }
     }
 
+    let mut total_burns: u128 = 0;
+    let mut burn_receipts = Vec::new();
+
     for (i, tx) in txs.iter().enumerate() {
+        // A burn may never exceed what the bundle proved is leaving the pool. Checked before
+        // conflict resolution so an invalid declaration invalidates the block rather than being
+        // silently skipped.
+        if let Some(receipt) = &tx.burn {
+            if receipt.v > tx.fee {
+                return Err(ShieldedStateError::BurnExceedsValueBalance { burn: receipt.v, value_balance: tx.fee });
+            }
+        }
+
         match resolver.try_accept(tx.nullifiers.iter().copied()) {
             Ok(()) => {
                 for &cmx in &tx.commitments {
                     subtree.push(cmx);
                 }
-                total_fees += tx.fee as u128;
+                // Split the declared value_balance: the burn leaves the pool as a recorded exit,
+                // the remainder is an ordinary miner fee.
+                let burn_value = tx.burn.as_ref().map_or(0, |r| r.v);
+                total_burns += burn_value as u128;
+                total_fees += (tx.fee - burn_value) as u128;
+                if let Some(receipt) = &tx.burn {
+                    burn_receipts.push(*receipt);
+                }
                 accepted.push(i);
             }
-            // Conflicting transaction: dropped (double-spend), records nothing.
+            // Conflicting transaction: dropped (double-spend), records nothing — including no
+            // burn receipt. A dropped peg-out must not become claimable on Kaspa.
             Err(_) => {}
         }
     }
@@ -261,6 +321,9 @@ pub fn apply_chain_block_to<S: NullifierSet + ?Sized>(
     if total_fees > 0 {
         new_supply.collect_fees(u64::try_from(total_fees).map_err(|_| TurnstileViolation::Overflow)?)?;
     }
+    if total_burns > 0 {
+        new_supply.burn(u64::try_from(total_burns).map_err(|_| TurnstileViolation::Overflow)?)?;
+    }
 
     // Step 3: append this block's subtree to the global tree, producing the anchor.
     new_tree.append_subtree(&subtree)?;
@@ -269,11 +332,15 @@ pub fn apply_chain_block_to<S: NullifierSet + ?Sized>(
     // Step 4: the turnstile invariant must hold after the update.
     new_supply.check()?;
 
-    // All checks passed: commit to the caller's tree/supply.
+    // All checks passed: commit to the caller's tree/supply/burn accumulator. The accumulator is
+    // appended last so a rejected block leaves it untouched.
     *tree = new_tree;
     *supply = new_supply;
+    for receipt in &burn_receipts {
+        burns.push(*receipt);
+    }
 
-    Ok(BlockShieldedOutcome { accepted, new_nullifiers, subtree, anchor })
+    Ok(BlockShieldedOutcome { accepted, new_nullifiers, subtree, anchor, burn_receipts })
 }
 
 impl Default for ShieldedState {
@@ -300,11 +367,142 @@ mod tests {
 
     fn tx(nfs: &[u8], cmxs: &[u32], fee: u64) -> ShieldedTx {
         ShieldedTx {
+            burn: None,
             nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
             commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
             fee,
             anchor: [0u8; 32],
         }
+    }
+
+    /// A declared burn becomes an exit receipt keyed by the bundle's first spent nullifier.
+    #[test]
+    fn burn_declaration_becomes_an_exit_receipt() {
+        use crate::bundle::{BUNDLE_FLAG_BURN, ShieldedBundle};
+
+        let mut bundle = ShieldedBundle::sample_for_test(2);
+        bundle.value_balance = 30;
+        bundle.flags |= BUNDLE_FLAG_BURN;
+        bundle.burn = Some((20, [0xA1; 32]));
+
+        let stx = ShieldedTx::from_bundle(&bundle).unwrap();
+        let receipt = stx.burn.expect("burn must be extracted");
+        assert_eq!(receipt.v, 20);
+        assert_eq!(receipt.recipient, [0xA1; 32]);
+        assert_eq!(receipt.n, bundle.actions[0].nullifier, "exit key is the first spent nullifier");
+        assert_eq!(stx.fee, 30, "fee still carries the full declared value_balance");
+    }
+
+    /// A burn with nothing spent has no unique exit key, so it must be rejected.
+    #[test]
+    fn burn_without_a_spend_is_rejected() {
+        use crate::bundle::{BUNDLE_FLAG_BURN, ShieldedBundle};
+
+        let mut bundle = ShieldedBundle::sample_for_test(0);
+        bundle.value_balance = 30;
+        bundle.flags |= BUNDLE_FLAG_BURN;
+        bundle.burn = Some((20, [0xA1; 32]));
+
+        assert!(matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::BurnWithoutSpend)));
+    }
+
+    fn burn_tx(nfs: &[u8], cmxs: &[u32], value_balance: u64, burn_v: u64, tag: u8) -> ShieldedTx {
+        ShieldedTx {
+            burn: Some(crate::burn::ExitReceipt { v: burn_v, recipient: [tag; 32], n: [tag.wrapping_add(0x90); 32] }),
+            nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
+            commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
+            fee: value_balance,
+            anchor: [0u8; 32],
+        }
+    }
+
+    /// A burn splits the declared `value_balance`: part is destroyed and recorded as an exit
+    /// receipt, the rest is an ordinary miner fee. Both leave the pool.
+    #[test]
+    fn burn_splits_value_balance_and_records_a_receipt() {
+        let mut st = ShieldedState::new();
+        let out = st
+            .apply_chain_block(
+                Some(&CoinbaseMint::new(vec![CoinbaseNote { value: 100, commitment: cmx(10) }])),
+                // value_balance 30, of which 20 is burned to the bridge and 10 is a fee.
+                &[burn_tx(&[1], &[100], 30, 20, 0xAA)],
+            )
+            .expect("valid block");
+
+        assert_eq!(out.burn_receipts.len(), 1);
+        assert_eq!(out.burn_receipts[0].v, 20);
+        assert_eq!(st.supply.cumulative_burns(), 20);
+        assert_eq!(st.supply.cumulative_fees(), 10);
+        // pool = 100 minted - 10 fee - 20 burned
+        assert_eq!(st.supply.pool_value().unwrap(), 70);
+        // The accumulator advanced, so the state root will change.
+        assert_eq!(st.burns.len(), 1);
+        assert_ne!(st.burns.root(), [0u8; 32]);
+    }
+
+    /// A burn larger than the value the bundle proved is leaving the pool must invalidate the
+    /// block. Otherwise a peg-out could claim value the binding signature never authorised —
+    /// i.e. mint on the Kaspa side out of thin air.
+    #[test]
+    fn burn_exceeding_value_balance_is_rejected() {
+        let mut st = ShieldedState::new();
+        let err = st
+            .apply_chain_block(
+                Some(&CoinbaseMint::new(vec![CoinbaseNote { value: 100, commitment: cmx(10) }])),
+                &[burn_tx(&[1], &[100], 10, 50, 0xBB)],
+            )
+            .expect_err("burn > value_balance must be rejected");
+
+        assert_eq!(err, ShieldedStateError::BurnExceedsValueBalance { burn: 50, value_balance: 10 });
+        // State untouched.
+        assert_eq!(st.supply.cumulative_burns(), 0);
+        assert_eq!(st.burns.len(), 0);
+    }
+
+    /// **A dropped double-spend must not record its burn.** If a conflicting transaction's exit
+    /// receipt still entered the accumulator, the peg-out would become claimable on Kaspa even
+    /// though the burn never happened — value created from nothing.
+    #[test]
+    fn dropped_double_spend_records_no_burn() {
+        let mut st = ShieldedState::new();
+
+        // First block spends nullifier 1 and burns 20.
+        st.apply_chain_block(
+            Some(&CoinbaseMint::new(vec![CoinbaseNote { value: 100, commitment: cmx(10) }])),
+            &[burn_tx(&[1], &[100], 30, 20, 0xAA)],
+        )
+        .expect("first spend accepted");
+        assert_eq!(st.burns.len(), 1);
+        let root_after_first = st.burns.root();
+
+        // Second block re-spends the same nullifier and tries to burn again.
+        let out = st
+            .apply_chain_block(
+                Some(&CoinbaseMint::new(vec![CoinbaseNote { value: 100, commitment: cmx(11) }])),
+                &[burn_tx(&[1], &[101], 30, 20, 0xCC)],
+            )
+            .expect("block is valid; the conflicting tx is merely dropped");
+
+        assert!(out.accepted.is_empty(), "the double-spend must be dropped");
+        assert!(out.burn_receipts.is_empty(), "a dropped tx must record no exit receipt");
+        assert_eq!(st.burns.len(), 1, "accumulator must not have grown");
+        assert_eq!(st.burns.root(), root_after_first, "burn root must be unchanged");
+        assert_eq!(st.supply.cumulative_burns(), 20, "no second burn was charged");
+    }
+
+    /// Burns are subject to the same anti-inflation rule as fees: they cannot take more out of
+    /// the pool than was ever issued.
+    #[test]
+    fn burn_cannot_drain_more_than_issuance() {
+        let mut st = ShieldedState::new();
+        let err = st
+            .apply_chain_block(
+                Some(&CoinbaseMint::new(vec![CoinbaseNote { value: 10, commitment: cmx(10) }])),
+                &[burn_tx(&[1], &[100], 50, 50, 0xDD)],
+            )
+            .expect_err("burning more than issuance must violate the turnstile");
+        assert!(matches!(err, ShieldedStateError::Turnstile(_)));
+        assert_eq!(st.burns.len(), 0, "a rejected block must leave the accumulator untouched");
     }
 
     /// THE make-or-break property (PLAN Phase 1 / task #9), at the algorithm
@@ -474,6 +672,7 @@ mod tests {
     fn extract_shielded_tx_from_bundle() {
         let bundle = ShieldedBundle {
             actions: vec![action(1, 100), action(2, 101)],
+            burn: None,
             flags: 0b11,
             value_balance: 7,
             anchor: [0; 32],
@@ -489,7 +688,7 @@ mod tests {
     #[test]
     fn extract_rejects_minting_value_balance() {
         let bundle =
-            ShieldedBundle { actions: vec![], flags: 0, value_balance: -1, anchor: [0; 32], proof: vec![], binding_sig: [0; 64] };
+            ShieldedBundle { actions: vec![], flags: 0, value_balance: -1, anchor: [0; 32], proof: vec![], binding_sig: [0; 64], burn: None };
         assert!(matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::MintingValueBalance)));
     }
 
@@ -498,7 +697,7 @@ mod tests {
         let mut bad = action(1, 0);
         bad.cmx = [0xff; 32]; // not a canonical Pallas base-field element
         let bundle =
-            ShieldedBundle { actions: vec![bad], flags: 0, value_balance: 0, anchor: [0; 32], proof: vec![], binding_sig: [0; 64] };
+            ShieldedBundle { actions: vec![bad], flags: 0, value_balance: 0, anchor: [0; 32], proof: vec![], binding_sig: [0; 64], burn: None };
         assert!(matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::NonCanonicalCommitment)));
     }
 

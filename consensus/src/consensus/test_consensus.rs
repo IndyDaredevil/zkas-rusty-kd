@@ -22,7 +22,7 @@ use crate::pipeline::virtual_processor::test_block_builder::TestBlockBuilder;
 use crate::processes::window::WindowManager;
 use crate::{
     config::Config,
-    constants::TX_VERSION,
+    constants::{TX_VERSION, TX_VERSION_TOCCATA},
     errors::BlockProcessResult,
     model::{
         services::reachability::MTReachabilityService,
@@ -143,6 +143,10 @@ impl TestConsensus {
         header.timestamp = self.consensus.services.window_manager.calc_past_median_time(&ghostdag_data).unwrap().0 + 1;
         header.blue_score = ghostdag_data.blue_score;
         header.blue_work = ghostdag_data.blue_work;
+        // Mirror the real block builder (virtual_processor): the header version forks to the
+        // Toccata version once toccata_activation is active. Without this, manual test blocks on
+        // a toccata-active network (e.g. always()) fail the post-PoW WrongBlockVersion check.
+        header.version = self.params.block_version().get(header.daa_score);
 
         header
     }
@@ -216,7 +220,9 @@ impl TestConsensus {
             .chain((0_u8).to_le_bytes().iter().copied()) // Script public key length
             .collect();
 
-        let cb = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, cb_payload);
+        // Coinbase tx version also forks at Toccata (mirrors CoinbaseManager::expected_coinbase_transaction).
+        let cb_tx_version = if self.params.toccata_activation.is_active(header.daa_score) { TX_VERSION_TOCCATA } else { TX_VERSION };
+        let cb = Transaction::new(cb_tx_version, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, cb_payload);
         txs.insert(0, cb);
         header.hash_merkle_root = calc_hash_merkle_root(txs.iter());
         MutableBlock::new(header, txs)
