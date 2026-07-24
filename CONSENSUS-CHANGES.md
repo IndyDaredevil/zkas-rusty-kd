@@ -273,7 +273,7 @@ must be finalized + its test updated before genesis lock.
   swap, repo cloned on branch, creds at `/root/.gh_creds`. See `external-build-box-vps3`.
 - **This branch is test-only. Do NOT deploy over the running node** (`fca5229`) until the
   full reset is cut and relaunch is coordinated.
-- Never delete `kaspa-upstream/data` (live merged-mining Kaspa parent), `fc-mainnet` (live
+- Never delete `kaspa-upstream/data` (live merged-mining Kaspa parent), `zkas-node-data` (live
   node appdir), or the running datadir.
 - This-session build evidence (VPS3): IBD integration test `1 passed` (15.9 s); #4
   consensus-core build + mass tests + full consensus build + shielded-core bundle tests

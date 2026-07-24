@@ -73,16 +73,16 @@ Step 1 — confirm your node is SYNCED and has peers BEFORE mining. Mining on an
 unsynced or isolated node means every block you make is orphaned/rejected.
 
   # Linux — run the node with a logfile
-  ./kaspad --appdir=./fc-node --utxoindex \
-    --connect=185.147.157.125:16111 --connect=160.187.211.153:16111 2>&1 | tee firecash-node.log
+  ./kaspad --appdir=./zkas-node --utxoindex \
+    --connect=185.147.157.125:16111 --connect=160.187.211.153:16111 2>&1 | tee zkas-node.log
 
   # then, in another terminal:
-  grep -iE "IBD|synced|Peers|Connected|Accepted .*block|reject|orphan|stale|invalid|timestamp" firecash-node.log | tail -80
+  grep -iE "IBD|synced|Peers|Connected|Accepted .*block|reject|orphan|stale|invalid|timestamp" zkas-node.log | tail -80
 
   # Windows (PowerShell)
-  .\kaspad.exe --appdir=.\fc-node --utxoindex `
-    --connect=185.147.157.125:16111 --connect=160.187.211.153:16111 *>&1 | Tee-Object firecash-node.log
-  Select-String firecash-node.log -Pattern "IBD|synced|Peers|Connected|Accepted .*block|reject|orphan|stale|invalid|timestamp" | Select-Object -Last 80
+  .\kaspad.exe --appdir=.\zkas-node --utxoindex `
+    --connect=185.147.157.125:16111 --connect=160.187.211.153:16111 *>&1 | Tee-Object zkas-node.log
+  Select-String zkas-node.log -Pattern "IBD|synced|Peers|Connected|Accepted .*block|reject|orphan|stale|invalid|timestamp" | Select-Object -Last 80
 
 How to read it:
   * still printing "IBD"                      -> not synced yet, DO NOT mine
@@ -98,7 +98,7 @@ Step 2 — rule out the big solo-only causes:
     (timedatectl on Linux, w32tm on Windows).
   * No peers: if there are no Peers/Connected lines, your blocks never propagate.
 
-Send: firecash-node.log (last ~200 lines) + the firecash-miner console output +
+Send: zkas-node.log (last ~200 lines) + the firecash-miner console output +
 the node version.
 
 
@@ -133,7 +133,7 @@ score (those extra blocks are the merged, still-rewarded blue side blocks).
   1. Pool or solo, and your OS.
   2. Pool:  miner/ASIC log (accepted vs rejected + reason), exact
             stratum+tcp://host:port and worker string, ASIC model/firmware.
-  3. Solo:  firecash-node.log + firecash-miner console + node version.
+  3. Solo:  zkas-node.log + firecash-miner console + node version.
   4. One block hash you mined + your mining address (for an explorer lookup of
      blue / red / chain status).
 

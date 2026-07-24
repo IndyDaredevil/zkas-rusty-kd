@@ -13,8 +13,8 @@ Two servers, each running its own full `kaspad` (own datadir), peered over P2P.
 |---|---|---|
 | Role | node + miner + mining pool + nginx | node + walletd + explorer API |
 | Process mgr | **systemd** | `setsid nohup` (from `/root/zkas/` → symlink to /root/zkas) |
-| Node datadir | `/root/work/fc-mainnet` | `/root/zkas/fc-node` |
-| Binaries | `/root/work/kaspad-run`, `zkas-miner-run`; pool `zkas-pool/bin/stratum-bridge` | `/root/zkas/bin/{kaspad,zkas-walletd,zkas-api}` |
+| Node datadir | `/root/work/zkas-node-data` | `/root/firecash/zkas-node-data` |
+| Binaries | `/root/work/zkas-node`, `zkas-miner-run`; pool `zkas-pool/bin/stratum-bridge` | `/root/zkas-node`, `/root/zkas/bin/{zkas-walletd,zkas-api}` |
 | Ports | node gRPC 16110, P2P 16111, pool stratum (see bridge yaml) | node gRPC 16110, walletd 8501, api 8500 |
 
 > **Port migration (reset):** these are the **current live** ports. The reset binary
@@ -94,7 +94,7 @@ OOMs; release is ~60 MB). `zkas-pool.service` env: `BRIDGE_ALLOW_UNSYNCED=1`
 2. VPS1: `systemctl start zkas-node zkas-miner zkas-pool`.
 3. VPS2 (from `/root/zkas`):
    ```
-   setsid nohup bin/kaspad --appdir=/root/zkas/fc-node --utxoindex \
+   setsid nohup bin/kaspad --appdir=/root/firecash/zkas-node-data --utxoindex \
      --rpclisten=127.0.0.1:16110 --addpeer=185.147.157.125:16111 \
      </dev/null >node.log 2>&1 &
    setsid nohup bin/zkas-walletd --network mainnet --rpc-server 127.0.0.1:16110 \
@@ -114,11 +114,11 @@ Order matters — both empty before either mines.
 
 # 1. VPS1: stop everything, wipe.
 systemctl stop zkas-miner zkas-node zkas-pool
-rm -rf /root/work/fc-mainnet
+rm -rf /root/work/zkas-node-data
 
 # 2. VPS2: stop everything (kill by PID), wipe.
 #    kill <kaspad_pid> <walletd_pid> <api_pid>   # NOT pkill -f (self-match!)
-rm -rf /root/zkas/fc-node
+rm -rf /root/firecash/zkas-node-data
 
 # 3. VPS1 first (has the miner): start node, then miner, then pool.
 systemctl start zkas-node && sleep 15 && systemctl start zkas-miner zkas-pool
