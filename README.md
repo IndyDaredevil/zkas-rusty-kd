@@ -91,11 +91,11 @@ Grab the binaries from the latest [Release](https://github.com/firecash/zkas-rus
 (or build from source, below), then run a node that syncs from the ZKas seed nodes:
 
 ```bash
-./kaspad --appdir=./fc-node --rpclisten=127.0.0.1:16810 --utxoindex \
-  --connect=185.147.157.125:16811 --connect=160.187.211.153:16811
+./kaspad --appdir=./zkas-node --rpclisten=127.0.0.1:16810 --utxoindex \
+  --connect=185.147.157.125:16111 --connect=160.187.211.153:16111
 ```
 Your node does an initial block download from the network and then follows the tip. It only
-needs outbound access to the seed nodes' **p2p port 16811**; its own RPC (16810) stays local.
+needs outbound access to the seed nodes' **p2p port 16111**; its own RPC (16810) stays local.
 
 > **Port note:** ZKas defaults to its own port block — gRPC **16810**, p2p **16811**, wRPC
 > borsh **17810**, json **18810** — distinct from Kaspa's 161xx so a ZKas node and the
@@ -155,7 +155,7 @@ Run it locally for a non-custodial wallet with a REST API on `:8501`:
 
 ```bash
 ./zkas-walletd --network mainnet --rpc-server 127.0.0.1:16810 \
-  --wallet-dir ./fc-wallets --listen 127.0.0.1:8501 \
+  --wallet-dir ./zkas-wallets --listen 127.0.0.1:8501 \
   --allow-origin http://localhost:5173   # your web-wallet origin (omit for same-origin)
 ```
 
