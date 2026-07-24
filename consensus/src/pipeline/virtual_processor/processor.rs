@@ -635,6 +635,14 @@ impl VirtualStateProcessor {
 
         let mut split_point: Option<Hash> = None;
 
+        // Shielded (PLAN §2.4): a reorg's nullifier mutations (down-walk reverts of the abandoned
+        // branch + up-walk re-applies of the rejoining branch) are accumulated into ONE batch and
+        // committed atomically at the end of the walk, so a crash mid-reorg can never leave the
+        // global nullifier set desynced from the selected chain (there is no header commitment to
+        // detect such a split). Read-visibility within the walk is unaffected: `insert_batch` /
+        // `delete_batch` update the store cache immediately, before the batch is committed.
+        let mut shielded_batch = WriteBatch::default();
+
         // Walk down to the reorg split point
         for current in self.reachability_service.default_backward_chain_iterator(from) {
             if self.reachability_service.is_chain_ancestor_of(current, to) {
@@ -646,13 +654,10 @@ impl VirtualStateProcessor {
             // Apply the diff in reverse
             diff.with_diff_in_place(&mergeset_diff.as_reversed()).unwrap();
 
-            // Shielded (PLAN §2.4): this chain block is leaving the selected chain,
-            // so remove the nullifiers it added from the global set (its per-block
-            // frontier/supply snapshots are intrinsic and retained for a rejoin).
-            // No-op for blocks with no shielded nullifiers.
-            let mut shielded_batch = WriteBatch::default();
+            // This chain block is leaving the selected chain, so remove the nullifiers it added
+            // from the global set (its per-block frontier/supply snapshots are intrinsic and
+            // retained for a rejoin). No-op for blocks with no shielded nullifiers.
             self.shielded_state_manager.revert_nullifiers_from_store(&mut shielded_batch, current).unwrap();
-            self.db.write(shielded_batch).unwrap();
         }
 
         let split_point = split_point.expect("chain iterator was expected to reach the reorg split point");
@@ -682,12 +687,10 @@ impl VirtualStateProcessor {
                     diff.with_diff_in_place(mergeset_diff.deref()).unwrap();
                     diff_point = current;
 
-                    // Shielded (PLAN §2.4): this already-validated chain block is
-                    // (re)joining the selected chain, so re-add the nullifiers it
-                    // added from its stored per-block diff. No-op when it has none.
-                    let mut shielded_batch = WriteBatch::default();
+                    // This already-validated chain block is (re)joining the selected chain, so
+                    // re-add the nullifiers it added from its stored per-block diff (accumulated
+                    // into the shared reorg batch above). No-op when it has none.
                     self.shielded_state_manager.apply_nullifiers_from_store(&mut shielded_batch, current).unwrap();
-                    self.db.write(shielded_batch).unwrap();
                 }
                 Err(StoreError::KeyNotFound(_)) => {
                     if self.statuses_store.read().get(current).unwrap() == StatusDisqualifiedFromChain {
@@ -750,6 +753,10 @@ impl VirtualStateProcessor {
         if chain_disqualified_counter > 0 {
             self.counters.chain_disqualified_counts.fetch_add(chain_disqualified_counter, Ordering::Relaxed);
         }
+
+        // Commit the whole reorg's nullifier reverts + re-applies atomically. Empty (no shielded
+        // nullifiers touched) is a cheap no-op write.
+        self.db.write(shielded_batch).unwrap();
 
         diff_point
     }
