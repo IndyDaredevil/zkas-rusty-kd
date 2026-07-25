@@ -71,6 +71,13 @@ pub struct SupplyLedger {
     /// peg-out seam, [`crate::burn`]). Mechanically identical to a fee — an
     /// amount leaving the pool — but with a recorded public destination.
     cumulative_burns: u128,
+    /// Value minted **into** the pool by the bridge peg-IN seam ([`crate::pegin`]):
+    /// native ZKAS issued against a verified, replay-protected mirror-ZKAS burn on
+    /// Kaspa. This is a second *authorized* entry seam alongside the coinbase — the
+    /// amount is bound to a proven Kaspa burn (Merkle-included under buried PoW), so
+    /// it can only add value that an equal amount of mirror-ZKAS was destroyed for.
+    /// Globally conserved: `pegged_in ≤ cumulative mirror ever minted (= prior burns)`.
+    cumulative_pegged_in: u128,
 }
 
 impl SupplyLedger {
@@ -89,8 +96,22 @@ impl SupplyLedger {
     }
 
     /// Reconstruct a ledger from persisted cumulative totals, including burns.
+    ///
+    /// Pre-peg-in callers use this with a `0` peg-in total via
+    /// [`from_totals_full`](Self::from_totals_full); a chain that never pegs in is byte-identical
+    /// to before the seam existed.
     pub fn from_totals_with_burns(cumulative_coinbase: u128, cumulative_fees: u128, cumulative_burns: u128) -> Self {
-        Self { cumulative_coinbase, cumulative_fees, cumulative_burns }
+        Self::from_totals_full(cumulative_coinbase, cumulative_fees, cumulative_burns, 0)
+    }
+
+    /// Reconstruct a ledger from all four persisted cumulative totals (incl. bridge peg-in).
+    pub fn from_totals_full(
+        cumulative_coinbase: u128,
+        cumulative_fees: u128,
+        cumulative_burns: u128,
+        cumulative_pegged_in: u128,
+    ) -> Self {
+        Self { cumulative_coinbase, cumulative_fees, cumulative_burns, cumulative_pegged_in }
     }
 
     /// Mint a coinbase subsidy into the pool (§2.7). The subsidy is public and
@@ -131,14 +152,32 @@ impl SupplyLedger {
         self.cumulative_burns
     }
 
-    /// The current shielded-pool value, `coinbase − fees − burns`. Errors with
+    /// Mint native ZKAS **into** the pool for a verified bridge peg-in ([`crate::pegin`]).
+    ///
+    /// Consensus must only call this for an amount bound to a valid [`crate::pegin::KaspaBurnProof`]
+    /// (a mirror-ZKAS burn Merkle-included under a buried-PoW Kaspa header) whose outpoint is not
+    /// already in the consumed-burns replay set. Given that, this is as safe as a coinbase mint: it
+    /// adds exactly the value that an equal amount of mirror-ZKAS was destroyed for on Kaspa.
+    pub fn peg_in(&mut self, value: u64) -> Result<(), TurnstileViolation> {
+        self.cumulative_pegged_in =
+            self.cumulative_pegged_in.checked_add(value as u128).ok_or(TurnstileViolation::Overflow)?;
+        Ok(())
+    }
+
+    /// Total value ever minted into the pool from bridge peg-ins.
+    pub fn cumulative_pegged_in(&self) -> u128 {
+        self.cumulative_pegged_in
+    }
+
+    /// The current shielded-pool value, `coinbase + pegged_in − fees − burns`. Errors with
     /// [`TurnstileViolation::PoolUnderflow`] if the exits exceed what was ever issued.
     pub fn pool_value(&self) -> Result<u128, TurnstileViolation> {
         self.cumulative_coinbase
-            .checked_sub(self.cumulative_fees)
+            .checked_add(self.cumulative_pegged_in)
+            .and_then(|v| v.checked_sub(self.cumulative_fees))
             .and_then(|v| v.checked_sub(self.cumulative_burns))
             .ok_or(TurnstileViolation::PoolUnderflow {
-                coinbase: self.cumulative_coinbase,
+                coinbase: self.cumulative_coinbase.saturating_add(self.cumulative_pegged_in),
                 fees: self.cumulative_fees.saturating_add(self.cumulative_burns),
             })
     }

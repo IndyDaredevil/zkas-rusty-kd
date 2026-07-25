@@ -97,6 +97,75 @@ pub fn create_coinbase_merkle_witness(tx_hashes: &[Hash]) -> alloc::vec::Vec<Has
     create_first_leaf_merkle_witness::<MerkleBranchHash>(tx_hashes)
 }
 
+/// General Merkle-inclusion witness for the leaf at `index` in `leaf_hashes`, against the root
+/// `calc_merkle_root_with_hasher::<H>` builds. Returns the ordered sibling hashes from the leaf up
+/// to the root. Unlike [`create_first_leaf_merkle_witness`] (leaf 0, siblings always on the right),
+/// a sibling here can be on either side; [`verify_merkle_witness`] recovers the side from `index`'s
+/// bits. This is the producing side of the **bridge peg-in** proof: it proves an arbitrary Kaspa
+/// transaction (the mirror-ZKAS burn, at any position in the block) is committed by the block's
+/// `hash_merkle_root`. A single-leaf tree yields an empty witness (the root is the leaf itself).
+pub fn create_merkle_witness<H: Hasher>(leaf_hashes: &[Hash], index: usize) -> alloc::vec::Vec<Hash> {
+    let mut branch = alloc::vec::Vec::new();
+    if leaf_hashes.len() <= 1 || index >= leaf_hashes.len() {
+        return branch;
+    }
+    let mut level = leaf_hashes.to_vec();
+    let mut idx = index;
+    while level.len() > 1 {
+        // The sibling is the pair-partner (padding a missing right child with ZERO_HASH), exactly as
+        // the reduction below pairs (i, i+1).
+        let sib = if idx % 2 == 0 {
+            if idx + 1 < level.len() { level[idx + 1] } else { ZERO_HASH }
+        } else {
+            level[idx - 1]
+        };
+        branch.push(sib);
+        let mut next = alloc::vec::Vec::with_capacity(level.len().div_ceil(2));
+        let mut i = 0;
+        while i < level.len() {
+            let left = level[i];
+            let right = if i + 1 < level.len() { level[i + 1] } else { ZERO_HASH };
+            next.push(merkle_hash_with_hasher(left, right, H::default()));
+            i += 2;
+        }
+        level = next;
+        idx /= 2;
+    }
+    branch
+}
+
+/// [`create_merkle_witness`] for the default transaction Merkle-branch hasher — the general (any
+/// index) tx-inclusion path against a block's `hash_merkle_root`, as [`create_coinbase_merkle_witness`]
+/// is for leaf 0. Used by the bridge peg-in relayer to build a burn tx's inclusion branch.
+pub fn create_tx_merkle_witness(tx_hashes: &[Hash], index: usize) -> alloc::vec::Vec<Hash> {
+    create_merkle_witness::<MerkleBranchHash>(tx_hashes, index)
+}
+
+/// [`verify_merkle_witness`] for the default transaction Merkle-branch hasher — the consensus-side
+/// check that a transaction at `index` is committed by a block's `hash_merkle_root`.
+pub fn verify_tx_merkle_witness(tx_hash: Hash, index: usize, branch: &[Hash], root: Hash) -> bool {
+    verify_merkle_witness::<MerkleBranchHash>(tx_hash, index, branch, root)
+}
+
+/// Verify a general Merkle-inclusion witness: fold `leaf` up `branch` using `index`'s bits (bit
+/// clear ⇒ the node is a left child, sibling on the right; bit set ⇒ right child, sibling on the
+/// left) and check it reproduces `root`. This is the consuming side of [`create_merkle_witness`]
+/// and the primitive the bridge peg-in verifies inside consensus: a Kaspa burn transaction is
+/// committed by a block whose PoW is buried.
+pub fn verify_merkle_witness<H: Hasher>(leaf: Hash, index: usize, branch: &[Hash], root: Hash) -> bool {
+    let mut acc = leaf;
+    let mut idx = index;
+    for sibling in branch {
+        acc = if idx % 2 == 0 {
+            merkle_hash_with_hasher(acc, *sibling, H::default())
+        } else {
+            merkle_hash_with_hasher(*sibling, acc, H::default())
+        };
+        idx /= 2;
+    }
+    acc == root
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +291,39 @@ mod tests {
             // Sanity on branch length: ceil(log2(n)) siblings (0 for a single leaf).
             let expected_len = n.next_power_of_two().trailing_zeros() as usize;
             assert_eq!(branch.len(), expected_len, "n={n}: unexpected branch length");
+        }
+    }
+
+    /// The general (any-index) witness must fold back to the root for **every** leaf position and
+    /// every tree size — this is the bridge peg-in inclusion proof for a burn tx at an arbitrary
+    /// position in a Kaspa block. Also cross-checks it agrees with the first-leaf builder at index 0.
+    #[test]
+    fn general_witness_reproduces_root_every_index() {
+        for n in 1..=33usize {
+            let leaves: Vec<Hash> = (0..n).map(|i| make_hash(&[i as u8, (i >> 8) as u8, 0xEE])).collect();
+            let root = calc_merkle_root(leaves.clone().into_iter());
+            for index in 0..n {
+                let branch = create_merkle_witness::<MerkleBranchHash>(&leaves, index);
+                assert!(
+                    verify_merkle_witness::<MerkleBranchHash>(leaves[index], index, &branch, root),
+                    "n={n} index={index}: general witness must reproduce the merkle root",
+                );
+                // A wrong index (when >1 leaf) must not verify against the same branch.
+                if n > 1 {
+                    let wrong = (index + 1) % n;
+                    assert!(
+                        !verify_merkle_witness::<MerkleBranchHash>(leaves[wrong], index, &branch, root)
+                            || leaves[wrong] == leaves[index],
+                        "n={n} index={index}: a different leaf must not verify at this position",
+                    );
+                }
+            }
+            // Index 0 must match the specialized first-leaf builder exactly.
+            assert_eq!(
+                create_merkle_witness::<MerkleBranchHash>(&leaves, 0),
+                create_first_leaf_merkle_witness::<MerkleBranchHash>(&leaves),
+                "n={n}: index-0 general witness must equal the first-leaf witness",
+            );
         }
     }
 

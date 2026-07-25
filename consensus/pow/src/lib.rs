@@ -1,4 +1,5 @@
 pub mod auxpow;
+pub mod pegin;
 // public for benchmarks
 #[doc(hidden)]
 pub mod matrix;
