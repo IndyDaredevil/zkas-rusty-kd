@@ -154,6 +154,11 @@ impl SupplyLedger {
 
     /// Mint native ZKAS **into** the pool for a verified bridge peg-in ([`crate::pegin`]).
     ///
+    /// **Currently dormant:** the bridge is deactivated ([`crate::burn::BRIDGE_ENABLED`] is `false`),
+    /// so this seam is not wired into any state transition and is never called by consensus. The
+    /// peg-in verifier (`kaspa_pow::pegin`) exists as inert primitives only. Do not wire this in until
+    /// the master switch is flipped.
+    ///
     /// Consensus must only call this for an amount bound to a valid [`crate::pegin::KaspaBurnProof`]
     /// (a mirror-ZKAS burn Merkle-included under a buried-PoW Kaspa header) whose outpoint is not
     /// already in the consumed-burns replay set. Given that, this is as safe as a coinbase mint: it

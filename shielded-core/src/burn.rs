@@ -35,6 +35,23 @@
 
 use sha2::{Digest, Sha256};
 
+/// **Master switch for the KAS⇄ZKAS bridge (both peg directions).**
+///
+/// The bridge is *deactivated* while this is `false`: consensus rejects any transaction that
+/// declares a peg-out burn (see `check_shielded_in_isolation` and [`crate::state::ShieldedTx::from_bundle`]),
+/// and the peg-in mint seam ([`crate::turnstile::SupplyLedger::peg_in`], `kaspa_pow::pegin`) is never
+/// wired into the state transition. With no burn ever admitted, the [`BurnAccumulator`] stays empty
+/// and its root is a constant, so a chain with the bridge off is byte-identical to one that never had
+/// the seam — flipping this flag is therefore a *tightening*, safe to deploy without a chain reset as
+/// long as no burn has ever been mined.
+///
+/// **Why off:** a trustless peg needs a settlement primitive Kaspa does not yet expose natively (a
+/// covenant cannot mint/track a token amount, only KAS value). Shipping a half-built peg-out would let
+/// users irrevocably burn ZKAS against a bridge that cannot honour it. Keep this `false` until Kaspa
+/// ships the settlement support, then flip to `true` (or replace with an activation-score gate) and
+/// re-enable in one place.
+pub const BRIDGE_ENABLED: bool = false;
+
 /// Domain byte for exit-receipt leaves.
 pub const LEAF_DOMAIN: u8 = 0x00;
 /// Domain byte for interior nodes.

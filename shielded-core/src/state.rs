@@ -62,6 +62,11 @@ pub enum BundleExtractError {
     /// A non-coinbase bundle declared a negative value balance, i.e. it claims to
     /// mint value into the pool — only the coinbase may do that (PLAN §2.7).
     MintingValueBalance,
+    /// A bundle declared a bridge peg-out burn while the bridge is deactivated
+    /// ([`crate::burn::BRIDGE_ENABLED`] is `false`). Consensus rejects such a tx up front in
+    /// `check_shielded_in_isolation`; this is the defense-in-depth guard at the extractor, so a
+    /// burn can never become an applied effect even if it reached here.
+    BridgeDisabled,
 }
 
 impl ShieldedTx {
@@ -88,6 +93,10 @@ impl ShieldedTx {
         // can never appear twice on the selected chain. So the Kaspa-side replay key inherits this
         // chain's own double-spend prevention rather than needing a separate uniqueness argument.
         let burn = match bundle.burn {
+            // Bridge deactivated: refuse to lift a peg-out declaration into an applied effect. The
+            // isolation check already rejects such a tx before it reaches consensus; this keeps the
+            // extractor honest as a second line of defense (see [`crate::burn::BRIDGE_ENABLED`]).
+            Some(_) if !crate::burn::BRIDGE_ENABLED => return Err(BundleExtractError::BridgeDisabled),
             Some((v, recipient)) => {
                 let n = *bundle.nullifiers().next().ok_or(BundleExtractError::BurnWithoutSpend)?;
                 Some(crate::burn::ExitReceipt { v, recipient, n })
@@ -375,9 +384,11 @@ mod tests {
         }
     }
 
-    /// A declared burn becomes an exit receipt keyed by the bundle's first spent nullifier.
+    /// While the bridge is deactivated, `from_bundle` refuses to lift a declared burn into an
+    /// applied effect. If the master switch is ever flipped, the same declaration is extracted into
+    /// an exit receipt keyed by the bundle's first spent nullifier (the pre-deactivation behavior).
     #[test]
-    fn burn_declaration_becomes_an_exit_receipt() {
+    fn burn_declaration_is_rejected_while_bridge_disabled() {
         use crate::bundle::{BUNDLE_FLAG_BURN, ShieldedBundle};
 
         let mut bundle = ShieldedBundle::sample_for_test(2);
@@ -385,15 +396,24 @@ mod tests {
         bundle.flags |= BUNDLE_FLAG_BURN;
         bundle.burn = Some((20, [0xA1; 32]));
 
-        let stx = ShieldedTx::from_bundle(&bundle).unwrap();
-        let receipt = stx.burn.expect("burn must be extracted");
-        assert_eq!(receipt.v, 20);
-        assert_eq!(receipt.recipient, [0xA1; 32]);
-        assert_eq!(receipt.n, bundle.actions[0].nullifier, "exit key is the first spent nullifier");
-        assert_eq!(stx.fee, 30, "fee still carries the full declared value_balance");
+        if crate::burn::BRIDGE_ENABLED {
+            let stx = ShieldedTx::from_bundle(&bundle).unwrap();
+            let receipt = stx.burn.expect("burn must be extracted");
+            assert_eq!(receipt.v, 20);
+            assert_eq!(receipt.recipient, [0xA1; 32]);
+            assert_eq!(receipt.n, bundle.actions[0].nullifier, "exit key is the first spent nullifier");
+            assert_eq!(stx.fee, 30, "fee still carries the full declared value_balance");
+        } else {
+            assert!(
+                matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::BridgeDisabled)),
+                "a peg-out burn must be refused while the bridge is off"
+            );
+        }
     }
 
-    /// A burn with nothing spent has no unique exit key, so it must be rejected.
+    /// A burn with nothing spent has no unique exit key. While the bridge is off it is rejected as
+    /// `BridgeDisabled` (the switch is checked first); with the bridge on it is rejected for the
+    /// missing spend key.
     #[test]
     fn burn_without_a_spend_is_rejected() {
         use crate::bundle::{BUNDLE_FLAG_BURN, ShieldedBundle};
@@ -403,7 +423,12 @@ mod tests {
         bundle.flags |= BUNDLE_FLAG_BURN;
         bundle.burn = Some((20, [0xA1; 32]));
 
-        assert!(matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::BurnWithoutSpend)));
+        let expected = if crate::burn::BRIDGE_ENABLED {
+            BundleExtractError::BurnWithoutSpend
+        } else {
+            BundleExtractError::BridgeDisabled
+        };
+        assert_eq!(ShieldedTx::from_bundle(&bundle).unwrap_err(), expected);
     }
 
     fn burn_tx(nfs: &[u8], cmxs: &[u32], value_balance: u64, burn_v: u64, tag: u8) -> ShieldedTx {

@@ -57,6 +57,12 @@ impl TransactionValidator {
         if bundle.actions.len() > kaspa_shielded_core::bundle::MAX_ACTIONS_PER_BUNDLE {
             return Err(TxRuleError::InvalidShieldedTransaction("shielded bundle exceeds the maximum number of actions"));
         }
+        // Bridge peg-out is deactivated (kaspa_shielded_core::burn::BRIDGE_ENABLED). Reject any
+        // transaction that declares a burn at the earliest, context-free point so a peg-out can
+        // never propagate over the mempool or be mined. Re-enable by flipping the master switch.
+        if bundle.burn.is_some() && !kaspa_shielded_core::burn::BRIDGE_ENABLED {
+            return Err(TxRuleError::InvalidShieldedTransaction("bridge peg-out is disabled"));
+        }
         Ok(())
     }
 
@@ -452,6 +458,56 @@ mod tests {
         let mut tx = valid_tx;
         tx.version = TX_VERSION + 1;
         assert_match!(tv.validate_tx_in_header_context(&tx, LockTimeArg::Finalized, 0), Err(TxRuleError::UnknownTxVersion(_)));
+    }
+
+    /// The bridge is deactivated: a shielded tx that declares a peg-out burn must be rejected up
+    /// front in isolation, so it can never propagate over the mempool or be mined. Tracks the master
+    /// switch `kaspa_shielded_core::burn::BRIDGE_ENABLED`.
+    #[test]
+    fn shielded_peg_out_burn_is_rejected_while_bridge_disabled() {
+        use kaspa_shielded_core::bundle::{ActionWire, BUNDLE_FLAG_BURN, ShieldedBundle, sizes};
+
+        let params = MAINNET_PARAMS.clone();
+        let tv = TransactionValidator::new_for_tests(
+            params.max_tx_inputs,
+            params.max_tx_outputs,
+            params.max_signature_script_len(),
+            params.max_script_public_key_len,
+            params.coinbase_payload_script_public_key_max_len,
+            params.coinbase_maturity(),
+            params.ghostdag_k(),
+            Default::default(),
+        );
+
+        // A well-formed shielded bundle that declares a burn. Only the context-free shape matters
+        // here; proof/anchor checks are contextual and run later.
+        let action = ActionWire {
+            nullifier: [1u8; sizes::FIELD],
+            rk: [0u8; sizes::FIELD],
+            cmx: [0u8; sizes::FIELD],
+            cv_net: [0u8; sizes::FIELD],
+            ephemeral_key: [0u8; sizes::FIELD],
+            enc_ciphertext: [0u8; sizes::ENC_CIPHERTEXT],
+            out_ciphertext: [0u8; sizes::OUT_CIPHERTEXT],
+            spend_auth_sig: [0u8; sizes::SIG],
+        };
+        let bundle = ShieldedBundle {
+            actions: vec![action],
+            flags: BUNDLE_FLAG_BURN,
+            value_balance: 30,
+            anchor: [0u8; sizes::FIELD],
+            proof: vec![],
+            binding_sig: [0u8; sizes::SIG],
+            burn: Some((20, [0xA1; sizes::FIELD])),
+        };
+        let tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, bundle.to_bytes());
+
+        let res = tv.check_shielded_in_isolation(&tx);
+        if kaspa_shielded_core::burn::BRIDGE_ENABLED {
+            assert!(res.is_ok(), "with the bridge on, a well-formed burn passes the context-free check");
+        } else {
+            assert_match!(res, Err(TxRuleError::InvalidShieldedTransaction("bridge peg-out is disabled")));
+        }
     }
 
     #[test]
