@@ -18,6 +18,7 @@ kaspa-consensus-core.workspace = true
 kaspa-consensus-client.workspace = true
 kaspa-hashes.workspace = true
 kaspa-math.workspace = true
+kaspa-merkle.workspace = true
 kaspa-utils.workspace = true
 wasm-bindgen.workspace = true
 workflow-wasm.workspace = true
@@ -25,7 +26,6 @@ num.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-kaspa-merkle.workspace = true
 
 [[bench]]
 name = "bench"
