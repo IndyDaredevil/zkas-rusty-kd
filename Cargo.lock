@@ -4356,11 +4356,14 @@ dependencies = [
  "group",
  "incrementalmerkletree",
  "kaspa-addresses",
+ "kaspa-hashes",
+ "kaspa-seq-commit",
  "nonempty",
  "orchard",
  "pasta_curves",
  "rand 0.8.6",
  "serde",
+ "sha2",
  "zcash_note_encryption",
 ]
 
@@ -9937,6 +9940,19 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "zkas-relayer"
+version = "2.0.1"
+dependencies = [
+ "kaspa-consensus-core",
+ "kaspa-grpc-client",
+ "kaspa-hashes",
+ "kaspa-rpc-core",
+ "kaspa-seq-commit",
+ "kaspa-shielded-core",
+ "tokio",
 ]
 
 [[package]]
