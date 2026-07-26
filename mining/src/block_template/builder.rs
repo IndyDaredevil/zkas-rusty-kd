@@ -101,8 +101,25 @@ impl BlockTemplateBuilder {
         let new_payload = consensus.modify_coinbase_payload(coinbase_tx.payload.clone(), new_miner_data)?;
         coinbase_tx.payload = new_payload;
         if block_template.coinbase_has_red_reward {
-            // The last output is always the coinbase red blocks reward
-            coinbase_tx.outputs.last_mut().unwrap().script_public_key = new_miner_data.script_public_key.clone();
+            // The red-blocks-reward output pays the template's miner. Upstream Kaspa assumes it is
+            // always the LAST coinbase output — but on ZKas a dev-fee note is appended AFTER it
+            // (see CoinbaseManager::expected_coinbase_transaction), so `outputs.last()` is the
+            // dev-fee note, not the red reward. Blindly rewriting the last output therefore (a)
+            // hijacked the dev fee to the requesting miner and (b) left the red reward paying the
+            // *cached* template's miner — producing a coinbase the virtual processor rejects as
+            // `BadCoinbaseTransaction`, disqualifying every cache-reused template under load.
+            //
+            // Locate the red reward as the last output that pays the cached miner (dev-fee note
+            // pays the dev fund, per-block blue rewards pay their own blocks' scripts, so a reverse
+            // scan lands on the red reward whether or not a dev-fee note trails it) and repoint
+            // only that output; the dev-fee note and blue rewards are preserved byte-for-byte.
+            let old_spk = block_template_to_modify.miner_data.script_public_key.clone();
+            match coinbase_tx.outputs.iter_mut().rev().find(|o| o.script_public_key == old_spk) {
+                Some(red_output) => red_output.script_public_key = new_miner_data.script_public_key.clone(),
+                // Defensive: layout not as expected. Rewriting the wrong output would only yield the
+                // same disqualification, so leave outputs untouched rather than guess.
+                None => {}
+            }
         }
         // Update the hash merkle root according to the modified transactions
         block_template.block.header.hash_merkle_root = consensus.calc_transaction_hash_merkle_root(&block_template.block.transactions);

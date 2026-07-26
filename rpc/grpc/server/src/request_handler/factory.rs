@@ -143,10 +143,19 @@ impl Factory {
 
         // Methods with special properties
         let network_bps = network_bps as usize;
+        // ZKas: a large merge-mining fleet (100+ ASICs behind one pool gRPC connection) bursts
+        // block submissions far above `network_bps`. Upstream sizes this route at
+        // (tasks=bps, queue=10.max(bps*2)) — on a 1-bps chain that is 1 worker / 10-slot queue,
+        // which overflows under fleet bursts and returns `RouteIsFull`, silently dropping valid
+        // target-clearing blocks. Widen the SubmitBlock route so concurrent submissions are
+        // validated in parallel and queued rather than dropped. Block validation is CPU-bound and
+        // idempotent, so extra workers/queue depth are safe; other routes are unchanged.
+        let submit_block_tasks = network_bps.max(8);
+        let submit_block_queue = 256.max(network_bps * 4);
         interface.set_method_properties(
             KaspadPayloadOps::SubmitBlock,
-            network_bps,
-            10.max(network_bps * 2),
+            submit_block_tasks,
+            submit_block_queue,
             KaspadRoutingPolicy::DropIfFull(Arc::new(Box::new(|_: &KaspadRequest| {
                 Ok(Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::RouteIsFull) }).into())
             }))),

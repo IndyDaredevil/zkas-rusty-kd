@@ -1146,6 +1146,60 @@ mod tests {
         // TODO: extend the test according to the golang scenario
     }
 
+    /// ZKas regression: `modify_block_template` must repoint the *red-blocks-reward* output to the
+    /// new miner while leaving the trailing dev-fee note untouched. Upstream assumed the red reward
+    /// was always the last coinbase output and blindly rewrote `outputs.last()`; on ZKas a dev-fee
+    /// note is appended after the red reward, so that rewrite hijacked the dev fee to the miner and
+    /// left the red reward paying the cached miner — producing a coinbase the virtual processor
+    /// rejects as `BadCoinbaseTransaction` and disqualifying every cache-reused block under load.
+    #[test]
+    fn test_modify_block_template_preserves_trailing_dev_fee_output() {
+        use kaspa_consensus_core::{
+            block::{BlockTemplate, MutableBlock},
+            header::Header,
+            subnets::SUBNETWORK_ID_COINBASE,
+            tx::Transaction,
+        };
+
+        let consensus = ConsensusMock::new();
+
+        // Distinct scripts for a mergeset blue reward, the cached miner (miner A), the dev fund, and
+        // the requesting miner (miner B).
+        let spk = |b: u8| ScriptPublicKey::new(0, scriptvec![b, b, b]);
+        let blue_spk = spk(0x11);
+        let miner_a_spk = spk(0xaa);
+        let dev_spk = spk(0xde);
+        let miner_a = MinerData::new(miner_a_spk.clone(), vec![]);
+        let miner_b = MinerData::new(spk(0xbb), vec![]);
+
+        // Coinbase output layout produced by CoinbaseManager::expected_coinbase_transaction when a
+        // block merges reds and a dev fee is active: [blue reward, red reward → miner, dev fee → dev].
+        // Payload only needs to be long enough for modify_coinbase_payload's truncate; outputs are
+        // what this test asserts on.
+        let coinbase = Transaction::new(
+            0,
+            vec![],
+            vec![
+                TransactionOutput::new(500, blue_spk.clone()),      // blue block reward (miner-independent)
+                TransactionOutput::new(300, miner_a_spk.clone()),   // red reward → template miner
+                TransactionOutput::new(25, dev_spk.clone()),        // dev fee note (must be preserved)
+            ],
+            0,
+            SUBNETWORK_ID_COINBASE,
+            0,
+            vec![0u8; 32],
+        );
+        let block = MutableBlock::new(Header::from_precomputed_hash(ZERO_HASH, vec![]), vec![coinbase]);
+        let template = BlockTemplate::new(block, miner_a, true, 0, 0, ZERO_HASH, vec![]);
+
+        let modified = BlockTemplateBuilder::modify_block_template(&consensus, &miner_b, &template).unwrap();
+        let outs = &modified.block.transactions[0].outputs;
+
+        assert_eq!(outs[0].script_public_key, blue_spk, "blue-block reward must be untouched");
+        assert_eq!(outs[1].script_public_key, miner_b.script_public_key, "red reward must be repointed to the new miner");
+        assert_eq!(outs[2].script_public_key, dev_spk, "trailing dev-fee note must be preserved, not hijacked to the miner");
+    }
+
     // This is a sanity test for the mempool eviction policy. We check that if the mempool reached to its maximum
     // (in bytes) a high paying transaction will evict as much transactions as needed so it can enter the
     // mempool.
