@@ -195,10 +195,34 @@ pub struct BlockrateParams {
     /// sink. Set to ~10 minutes of blocks (`600 * BPS`), independent of
     /// `finality_depth`, so spends do not have to wait the full finality window.
     pub shielded_anchor_depth: u64,
+    /// Maximum shielded-spend anchor age in blue-score units (security audit
+    /// F-04/F-05): a spend proving against an anchor older than this is dropped
+    /// on every node class. Must satisfy
+    /// `shielded_anchor_depth < max_shielded_anchor_age < pruning_depth - finality_depth`
+    /// (compile-time asserted in [`BlockrateParams::new`]). The upper bound is
+    /// what makes anchor finality a pure function of replicated data: any
+    /// in-window anchor's source block is necessarily younger than every synced
+    /// node's pruning point, so its ghostdag/reachability data exists on full,
+    /// pruned AND IBD-seeded nodes alike — validation can fail closed on missing
+    /// data without any risk of wedging the chain. Set to `pruning_depth / 4`
+    /// (~7.5 hours of blocks on all four networks).
+    pub max_shielded_anchor_age: u64,
 }
 
 impl BlockrateParams {
     pub const fn new<const BPS: u64>() -> Self {
+        // F-04/F-05: bound the anchor validity window from above by a value
+        // strictly below the pruning depth (with a finality-depth margin), so an
+        // in-window anchor's source block always has ghostdag/reachability data
+        // on every synced node (full, pruned or IBD-seeded). `new` is const and
+        // evaluated for every network's params, so these asserts are compile-time
+        // guarantees for all four networks.
+        let max_shielded_anchor_age = Bps::<BPS>::pruning_depth() / 4;
+        assert!(600 * BPS < max_shielded_anchor_age, "shielded_anchor_depth must be below max_shielded_anchor_age");
+        assert!(
+            max_shielded_anchor_age < Bps::<BPS>::pruning_depth() - Bps::<BPS>::finality_depth(),
+            "max_shielded_anchor_age must be below pruning_depth - finality_depth"
+        );
         Self {
             target_time_per_block: Bps::<BPS>::target_time_per_block(),
             ghostdag_k: Bps::<BPS>::ghostdag_k(),
@@ -212,6 +236,8 @@ impl BlockrateParams {
             coinbase_maturity: Bps::<BPS>::coinbase_maturity(),
             // ~10 minutes of blocks: shielded-spend maturity (PLAN §2.5).
             shielded_anchor_depth: 600 * BPS,
+            // ~7.5 hours of blocks: shielded-spend maximum anchor age (F-04/F-05).
+            max_shielded_anchor_age,
         }
     }
 
@@ -580,6 +606,13 @@ impl Params {
         self.blockrate.shielded_anchor_depth
     }
 
+    /// Maximum shielded-spend anchor age in blue-score units (audit F-04/F-05):
+    /// beyond this an anchor is uniformly rejected on every node class
+    /// (~7.5 h at any BPS). See [`BlockrateParams::max_shielded_anchor_age`].
+    pub fn max_shielded_anchor_age(&self) -> u64 {
+        self.blockrate.max_shielded_anchor_age
+    }
+
     pub fn pruning_depth(&self) -> u64 {
         self.blockrate.pruning_depth
     }
@@ -844,15 +877,20 @@ pub const MAINNET_PARAMS: Params = Params {
     // applies; the fresh-genesis reset makes always() the intended, correct value.)
     merged_mining_activation: ForkActivation::always(),
 
-    // ZKas launch difficulty schedule (blue-score units, 1 BPS — block counts scaled ÷10 vs
-    // the prior 10-BPS values so the wall-clock windows are unchanged):
-    //  - first 5_000 blocks (~1.4 h): difficulty pinned to the (super-easy) genesis target → CPU-mineable low-difficulty start.
-    //  - next 20_000 blocks: the difficulty *ceiling* tightens geometrically toward real difficulty;
-    //    the pure DAA takes over the moment the ceiling drops below actual network difficulty, so
-    //    there is no post-start difficulty cliff and post-launch blocks are not easily mined.
-    //  - launch window ends at blue score 25_000 (~6.9 h at the 1 BPS target rate).
-    low_difficulty_start_blocks: 5_000,
-    difficulty_ramp_blocks: 20_000,
+    // ZKas launch difficulty: the low-difficulty bootstrap schedule is DISABLED on mainnet
+    // (both 0), so the chain launches under pure upstream KIP-0004 DAA from genesis — the
+    // genesis `bits` are the starting difficulty and the DAA governs from block 1. This is the
+    // normal-launch path (identical to testnet/simnet). Rationale:
+    //  - the chain is merge-mined with real Kaspa hashrate from block 0, so no CPU-mineable
+    //    bootstrap ramp is needed; calibrate the genesis `bits` to the launch hashrate at re-cut.
+    //  - removes the pinned super-easy window entirely: no blocks without economic finality and
+    //    no cheap-block-flood launch surface (audit F-23).
+    //  - `ramp_end == 0` also disables the post-ramp genesis-target difficulty floor, so difficulty
+    //    can always ease back toward `MAX_DIFFICULTY_TARGET` if hashrate drops — no floor-induced
+    //    soft-wedge (audit F-32). The DAA alone (bounded by MAX_DIFFICULTY_TARGET) governs, exactly
+    //    as on upstream Kaspa.
+    low_difficulty_start_blocks: 0,
+    difficulty_ramp_blocks: 0,
 
     // ZKas dev fund: 5% of every block's subsidy is minted as a shielded coinbase note
     // to ZKAS_DEV_FEE_RECIPIENT. Mainnet is shielded_coinbase, so the note is diverted

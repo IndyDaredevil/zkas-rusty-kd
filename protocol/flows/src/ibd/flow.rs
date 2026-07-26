@@ -798,10 +798,68 @@ impl IbdFlow {
     /// accumulator, state root) plus the whole spent-nullifier set, streamed in
     /// flow-controlled chunks and seeded into consensus so the pruning point's
     /// descendants can be validated. Mirrors `sync_new_smt_state`.
+    ///
+    /// Audit hardening (F-02/F-15): before ANY peer data is trusted, the import is
+    /// bound to PoW-committed data — the coinbase `shielded_commitment` of the
+    /// pruning point's selected child on the proof-verified header chain. If the
+    /// locally held state root already equals that commitment the import is
+    /// skipped entirely (a re-import would union the seeded PP-time nullifier set
+    /// into the live global set); if it differs, the import proceeds only when no
+    /// validated chain blocks sit above the pruning point, and the seeded state
+    /// must match the commitment.
     async fn sync_new_shielded_state(&mut self, consensus: &ConsensusProxy, pruning_point: Hash) -> Result<(), ProtocolError> {
         use super::streams::ShieldedStream;
         use kaspa_p2p_lib::pb::RequestPruningPointShieldedStateMessage;
 
+        // F-02: determine the PoW-committed shielded state root for this pruning point.
+        let binding = self.shielded_pp_commitment(consensus, pruning_point).await?;
+
+        if let Some(&(child, committed)) = binding.as_ref() {
+            // F-15: if the locally held state root at the pruning point already equals the
+            // PoW-committed root, the local state IS the committed state (the root binds the
+            // frontier, supply totals, burns and the nullifier-set accumulator) — skip the
+            // import entirely. This covers the fully-synced PruningCatchUp node (whose global
+            // nullifier set reflects its old tip; the pre-fix unconditional re-import UNIONED
+            // the seeded PP-time set into it, freezing spends of unspent notes), a crash
+            // between seed and stable-flag write, and the default-true flag on a network with
+            // no shielded activity.
+            let local_root = consensus
+                .async_get_shielded_state_root(pruning_point)
+                .await
+                .map_err(|e| ProtocolError::OtherOwned(format!("local shielded state root at pruning point {pruning_point}: {e}")))?;
+            if local_root == committed {
+                info!("local shielded state at pruning point {} already matches the PoW-committed root; skipping re-import", pruning_point);
+                consensus.async_set_pruning_shielded_stable().await;
+                return Ok(());
+            }
+
+            // F-15 SAFETY: the re-import below clears the global nullifier set. If the pruning
+            // point's selected child was already UTXO-validated locally, validated chain blocks
+            // above the pruning point have contributed nullifiers to that set which a clear
+            // would destroy without revalidation. An honest node in that situation matches the
+            // committed root (handled above), so reaching here means the local state is corrupt
+            // AND has validated descendants — no in-place re-import can repair that, and
+            // clearing would trade a detectable wedge for silent state loss.
+            if consensus.async_get_block_status(child).await.is_some_and(|s| s == kaspa_consensus_core::blockstatus::BlockStatus::StatusUTXOValid)
+            {
+                return Err(ProtocolError::OtherOwned(format!(
+                    "local shielded state at pruning point {pruning_point} does not match the PoW-committed root, but chain \
+                     blocks above it are already validated; refusing to clear live shielded state — a full resync is required"
+                )));
+            }
+        } else {
+            // The pruning point has no selected child in the local DAG yet (or its coinbase
+            // carries no commitment). This fallback exists only while the chain tip is within
+            // one block of the pruning point; the import then proceeds unverified, as before.
+            warn!(
+                "could not determine a PoW coinbase binding for pruning point {}; proceeding with an UNVERIFIED shielded import",
+                pruning_point
+            );
+        }
+
+        // F-15: the real clear (global nullifier set + pruning-point snapshots + stable flag,
+        // atomically) — only here, immediately before the re-seed, and only after the
+        // no-validated-descendants check above.
         consensus.async_clear_pruning_shielded_stores().await;
 
         info!("downloading the pruning point shielded state from {}", self.router);
@@ -818,17 +876,32 @@ impl IbdFlow {
         // Metadata frame. Empty `data` => the pruning point has no shielded state.
         let md = stream.recv_metadata().await?;
         if md.data.is_empty() {
+            // F-02: the "empty" claim must also match the PoW commitment — a peer that claims
+            // empty while the selected child commits a non-empty root is misbehaving.
+            if let Some(&(_, committed)) = binding.as_ref() {
+                let empty_root = consensus.async_empty_shielded_state_root().await;
+                if committed != empty_root {
+                    return Err(ProtocolError::OtherOwned(format!(
+                        "peer claims pruning point {pruning_point} has no shielded state, but its selected child commits a \
+                         non-empty shielded state root"
+                    )));
+                }
+            }
             consensus.async_set_pruning_shielded_stable().await;
             info!("pruning point {} has no shielded state to import", pruning_point);
             return Ok(());
         }
+
+        // F-02: the seeded state must match the PoW-committed root (checked inside consensus
+        // before anything is seeded; on mismatch the import fails and this peer can be dropped).
+        let expected_state_root = binding.map(|(_, committed)| committed);
 
         // One chunk in flight + one being processed by the importer is enough headroom.
         let (tx, rx) = tokio::sync::mpsc::channel::<Vec<[u8; 32]>>(2);
 
         let consensus_for_import = consensus.clone();
         let builder_handle =
-            tokio::task::spawn_blocking(move || consensus_for_import.import_pruning_point_shielded(pruning_point, md, rx));
+            tokio::task::spawn_blocking(move || consensus_for_import.import_pruning_point_shielded(pruning_point, md, expected_state_root, rx));
 
         while let Some(chunk) = stream.next_chunk().await? {
             tx.send(chunk).await.map_err(|_| ProtocolError::Other("streaming shielded importer stopped unexpectedly"))?;
@@ -840,6 +913,65 @@ impl IbdFlow {
 
         info!("shielded state synced: {} nullifiers", stream.count());
         Ok(())
+    }
+
+    /// F-02: determine the pruning point's selected child `c` on the local header
+    /// DAG (the ghostdag selected chain, which the headers-proof / header sync
+    /// already PoW-verified) and return `(c, shielded_commitment)` extracted from
+    /// `c`'s coinbase payload (the #24 commitment: `c` commits
+    /// `shielded_state_root(pruning_point)`, and the commitment is PoW-anchored via
+    /// the header's `hash_merkle_root`). Returns `Ok(None)` when `c` cannot be
+    /// determined locally (the pruning point has no selected chain child yet — tip
+    /// within one block of the pruning point) or its coinbase carries no
+    /// commitment slot; the caller then falls back to the legacy unverified
+    /// import. Any actual misbehaviour (wrong block, merkle-root mismatch, no
+    /// coinbase) is a `ProtocolError`.
+    async fn shielded_pp_commitment(&mut self, consensus: &ConsensusProxy, pruning_point: Hash) -> Result<Option<(Hash, [u8; 32])>, ProtocolError> {
+        let Some(children) = consensus.async_get_block_children(pruning_point).await else { return Ok(None) };
+        let hst = consensus.async_get_headers_selected_tip().await;
+        let mut selected_child = None;
+        for child in children {
+            let Ok(gd) = consensus.async_get_ghostdag_data(child).await else { continue };
+            if gd.selected_parent != pruning_point {
+                continue;
+            }
+            // On a fork right at the pruning point several children can share it as selected
+            // parent; the selected child is the one on the header-DAG selected chain — the
+            // proof-verified chain the import must bind to.
+            if consensus.async_is_chain_ancestor_of(child, hst).await.unwrap_or(false) {
+                selected_child = Some(child);
+                break;
+            }
+        }
+        let Some(child) = selected_child else { return Ok(None) };
+
+        // Obtain `c`'s body: the local block store first (trusted-set bodies may already be
+        // synced depending on the IBD path), else request it by hash from the sync peer.
+        let block = if consensus.async_get_block_status(child).await.is_some_and(|s| s.has_block_body()) {
+            consensus.async_get_block(child).await.map_err(|e| ProtocolError::OtherOwned(format!("local block {child}: {e}")))?
+        } else {
+            self.router
+                .enqueue(make_message!(Payload::RequestIbdBlocks, RequestIbdBlocksMessage { hashes: vec![child.into()] }))
+                .await?;
+            let msg = dequeue_with_timeout!(self.incoming_route, Payload::IbdBlock)?;
+            let block: Block = Versioned(self.header_format, msg).try_into()?;
+            block
+        };
+
+        // Verify the block against the locally stored header before trusting its coinbase.
+        if block.hash() != child {
+            return Err(ProtocolError::OtherOwned(format!("expected block {} but got {}", child, block.hash())));
+        }
+        if block.is_header_only() {
+            return Err(ProtocolError::OtherOwned(format!("sent header of {} where expected block with body", block.hash())));
+        }
+        let local_header = consensus.async_get_header(child).await?;
+        if block.header.hash_merkle_root != local_header.hash_merkle_root {
+            return Err(ProtocolError::OtherOwned(format!("block {} hash_merkle_root does not match the locally stored header", child)));
+        }
+        let coinbase =
+            block.transactions.first().ok_or_else(|| ProtocolError::OtherOwned(format!("block {} has no coinbase transaction", child)))?;
+        Ok(kaspa_consensus_core::zkas_state_binding::extract_state_root(&coinbase.payload).map(|root| (child, root)))
     }
 
     async fn sync_new_utxo_set(&mut self, consensus: &ConsensusProxy, pruning_point: Hash) -> Result<(), ProtocolError> {

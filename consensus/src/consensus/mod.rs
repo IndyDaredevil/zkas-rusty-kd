@@ -1101,6 +1101,12 @@ impl ConsensusApi for Consensus {
         self.services.coinbase_manager.modify_coinbase_payload(payload, miner_data)
     }
 
+    fn dev_fee_spk(&self) -> Option<kaspa_consensus_core::tx::ScriptPublicKey> {
+        use kaspa_consensus_core::tx::{ScriptPublicKey, ScriptVec};
+        // Mirrors the dev-fee output construction in CoinbaseManager::expected_coinbase_transaction.
+        self.config.params.dev_fee_recipient.map(|recipient| ScriptPublicKey::new(0, ScriptVec::from_slice(&recipient)))
+    }
+
     fn calc_transaction_hash_merkle_root(&self, txs: &[Transaction]) -> Hash {
         calc_hash_merkle_root(txs.iter())
     }
@@ -1731,30 +1737,67 @@ impl ConsensusApi for Consensus {
         }
         let all = self
             .virtual_processor
-            .collect_pruning_point_nullifiers()
+            .collect_pruning_point_nullifiers(pp)
             .map_err(|e| ConsensusError::GeneralOwned(format!("nullifier-set collection failed: {e}")))?;
-        Ok(Box::new(all.into_iter().map(Ok)))
+        // Iterate the shared captured view by index — no second copy of the set.
+        Ok(Box::new((0..all.len()).map(move |i| Ok(all[i]))))
     }
 
     fn import_pruning_point_shielded(
         &self,
         new_pruning_point: Hash,
         metadata: kaspa_consensus_core::api::ShieldedExportMetadata,
+        expected_state_root: Option<[u8; 32]>,
         nullifier_batches: kaspa_consensus_core::api::ShieldedNullifierBatchIterator<'_>,
     ) -> PruningImportResult<()> {
-        let mut nullifiers: Vec<[u8; 32]> = Vec::with_capacity(metadata.nullifier_count as usize);
+        // F-08: `nullifier_count` is declared by an untrusted sync peer. Never
+        // pre-allocate from it (a huge value aborts the process on allocation
+        // failure), cap it to bound memory/CPU, and fail as soon as the stream
+        // overruns the declared count instead of buffering unboundedly first.
+        if metadata.nullifier_count > kaspa_consensus_core::api::MAX_SHIELDED_NULLIFIER_IMPORT_COUNT {
+            return Err(PruningImportError::ShieldedStateError(format!(
+                "declared nullifier count {} exceeds the sanity cap {}",
+                metadata.nullifier_count,
+                kaspa_consensus_core::api::MAX_SHIELDED_NULLIFIER_IMPORT_COUNT
+            )));
+        }
+        let mut nullifiers: Vec<[u8; 32]> = Vec::new();
         for batch in nullifier_batches {
             nullifiers.extend(batch);
+            if nullifiers.len() as u64 > metadata.nullifier_count {
+                return Err(PruningImportError::ShieldedStateError(format!(
+                    "streamed nullifiers exceed the declared count {}",
+                    metadata.nullifier_count
+                )));
+            }
         }
         self.virtual_processor
-            .seed_pruning_point_shielded(new_pruning_point, metadata, nullifiers)
+            .seed_pruning_point_shielded(new_pruning_point, metadata, expected_state_root, nullifiers)
             .map_err(PruningImportError::ShieldedStateError)?;
         Ok(())
     }
 
+    fn get_shielded_state_root(&self, block: Hash) -> ConsensusResult<[u8; 32]> {
+        self.virtual_processor
+            .shielded_state_root_at(block)
+            .map_err(|e| ConsensusError::GeneralOwned(format!("shielded state root at {block}: {e}")))
+    }
+
+    fn empty_shielded_state_root(&self) -> [u8; 32] {
+        crate::processes::shielded::PruningPointShieldedMetadata::empty_state_root()
+    }
+
+    /// F-15: really clear the shielded import state — the whole global nullifier
+    /// set and the per-block snapshots at the current pruning point, together with
+    /// the stable flag, in one atomic batch. Call ONLY immediately before a full
+    /// re-seed, and only when no locally UTXO-validated chain blocks exist above
+    /// the pruning point (their nullifier contributions would be lost without
+    /// revalidation); the IBD flow enforces both preconditions.
     fn clear_pruning_shielded_stores(&self) {
-        let mut pruning_meta_write = self.pruning_meta_stores.write();
+        let pruning_point = self.pruning_point_store.read().pruning_point().unwrap();
         let mut batch = rocksdb::WriteBatch::default();
+        self.virtual_processor.clear_shielded_state_for_pruning_reimport(&mut batch, pruning_point).unwrap();
+        let mut pruning_meta_write = self.pruning_meta_stores.write();
         pruning_meta_write.set_pruning_shielded_stable_flag(&mut batch, false).unwrap();
         self.db.write(batch).unwrap();
     }
@@ -1806,5 +1849,60 @@ impl ConsensusApi for Consensus {
     fn get_n_last_pruning_points(&self, n: usize) -> Vec<Hash> {
         let (_pruning_point, pruning_index) = self.pruning_point_store.read().pruning_point_and_index().unwrap();
         (0..=pruning_index).rev().take(n).map(|ind| self.past_pruning_points_store.get(ind).unwrap()).collect_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::test_consensus::TestConsensus;
+    use kaspa_consensus_core::api::{ConsensusApi, ShieldedExportMetadata};
+    use kaspa_consensus_core::config::params::MAINNET_PARAMS;
+
+    /// F-08 regression: the peer-declared `nullifier_count` must never drive an
+    /// allocation, an absurd count must be rejected up front by the sanity cap, and
+    /// a stream overrunning the declared count must fail early — all as clean
+    /// `PruningImportError`s, never a process abort (the pre-fix code did
+    /// `Vec::with_capacity(count)` on the untrusted value and buffered unboundedly).
+    #[test]
+    fn import_pruning_point_shielded_rejects_peer_controlled_counts() {
+        let config = Config::new(MAINNET_PARAMS);
+        let tc = TestConsensus::new(&config);
+        let consensus = tc.consensus_clone();
+        let pp = config.genesis.hash;
+
+        // 1. `u64::MAX` declared count: rejected by the sanity cap before any
+        //    allocation or store access (pre-fix: allocation-failure abort).
+        let metadata = ShieldedExportMetadata { data: vec![], nullifier_count: u64::MAX };
+        let mut empty = std::iter::empty();
+        match consensus.import_pruning_point_shielded(pp, metadata, None, &mut empty) {
+            Err(PruningImportError::ShieldedStateError(msg)) => {
+                assert!(msg.contains("exceeds the sanity cap"), "cap rejection, got: {msg}")
+            }
+            other => panic!("expected sanity-cap ShieldedStateError, got {other:?}"),
+        }
+
+        // 2. Stream longer than declared: fail early as soon as the buffered
+        //    entries exceed the declared count (pre-fix: buffered everything first).
+        let metadata = ShieldedExportMetadata { data: vec![], nullifier_count: 1 };
+        let mut over = vec![vec![[7u8; 32]; 2]].into_iter();
+        match consensus.import_pruning_point_shielded(pp, metadata, None, &mut over) {
+            Err(PruningImportError::ShieldedStateError(msg)) => {
+                assert!(msg.contains("exceed the declared count"), "early-overrun error, got: {msg}")
+            }
+            other => panic!("expected early-overrun ShieldedStateError, got {other:?}"),
+        }
+
+        // 3. The cap itself is not off-by-one hostile: a declared count within the
+        //    cap passes the F-08 checks (it then fails later on malformed metadata —
+        //    still a clean error, not an abort).
+        let metadata = ShieldedExportMetadata { data: vec![], nullifier_count: 0 };
+        let mut empty = std::iter::empty();
+        match consensus.import_pruning_point_shielded(pp, metadata, None, &mut empty) {
+            Err(PruningImportError::ShieldedStateError(msg)) => {
+                assert!(!msg.contains("sanity cap") && !msg.contains("declared count"), "F-08 checks must pass, got: {msg}")
+            }
+            other => panic!("expected a downstream ShieldedStateError, got {other:?}"),
+        }
     }
 }

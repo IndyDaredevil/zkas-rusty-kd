@@ -229,7 +229,7 @@ mod tests {
             version: PreparedPayment::VERSION,
             network_domain: [1; 32],
             tx_context: vec![2, 0],
-            bundle: ShieldedBundle { actions: vec![], flags: 0, value_balance, anchor: [0; 32], proof: vec![], binding_sig: [0; 64] },
+            bundle: ShieldedBundle { actions: vec![], flags: 0, value_balance, anchor: [0; 32], proof: vec![], binding_sig: [0; 64], burn: None },
             disclosure: vec![],
             spend_auth: vec![],
             claimed,

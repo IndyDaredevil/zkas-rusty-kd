@@ -588,15 +588,28 @@ impl ConsensusSessionOwned {
     /// driven from `tokio::task::spawn_blocking` so the caller can interleave it
     /// with the async work feeding `rx` — see
     /// `protocol/flows/src/ibd/flow.rs::sync_new_shielded_state`.
+    /// `expected_state_root` is the F-02 PoW-committed binding (see the trait).
     pub fn import_pruning_point_shielded(
         &self,
         new_pruning_point: Hash,
         metadata: kaspa_consensus_core::api::ShieldedExportMetadata,
+        expected_state_root: Option<[u8; 32]>,
         mut rx: tokio::sync::mpsc::Receiver<Vec<[u8; 32]>>,
     ) -> PruningImportResult<()> {
         let nullifier_batches: kaspa_consensus_core::api::ShieldedNullifierBatchIterator =
             &mut std::iter::from_fn(move || rx.blocking_recv());
-        self.consensus.import_pruning_point_shielded(new_pruning_point, metadata, nullifier_batches)
+        self.consensus.import_pruning_point_shielded(new_pruning_point, metadata, expected_state_root, nullifier_batches)
+    }
+
+    /// The locally held shielded state root as of `block` (F-02/F-15 import
+    /// short-circuit check).
+    pub async fn async_get_shielded_state_root(&self, block: Hash) -> ConsensusResult<[u8; 32]> {
+        self.clone().spawn_blocking(move |c| c.get_shielded_state_root(block)).await
+    }
+
+    /// The shielded state root of the empty state (F-02 empty-metadata binding).
+    pub async fn async_empty_shielded_state_root(&self) -> [u8; 32] {
+        self.clone().spawn_blocking(|c| c.empty_shielded_state_root()).await
     }
 
     /// Server side: open a streaming iterator over the whole spent-nullifier set at

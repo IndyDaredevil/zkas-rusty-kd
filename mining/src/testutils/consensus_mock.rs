@@ -15,7 +15,7 @@ use kaspa_consensus_core::{
     header::{CompressedParents, Header},
     mass::{ContextualMasses, NonContextualMasses, transaction_estimated_serialized_size},
     merkle::calc_hash_merkle_root,
-    tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
+    tx::{MutableTransaction, ScriptPublicKey, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
     utxo::utxo_collection::UtxoCollection,
 };
 use kaspa_core::time::unix_now;
@@ -29,6 +29,7 @@ pub(crate) struct ConsensusMock {
     transactions: RwLock<HashMap<TransactionId, Arc<Transaction>>>,
     statuses: RwLock<HashMap<TransactionId, TxResult<()>>>,
     utxos: RwLock<UtxoCollection>,
+    dev_fee_spk: Option<ScriptPublicKey>,
 }
 
 impl ConsensusMock {
@@ -37,7 +38,14 @@ impl ConsensusMock {
             transactions: RwLock::new(HashMap::default()),
             statuses: RwLock::new(HashMap::default()),
             utxos: RwLock::new(HashMap::default()),
+            dev_fee_spk: None,
         }
+    }
+
+    /// Configure the dev-fee coinbase script this mock reports (see
+    /// `ConsensusApi::dev_fee_spk`), for `modify_block_template` tests.
+    pub(crate) fn set_dev_fee_spk(&mut self, dev_fee_spk: ScriptPublicKey) {
+        self.dev_fee_spk = Some(dev_fee_spk);
     }
 
     pub(crate) fn set_status(&self, transaction_id: TransactionId, status: TxResult<()>) {
@@ -82,6 +90,10 @@ impl ConsensusMock {
 }
 
 impl ConsensusApi for ConsensusMock {
+    fn dev_fee_spk(&self) -> Option<ScriptPublicKey> {
+        self.dev_fee_spk.clone()
+    }
+
     fn build_block_template(
         &self,
         miner_data: MinerData,

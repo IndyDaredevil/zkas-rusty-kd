@@ -22,7 +22,7 @@ use crate::{
     pruning::{PruningPointProof, PruningPointTrustedData, PruningPointsList, PruningProofMetadata},
     trusted::{ExternalGhostdagData, TrustedBlock},
     tx::{
-        MutableTransaction, Transaction, TransactionId, TransactionIndexType, TransactionOutpoint, TransactionQueryResult,
+        MutableTransaction, ScriptPublicKey, Transaction, TransactionId, TransactionIndexType, TransactionOutpoint, TransactionQueryResult,
         TransactionType, UtxoEntry,
     },
 };
@@ -125,6 +125,13 @@ pub struct ShieldedExportMetadata {
     pub data: Vec<u8>,
     pub nullifier_count: u64,
 }
+
+/// Upper bound on [`ShieldedExportMetadata::nullifier_count`] accepted on import
+/// (audit finding F-08). The count is declared by an untrusted sync peer; the cap
+/// bounds the memory/CPU the import can be made to spend (2^26 ≈ 67M entries ≈
+/// 2 GiB of raw nullifiers) while still far exceeding any realistic near-term
+/// shielded pool.
+pub const MAX_SHIELDED_NULLIFIER_IMPORT_COUNT: u64 = 1 << 26;
 
 /// Batches of spent nullifiers (each 32 bytes) streamed during pruning-point
 /// shielded-state import, mirroring [`ImportLaneBatchIterator`].
@@ -358,6 +365,16 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// The dev-fee coinbase output script for this network, when a dev fee is configured
+    /// (the recipient's bytes as a version-0 script; `CoinbaseManager::expected_coinbase_transaction`
+    /// appends the dev-fee note as the LAST coinbase output). `modify_block_template` uses it
+    /// to exclude the dev-fee note from the red-reward reverse scan — otherwise, when the cached
+    /// template's miner script equals the dev-fee recipient, the scan would repoint the fee
+    /// (audit finding F-31). `None` when no dev fee is active.
+    fn dev_fee_spk(&self) -> Option<ScriptPublicKey> {
+        None
+    }
+
     fn calc_transaction_hash_merkle_root(&self, txs: &[Transaction]) -> Hash {
         unimplemented!()
     }
@@ -431,12 +448,36 @@ pub trait ConsensusApi: Send + Sync {
     /// sync). Verifies internal consistency before seeding; the consensus binding
     /// is the #24 coinbase commitment enforced when the pruning point's children
     /// are validated.
+    ///
+    /// `expected_state_root` (audit finding F-02): when `Some`, the imported
+    /// metadata's declared state root must equal it before anything is seeded. The
+    /// caller obtains it from the coinbase `shielded_commitment` of the pruning
+    /// point's selected child — a PoW-committed value on the proof-verified header
+    /// chain — so a malicious syncer can no longer seed arbitrary state. `None`
+    /// skips the binding check (fallback only when the selected child cannot be
+    /// determined; see the IBD flow).
     fn import_pruning_point_shielded(
         &self,
         _new_pruning_point: Hash,
         _metadata: ShieldedExportMetadata,
+        _expected_state_root: Option<[u8; 32]>,
         _nullifier_batches: ShieldedNullifierBatchIterator<'_>,
     ) -> PruningImportResult<()> {
+        unimplemented!()
+    }
+
+    /// The locally held shielded state root (PLAN §2.10) as of `block`, recomputed
+    /// from the per-block snapshots (defaults to the empty-state root for blocks
+    /// with no shielded state). Used on the IBD import path to decide whether the
+    /// local state already matches the PoW-committed root (F-02/F-15).
+    fn get_shielded_state_root(&self, _block: Hash) -> ConsensusResult<[u8; 32]> {
+        unimplemented!()
+    }
+
+    /// The shielded state root of the empty state — what a chain block's coinbase
+    /// commits when its selected parent has no shielded state. Used to bind a
+    /// peer's "empty shielded state" claim to the PoW-committed root (F-02).
+    fn empty_shielded_state_root(&self) -> [u8; 32] {
         unimplemented!()
     }
 
@@ -655,6 +696,11 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// F-15: really clears the shielded import state — the whole global nullifier
+    /// set, the per-block snapshots at the current pruning point, and the stable
+    /// flag, in one atomic batch. Call ONLY immediately before a full re-seed (see
+    /// `ShieldedStateManager::clear_for_pruning_reimport` in `kaspa-consensus` for
+    /// the safety preconditions; the IBD flow enforces them).
     fn clear_pruning_shielded_stores(&self) {
         unimplemented!()
     }

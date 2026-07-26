@@ -212,7 +212,7 @@ mod tests {
             })
             .collect();
         let bundle =
-            ShieldedBundle { actions, flags: 0b11, value_balance: 0, anchor: [0u8; sizes::FIELD], proof: vec![], binding_sig: [0u8; sizes::SIG] };
+            ShieldedBundle { actions, flags: 0b11, value_balance: 0, anchor: [0u8; sizes::FIELD], proof: vec![], binding_sig: [0u8; sizes::SIG], burn: None };
         let tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, bundle.to_bytes());
         MutableTransaction::from_tx(tx)
     }

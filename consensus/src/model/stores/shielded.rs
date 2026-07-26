@@ -15,7 +15,8 @@
 //!   chain block (§2.6).
 //! - [`DbAnchorBlockStore`] — maps each shielded tree root (anchor) to the block
 //!   that produced it, so anchor-finality is decided reorg-consistently at
-//!   validation time (canonical ancestor + `shielded_anchor_depth` deep), §2.5.
+//!   validation time (canonical ancestor + age in `[shielded_anchor_depth,
+//!   max_shielded_anchor_age]`, audit F-04/F-05), §2.5.
 //!
 //! The append/conflict/turnstile logic lives in `kaspa-shielded-core`; these are
 //! the rocksdb-backed persistence the virtual processor drives.
@@ -435,7 +436,8 @@ pub trait AnchorBlockStoreReader {
 /// block, so it uniquely identifies `(block, its selected-chain history)`. This
 /// index lets anchor-finality be decided reorg-consistently at validation time:
 /// a spend's anchor is acceptable iff its source block is a selected-chain
-/// ancestor of the spending block **and** at least `shielded_anchor_depth` deep.
+/// ancestor of the spending block **and** its blue-score age lies in
+/// `[shielded_anchor_depth, max_shielded_anchor_age]` (audit F-04/F-05).
 /// Because that canonicality is re-checked via reachability on every query, the
 /// index itself is append-only and needs no reorg reverting — an anchor from an
 /// abandoned branch simply fails the ancestor check.

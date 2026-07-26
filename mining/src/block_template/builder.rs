@@ -113,8 +113,20 @@ impl BlockTemplateBuilder {
             // pays the dev fund, per-block blue rewards pay their own blocks' scripts, so a reverse
             // scan lands on the red reward whether or not a dev-fee note trails it) and repoint
             // only that output; the dev-fee note and blue rewards are preserved byte-for-byte.
+            //
+            // F-31: the reverse scan is AMBIGUOUS when the cached template's miner script equals
+            // the dev-fee recipient (anyone can request a template paying the public dev address):
+            // it would hit the trailing dev-fee note FIRST, repointing the fee and leaving the red
+            // reward on the dev address → BadCoinbaseTransaction self-DoS. The dev-fee note, when
+            // present, is deterministically the LAST output, so exclude it from the scan range
+            // whenever the last output pays the consensus dev-fee recipient.
             let old_spk = block_template_to_modify.miner_data.script_public_key.clone();
-            match coinbase_tx.outputs.iter_mut().rev().find(|o| o.script_public_key == old_spk) {
+            let outputs = &mut coinbase_tx.outputs;
+            let scan_len = match (outputs.last(), consensus.dev_fee_spk()) {
+                (Some(last), Some(dev_spk)) if last.script_public_key == dev_spk => outputs.len() - 1,
+                _ => outputs.len(),
+            };
+            match outputs[..scan_len].iter_mut().rev().find(|o| o.script_public_key == old_spk) {
                 Some(red_output) => red_output.script_public_key = new_miner_data.script_public_key.clone(),
                 // Defensive: layout not as expected. Rewriting the wrong output would only yield the
                 // same disqualification, so leave outputs untouched rather than guess.

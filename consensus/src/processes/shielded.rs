@@ -24,7 +24,7 @@ use kaspa_shielded_core::nullifier::{MemNullifierSet, NullifierBytes, NullifierC
 #[cfg(test)]
 use kaspa_shielded_core::state::CoinbaseNote;
 use kaspa_shielded_core::state::{BlockShieldedOutcome, CoinbaseMint, ShieldedStateError, ShieldedTx, apply_chain_block_to};
-use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree};
+use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree, TreeStateError};
 use kaspa_shielded_core::turnstile::SupplyLedger;
 
 use rocksdb::WriteBatch;
@@ -132,21 +132,37 @@ impl PruningPointShieldedMetadata {
     }
 
     /// The shielded state root implied by (frontier, supply, nullifier_muhash, burns).
-    fn recompute_state_root(
+    ///
+    /// Returns the [`TreeStateError`] instead of panicking when the frontier bytes are
+    /// malformed (non-canonical Pallas encoding, inconsistent ommers): this data is
+    /// peer-controlled on the pruning-point IBD import path, so a panic here would be
+    /// a remote DoS (audit finding F-17).
+    pub fn recompute_state_root(
         frontier: &FrontierState,
         supply: &SupplyTotals,
         nullifier_muhash: &MuHash,
         burns: &BurnReceipts,
-    ) -> [u8; 32] {
-        let anchor = GlobalTree::from_state(frontier).expect("frontier corrupt").anchor().to_bytes();
+    ) -> Result<[u8; 32], TreeStateError> {
+        let anchor = GlobalTree::from_state(frontier)?.anchor().to_bytes();
         let nullifier_root = nullifier_muhash.clone().finalize().as_bytes().to_owned();
-        kaspa_shielded_core::commitment::shielded_state_root(
+        Ok(kaspa_shielded_core::commitment::shielded_state_root(
             &anchor,
             &nullifier_root,
             supply.cumulative_coinbase,
             supply.cumulative_fees,
             &burns.to_accumulator().root(),
-        )
+        ))
+    }
+
+    /// The shielded state root of the **empty** state (empty tree, empty nullifier
+    /// accumulator, zero supply, no burns) — what a chain block's coinbase commits
+    /// when its selected parent has no shielded state. Used on the IBD import path
+    /// to bind the peer's "this pruning point has no shielded state" claim (empty
+    /// metadata) to the PoW-committed root (audit finding F-02). Computed over
+    /// local constants only, so the expect below cannot fire on peer input.
+    pub fn empty_state_root() -> [u8; 32] {
+        Self::recompute_state_root(&FrontierState::default(), &SupplyTotals::default(), &MuHash::new(), &BurnReceipts::default())
+            .expect("the default frontier is the canonical empty tree")
     }
 }
 
@@ -237,9 +253,10 @@ pub struct ShieldedStateManager {
 }
 
 impl ShieldedStateManager {
-    /// Construct over the consensus database. Anchor-finality (maturity + canonical
-    /// ancestry) is decided by the caller (virtual processor) using reachability and
-    /// `shielded_anchor_depth`; this manager only records the anchor→block index.
+    /// Construct over the consensus database. Anchor-finality (canonical ancestry +
+    /// the `[shielded_anchor_depth, max_shielded_anchor_age]` age window, audit
+    /// F-04/F-05) is decided by the caller (virtual processor) using reachability
+    /// and blue-score data; this manager only records the anchor→block index.
     pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
         Self {
             nullifiers: DbNullifierSetStore::new(Arc::clone(&db), cache_policy),
@@ -279,8 +296,9 @@ impl ShieldedStateManager {
     /// The chain block whose shielded tree root equals `anchor`, if any block ever
     /// produced it (PLAN §2.5). The caller decides finality by checking that this
     /// block is a selected-chain ancestor of the spending block (reorg-safety) and
-    /// at least `shielded_anchor_depth` deep (maturity). `None` means the anchor is
-    /// not a real tree root of any block.
+    /// that its blue-score age lies in `[shielded_anchor_depth,
+    /// max_shielded_anchor_age]` (maturity + fail-closed upper bound, audit
+    /// F-04/F-05). `None` means the anchor is not a real tree root of any block.
     pub fn anchor_source_block(&self, anchor: &[u8; 32]) -> StoreResult<Option<Hash>> {
         self.anchor_block.get(anchor)
     }
@@ -471,8 +489,9 @@ impl ShieldedStateManager {
 
     /// Export the shielded metadata at `block` (a pruning point) for IBD transfer.
     /// Returns `None` when the block has no shielded state (empty pool — nothing to
-    /// transfer). The caller streams the full global nullifier set separately via
-    /// [`Self::nullifiers`]`().iter_all()`.
+    /// transfer). The caller streams the **PP-time** nullifier set separately, built
+    /// from [`Self::nullifier_set_snapshot`] + [`Self::subtract_nullifier_diffs`]
+    /// (F-03: the raw global set reflects the virtual tip, not the pruning point).
     pub fn export_pruning_point_shielded(&self, block: Hash) -> StoreResult<Option<PruningPointShieldedMetadata>> {
         let frontier = self.tree_store.get(block)?;
         if frontier.size == 0 {
@@ -481,9 +500,40 @@ impl ShieldedStateManager {
         let supply = self.supply_store.get(block)?;
         let nullifier_muhash = self.nullifier_muhash.get(block)?;
         let burns = self.burn_store.get(block)?;
-        let state_root =
-            PruningPointShieldedMetadata::recompute_state_root(&frontier, &supply, &nullifier_muhash, &burns);
+        let state_root = PruningPointShieldedMetadata::recompute_state_root(&frontier, &supply, &nullifier_muhash, &burns)
+            .map_err(|e| StoreError::DataInconsistency(format!("stored shielded frontier at {block} is corrupt: {e:?}")))?;
         Ok(Some(PruningPointShieldedMetadata { frontier, supply, nullifier_muhash, burns, state_root }))
+    }
+
+    /// Snapshot of the current global spent-nullifier set (append-only; reflects the
+    /// virtual selected tip, not any past block). First half of the F-03 PP-time
+    /// export; the caller subtracts the post-pruning-point selected-chain diffs via
+    /// [`Self::subtract_nullifier_diffs`].
+    pub fn nullifier_set_snapshot(&self) -> StoreResult<Vec<[u8; 32]>> {
+        self.nullifiers.iter_all().collect()
+    }
+
+    /// Subtract from `set` the nullifiers added by `post_blocks` (read from the
+    /// per-block diff store). Recovers the PP-time nullifier set from the tip-time
+    /// global set (audit finding F-03): the global set is append-only and tracks the
+    /// virtual selected tip — typically a full pruning period ahead of the pruning
+    /// point — so the set as of the pruning point is the current set minus the diffs
+    /// of the selected-chain blocks in `(pp, tip]`. Both the exported `nullifier_count`
+    /// and the streamed set must be this PP-time set, or the receiver's
+    /// [`Self::verify_pruning_point_shielded`] fails against the PP MuHash snapshot.
+    pub fn subtract_nullifier_diffs(
+        &self,
+        mut set: Vec<[u8; 32]>,
+        post_blocks: impl IntoIterator<Item = Hash>,
+    ) -> StoreResult<Vec<[u8; 32]>> {
+        let mut post: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        for block in post_blocks {
+            post.extend(self.nullifier_diffs.get(block)?);
+        }
+        if !post.is_empty() {
+            set.retain(|nf| !post.contains(nf));
+        }
+        Ok(set)
     }
 
     /// Verify imported pruning-point shielded metadata against the streamed
@@ -507,8 +557,11 @@ impl ShieldedStateManager {
             return Err(format!("streamed nullifier set ({count}) does not reproduce the committed accumulator"));
         }
         // 2. The declared state root must be consistent with the transferred parts.
+        //    The frontier is peer-controlled: propagate a rebuild failure as an Err
+        //    rather than panicking (audit finding F-17).
         let recomputed =
-            PruningPointShieldedMetadata::recompute_state_root(&md.frontier, &md.supply, &md.nullifier_muhash, &md.burns);
+            PruningPointShieldedMetadata::recompute_state_root(&md.frontier, &md.supply, &md.nullifier_muhash, &md.burns)
+                .map_err(|e| format!("malformed shielded frontier in pruning-point metadata: {e:?}"))?;
         if recomputed != md.state_root {
             return Err(
                 "declared shielded state root is inconsistent with (frontier, supply, nullifier_muhash, burns)".to_string()
@@ -535,7 +588,13 @@ impl ShieldedStateManager {
     {
         // Per-block snapshots at the pruning point (mirrors `persist`).
         self.tree_store.set_batch(batch, block, md.frontier.clone())?;
-        let anchor = GlobalTree::from_state(&md.frontier).expect("verified frontier").anchor().to_bytes();
+        // Defense in depth (audit finding F-17): `verify_pruning_point_shielded` already rejects a
+        // malformed frontier, but never panic on peer-supplied bytes here either — surface the
+        // failure as a store data-inconsistency error instead.
+        let anchor = GlobalTree::from_state(&md.frontier)
+            .map_err(|e| StoreError::DataInconsistency(format!("malformed shielded frontier in pruning-point metadata: {e:?}")))?
+            .anchor()
+            .to_bytes();
         self.anchor_block.set_batch(batch, anchor, block)?;
         if md.supply.cumulative_coinbase > 0 || md.supply.cumulative_fees > 0 {
             self.supply_store.set_batch(batch, block, md.supply)?;
@@ -550,6 +609,59 @@ impl ShieldedStateManager {
         for nf in nullifiers {
             self.nullifiers.insert_batch(batch, *nf)?;
         }
+        Ok(())
+    }
+
+    /// F-02: bind an import to PoW-committed data. The pruning point's selected
+    /// child commits `shielded_commitment = state_root(pruning_point)` in its
+    /// coinbase payload (the #24 commitment, committed by the header's
+    /// `hash_merkle_root` and hence by proof-of-work on the proof-verified header
+    /// chain the syncee already holds). The imported metadata's declared state root
+    /// must equal that commitment; without this check every import input is
+    /// attacker-controlled and a malicious syncer can permanently fork the syncee.
+    pub fn verify_import_binding(md: &PruningPointShieldedMetadata, committed_state_root: [u8; 32]) -> Result<(), String> {
+        if md.state_root != committed_state_root {
+            return Err(format!(
+                "imported shielded state root does not match the PoW-committed coinbase binding \
+                 (import is not anchored to the proof-verified header chain — refusing to seed)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// F-15: actually clear the shielded import state before a full re-seed —
+    /// delete the whole global nullifier set and the per-block snapshots keyed at
+    /// `pruning_point` into `batch` (the caller writes the stable-flag reset into
+    /// the same batch, so the clear is atomic with the flag flip).
+    ///
+    /// SAFETY: this destroys live state. Call only on a path that immediately
+    /// re-seeds the pruning point from scratch, and only when no locally
+    /// UTXO-validated chain blocks above `pruning_point` exist (their nullifier
+    /// contributions to the global set would be lost without revalidation). The
+    /// IBD flow enforces both preconditions (see
+    /// `protocol/flows/src/ibd/flow.rs::sync_new_shielded_state`).
+    ///
+    /// Note: the staged deletes become visible to store reads only once `batch` is
+    /// written (`CachedDbAccess` removes the cache entry but RocksDB deletes land
+    /// with the batch — the same semantics behind the F-01 two-batch reorg fix),
+    /// so the caller MUST write the batch before any subsequent seed/validation.
+    ///
+    /// The per-block nullifier diffs and the anchor→block index are deliberately
+    /// retained: diffs of chain blocks above the pruning point stay valid (the
+    /// re-seeded set is their base state), and the anchor index is append-only by
+    /// design with canonicality re-checked via reachability on every query.
+    pub fn clear_for_pruning_reimport(&self, batch: &mut WriteBatch, pruning_point: Hash) -> StoreResult<()> {
+        // The whole global membership set. `iter_all` is a pure RocksDB iterator
+        // (no cache), and the deletions are only staged in `batch`, so iterating
+        // while staging deletes is safe.
+        for nf in self.nullifiers.iter_all() {
+            self.nullifiers.delete_batch(batch, nf?)?;
+        }
+        // Per-block snapshots at the pruning point (absent keys are no-op deletes).
+        self.tree_store.delete_batch(batch, pruning_point)?;
+        self.supply_store.delete_batch(batch, pruning_point)?;
+        self.nullifier_muhash.delete_batch(batch, pruning_point)?;
+        self.burn_store.delete_batch(batch, pruning_point)?;
         Ok(())
     }
 }
@@ -798,6 +910,60 @@ mod tests {
         assert_eq!(ok.outcome.accepted, vec![0], "a genuinely new spend is accepted on the seeded node");
     }
 
+    /// F-03 regression: the IBD export must serve the **PP-time** nullifier set, not
+    /// the tip-time global set. Build a chain with spends up to the "pruning point",
+    /// then add MORE spends past it (as happens in the full pruning period between
+    /// the PP and the virtual tip), and confirm that `nullifier_set_snapshot` +
+    /// `subtract_nullifier_diffs` over the post-PP selected-chain blocks recovers a
+    /// (set, count) pair that reproduces the PP MuHash — the receiver's
+    /// `verify_pruning_point_shielded` check — while the raw tip-time set fails it.
+    /// (Advancing a real pruning point is impractical in this harness, so the test
+    /// exercises the diff-subtraction helper directly with explicit post-PP blocks.)
+    #[test]
+    fn pruning_point_export_serves_pp_time_nullifier_set() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = manager(&db);
+        let (b1, pp, a1, a2) = (h(1), h(2), h(3), h(4));
+
+        // Up to and including the pruning point: two spends.
+        commit_block(&mgr, &db, b1, h(0), Some(coinbase(50, 10)), vec![stx(&[1], &[100], 5)]);
+        let cpp = commit_block(&mgr, &db, pp, b1, Some(coinbase(50, 20)), vec![stx(&[2], &[200], 5)]);
+        let pp_root = cpp.state_root();
+
+        // Past the pruning point: two MORE spends. The append-only global set now
+        // reflects the tip (4 nullifiers), a superset of the PP-time set.
+        commit_block(&mgr, &db, a1, pp, Some(coinbase(50, 30)), vec![stx(&[3], &[300], 5)]);
+        commit_block(&mgr, &db, a2, a1, Some(coinbase(50, 40)), vec![stx(&[4], &[400], 5)]);
+        assert_eq!(mgr.nullifiers().count(), 4, "tip-time global set is a superset of the PP-time set");
+
+        // Export at the PP, then recover the PP-time set by subtracting the diffs of
+        // the selected-chain blocks in (pp, tip].
+        let md = mgr.export_pruning_point_shielded(pp).unwrap().expect("pp has shielded state");
+        assert_eq!(md.state_root, pp_root, "exported root == the committed root");
+        let pp_set = mgr.subtract_nullifier_diffs(mgr.nullifier_set_snapshot().unwrap(), [a1, a2]).unwrap();
+        assert_eq!(pp_set.len(), 2, "post-PP nullifiers removed from the export");
+
+        // The exported (set, count) reproduces the PP MuHash — the receiver's check.
+        assert_eq!(ShieldedStateManager::verify_pruning_point_shielded(&md, pp_set.iter()).unwrap(), 2);
+
+        // The raw tip-time set must NOT verify against the PP snapshot — exactly the
+        // pre-fix failure that deterministically broke honest IBD once the pool was used.
+        let tip_set = mgr.nullifier_set_snapshot().unwrap();
+        assert!(
+            ShieldedStateManager::verify_pruning_point_shielded(&md, tip_set.iter()).is_err(),
+            "the tip-time set must not reproduce the PP accumulator"
+        );
+
+        // The subtraction is a set operation: post-PP block order does not matter.
+        let pp_set_rev = mgr.subtract_nullifier_diffs(mgr.nullifier_set_snapshot().unwrap(), [a2, a1]).unwrap();
+        assert_eq!(ShieldedStateManager::verify_pruning_point_shielded(&md, pp_set_rev.iter()).unwrap(), 2);
+
+        // Blocks with no shielded spends contribute an empty diff (not an error),
+        // and the PP itself is excluded by the caller's (pp, tip] window.
+        let pp_set_extra = mgr.subtract_nullifier_diffs(mgr.nullifier_set_snapshot().unwrap(), [a1, a2, h(9)]).unwrap();
+        assert_eq!(ShieldedStateManager::verify_pruning_point_shielded(&md, pp_set_extra.iter()).unwrap(), 2);
+    }
+
     /// Reverting a block removes the nullifiers it added, so the same nullifier
     /// can be spent again on the new branch (reorg correctness).
     #[test]
@@ -1042,5 +1208,82 @@ mod tests {
         assert_eq!(mgr.anchor_source_block(&anchor).unwrap(), Some(h(1)));
         // An anchor no block produced is unknown.
         assert_eq!(mgr.anchor_source_block(&[0xabu8; 32]).unwrap(), None);
+    }
+
+    /// F-02: the empty-state root (used to bind a peer's "no shielded state" claim
+    /// to the PoW commitment) must equal the root recomputed from untouched stores,
+    /// and `verify_import_binding` must accept exactly the committed root and
+    /// reject anything else.
+    #[test]
+    fn empty_state_root_and_import_binding() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = manager(&db);
+
+        // A block with no shielded state reads back the empty root from default stores.
+        assert_eq!(mgr.state_root_at(h(0)).unwrap(), PruningPointShieldedMetadata::empty_state_root());
+
+        // A real export binds to its own root; a single-bit difference is rejected.
+        commit_block(&mgr, &db, h(1), h(0), Some(coinbase(50, 10)), vec![stx(&[1], &[100], 5)]);
+        let md = mgr.export_pruning_point_shielded(h(1)).unwrap().expect("has shielded state");
+        assert!(ShieldedStateManager::verify_import_binding(&md, md.state_root).is_ok());
+        let mut wrong = md.state_root;
+        wrong[0] ^= 1;
+        assert!(ShieldedStateManager::verify_import_binding(&md, wrong).is_err(), "root mismatch must be rejected");
+        // In particular the binding distinguishes non-empty state from the empty root
+        // (the flow.rs:820 empty-metadata wedge).
+        assert!(ShieldedStateManager::verify_import_binding(&md, PruningPointShieldedMetadata::empty_state_root()).is_err());
+    }
+
+    /// F-15 regression: `clear_for_pruning_reimport` must REALLY clear — the whole
+    /// global nullifier set plus the per-block snapshots at the pruning point — so
+    /// a re-seed starts from a clean slate and cannot union stale nullifiers into
+    /// the new state (the pre-fix clear only flipped the stable flag, so nullifiers
+    /// of abandoned-fork blocks survived and froze spends of unspent notes).
+    #[test]
+    fn clear_for_pruning_reimport_enables_clean_reseed() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = manager(&db);
+        let (b1, pp) = (h(1), h(2));
+
+        // Original state at the pruning point: two spends.
+        commit_block(&mgr, &db, b1, h(0), Some(coinbase(50, 10)), vec![stx(&[1], &[100], 5)]);
+        commit_block(&mgr, &db, pp, b1, Some(coinbase(50, 20)), vec![stx(&[2], &[200], 5)]);
+        assert!(mgr.export_pruning_point_shielded(pp).unwrap().is_some(), "pp has shielded state");
+        assert_eq!(mgr.nullifiers().count(), 2);
+
+        // Clear for a from-scratch re-import (what the IBD flow now does before seeding).
+        let mut cb = WriteBatch::default();
+        mgr.clear_for_pruning_reimport(&mut cb, pp).unwrap();
+        db.write(cb).unwrap();
+
+        // The global set is empty and the pruning point's snapshots are gone (the
+        // root reads back as the empty-state root). The anchor→block index is
+        // intentionally retained (append-only; canonicality is re-checked at query).
+        assert_eq!(mgr.nullifiers().count(), 0, "the whole global nullifier set must be deleted");
+        assert!(!mgr.nullifiers().contains(&nf(1)).unwrap() && !mgr.nullifiers().contains(&nf(2)).unwrap());
+        assert_eq!(mgr.state_root_at(pp).unwrap(), PruningPointShieldedMetadata::empty_state_root(), "pp snapshots cleared");
+
+        // Re-seed a DIFFERENT state at the same pruning point (e.g. the syncer's chain
+        // disagreed with our abandoned fork): one spend, nf(3). The stale nf(1)/nf(2)
+        // must NOT survive into the new state — the exact pre-fix union bug.
+        let (_lt2, db2) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let donor = manager(&db2);
+        commit_block(&donor, &db2, h(1), h(0), Some(coinbase(50, 10)), vec![]);
+        let cpp = commit_block(&donor, &db2, pp, h(1), Some(coinbase(50, 20)), vec![stx(&[3], &[300], 5)]);
+        let md_new = donor.export_pruning_point_shielded(pp).unwrap().expect("donor pp has shielded state");
+        let new_set = donor.nullifier_set_snapshot().unwrap();
+        assert_eq!(ShieldedStateManager::verify_pruning_point_shielded(&md_new, new_set.iter()).unwrap(), 1);
+        let mut sb = WriteBatch::default();
+        mgr.seed_pruning_point_shielded(&mut sb, pp, &md_new, new_set.iter()).unwrap();
+        db.write(sb).unwrap();
+
+        assert_eq!(mgr.nullifiers().count(), 1, "no stale nullifiers survive the re-seed");
+        assert!(mgr.nullifiers().contains(&nf(3)).unwrap());
+        assert!(!mgr.nullifiers().contains(&nf(1)).unwrap(), "stale nullifier of the abandoned state is gone");
+        assert!(!mgr.nullifiers().contains(&nf(2)).unwrap(), "stale nullifier of the abandoned state is gone");
+        assert_eq!(mgr.state_root_at(pp).unwrap(), cpp.state_root(), "re-seeded root matches the new state");
+        // And a spend of nf(1) — unspent on the new chain — is accepted, not frozen.
+        let ok = mgr.compute(pp, Some(&coinbase(50, 30)), &[stx(&[1], &[400], 5)]).unwrap();
+        assert_eq!(ok.outcome.accepted, vec![0], "previously-frozen note is spendable again after the clean re-seed");
     }
 }

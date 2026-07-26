@@ -42,8 +42,10 @@ const SOMPI_PER_ZKAS: u64 = 100_000_000;
 const BPS: u64 = 1;
 /// Blocks per halving ≈ 3 months (90d · 86400s · BPS).
 const HALVING_INTERVAL_BLOCKS: u64 = 90 * 86_400 * BPS;
-/// How many recent blocks to keep in the live feed ring.
-const RECENT_CAP: usize = 200;
+/// Keep enough history for a real trailing-hour pulse while limiting the public
+/// live-feed response separately.
+const RECENT_CAP: usize = 6_000;
+const RECENT_PUBLIC_CAP: usize = 200;
 /// How many transactions the id→location index retains. The live feed ring only
 /// covers RECENT_CAP blocks (~3 min at 1 BPS), which made EVERY transaction older
 /// than a few minutes report "not found" — the explorer had no tx index at all.
@@ -79,6 +81,8 @@ struct TxLoc {
 struct BlockSummary {
     block_hash: String,
     difficulty: f64,
+    #[serde(rename = "daaScore")]
+    daa_score: String,
     #[serde(rename = "blueScore")]
     blue_score: String,
     timestamp: String,
@@ -278,6 +282,7 @@ fn ingest(block: &RpcBlock, agg: &mut ShieldedAgg) -> BlockSummary {
     BlockSummary {
         block_hash: block.header.hash.to_string(),
         difficulty,
+        daa_score: block.header.daa_score.to_string(),
         blue_score: blue_score.to_string(),
         timestamp: block.header.timestamp.to_string(),
         tx_count: block.transactions.len() as u64,
@@ -570,7 +575,69 @@ async fn transactions_count(State(s): State<Arc<AppState>>) -> impl IntoResponse
 
 async fn blocks_recent(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     let recent = s.recent.read().await;
-    Json(recent.iter().cloned().collect::<Vec<_>>())
+    Json(recent.iter().take(RECENT_PUBLIC_CAP).cloned().collect::<Vec<_>>())
+}
+
+async fn info_pulse(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    const FIFTEEN_MIN_MS: u64 = 15 * 60 * 1_000;
+    const HOUR_MS: u64 = 60 * 60 * 1_000;
+    const BIN_MS: u64 = 15_000;
+    const BINS: usize = (FIFTEEN_MIN_MS / BIN_MS) as usize;
+
+    let now_ms = now_secs() * 1_000;
+    let recent = s.recent.read().await;
+    let mut blocks_15m = 0_u64;
+    let mut transactions_15m = 0_u64;
+    let mut transactions_1h = 0_u64;
+    let mut block_bins = vec![0_u64; BINS];
+    let mut transaction_bins = vec![0_u64; BINS];
+    let mut daa_15m = Vec::new();
+    let mut daa_1h = Vec::new();
+
+    for block in recent.iter() {
+        let Ok(ts) = block.timestamp.parse::<u64>() else { continue };
+        if ts > now_ms {
+            continue;
+        }
+        let age = now_ms - ts;
+        let daa = block.daa_score.parse::<u64>().unwrap_or(0);
+        if age < HOUR_MS {
+            transactions_1h = transactions_1h.saturating_add(block.tx_count);
+            daa_1h.push(daa);
+        }
+        if age < FIFTEEN_MIN_MS {
+            blocks_15m += 1;
+            transactions_15m = transactions_15m.saturating_add(block.tx_count);
+            let bin = BINS - 1 - (age / BIN_MS) as usize;
+            block_bins[bin] += 1;
+            transaction_bins[bin] = transaction_bins[bin].saturating_add(block.tx_count);
+            daa_15m.push(daa);
+        }
+    }
+    // Selected-parent backfill contains only blue-chain blocks, but consecutive
+    // DAA scores account for the full DAG (including parallel/red blocks).
+    let dag_blocks_15m = daa_15m.iter().max().zip(daa_15m.iter().min())
+        .map(|(max, min)| max.saturating_sub(*min)).unwrap_or(0);
+    let dag_blocks_1h = daa_1h.iter().max().zip(daa_1h.iter().min())
+        .map(|(max, min)| max.saturating_sub(*min)).unwrap_or(0);
+    // Coinbase is one transaction per DAG block. Add non-coinbase transactions
+    // observed in the window without double-counting the selected-chain coinbases.
+    let non_coinbase_1h = transactions_1h.saturating_sub(daa_1h.len() as u64);
+    transactions_1h = dag_blocks_1h.saturating_add(non_coinbase_1h);
+    blocks_15m = dag_blocks_15m;
+
+    Json(json!({
+        "windowSeconds": 900,
+        "blocks15m": blocks_15m,
+        "bps15m": dag_blocks_15m as f64 / 900.0,
+        "averageBlockTime15m": if blocks_15m > 0 { 900.0 / blocks_15m as f64 } else { 0.0 },
+        "transactions15m": transactions_15m,
+        "transactions1h": transactions_1h,
+        "binSeconds": 15,
+        "blockBins": block_bins,
+        "transactionBins": transaction_bins,
+        "timestamp": now_ms,
+    }))
 }
 
 async fn block_by_id(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> impl IntoResponse {
@@ -911,6 +978,7 @@ async fn main() {
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
     let app = Router::new()
         .route("/info/blockdag", get(info_blockdag))
+        .route("/info/pulse", get(info_pulse))
         .route("/info/network", get(info_network))
         .route("/info/coinsupply", get(info_coinsupply))
         .route("/info/blockreward", get(info_blockreward))

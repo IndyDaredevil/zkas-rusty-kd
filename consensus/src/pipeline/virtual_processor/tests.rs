@@ -190,6 +190,24 @@ impl TestContext {
         t.block.header.finalize();
         t.block.to_immutable()
     }
+
+    /// As `mine_real_pow_block_with`, but with explicit parents — for building a
+    /// competing branch that does not extend the current virtual tips. The block is
+    /// only BUILT; the caller inserts it (parents must already be in consensus so the
+    /// template builder can resolve their ghostdag/UTXO context).
+    fn mine_real_pow_block_on(&mut self, parents: Vec<Hash>, txs: Vec<Transaction>) -> Block {
+        self.simulated_time += self.consensus.params().target_time_per_block();
+        let mut b = self.consensus.build_utxo_valid_block_with_parents(blockhash::NONE, parents, self.miner_data.clone(), txs);
+        b.header.timestamp = self.simulated_time;
+        let state = kaspa_pow::State::new(&b.header);
+        let mut nonce = 0u64;
+        while !state.check_pow(nonce).0 {
+            nonce += 1;
+        }
+        b.header.nonce = nonce;
+        b.header.finalize(); // Overrides the NONE hash passed above with the actual hash
+        b.to_immutable()
+    }
 }
 
 /// LIVE real-PoW proof: mine a chain of blocks whose PoW is the actual
@@ -630,6 +648,146 @@ async fn non_canonical_anchor_is_not_final() {
     assert!(vp.is_shielded_anchor_final(&empty_anchor, q, blue_score(q)), "the empty-tree (genesis) anchor is always final");
 }
 
+/// REORG / F-01 regression (Critical): a shielded spend on an abandoned branch adds
+/// its nullifier to the global set; when a heavier competing branch re-spends the
+/// SAME note, the reorg down-walk must make the reverted nullifier visible as
+/// unspent BEFORE the up-walk validates the rejoining branch. Commit 603afce staged
+/// reverts and re-applies in ONE WriteBatch committed after the walk — but RocksDB
+/// deletes staged in a batch are invisible to store reads until written
+/// (`CachedDbAccess::delete` removes the cache entry, `has()` then falls through to
+/// RocksDB where the key is still present), so the rejoining branch's re-spend was
+/// wrongly dropped as a double-spend and that outcome was persisted via
+/// `commit_utxo_state` — a permanent divergence from nodes that never saw the
+/// abandoned branch. The fix commits the down-walk reverts in a first batch before
+/// the up-walk.
+///
+/// Drive: common chain mints note N; branch A spends N (nullifier added); heavier
+/// branch B re-spends the SAME N and takes over the selected chain. Assert B's
+/// spend outcome equals A's (the same spend applied: fee left the pool exactly
+/// once), i.e. B's spend was NOT dropped due to a stale nullifier.
+#[tokio::test]
+async fn reorg_nullifier_revert_is_visible_to_rejoining_spend() {
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+    use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    // Isolate the shielded-spend mechanics from the dev fee (single-note coinbases,
+    // as in the other shielded tests; the dev fee is covered by the coinbase unit test).
+    params.dev_fee_recipient = None;
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff; // trivial real PoW
+            p.blockrate.finality_depth = 5;
+            p.blockrate.shielded_anchor_depth = 3; // mature the coinbase note's anchor within a short chain
+        })
+        .build();
+    let net = config.genesis.hash.as_bytes();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_seed = [7u8; 32];
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed(miner_seed).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+
+    // Common chain: block 1 mints the first (position-0) note N.
+    let mut block1 = None;
+    for _ in 0..2 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+        block1 = Some(b);
+    }
+    let block1 = block1.unwrap();
+    let cb = &block1.transactions[0];
+    assert_eq!(cb.outputs.len(), 1, "block 1 coinbase is a single note at position 0");
+    let cb_txid = cb.id();
+    let note_value = cb.outputs[0].value;
+    let anchor1 = ctx.consensus.virtual_processor().shielded_anchor_at(block1.header.hash).unwrap();
+
+    // Extend the common chain until block 1's anchor matures (depth = 3); the last
+    // common block is the reorg split point.
+    let mut split = block1.header.hash;
+    for _ in 0..5 {
+        let b = ctx.mine_real_pow_block();
+        split = b.header.hash;
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    let fees_at_split = ctx.consensus.virtual_processor().shielded_supply_totals_at(split).unwrap().cumulative_fees;
+
+    // One REAL proven spend of note N (fee = 2_000), to be carried by BOTH branches.
+    let recipient_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).unwrap();
+    let mut spend_tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+    let tx_ctx = spend_tx.shielded_sighash_context();
+    let payload = kaspa_shielded_core::wallet::build::build_singleleaf_coinbase_spend(
+        miner_seed,
+        cb_txid.as_bytes(),
+        0,
+        note_value,
+        recipient_addr,
+        note_value - 2_000,
+        &net,
+        &tx_ctx,
+    )
+    .expect("wallet builds a real spend bundle");
+    spend_tx.payload = payload;
+    spend_tx.finalize();
+
+    // Build (not yet insert) the competing branch blocks while the selected chain is
+    // still the common chain: template-time validation must see note N unspent in the
+    // branch PoV. B1 carries the same re-spend of N.
+    let b1 = ctx.mine_real_pow_block_on(vec![split], vec![spend_tx.clone()]);
+    let b1_hash = b1.header.hash;
+    // Branch A: A1 carries the spend on top of the split point; A2 (empty) merges A1
+    // and applies the spend — nullifier N enters the global set.
+    let a1 = ctx.mine_real_pow_block_on(vec![split], vec![spend_tx.clone()]);
+    let a1_hash = a1.header.hash;
+    ctx.consensus.validate_and_insert_block(a1).virtual_state_task.await.unwrap();
+    let a2 = ctx.mine_real_pow_block_on(vec![a1_hash], vec![]);
+    let a2_hash = a2.header.hash;
+    let status = ctx.consensus.validate_and_insert_block(a2).virtual_state_task.await.unwrap();
+    assert!(status.is_utxo_valid_or_pending(), "branch A applied the spend: {status:?}");
+    assert_eq!(ctx.consensus.block_status(a2_hash), BlockStatus::StatusUTXOValid);
+    assert_eq!(
+        ctx.consensus.virtual_processor().shielded_supply_totals_at(a2_hash).unwrap().cumulative_fees,
+        fees_at_split + 2_000,
+        "branch A applied the spend: its fee left the pool exactly once"
+    );
+
+    // Now feed branch B. B1 alone is shorter than A (no reorg yet); B2 ties; B3 makes
+    // B strictly heavier — the virtual selected chain reorgs off A onto B, and B2
+    // (which merges B1's re-spend of N) is UTXO-validated during the up-walk.
+    ctx.consensus.validate_and_insert_block(b1).virtual_state_task.await.unwrap();
+    let b2 = ctx.mine_real_pow_block_on(vec![b1_hash], vec![]);
+    let b2_hash = b2.header.hash;
+    ctx.consensus.validate_and_insert_block(b2).virtual_state_task.await.unwrap();
+    let b3 = ctx.mine_real_pow_block_on(vec![b2_hash], vec![]);
+    let b3_hash = b3.header.hash;
+    let status = ctx.consensus.validate_and_insert_block(b3).virtual_state_task.await.unwrap();
+    assert!(status.is_utxo_valid_or_pending(), "branch B took over the selected chain: {status:?}");
+    let vp = ctx.consensus.virtual_processor();
+
+    // The reorg happened: the selected chain now runs through B, not A.
+    assert_eq!(ctx.consensus.get_sink(), b3_hash, "the heavier branch B won the selected chain");
+    assert_eq!(ctx.consensus.block_status(b3_hash), BlockStatus::StatusUTXOValid);
+    assert_eq!(ctx.consensus.block_status(b2_hash), BlockStatus::StatusUTXOValid);
+    assert!(!ctx.consensus.reachability_service().is_chain_ancestor_of(a2_hash, b3_hash), "branch A was abandoned by the reorg");
+
+    // F-01 core assertion: B's re-spend of N was NOT dropped as a double-spend against
+    // a stale nullifier. B2's accepted set applied the spend — its 2_000 fee left the
+    // pool — matching A's outcome for the identical spend. Pre-fix this read
+    // `fees_at_split` (spend dropped: reverted nullifier still read SPENT during the
+    // up-walk), diverging from nodes that only ever saw branch B.
+    assert_eq!(
+        vp.shielded_supply_totals_at(b2_hash).unwrap().cumulative_fees,
+        fees_at_split + 2_000,
+        "B's re-spend must be applied, not dropped against a stale nullifier (F-01)"
+    );
+    assert_eq!(
+        vp.shielded_supply_totals_at(b2_hash).unwrap().cumulative_fees,
+        vp.shielded_supply_totals_at(a2_hash).unwrap().cumulative_fees,
+        "B's spend outcome equals A's outcome for the identical spend"
+    );
+}
+
 #[tokio::test]
 async fn block_template_version_changes_to_v2_upon_activation() {
     let activation = MAINNET_PARAMS.genesis.daa_score + 10;
@@ -982,4 +1140,174 @@ async fn canonical_r_witness_reconstructs_seq_commit_from_mined_block() {
         proof.parent_seq_commit,
     );
     assert_eq!(outsider.err(), Some(kaspa_shielded_core::witness_chain::WitnessError::TargetNotInMergeset));
+}
+
+
+/// AGE WINDOW (audit F-04/F-05, task test #1/#2 — predicate level): an anchor is
+/// final iff its source block's blue-score age lies in `[shielded_anchor_depth,
+/// max_shielded_anchor_age]` — both bounds inclusive. Below the depth the anchor is
+/// immature (PLAN §2.5); above the max age it is uniformly rejected on every node
+/// class (fail-closed), which is what kills the abandoned-anchor inflation vector
+/// and the full-vs-IBD-seeded divergence. Exercises the gate directly on a real
+/// mined chain (no proving cost).
+#[tokio::test]
+async fn shielded_anchor_age_window_bounds() {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.dev_fee_recipient = None; // single-note coinbases (determinism)
+    let config = ConfigBuilder::new(params)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.blockrate.shielded_anchor_depth = 2;
+            p.blockrate.max_shielded_anchor_age = 5;
+        })
+        .build();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([7u8; 32]).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+
+    // Linear chain: the i-th mined block has blue score i+1.
+    let mut chain = Vec::new();
+    for _ in 0..9 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await.assert_valid_utxo_tip();
+        chain.push(ctx.consensus.get_sink());
+    }
+
+    let vp = ctx.consensus.virtual_processor();
+    let blue_score = |h: Hash| ctx.consensus.get_header(h).unwrap().blue_score;
+    let source = chain[2]; // blue score 3
+    assert_eq!(blue_score(source), 3);
+    let anchor = vp.shielded_anchor_at(source).unwrap();
+    assert_ne!(anchor, kaspa_shielded_core::Anchor::empty_tree().to_bytes(), "the chain minted notes by blue score 3");
+    assert_eq!(vp.shielded_state_manager.anchor_source_block(&anchor).unwrap(), Some(source), "anchor indexed to its source");
+
+    let final_at = |q: Hash| vp.is_shielded_anchor_final(&anchor, q, blue_score(q));
+    // q's blue score minus the source's (3) is the anchor age:
+    assert!(!final_at(chain[3]), "age 1 < depth 2: immature anchor must be rejected");
+    assert!(final_at(chain[4]), "age 2 == shielded_anchor_depth: in-window (lower bound inclusive) must be final");
+    assert!(final_at(chain[7]), "age 5 == max_shielded_anchor_age: in-window (upper bound inclusive) must be final");
+    assert!(!final_at(chain[8]), "age 6 > max_shielded_anchor_age 5: over-aged anchor must be rejected (F-04/F-05)");
+}
+
+/// NEGATIVE / soundness + LIVENESS, upper age bound (audit F-04/F-05, task test
+/// #2): a **cryptographically valid** shielded spend proving against an anchor
+/// older than `max_shielded_anchor_age` must be DROPPED (spend not applied, fee
+/// not re-minted) — exactly like an immature-anchor spend — without
+/// disqualifying the merging block. Before the age window, an over-aged anchor
+/// on the canonical chain resolved as final indefinitely (and once its source
+/// pruned, the fail-open short-circuit kept it final forever — F-04).
+///
+/// Mirrors `immature_shielded_anchor_spend_is_dropped_not_fatal`, but the only
+/// defect here is that the anchor is TOO OLD: maturity (depth = 2) is satisfied
+/// (age 11 ≥ 2 at merge time), so rejection can only come from the upper bound
+/// (age 11 > max age 5). A positive predicate control confirms the same anchor
+/// IS final while inside the window.
+#[tokio::test]
+async fn overaged_shielded_anchor_spend_is_dropped() {
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+    use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.dev_fee_recipient = None; // single-note coinbases (fee accounting below)
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff; // trivial real PoW
+            p.blockrate.finality_depth = 5;
+            p.blockrate.shielded_anchor_depth = 2; // maturity easily satisfied...
+            p.blockrate.max_shielded_anchor_age = 5; // ...but the upper bound is not
+        })
+        .build();
+    let net = config.genesis.hash.as_bytes();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_seed = [7u8; 32];
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed(miner_seed).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+
+    // chain[0]'s mergeset is only genesis (never rewarded), so it mints no note;
+    // chain[1] mints the first and only note, at tree position 0. anchor1 is the
+    // tree root chain[1] produced.
+    let mut chain = Vec::new();
+    for _ in 0..2 {
+        let b = ctx.mine_real_pow_block();
+        chain.push(b.header.hash);
+        ctx.consensus.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+    }
+    let block1 = ctx.consensus.get_block(chain[1]).unwrap();
+    let cb = &block1.transactions[0];
+    assert_eq!(cb.outputs.len(), 1, "block chain[1] coinbase is a single note at position 0");
+    let cb_txid = cb.id();
+    let note_value = cb.outputs[0].value;
+    let anchor1 = ctx.consensus.virtual_processor().shielded_anchor_at(chain[1]).unwrap();
+
+    // Mine 8 empty blocks: tip is now blue score 10, anchor1's source (chain[1],
+    // blue score 2) is 8 deep — matured (>= 2) but already older than the max age (5).
+    for _ in 0..8 {
+        let b = ctx.mine_real_pow_block();
+        chain.push(b.header.hash);
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+
+    // Predicate sanity: the SAME anchor is final inside the window (age 2 at
+    // chain[3], blue score 4) but over-aged at the tip (age 8 > 5).
+    {
+        let vp = ctx.consensus.virtual_processor();
+        let blue_score = |h: Hash| ctx.consensus.get_header(h).unwrap().blue_score;
+        assert!(vp.is_shielded_anchor_final(&anchor1, chain[3], blue_score(chain[3])), "positive control: age 2 is in [2, 5]");
+        let tip = ctx.consensus.get_sink();
+        assert!(!vp.is_shielded_anchor_final(&anchor1, tip, blue_score(tip)), "age 8 > max age 5: over-aged (F-04/F-05)");
+    }
+
+    // Wallet side: build a REAL proven spend of block 1's coinbase note against
+    // anchor1 (the bundle is cryptographically valid — the anchor is just too old).
+    let recipient_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).unwrap();
+    let mut spend_tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+    let tx_ctx = spend_tx.shielded_sighash_context();
+    let payload = kaspa_shielded_core::wallet::build::build_singleleaf_coinbase_spend(
+        miner_seed,
+        cb_txid.as_bytes(),
+        0,
+        note_value,
+        recipient_addr,
+        note_value - 2_000,
+        &net,
+        &tx_ctx,
+    )
+    .expect("wallet builds a real spend bundle");
+    spend_tx.payload = payload;
+    spend_tx.finalize();
+    let bundle = kaspa_shielded_core::bundle::ShieldedBundle::from_bytes(&spend_tx.payload).unwrap();
+    assert_eq!(bundle.anchor, anchor1, "spend proves against block 1's real (over-aged) anchor");
+
+    // Mine block B carrying the spend, then child C merging B. C's shielded state
+    // transition checks the spend's anchor: age 9 > max age 5 ⇒ DROPPED (not fatal).
+    let spend_block = ctx.mine_real_pow_block_with(vec![spend_tx]);
+    let spend_block_hash = spend_block.header.hash;
+    assert_eq!(spend_block.transactions.len(), 2, "the over-aged spend was included in the block body");
+    ctx.consensus.validate_and_insert_block(spend_block).virtual_state_task.await.unwrap();
+
+    let child = ctx.mine_real_pow_block();
+    let child_hash = child.header.hash;
+
+    // ANTI-INFLATION: the dropped spend's fee (2_000) never left the pool, so C's
+    // coinbase re-mints only the bare subsidy (note_value), not subsidy + fee.
+    let child_coinbase_total: u64 = child.transactions[0].outputs.iter().map(|o| o.value).sum();
+    assert_eq!(child_coinbase_total, note_value, "the merging block's coinbase must not re-mint a dropped spend's fee");
+
+    ctx.consensus.validate_and_insert_block(child).virtual_state_task.await.unwrap();
+
+    // LIVENESS: merging an over-aged-anchor spend does NOT disqualify the block.
+    assert_eq!(ctx.consensus.block_status(child_hash), BlockStatus::StatusUTXOValid, "drop the spend, keep liveness");
+    assert_eq!(ctx.consensus.get_sink(), child_hash, "the sink advances to the child — the chain did not halt");
+
+    // ANTI-INFLATION, ledger side: across the block that dropped the spend, the
+    // pool grew by exactly the subsidy.
+    let vp = ctx.consensus.virtual_processor();
+    let before = vp.shielded_supply_totals_at(spend_block_hash).unwrap();
+    let after = vp.shielded_supply_totals_at(child_hash).unwrap();
+    let pool_delta = (after.cumulative_coinbase - before.cumulative_coinbase) as i128
+        - (after.cumulative_fees - before.cumulative_fees) as i128;
+    assert_eq!(pool_delta, note_value as i128, "the pool must grow by exactly the subsidy when a spend is dropped");
 }

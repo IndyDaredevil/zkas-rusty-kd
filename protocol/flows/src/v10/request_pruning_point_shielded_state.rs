@@ -132,7 +132,16 @@ impl RequestPruningPointShieldedStateFlow {
             Err(e) => return Err(ProtocolError::OtherOwned(format!("shielded nullifier reader task panicked: {e}"))),
         };
 
-        assert!(sent == reader_count && sent == nullifier_count);
+        // F-03: the metadata (count) and the stream are produced by two separate
+        // consensus calls; a concurrent virtual update (e.g. a reorg walk) can
+        // transiently desync them. Abort the transfer cleanly — the peer detects the
+        // torn stream and retries — rather than panicking the whole node.
+        if sent != reader_count || sent != nullifier_count {
+            return Err(ProtocolError::OtherOwned(format!(
+                "shielded nullifier stream for pruning point {expected_pp} drifted during transfer: \
+                 sent {sent}, reader streamed {reader_count}, metadata declared {nullifier_count}; aborting"
+            )));
+        }
 
         info!("Finished sending shielded state for pruning point {}: {} nullifiers in {} chunks", expected_pp, sent, chunks_sent);
         Ok(())

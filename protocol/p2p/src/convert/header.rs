@@ -1,5 +1,5 @@
 use crate::pb as protowire;
-use kaspa_consensus_core::{BlueWorkType, auxpow::AuxPow, header::Header};
+use kaspa_consensus_core::{BlueWorkType, auxpow::AuxPow, header::{CompressedParents, Header}};
 use kaspa_hashes::Hash;
 
 use super::error::ConversionError;
@@ -126,6 +126,16 @@ impl TryFrom<Versioned<protowire::BlockHeader>> for Header {
                     kaspa_consensus_core::auxpow::MAX_COINBASE_MERKLE_BRANCH
                 )));
             }
+            // F-07: borsh-decoding the aux witness bypasses the `TryFrom` validation
+            // the main header's parents went through above. The aux parent header is
+            // later hashed (`parent_pow` in kaspa_pow), and hashing expands
+            // `parents_by_level`, whose `expand_rle` PANICS on non-strictly-increasing
+            // cumulative counts — a remote zero-work panic in header processing.
+            // Re-run the same CompressedParents validation at the edge, before the
+            // witness can be stored or relayed.
+            CompressedParents::try_from(aux.parent_header.parents_by_level.raw().to_vec()).map_err(|e| {
+                ConversionError::AuxPowDecodeError(format!("aux parent parents_by_level invalid: {e}"))
+            })?;
             Ok(header.with_aux_pow(aux))
         }
     }
@@ -175,5 +185,41 @@ mod tests {
         let back: Header = Versioned(HeaderFormat::Compressed, pb).try_into().unwrap();
         assert!(back.aux_pow.is_none());
         assert_eq!(back.hash, native.hash);
+    }
+
+    /// F-07 regression: the aux witness is borsh-decoded, which bypasses the
+    /// `CompressedParents` validation the main header's parents go through. An aux
+    /// parent whose `parents_by_level` cumulative counts are not strictly increasing
+    /// later PANICS `expand_rle` during parent_pow hashing — a remote zero-work
+    /// panic. The p2p edge must reject it with a ConversionError instead.
+    #[test]
+    fn aux_parent_with_invalid_parents_by_level_is_rejected() {
+        let header = finalized(1);
+        let h1 = Hash::from_bytes([7u8; 32]);
+        let h2 = Hash::from_bytes([8u8; 32]);
+
+        let cases: Vec<Vec<(u8, Vec<Hash>)>> = vec![
+            vec![(0, vec![h1])],              // first cumulative count is 0
+            vec![(5, vec![h1]), (2, vec![h1])], // decreasing cumulative counts
+            vec![(3, vec![h1]), (3, vec![h2])], // repeated cumulative count
+        ];
+        for raw in cases {
+            // Craft the invalid CompressedParents exactly the way the wire path
+            // receives it: borsh decode performs no validation.
+            let bad: CompressedParents = borsh::from_slice(&borsh::to_vec(&raw).unwrap()).unwrap();
+            let mut parent = finalized(9);
+            parent.parents_by_level = bad;
+            let cb = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, AuxPow::embed_commitment(&[], header.hash, &[]));
+            let aux = AuxPow { parent_header: parent, parent_coinbase: cb, coinbase_merkle_branch: vec![] };
+
+            let mut pb: protowire::BlockHeader = (HeaderFormat::Compressed, &header).into();
+            pb.aux_pow = borsh::to_vec(&aux).unwrap();
+
+            let res: Result<Header, ConversionError> = Versioned(HeaderFormat::Compressed, pb).try_into();
+            assert!(
+                matches!(res, Err(ConversionError::AuxPowDecodeError(_))),
+                "case {raw:?} must be rejected with AuxPowDecodeError, not accepted or panicked"
+            );
+        }
     }
 }

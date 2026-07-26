@@ -33,7 +33,7 @@ mod tests {
             UtxoEntry, scriptvec,
         },
     };
-    use kaspa_hashes::Hash;
+    use kaspa_hashes::{Hash, ZERO_HASH};
     use kaspa_mining_errors::mempool::RuleResult;
     use kaspa_txscript::{
         pay_to_address_script, pay_to_script_hash_signature_script,
@@ -1200,6 +1200,60 @@ mod tests {
         assert_eq!(outs[2].script_public_key, dev_spk, "trailing dev-fee note must be preserved, not hijacked to the miner");
     }
 
+    /// ZKas regression (audit finding F-31): when the cached template's miner script EQUALS the
+    /// dev-fee recipient — anyone can request a template paying the public dev address — the
+    /// reverse scan for the red reward must skip the trailing dev-fee note, or it repoints the
+    /// FEE and leaves the red reward on the dev address (BadCoinbaseTransaction self-DoS). The
+    /// dev-fee note is deterministically the last output, so `modify_block_template` excludes a
+    /// trailing output that pays the consensus dev-fee recipient from the scan range.
+    #[test]
+    fn test_modify_block_template_miner_spk_equals_dev_fee_recipient() {
+        use kaspa_consensus_core::{
+            block::{BlockTemplate, MutableBlock},
+            header::Header,
+            subnets::SUBNETWORK_ID_COINBASE,
+            tx::Transaction,
+        };
+
+        // Miner A (the cached template's miner) pays the public dev address.
+        let spk = |b: u8| ScriptPublicKey::new(0, scriptvec![b, b, b]);
+        let blue_spk = spk(0x11);
+        let dev_spk = spk(0xde);
+        let miner_a = MinerData::new(dev_spk.clone(), vec![]);
+        let miner_b = MinerData::new(spk(0xbb), vec![]);
+
+        let mut consensus = ConsensusMock::new();
+        consensus.set_dev_fee_spk(dev_spk.clone());
+
+        // [blue reward, red reward → dev address (miner A), dev fee note → dev address]: the red
+        // reward and the dev-fee note carry the SAME script, so a plain reverse scan for the old
+        // miner script would hit the dev-fee note first.
+        let coinbase = Transaction::new(
+            0,
+            vec![],
+            vec![
+                TransactionOutput::new(500, blue_spk.clone()),    // blue block reward (miner-independent)
+                TransactionOutput::new(300, dev_spk.clone()),     // red reward → template miner (= dev script)
+                TransactionOutput::new(25, dev_spk.clone()),      // dev fee note (must stay byte-identical)
+            ],
+            0,
+            SUBNETWORK_ID_COINBASE,
+            0,
+            vec![0u8; 32],
+        );
+        let block = MutableBlock::new(Header::from_precomputed_hash(ZERO_HASH, vec![]), vec![coinbase]);
+        let template = BlockTemplate::new(block, miner_a, true, 0, 0, ZERO_HASH, vec![]);
+
+        let modified = BlockTemplateBuilder::modify_block_template(&consensus, &miner_b, &template).unwrap();
+        let outs = &modified.block.transactions[0].outputs;
+
+        assert_eq!(outs[0].script_public_key, blue_spk, "blue-block reward must be untouched");
+        assert_eq!(outs[1].script_public_key, miner_b.script_public_key, "the RED reward (not the dev fee) must be repointed to the new miner");
+        assert_eq!(outs[1].value, 300, "the red reward's value must be unchanged");
+        assert_eq!(outs[2].script_public_key, dev_spk, "dev-fee note must stay on the dev address, not be repointed");
+        assert_eq!(outs[2].value, 25, "dev-fee note must be byte-identical (value unchanged)");
+    }
+
     // This is a sanity test for the mempool eviction policy. We check that if the mempool reached to its maximum
     // (in bytes) a high paying transaction will evict as much transactions as needed so it can enter the
     // mempool.
@@ -1632,6 +1686,7 @@ mod tests {
             anchor: [0u8; sizes::FIELD],
             proof: vec![],
             binding_sig: [0u8; sizes::SIG],
+            burn: None,
         };
         let tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, bundle.to_bytes());
         MutableTransaction::from_tx(tx)

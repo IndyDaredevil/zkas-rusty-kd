@@ -90,7 +90,7 @@ use itertools::Itertools;
 use kaspa_consensus_core::config::params::ForkedParam;
 use kaspa_consensus_core::tx::ValidatedTransaction;
 use kaspa_utils::binary_heap::BinaryHeapExtensions;
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use rand::{Rng, seq::SliceRandom};
 use rayon::{
     ThreadPool,
@@ -127,6 +127,12 @@ pub struct VirtualStateProcessor {
     /// finality/pruning) so a note becomes spendable in ~10 minutes rather than the
     /// full ~12-hour finality window.
     pub(super) shielded_anchor_depth: u64,
+    /// Maximum shielded-spend anchor age in blue-score units (audit F-04/F-05):
+    /// a spend whose anchor is older than this is dropped. Strictly below the
+    /// pruning depth (param-invariant, compile-time asserted), so the source of
+    /// any in-window anchor is never pruned on any synced node class — which is
+    /// what allows `is_shielded_anchor_final` to fail CLOSED on pruned data.
+    pub(super) max_shielded_anchor_age: u64,
     /// The Orchard empty-tree anchor, precomputed (always canonical/mature, PLAN §2.5).
     pub(super) empty_shielded_anchor: [u8; 32],
     pub(super) mempool_mass_cofactors: kaspa_consensus_core::config::params::ForkedParam<kaspa_consensus_core::mass::MassCofactors>,
@@ -194,6 +200,13 @@ pub struct VirtualStateProcessor {
     // accepted order. Currently constructed and queryable; the accepted-order
     // commit hook is wired separately.
     pub(super) shielded_state_manager: crate::processes::shielded::ShieldedStateManager,
+
+    /// F-03: the PP-time nullifier set last computed for shielded IBD export,
+    /// shared between the metadata call (which reports its length as
+    /// `nullifier_count`) and the streaming call so one request serves a single
+    /// captured view. Keyed by pruning-point hash; the PP-time set is immutable per
+    /// pruning point, so the cached value never goes stale.
+    pub(super) pp_nullifier_export_cache: Mutex<Option<(Hash, Arc<Vec<[u8; 32]>>)>>,
 
     // zkas: when true, the coinbase reward enters the shielded pool as
     // coinbase notes (no transparent outputs) — see `build_coinbase_mint`.
@@ -295,9 +308,11 @@ impl VirtualStateProcessor {
             smt_stores: storage.smt_stores.clone(),
             smt_metadata_store: storage.smt_metadata_store.clone(),
             shielded_state_manager,
+            pp_nullifier_export_cache: Mutex::new(None),
             _mining_rules: mining_rules,
             finality_depth: params.finality_depth(),
             shielded_anchor_depth: params.shielded_anchor_depth(),
+            max_shielded_anchor_age: params.max_shielded_anchor_age(),
             empty_shielded_anchor: kaspa_shielded_core::Anchor::empty_tree().to_bytes(),
         }
     }
@@ -319,13 +334,6 @@ impl VirtualStateProcessor {
         self.shielded_state_manager.frontier_at(block)
     }
 
-    /// The canonical shielded state root (PLAN §2.10) as of a given chain block —
-    /// the value a child block's coinbase must commit to. Exposed for block
-    /// construction (templates/tests) and sync verification.
-    pub fn shielded_state_root_at(&self, block: kaspa_hashes::Hash) -> Result<[u8; 32], kaspa_database::prelude::StoreError> {
-        self.shielded_state_manager.state_root_at(block)
-    }
-
     /// The turnstile cumulative totals (PLAN §2.6) as of a given chain block.
     /// Exposed for supply queries and the pool-accounting tests.
     pub fn shielded_supply_totals_at(
@@ -341,6 +349,10 @@ impl VirtualStateProcessor {
     /// transfer. `Ok(None)` means the pruning point has no shielded state (empty
     /// pool — nothing to transfer). The nullifier set is streamed separately via
     /// [`Self::collect_pruning_point_nullifiers`].
+    ///
+    /// F-03: `nullifier_count` must count the **PP-time** nullifier set (the set the
+    /// PP MuHash snapshot in `md` commits to), not the tip-time global set — see
+    /// [`Self::pruning_point_nullifier_set`].
     pub fn export_pruning_point_shielded(
         &self,
         pp: kaspa_hashes::Hash,
@@ -348,29 +360,77 @@ impl VirtualStateProcessor {
         let Some(md) = self.shielded_state_manager.export_pruning_point_shielded(pp)? else {
             return Ok(None);
         };
-        let nullifier_count = self.shielded_state_manager.nullifiers().count() as u64;
+        let nullifier_count = self.pruning_point_nullifier_set(pp)?.len() as u64;
         Ok(Some(kaspa_consensus_core::api::ShieldedExportMetadata { data: md.to_wire_bytes(), nullifier_count }))
     }
 
-    /// Server side: the whole spent-nullifier set (for shielded IBD streaming).
+    /// Server side: the spent-nullifier set **as of the pruning point** (for shielded
+    /// IBD streaming) — the same captured view the metadata call counted (F-03).
     pub fn collect_pruning_point_nullifiers(
         &self,
-    ) -> Result<Vec<[u8; 32]>, kaspa_database::prelude::StoreError> {
-        self.shielded_state_manager.nullifiers().iter_all().collect()
+        pp: kaspa_hashes::Hash,
+    ) -> Result<Arc<Vec<[u8; 32]>>, kaspa_database::prelude::StoreError> {
+        self.pruning_point_nullifier_set(pp)
+    }
+
+    /// The spent-nullifier set as of pruning point `pp` (audit finding F-03): the
+    /// current global set (which tracks the virtual selected tip, typically a full
+    /// pruning period ahead of the PP) minus the nullifiers added by selected-chain
+    /// blocks in `(pp, virtual selected tip]`, read from the per-block diff store.
+    ///
+    /// The computed set is cached per pruning point and shared by the metadata
+    /// (count) and stream calls of one request, so both serve a single captured
+    /// view. The PP-time set is immutable per pruning point, so the cache never
+    /// goes stale; a different PP simply replaces it.
+    ///
+    /// Race note: the tip-time set is snapshotted BEFORE the tip is captured. A
+    /// block committed while the snapshot streams has its commit ordered before the
+    /// virtual-state update, so the tip captured afterward is at/after it and the
+    /// subtraction window covers it — the result still lands on the exact PP-time
+    /// set. A concurrent reorg walk can transiently desync the global set; that is
+    /// tolerated by the serving flow, which aborts the transfer cleanly on drift
+    /// instead of panicking.
+    fn pruning_point_nullifier_set(&self, pp: kaspa_hashes::Hash) -> Result<Arc<Vec<[u8; 32]>>, kaspa_database::prelude::StoreError> {
+        if let Some((cached_pp, set)) = self.pp_nullifier_export_cache.lock().as_ref() {
+            if *cached_pp == pp {
+                return Ok(Arc::clone(set));
+            }
+        }
+        let snapshot = self.shielded_state_manager.nullifier_set_snapshot()?;
+        let tip = self.lkg_virtual_state.load().ghostdag_data.selected_parent;
+        // `forward_chain_iterator(pp, tip, true)` yields `[pp, tip]` along the
+        // selected chain; `skip(1)` drops the PP itself, leaving exactly `(pp, tip]`.
+        // The PP is finality-deep, so it is always a chain ancestor of the tip.
+        let post_blocks = self.reachability_service.forward_chain_iterator(pp, tip, true).skip(1);
+        let set = Arc::new(self.shielded_state_manager.subtract_nullifier_diffs(snapshot, post_blocks)?);
+        *self.pp_nullifier_export_cache.lock() = Some((pp, Arc::clone(&set)));
+        Ok(set)
     }
 
     /// Receiver side: verify + seed the shielded state at a pruning point from
     /// transferred metadata + the full streamed nullifier set. See
     /// [`crate::processes::shielded::PruningPointShieldedMetadata`] for how the
     /// consensus binding (the #24 coinbase commitment) is enforced afterward.
+    ///
+    /// `expected_state_root` (audit finding F-02): when `Some`, the metadata's
+    /// declared state root must equal this PoW-committed value (the coinbase
+    /// `shielded_commitment` of the pruning point's selected child) BEFORE anything
+    /// is seeded — the import is otherwise entirely attacker-controlled.
     pub fn seed_pruning_point_shielded(
         &self,
         pp: kaspa_hashes::Hash,
         metadata: kaspa_consensus_core::api::ShieldedExportMetadata,
+        expected_state_root: Option<[u8; 32]>,
         nullifiers: Vec<[u8; 32]>,
     ) -> Result<(), String> {
         use crate::processes::shielded::{PruningPointShieldedMetadata, ShieldedStateManager};
         let md = PruningPointShieldedMetadata::from_wire_bytes(&metadata.data)?;
+        // F-02: reject the import before seeding if it does not match the
+        // PoW-committed shielded state root (peer can be dropped; another syncer
+        // can be tried).
+        if let Some(committed) = expected_state_root {
+            ShieldedStateManager::verify_import_binding(&md, committed)?;
+        }
         let n = ShieldedStateManager::verify_pruning_point_shielded(&md, nullifiers.iter())?;
         if n as u64 != metadata.nullifier_count {
             return Err(format!("nullifier count mismatch: metadata says {}, streamed {}", metadata.nullifier_count, n));
@@ -382,6 +442,26 @@ impl VirtualStateProcessor {
         self.db.write(batch).unwrap();
         info!("Imported shielded state for pruning point {}: {} nullifiers imported", pp, n);
         Ok(())
+    }
+
+    /// The locally held shielded state root (PLAN §2.10) as of `block`, recomputed
+    /// from the per-block snapshots (the empty-state root for blocks with no
+    /// shielded state). Used on the IBD import path to detect whether local state
+    /// already matches the PoW-committed root (F-02/F-15).
+    pub fn shielded_state_root_at(&self, block: kaspa_hashes::Hash) -> Result<[u8; 32], kaspa_database::prelude::StoreError> {
+        self.shielded_state_manager.state_root_at(block)
+    }
+
+    /// F-15: stage the real clear of the shielded import state (the whole global
+    /// nullifier set + the per-block snapshots at `pruning_point`) into `batch`.
+    /// See `ShieldedStateManager::clear_for_pruning_reimport` for the safety
+    /// preconditions — the caller (IBD flow via `Consensus`) enforces them.
+    pub fn clear_shielded_state_for_pruning_reimport(
+        &self,
+        batch: &mut WriteBatch,
+        pruning_point: kaspa_hashes::Hash,
+    ) -> Result<(), kaspa_database::prelude::StoreError> {
+        self.shielded_state_manager.clear_for_pruning_reimport(batch, pruning_point)
     }
 
     /// The shielded effects one **chain block** applied (PLAN §2.4), for wallet sync
@@ -519,7 +599,8 @@ impl VirtualStateProcessor {
 
         // Shielded (PLAN §2.5): nothing to publish here. Anchor-finality is decided
         // per spend at block-validation time (`is_shielded_anchor_final`) via the
-        // reorg-safe anchor→block index + reachability + `shielded_anchor_depth`, so
+        // reorg-safe anchor→block index + reachability + the
+        // `[shielded_anchor_depth, max_shielded_anchor_age]` age window, so
         // there is no tip-level anchor window to maintain.
 
         let compact_sink_ghostdag_data = if let Some(sink_ghostdag_data) = Lazy::get(&sink_ghostdag_data) {
@@ -578,15 +659,41 @@ impl VirtualStateProcessor {
 
     /// Whether a shielded spend proving against `anchor` is acceptable in a block
     /// with selected parent `selected_parent` and blue score `block_blue_score`
-    /// (PLAN §2.5). Reorg-safe by construction: an anchor is final iff its source
-    /// block (from the append-only anchor→block index) is
+    /// (PLAN §2.5). Reorg- and sync-mode-safe by construction: an anchor is final
+    /// iff its source block (from the append-only anchor→block index) is
     ///
     ///  1. **canonical** — a selected-chain ancestor of `selected_parent` (an anchor
     ///     from an abandoned branch fails this, so a >`shielded_anchor_depth` reorg
     ///     cannot resurrect it — closing the shallow-anchor value-creation vector), and
-    ///  2. **matured** — at least `shielded_anchor_depth` blue-score units deep
-    ///     relative to this block (~10 min at 10 BPS), so the note it proves cannot
-    ///     be cheaply reorged out from under the spend.
+    ///  2. **in-window** — the source's blue-score age relative to this block lies in
+    ///     `[shielded_anchor_depth, max_shielded_anchor_age]` (~10 min to ~7.5 h).
+    ///
+    /// FAIL-CLOSED on missing data (security audit F-04/F-05). The parameter
+    /// invariant `max_shielded_anchor_age < pruning_depth - finality_depth`
+    /// (compile-time asserted in `BlockrateParams::new`) guarantees that the
+    /// source block of any *in-window* anchor is younger than every synced
+    /// node's pruning point, so its ghostdag and reachability data exists on
+    /// full, pruned AND IBD-seeded nodes alike. Therefore:
+    ///
+    ///  - a pruned source (`get_blue_score` Err) can only belong to an anchor
+    ///    that is out-of-window anyway — REJECT. The historical fail-open here
+    ///    (`return true`, motivated by a panic-freeze when a `.unwrap()` hit a
+    ///    pruned source) assumed "pruned == canonical". That is false: the
+    ///    anchor→block index is written for every chain block while selected
+    ///    and is NEVER reverted on reorg, so anchors of abandoned-then-pruned
+    ///    branches kept resolving as final — notes that only ever existed on a
+    ///    dead branch could be spent: inflation (F-04).
+    ///  - a reachability `Err` likewise means out-of-window/abandoned, not
+    ///    "pruned canonical" — REJECT.
+    ///  - an IBD-seeded node (whose anchor index holds only the pruning point's
+    ///    own anchor and later) now rejects out-of-window anchors exactly as a
+    ///    full node does, instead of silently dropping old-but-canonical spends
+    ///    full nodes accepted — removing the permanent full-vs-seeded split
+    ///    (F-05). Wallets pick anchors near the maturity end of the window, far
+    ///    below `max_shielded_anchor_age`, so honest spends are unaffected.
+    ///
+    /// Failing closed cannot wedge validation: no in-window anchor can ever hit
+    /// either pruned-data path, on any node class.
     ///
     /// The empty-tree anchor is genesis (always canonical and mature); a spend can
     /// never actually prove a note into it, so its proof fails elsewhere.
@@ -597,29 +704,26 @@ impl VirtualStateProcessor {
         let Some(source) = self.shielded_state_manager.anchor_source_block(anchor).unwrap() else {
             return false; // not a real tree root of any block
         };
-        // A source block below the pruning point has had its ghostdag/reachability data
-        // pruned. Reading its blue score with `.unwrap()` here panicked the virtual
-        // processor the instant pruning first advanced past a live anchor's source — and
-        // since every virtual-chain update re-runs this check, the panic recurred every
-        // pass and FROZE THE WHOLE CHAIN (observed: node stuck ~17h, node panicking every
-        // ~30s at this line). A pruned source is finalized selected-chain history: the
-        // global shielded tree only ever advances on accepted chain blocks, and the pruning
-        // depth is far greater than `shielded_anchor_depth`, so such a source is by
-        // construction both canonical and matured. Treat "blue score unavailable" as
-        // pruned ⟹ final, before touching reachability (also pruned for such a block).
+        // F-04: a source block below the pruning point has had its ghostdag data
+        // pruned. With the age window above, such a source is necessarily older
+        // than any acceptable anchor (or abandoned) — fail CLOSED. (Fail-open was
+        // the F-04 inflation vector; see the doc comment.)
         let Ok(source_blue_score) = self.ghostdag_store.get_blue_score(source) else {
-            return true;
+            return false;
         };
         // Canonical: the source block is on this block's selected chain. Use the
         // pruning-aware `try_is_chain_ancestor_of` (not the panicking `is_chain_ancestor_of`)
         // so a source whose reachability data has been pruned since the blue-score read can
-        // never crash the virtual processor here either. `Err` == reachability pruned ==
-        // the source is finalized selected-chain history == canonical.
-        if source != selected_parent && !matches!(self.reachability_service.try_is_chain_ancestor_of(source, selected_parent), Ok(true) | Err(_)) {
+        // never crash the virtual processor here either. With the age window, an in-window
+        // source's reachability is never pruned, so `Err` means out-of-window/abandoned —
+        // fail closed (F-04); only an explicit `Ok(true)` is canonical.
+        if source != selected_parent && !matches!(self.reachability_service.try_is_chain_ancestor_of(source, selected_parent), Ok(true)) {
             return false;
         }
-        // Matured: at least `shielded_anchor_depth` deep relative to this block.
-        block_blue_score.saturating_sub(source_blue_score) >= self.shielded_anchor_depth
+        // In-window: at least `shielded_anchor_depth` deep (maturity, PLAN §2.5) and
+        // at most `max_shielded_anchor_age` old (F-04/F-05 fail-closed bound).
+        let age = block_blue_score.saturating_sub(source_blue_score);
+        age >= self.shielded_anchor_depth && age <= self.max_shielded_anchor_age
     }
 
     /// Calculates the UTXO state of `to` starting from the state of `from`.
@@ -635,13 +739,30 @@ impl VirtualStateProcessor {
 
         let mut split_point: Option<Hash> = None;
 
-        // Shielded (PLAN §2.4): a reorg's nullifier mutations (down-walk reverts of the abandoned
-        // branch + up-walk re-applies of the rejoining branch) are accumulated into ONE batch and
-        // committed atomically at the end of the walk, so a crash mid-reorg can never leave the
-        // global nullifier set desynced from the selected chain (there is no header commitment to
-        // detect such a split). Read-visibility within the walk is unaffected: `insert_batch` /
-        // `delete_batch` update the store cache immediately, before the batch is committed.
-        let mut shielded_batch = WriteBatch::default();
+        // Shielded (PLAN §2.4): a reorg's nullifier mutations are written in TWO batches, not one.
+        //
+        // Batch 1 (committed immediately after the down-walk, before the up-walk) holds the reverts
+        // of the abandoned branch's nullifiers. It MUST land before the up-walk validates and
+        // commits any new-branch block: `CachedDbAccess::delete` removes the key from the store
+        // cache but only stages the RocksDB delete in the uncommitted batch, so `has()` misses the
+        // cache and falls through to RocksDB where the key is still present. With a single
+        // end-of-walk batch (the pre-F-01 design), abandoned-branch nullifiers therefore still read
+        // as SPENT during the up-walk, and a new-branch block re-spending the same note would have
+        // its spend wrongly dropped / the block disqualified via `commit_utxo_state` — a permanent
+        // consensus divergence between nodes that reorged and nodes that never saw the abandoned
+        // branch (audit finding F-01).
+        //
+        // Batch 2 (committed at the end of the walk, as before) holds the up-walk re-applies of the
+        // rejoining branch's nullifiers. Inserts are cache-visible immediately, so within-walk
+        // reads are unaffected; the batch still lands atomically at the end of the walk so a crash
+        // mid-reorg can never leave the global nullifier set desynced from the selected chain
+        // (there is no header commitment to detect such a split).
+        //
+        // Crash consistency: both batches are idempotent (deleting an absent key and re-inserting a
+        // present key are no-ops in RocksDB) and the walk re-executes from the last committed
+        // virtual state on restart, so a crash between batch 1 and batch 2 simply re-walks: reverts
+        // are no-op deletes and re-applies re-run.
+        let mut shielded_revert_batch = WriteBatch::default();
 
         // Walk down to the reorg split point
         for current in self.reachability_service.default_backward_chain_iterator(from) {
@@ -657,8 +778,16 @@ impl VirtualStateProcessor {
             // This chain block is leaving the selected chain, so remove the nullifiers it added
             // from the global set (its per-block frontier/supply snapshots are intrinsic and
             // retained for a rejoin). No-op for blocks with no shielded nullifiers.
-            self.shielded_state_manager.revert_nullifiers_from_store(&mut shielded_batch, current).unwrap();
+            self.shielded_state_manager.revert_nullifiers_from_store(&mut shielded_revert_batch, current).unwrap();
         }
+
+        // Commit the down-walk reverts NOW: RocksDB deletes staged in a batch are invisible to
+        // store reads until the batch is written (see the F-01 comment above), and the up-walk
+        // must observe the abandoned branch's nullifiers as unspent.
+        self.db.write(shielded_revert_batch).unwrap();
+
+        // Fresh batch for the up-walk re-applies (committed at the end of the walk, as before).
+        let mut shielded_batch = WriteBatch::default();
 
         let split_point = split_point.expect("chain iterator was expected to reach the reorg split point");
         debug!("VIRTUAL PROCESSOR, found split point: {split_point}");
@@ -689,7 +818,7 @@ impl VirtualStateProcessor {
 
                     // This already-validated chain block is (re)joining the selected chain, so
                     // re-add the nullifiers it added from its stored per-block diff (accumulated
-                    // into the shared reorg batch above). No-op when it has none.
+                    // into the up-walk batch committed at the end of the walk). No-op when it has none.
                     self.shielded_state_manager.apply_nullifiers_from_store(&mut shielded_batch, current).unwrap();
                 }
                 Err(StoreError::KeyNotFound(_)) => {
@@ -713,6 +842,29 @@ impl VirtualStateProcessor {
                     match res {
                         Err(rule_error) => {
                             info!("Block {} is disqualified from virtual chain: {}", current, rule_error);
+                            // F-09: a shielded-related disqualification of a CHAIN block means the
+                            // local shielded state is likely inconsistent with the observed chain
+                            // (e.g. a poisoned pruning-point IBD import). Once the shielded-stable
+                            // flag was set, no failure path ever reset it, so this recurred forever
+                            // with no operator signal and no recovery short of a DB wipe. Warn
+                            // loudly and reset the flag so the next IBD re-validates the imported
+                            // state against the PoW-committed coinbase binding (F-02): if the local
+                            // state is actually fine (a one-off invalid block), the re-check
+                            // short-circuits and re-sets the flag; if it is poisoned, the operator
+                            // must resync.
+                            if matches!(rule_error, RuleError::BadCoinbaseTransaction | RuleError::InvalidShieldedState(..)) {
+                                warn!(
+                                    "chain block {} failed shielded-related validation ({}): the local shielded state may be \
+                                     inconsistent with the observed chain (possibly a poisoned shielded IBD import). Resetting the \
+                                     shielded-stable flag so the next IBD re-checks the import; if this warning recurs after \
+                                     re-import, a full resync of the node is required",
+                                    current, rule_error
+                                );
+                                let mut pruning_meta_write = self.pruning_meta_stores.write();
+                                let mut batch = WriteBatch::default();
+                                pruning_meta_write.set_pruning_shielded_stable_flag(&mut batch, false).unwrap();
+                                self.db.write(batch).unwrap();
+                            }
                             self.statuses_store.write().set(current, StatusDisqualifiedFromChain).unwrap();
                             chain_disqualified_counter += 1;
                         }
@@ -754,8 +906,9 @@ impl VirtualStateProcessor {
             self.counters.chain_disqualified_counts.fetch_add(chain_disqualified_counter, Ordering::Relaxed);
         }
 
-        // Commit the whole reorg's nullifier reverts + re-applies atomically. Empty (no shielded
-        // nullifiers touched) is a cheap no-op write.
+        // Commit the up-walk's nullifier re-applies atomically at the end of the walk (batch 2 of
+        // the two-batch F-01 scheme; the down-walk reverts were already committed before the
+        // up-walk). Empty (no shielded nullifiers touched) is a cheap no-op write.
         self.db.write(shielded_batch).unwrap();
 
         diff_point
