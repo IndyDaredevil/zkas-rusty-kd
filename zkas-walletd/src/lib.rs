@@ -1630,6 +1630,17 @@ impl WalletEntry {
                     note_count.max(1) as usize
                 };
                 self.db.set_witness_budget(budget);
+                // Note-heavy wallets are served at spend time by the batch builder
+                // (`witness_paths_at`, one O(chain) pass for all selected notes), which does
+                // NOT read the legacy live-witness set. So the per-note ~30 s O(chain)
+                // `install_witness` adopts below are pure waste — and worse, they run on a
+                // blocking thread and steal CPU from the actual Halo 2 proof of a concurrent
+                // send. Skip them: mark warm (bypasses the adopt loop) and keep a minimal
+                // live set. The base still rolls up on the cheap steady path below.
+                if note_count > EAGER_WARM_MAX_NOTES {
+                    self.db.set_witness_budget(1);
+                    self.witnesses_warm = true;
+                }
                 // Take a warm permit, or leave the heavy catch-up to another tick. This is
                 // `try_acquire`, not `acquire`: a wallet that can't warm right now should
                 // fall through and keep doing its cheap incremental sync rather than block
