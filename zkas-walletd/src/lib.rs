@@ -722,11 +722,17 @@ const COLD_WARM_TICK: std::time::Duration = std::time::Duration::from_secs(4);
 /// `leaves × notes`, so these wallets stay warm like any other.
 const EAGER_WARM_MAX_NOTES: u64 = 32;
 
-/// Witness slots kept for a note-heavy wallet. Enough to cover a full standard
-/// transaction's spends (`max_spends_per_tx()` = 6) with slack, so the value-descending
-/// selection a send makes lands on warm notes — but a small constant, so the one-time
-/// catch-up is bounded regardless of how many thousands of notes the wallet holds.
-const SPENDABLE_WITNESS_BUDGET: usize = 12;
+/// Witness slots kept for a note-heavy wallet. MUST cover a full standard transaction's
+/// spends (`max_spends_per_tx()`, currently **38**) with slack, so the value-descending
+/// selection a single-tx send makes lands entirely on warm notes and the send is an O(1)
+/// lookup instead of paying a base→matured Sinsemilla rebuild for every note past the
+/// budget. This was `12`, sized when `max_spends_per_tx()` was 6; the spend cap was later
+/// lifted 6→38 (the block-fit "6× lift" in `sdk/wallet-engine`) without raising this, so a
+/// 38-note send warm-covered only 12 notes and rebuilt the other 26 cold — ~22 s each,
+/// i.e. minutes per send on a note-heavy wallet. Kept a small constant so the one-time warm
+/// catch-up (and the ~`budget` hashes/leaf steady cost) stays bounded no matter how many
+/// thousands of notes the wallet holds. Keep this ≥ `max_spends_per_tx()`.
+const SPENDABLE_WITNESS_BUDGET: usize = 48;
 
 /// Longest witness climb a note-heavy (never-eager-warmed) wallet may do inline at
 /// send time. Each climbed leaf costs one Sinsemilla append per live witness (up to
@@ -3388,23 +3394,29 @@ async fn wallet_send(
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     ensure_canonical_checkpoint(&state, &w).await?;
-    let node_tip = state.node_tip.lock().await.0;
     let (seed, recoverable) = {
         let e = w.lock().await;
-        // `scanned` intentionally trails the live tip by SYNC_TIP_MARGIN: blocks
-        // newer than that are previewed but not committed to the append-only tree.
-        // Treat that normal settlement lag (plus two poll margins) as current.
-        // `sink_blue` is a blue score while `node_tip` is DAA score, so comparing
-        // those counters directly is invalid and used to reject healthy wallets.
-        if node_tip == 0
-            || (e.scanned as u64).saturating_add(SYNC_TIP_MARGIN + 2 * SYNC_MARGIN) < node_tip
-            || e.reorged_strikes > 0
-        {
+        // A send roots at the MATURED anchor (>= DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK blue
+        // below the sink), which by construction already trails the live tip. Whether the
+        // wallet's scan cursor has closed the entire gap to the tip is irrelevant to that
+        // anchor's validity, so gate on (a) a matured anchor being available and (b) no
+        // in-progress reorg repair — NOT on scanned-vs-tip. The old tip-proximity test
+        // (scanned + 264 < node_tip) spuriously 409'd note-heavy / busy payout wallets:
+        // they legitimately trail the tip by more than that while a slow spend is in
+        // flight, yet every note they would spend is already matured and spendable.
+        // `ensure_canonical_checkpoint` above still rejects a genuinely divergent tree.
+        if e.reorged_strikes > 0 {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "wallet checkpoint is being repaired after a reorg; retry shortly",
+            ));
+        }
+        if e.matured_leaves().is_none() {
             return Err(err(
                 StatusCode::CONFLICT,
                 format!(
-                    "wallet is still updating its canonical chain view (wallet DAA {}, node DAA {}); wait for sync before sending",
-                    e.scanned, node_tip
+                    "wallet has not established a matured anchor yet (scanned DAA {}); wait for initial sync",
+                    e.scanned
                 ),
             ));
         }
@@ -3475,16 +3487,26 @@ async fn wallet_send(
             let have: u64 = values.iter().sum();
             match plan_chunks(&values, amount, fee, max_per_tx) {
                 Some(plan) => {
+                    // All notes the plan will spend are candidates[0..total]; witness them
+                    // in ONE base→matured pass (O(chain + N·depth)) rather than a per-note
+                    // O(chain) rebuild each, then distribute into chunks. A note the batch
+                    // declines falls back to the exact per-note rebuild — never wrong.
+                    let total: usize = plan.iter().map(|(n, _, _)| *n).sum();
+                    let all_positions: Vec<u64> = candidates[..total].iter().map(|n| n.position).collect();
+                    let batch_paths = tokio::task::block_in_place(|| e.db.witness_paths_at(&all_positions, matured));
                     let mut chunks = Vec::with_capacity(plan.len());
                     let mut idx = 0usize;
                     for (n_notes, pay, cfee) in plan {
                         let mut inputs = Vec::with_capacity(n_notes);
                         let mut positions = Vec::with_capacity(n_notes);
-                        for note in &candidates[idx..idx + n_notes] {
-                            // block_in_place: a cold note's on-demand rebuild is an
-                            // O(chain) Sinsemilla replay — must not pin a runtime worker.
-                            let path = tokio::task::block_in_place(|| e.db.witness_path_at(note.position, matured))
-                                .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+                        for (j, note) in candidates[idx..idx + n_notes].iter().enumerate() {
+                            let path = match batch_paths[idx + j].clone() {
+                                Some(p) => p,
+                                // block_in_place: a cold note's on-demand rebuild is an
+                                // O(chain) Sinsemilla replay — must not pin a runtime worker.
+                                None => tokio::task::block_in_place(|| e.db.witness_path_at(note.position, matured))
+                                    .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?,
+                            };
                             inputs.push((note.note.clone(), path));
                             positions.push(note.position);
                         }
@@ -3515,15 +3537,24 @@ async fn wallet_send(
             let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
             let have: u64 = values.iter().sum();
             let plan = plan_chunks(&values, amount, fee, max_per_tx).ok_or_else(|| insufficient(have, 0))?;
+            // The replayed `db` roots witnesses at its tip; batch all selected notes in
+            // one pass, per-note fallback for any the batch declines.
+            let matured_tip = db.size();
+            let total: usize = plan.iter().map(|(n, _, _)| *n).sum();
+            let all_positions: Vec<u64> = candidates[..total].iter().map(|n| n.position).collect();
+            let batch_paths = db.witness_paths_at(&all_positions, matured_tip);
             let mut chunks = Vec::with_capacity(plan.len());
             let mut idx = 0usize;
             for (n_notes, pay, cfee) in plan {
                 let mut inputs = Vec::with_capacity(n_notes);
                 let mut positions = Vec::with_capacity(n_notes);
-                for note in &candidates[idx..idx + n_notes] {
-                    let path = db
-                        .witness_path(note.position)
-                        .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+                for (j, note) in candidates[idx..idx + n_notes].iter().enumerate() {
+                    let path = match batch_paths[idx + j].clone() {
+                        Some(p) => p,
+                        None => db
+                            .witness_path(note.position)
+                            .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?,
+                    };
                     inputs.push((note.note.clone(), path));
                     positions.push(note.position);
                 }
@@ -3600,6 +3631,14 @@ async fn wallet_send(
 #[derive(Deserialize, Default)]
 struct ConsolidateReq {
     fee: Option<u64>,
+    /// Select the OLDEST (lowest-position) matured notes instead of the smallest by
+    /// value. Merging the oldest notes lets `advance_base_capped` roll the fast-sync
+    /// base past them, which shortens EVERY future on-demand witness rebuild — the
+    /// right strategy for healing a note-heavy miner/pool treasury, whose coinbase
+    /// notes are near-equal value (so smallest-value selection is ~arbitrary and does
+    /// not systematically unpin the base). Loop this endpoint with `heal:true` to walk
+    /// the base up. Default false = smallest-value dust cleanup.
+    heal: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -3630,7 +3669,10 @@ async fn wallet_consolidate(
         let e = w.lock().await;
         (e.key.seed()?, e.recoverable_history)
     };
-    let base_fee = body.and_then(|Json(b)| b.fee).unwrap_or(DEFAULT_FEE_SOMPI);
+    let (base_fee, heal) = match body {
+        Some(Json(b)) => (b.fee.unwrap_or(DEFAULT_FEE_SOMPI), b.heal.unwrap_or(false)),
+        None => (DEFAULT_FEE_SOMPI, false),
+    };
     let own_recipient =
         address_bytes_from_seed(seed).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "seed is not a valid spending key"))?;
 
@@ -3644,7 +3686,15 @@ async fn wallet_consolidate(
             return Err(err(StatusCode::CONFLICT, "wallet is still syncing the maturity window; try again shortly"));
         };
         let (mut candidates, _stranded) = matured_candidates(&e.db, matured);
-        candidates.sort_by_key(|n| n.value());
+        if heal {
+            // Oldest first: spending the lowest-position notes lets the fast-sync base
+            // roll forward past them (`advance_base_capped`), shortening every later
+            // rebuild. This is what actually heals a note-heavy treasury.
+            candidates.sort_by_key(|n| n.position);
+        } else {
+            // Smallest value first: ordinary dust cleanup.
+            candidates.sort_by_key(|n| n.value());
+        }
         candidates.truncate(max_spends_per_tx());
         let sum: u64 = candidates.iter().map(|n| n.value()).sum();
         if candidates.len() < 2 {
@@ -3658,11 +3708,19 @@ async fn wallet_consolidate(
         }
         let mut inputs = Vec::with_capacity(candidates.len());
         let mut positions = Vec::with_capacity(candidates.len());
-        for n in &candidates {
-            // block_in_place: an on-demand rebuild is an O(chain) Sinsemilla replay —
-            // must not pin a runtime worker (it can hold the tokio I/O driver).
-            let path = tokio::task::block_in_place(|| e.db.witness_path_at(n.position, matured))
-                .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+        // One base→matured pass for every note being merged (O(chain + N·depth)); this is
+        // what makes healing a fragmented treasury feasible — a full 38-note consolidation
+        // costs one pass, not 38 × ~26 s. Declined notes fall back to the exact rebuild.
+        let cons_positions: Vec<u64> = candidates.iter().map(|n| n.position).collect();
+        let cons_paths = tokio::task::block_in_place(|| e.db.witness_paths_at(&cons_positions, matured));
+        for (i, n) in candidates.iter().enumerate() {
+            let path = match cons_paths[i].clone() {
+                Some(p) => p,
+                // block_in_place: an on-demand rebuild is an O(chain) Sinsemilla replay —
+                // must not pin a runtime worker (it can hold the tokio I/O driver).
+                None => tokio::task::block_in_place(|| e.db.witness_path_at(n.position, matured))
+                    .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?,
+            };
             inputs.push((n.note.clone(), path));
             positions.push(n.position);
         }
@@ -3880,22 +3938,27 @@ async fn wallet_prepare(
     // wallet to record against.
     let mut spent_positions: Vec<u64> = Vec::new();
     let mut session_token: Option<String> = None;
-    let current_node_tip = state.node_tip.lock().await.0;
     if let Ok(token) = token_from(&headers, state.allow_default_token) {
         if let Some(w) = state.get_wallet(&token).await {
             ensure_canonical_checkpoint(&state, &w).await?;
             let mut e = w.lock().await;
             if e.db.fvk().to_bytes() == fvk_bytes {
-                let node_tip = current_node_tip;
-                if node_tip == 0
-                    || (e.scanned as u64).saturating_add(SYNC_TIP_MARGIN + 2 * SYNC_MARGIN) < node_tip
-                    || e.reorged_strikes > 0
-                {
+                // Gate on a matured anchor being available + no in-progress reorg repair,
+                // not on scanned-vs-tip — see the note in `wallet_send`. A note-heavy or
+                // busy wallet legitimately trails the live tip while every note it would
+                // spend is already matured and spendable.
+                if e.reorged_strikes > 0 {
+                    return Err(err(
+                        StatusCode::CONFLICT,
+                        "wallet checkpoint is being repaired after a reorg; retry shortly",
+                    ));
+                }
+                if e.matured_leaves().is_none() {
                     return Err(err(
                         StatusCode::CONFLICT,
                         format!(
-                            "wallet is still updating its canonical chain view (wallet DAA {}, node DAA {}); wait for sync before sending",
-                            e.scanned, node_tip
+                            "wallet has not established a matured anchor yet (scanned DAA {}); wait for initial sync",
+                            e.scanned
                         ),
                     ));
                 }
@@ -3926,13 +3989,33 @@ async fn wallet_prepare(
                     let (take, dyn_fee) = select_spend_count(&values, amount, base_fee, max_per_tx);
                     fee = dyn_fee;
                     need = amount.saturating_add(fee);
-                    for n in candidates.iter().take(take) {
-                        let t_p = std::time::Instant::now();
-                        // block_in_place: a cold note's rebuild is an O(chain) Sinsemilla
-                        // replay — must not pin a runtime worker.
-                        let path = tokio::task::block_in_place(|| e.db.witness_path_at(n.position, matured))
-                            .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
-                        log::info!("prepare: witness_path_at(note@{}) took {:.1?}", n.position, t_p.elapsed());
+                    // Build every selected note's witness in ONE base→matured pass
+                    // (O(chain + N·depth)) instead of N independent O(chain) replays —
+                    // the difference between ~one pass and N × ~26 s on a note-heavy
+                    // wallet. Any note the batch declines (warm-miss edge / out of window)
+                    // falls back to the exact per-note rebuild, so this is never wrong.
+                    let selected_notes: Vec<_> = candidates.iter().take(take).cloned().collect();
+                    let positions: Vec<u64> = selected_notes.iter().map(|n| n.position).collect();
+                    let t_b = std::time::Instant::now();
+                    let paths = tokio::task::block_in_place(|| e.db.witness_paths_at(&positions, matured));
+                    let batched = paths.iter().filter(|p| p.is_some()).count();
+                    log::info!(
+                        "prepare: batch-witnessed {}/{} notes in {:.1?} (rest rebuild individually)",
+                        batched,
+                        positions.len(),
+                        t_b.elapsed(),
+                    );
+                    for (i, n) in selected_notes.iter().enumerate() {
+                        let path = match paths[i].clone() {
+                            Some(p) => p,
+                            None => {
+                                let t_p = std::time::Instant::now();
+                                let p = tokio::task::block_in_place(|| e.db.witness_path_at(n.position, matured))
+                                    .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?;
+                                log::info!("prepare: fallback witness_path_at(note@{}) took {:.1?}", n.position, t_p.elapsed());
+                                p
+                            }
+                        };
                         inputs.push((n.note.clone(), path));
                         spent_positions.push(n.position);
                         selected += n.value();

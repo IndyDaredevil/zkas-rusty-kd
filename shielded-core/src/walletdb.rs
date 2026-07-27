@@ -33,6 +33,7 @@
 
 use incrementalmerkletree::frontier::{CommitmentTree, Frontier};
 use incrementalmerkletree::witness::IncrementalWitness;
+use incrementalmerkletree::{Hashable, Level};
 use orchard::{
     Address,
     keys::{FullViewingKey, IncomingViewingKey, OutgoingViewingKey, PreparedIncomingViewingKey, Scope, SpendingKey},
@@ -1335,6 +1336,155 @@ impl WalletDb {
         Some(MerklePath::from_parts(u64::from(path.position()) as u32, auth))
     }
 
+    /// Build membership paths for **many** owned notes in a SINGLE pass over the leaf
+    /// stream, each rooted at `matured_leaves`. This is the batch form of
+    /// [`Self::witness_path_at`]: that rebuilds the tree from the base frontier up to
+    /// each note independently — **O(chain) per note**, so an N-note spend on a
+    /// note-heavy wallet pays N full replays (the live 43k-note wallet: 27 notes ≈ 12
+    /// min of witnessing before the proof even starts). This does ONE base→matured walk
+    /// and reads every note's path from shared state — **O(chain + N·depth)** — turning a
+    /// large or pool-scale send from minutes/hours into one ~one-pass wait.
+    ///
+    /// Correctness is not hand-derived: for each note the **left** authentication
+    /// siblings come from `IncrementalWitness::from_tree` (the same primitive
+    /// [`Self::rebuild_witness`] trusts, which carries the below-base frontier context),
+    /// and only the **right** siblings — subtrees strictly inside `[base, matured)`, or
+    /// empty above it — are substituted from a node map built once in this pass. Every
+    /// assembled path is then **verified to root to the matured anchor**; any that does
+    /// not (a bug, or an out-of-window note) is returned as `None` so the caller falls
+    /// back to the exact `witness_path_at` replay. It can therefore never yield a wrong
+    /// witness — at worst it declines and the slow path runs.
+    ///
+    /// Returns paths in the same order as `positions`; `None` for a warm-miss the caller
+    /// should rebuild, or a position outside `[base_size, matured_leaves)`.
+    pub fn witness_paths_at(&self, positions: &[u64], matured_leaves: u64) -> Vec<Option<MerklePath>> {
+        let n = positions.len();
+        let mut out: Vec<Option<MerklePath>> = vec![None; n];
+        let base = self.base_size;
+        let leaves = self.decoded_leaves();
+        let matured_rel = match matured_leaves.checked_sub(base) {
+            Some(r) if (r as usize) <= leaves.len() => r as usize,
+            _ => return out, // matured precedes the base or exceeds ingest: all fall back
+        };
+        if matured_rel == 0 {
+            return out;
+        }
+
+        // Warm hits are free; collect the rest (range-checked, de-duplicated by position).
+        let mut cold: Vec<(u64, Vec<usize>)> = Vec::new();
+        for (i, &pos) in positions.iter().enumerate() {
+            if let Some(p) = self.live_witness_path(pos, matured_leaves) {
+                out[i] = Some(p);
+                continue;
+            }
+            let rel = match pos.checked_sub(base) {
+                Some(r) => r as usize,
+                None => continue,
+            };
+            if rel >= matured_rel {
+                continue; // note not inside the matured prefix
+            }
+            if let Some(slot) = cold.iter_mut().find(|(p, _)| *p == pos) {
+                slot.1.push(i);
+            } else {
+                cold.push((pos, vec![i]));
+            }
+        }
+        if cold.is_empty() {
+            return out;
+        }
+        cold.sort_by_key(|(p, _)| *p);
+
+        // Node map over [base, matured): nodes[l] maps an ABSOLUTE level-l index to the
+        // hash of that subtree, for subtrees whose range is fully >= base (partially
+        // filled at the right edge → combined with empty_root; fully >= matured → absent,
+        // meaning empty_root). This supplies every RIGHT authentication sibling — those
+        // ranges are all > the note's position >= base — in O(1). Total build O(matured-base).
+        let mut nodes: Vec<std::collections::HashMap<u64, MerkleHashOrchard>> = Vec::with_capacity(TREE_DEPTH as usize + 1);
+        nodes.push((0..matured_rel).map(|r| (base + r as u64, leaves[r])).collect());
+        for l in 0..TREE_DEPTH {
+            let cur = &nodes[l as usize];
+            let mut parents: Vec<u64> = cur.keys().map(|j| j >> 1).collect();
+            parents.sort_unstable();
+            parents.dedup();
+            let mut up: std::collections::HashMap<u64, MerkleHashOrchard> = std::collections::HashMap::with_capacity(parents.len());
+            for pj in parents {
+                let lidx = pj << 1;
+                let Some(left) = cur.get(&lidx) else { continue }; // left child below/straddling base → left context
+                if (lidx << l) < base {
+                    continue;
+                }
+                let right = cur.get(&(lidx + 1)).cloned().unwrap_or_else(|| MerkleHashOrchard::empty_root(Level::from(l)));
+                up.insert(pj, MerkleHashOrchard::combine(Level::from(l), left, &right));
+            }
+            nodes.push(up);
+        }
+
+        // The authoritative matured root (root of the tree at exactly `matured_rel`
+        // leaves) — what every assembled path must reproduce.
+        let mut vtree = CommitmentTree::from_frontier(&self.base_frontier);
+        for r in 0..matured_rel {
+            if vtree.append(leaves[r]).is_err() {
+                return out;
+            }
+        }
+        let matured_root = vtree.root();
+
+        // Left context: one shared ascending walk. `from_tree` at position p yields the
+        // correct left siblings (incl. below-base frontier context); we take those and
+        // substitute matured right siblings from the node map.
+        let mut tree = CommitmentTree::from_frontier(&self.base_frontier);
+        let mut walk = 0usize; // relative leaves already appended into `tree`
+        for (pos, idxs) in &cold {
+            let rel = (pos - base) as usize;
+            while walk <= rel {
+                if tree.append(leaves[walk]).is_err() {
+                    break;
+                }
+                walk += 1;
+            }
+            let Some(w) = IncrementalWitness::<MerkleHashOrchard, TREE_DEPTH>::from_tree(tree.clone()) else { continue };
+            let Some(left_path) = w.path() else { continue };
+            let left_elems = left_path.path_elems();
+            if left_elems.len() != TREE_DEPTH as usize {
+                continue;
+            }
+
+            let p = *pos;
+            let mut auth = [MerkleHashOrchard::empty_leaf(); TREE_DEPTH as usize];
+            for l in 0..TREE_DEPTH as usize {
+                if (p >> l) & 1 == 0 {
+                    // right sibling: subtree at absolute index (p>>l)+1, level l
+                    let sib = (p >> l) + 1;
+                    auth[l] = nodes[l].get(&sib).copied().unwrap_or_else(|| MerkleHashOrchard::empty_root(Level::from(l as u8)));
+                } else {
+                    // left sibling: from the trusted from_tree path
+                    auth[l] = left_elems[l];
+                }
+            }
+
+            // Verify the assembled path roots to the matured anchor, from the note's own
+            // leaf. If it does not, decline (caller rebuilds) — never emit a bad witness.
+            let leaf = leaves[rel];
+            let mut node = leaf;
+            for (l, sib) in auth.iter().enumerate() {
+                node = if (p >> l) & 1 == 0 {
+                    MerkleHashOrchard::combine(Level::from(l as u8), &node, sib)
+                } else {
+                    MerkleHashOrchard::combine(Level::from(l as u8), sib, &node)
+                };
+            }
+            if node != matured_root {
+                continue; // assembly disagreed with consensus root — fall back
+            }
+            let mp = MerklePath::from_parts(p as u32, auth);
+            for &i in idxs {
+                out[i] = Some(mp.clone());
+            }
+        }
+        out
+    }
+
     /// Reconstruct a coinbase note if it was paid to this wallet. A coinbase note
     /// is ours iff its stated recipient equals our address; the note is then fully
     /// determined by the public `(recipient, ρ, rseed)` and the public `value`,
@@ -2027,6 +2177,76 @@ mod tests {
                 let cm = ExtractedNoteCommitment::from(n.note.commitment());
                 assert_eq!(got.root(cm), want.root(cm), "same anchor at cutoff {cutoff}, position {}", n.position);
                 assert_eq!(got.auth_path(), want.auth_path(), "same authentication path");
+            }
+        }
+    }
+
+    /// The batch witness builder [`WalletDb::witness_paths_at`] must produce a path
+    /// **byte-identical** to the trusted per-note [`WalletDb::witness_path_at`] for every
+    /// selected note — that equality is the whole safety claim, since a spend roots at
+    /// these paths. Exercised on a wallet with many notes spread across the whole stream
+    /// (the note-heavy shape that makes per-note rebuilds explode), at several matured
+    /// cutoffs, and on BOTH a full-scan wallet (base = 0) and a compacted one (base > 0),
+    /// so the below-base frontier context path is covered.
+    #[test]
+    fn batch_witness_paths_match_per_note() {
+        let mine = [33u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        // 120 blocks; ours roughly every third block, each behind a stranger's note, so
+        // owned notes are scattered from near-genesis to near-tip across ~200 leaves.
+        for b in 0..120u32 {
+            let theirs = coinbase_for(address_of([(b % 251) as u8 + 1; 32]), format!("s{b}").as_bytes(), 100 + b as u64);
+            if b % 3 == 0 {
+                let ours = coinbase_for(address_of(mine), format!("m{b}").as_bytes(), 1_000 + b as u64);
+                db.ingest_block(&[theirs, ours], &[]);
+            } else {
+                db.ingest_block(&[theirs], &[]);
+            }
+        }
+        assert!(db.notes().len() >= 30, "enough owned notes to be meaningful");
+
+        let all_positions: Vec<u64> = db.notes().iter().map(|n| n.position).collect();
+        let cmx_of: std::collections::HashMap<u64, ExtractedNoteCommitment> =
+            db.notes().iter().map(|n| (n.position, ExtractedNoteCommitment::from(n.note.commitment()))).collect();
+        let n = db.size();
+
+        for &base in &[0u64, 64, 130] {
+            // Reference wallet: pristine replay (never advances witnesses → always the
+            // on-demand rebuild path), optionally compacted to `base`.
+            let mut w = WalletDb::from_seed(mine).unwrap();
+            w.leaves = db.leaves.clone();
+            w.notes = db.notes.to_vec();
+            w.size = db.size;
+            w.tree = db.tree.clone();
+            if base > 0 {
+                w.advance_base_capped(base, u64::MAX);
+            }
+
+            for &cutoff in &[n - 5, n - 1, n] {
+                let sel: Vec<u64> = all_positions.iter().copied().filter(|&p| p >= w.base_size() && p < cutoff).collect();
+                if sel.is_empty() {
+                    continue;
+                }
+                let batch = w.witness_paths_at(&sel, cutoff);
+                for (k, &pos) in sel.iter().enumerate() {
+                    let want = w.witness_path_at(pos, cutoff).expect("per-note witness");
+                    let got = batch[k].clone().expect("batch produced a path");
+                    assert_eq!(got.auth_path(), want.auth_path(), "auth path base={base} cutoff={cutoff} pos={pos}");
+                    assert_eq!(got.position(), want.position(), "position base={base} cutoff={cutoff} pos={pos}");
+                    let cm = cmx_of[&pos];
+                    assert_eq!(got.root(cm), want.root(cm), "root base={base} cutoff={cutoff} pos={pos}");
+                }
+                // Order/dedup robustness: reversed + duplicated request maps back correctly.
+                let mut mixed = sel.clone();
+                mixed.reverse();
+                mixed.extend_from_slice(&sel);
+                let mixed_batch = w.witness_paths_at(&mixed, cutoff);
+                for (k, &pos) in mixed.iter().enumerate() {
+                    let got = mixed_batch[k].clone().expect("batch path for mixed request");
+                    let cm = cmx_of[&pos];
+                    let want = w.witness_path_at(pos, cutoff).unwrap();
+                    assert_eq!(got.root(cm), want.root(cm), "mixed root pos={pos}");
+                }
             }
         }
     }
