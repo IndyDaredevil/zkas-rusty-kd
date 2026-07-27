@@ -621,6 +621,28 @@ fn write_wallet_file(dir: &str, token: &str, wf: &WalletFile) -> std::io::Result
     Ok(())
 }
 
+/// Reset a wallet file's `birthday` to 0 in place, preserving every other field
+/// (seed/fvk, encryption, network, history flag) and its 0600 perms. A rescan uses
+/// this so the reload FULL-SCANS from genesis instead of fast-syncing from a stored
+/// birthday: a birthday set later than the wallet's actual notes makes fast-sync skip
+/// the older blocks into the frontier and the balance comes back ZERO (the 2026-07-27
+/// "rescan wiped my balance" reports). The node is archival, so a full scan loses
+/// nothing, and the rebuilt checkpoint keeps future restarts fast.
+fn reset_wallet_birthday(dir: &str, token: &str) -> std::io::Result<()> {
+    let path = wallet_path(dir, token);
+    let bytes = std::fs::read(&path)?;
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    v["birthday"] = serde_json::json!(0u64);
+    std::fs::write(&path, serde_json::to_vec_pretty(&v).expect("serializes"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Scan checkpoint: persist the scanned commitment stream + owned notes + cursor
 // so a restart resumes instead of rescanning the chain from the wallet birthday.
@@ -3276,6 +3298,14 @@ async fn wallet_rescan(
     // at a genuinely pruned node, a birthday-0 wallet's rescan can drop notes below
     // the pruning point — run it against an archival node (which is the norm here).
     let _ = &body;
+    // A rescan is the "find my funds" recovery action, so it must not trust the
+    // stored birthday — fast-syncing from a birthday set later than the wallet's
+    // real notes skips those older blocks and the balance returns ZERO. Force a
+    // full scan from genesis (archival node → nothing is lost).
+    match reset_wallet_birthday(&state.wallet_dir, &token) {
+        Ok(()) => log::info!("wallet '{token}': rescan reset birthday to 0 — reload will full-scan from genesis"),
+        Err(e) => log::warn!("wallet '{token}': could not reset birthday for rescan ({e}); reload uses stored birthday"),
+    }
     // Poison any in-flight sync pass first: checkpoint writes are gated on
     // `error.is_none()`, so this stops a concurrent pass from re-persisting the
     // old cursor after we retire it below.
