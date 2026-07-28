@@ -524,6 +524,36 @@ curl -X POST -H "X-Wallet-Token: $TOK" -H 'Content-Type: application/json' \
 
 Batches past 37 payees are split for you; the response carries `txids` and `tx_count`.
 
+#### One big send, or several small ones?
+
+Always **one call for the full amount**. The daemon splits it into transactions itself,
+and splitting by hand is worse on every axis. Sending 5 000 ZKAS from a treasury of
+~57 ZKAS coinbase notes needs **88 notes** whichever way you do it:
+
+| Approach | Notes spent | Txs | Proving (4 cores) | Fees |
+| --- | --- | --- | --- | --- |
+| **1 call, `amount_fc: 5000`** | **88** | 3 (38+38+12) | **~60 s** | **0.573 ZKAS** |
+| 3 calls of ~1 667 | 90 | 3 (30 each) | ~70 s | 0.586 ZKAS |
+| 88 calls of one note each | 88 | 88 | ~68 s + 88 round-trips | 1.63 ZKAS |
+
+The single call wins because:
+
+1. **One plan across the whole amount.** Selection is value-descending and runs once;
+   separate calls each round up their own change, so you spend *more* notes (90 vs 88).
+2. **Chunk proofs get grouped** (§4) — 1.21× — which only happens inside one call.
+3. **One witness pass** over all selected notes, at one anchor, under one lock.
+4. **Fees are per-transaction and byte-priced**, so many small sends multiply the fixed
+   2 837-byte header and the per-tx floor: 88 × 0.0186 = 1.63 ZKAS against 0.573.
+
+Do **not** issue payment calls concurrently on the same wallet to go faster. They contend
+for the same cores *and* can select the same notes, and the loser is rejected for reusing
+a nullifier.
+
+All three rows are within ~15 % of each other because they all spend ~88 notes — which is
+the point. Consolidated, those notes are ~2 166 ZKAS, so the same 5 000 ZKAS payment is
+**3 notes, 1 transaction, ~7 seconds**. Splitting strategy is a rounding error; note size
+is the whole game.
+
 #### Pool health checks
 
 ```bash
