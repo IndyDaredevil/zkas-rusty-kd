@@ -147,6 +147,10 @@ reference tool; use the daemon or web wallet for real random-seed wallets.)
 
 ### `zkas-walletd` — wallet daemon (REST, powers the web wallet)
 
+> **Full reference: [`docs/WALLETD.md`](docs/WALLETD.md)** — every endpoint, all flags,
+> the custody model, performance/sizing, and how to wire up a mining pool's payouts
+> (use `send_many`, not one `send` per payee).
+
 Run it locally for a non-custodial wallet with a REST API on `:8501`:
 
 ```bash
