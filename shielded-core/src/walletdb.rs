@@ -1395,62 +1395,99 @@ impl WalletDb {
         }
         cold.sort_by_key(|(p, _)| *p);
 
-        // Node map over [base, matured): nodes[l] maps an ABSOLUTE level-l index to the
-        // hash of that subtree, for subtrees whose range is fully >= base (partially
-        // filled at the right edge → combined with empty_root; fully >= matured → absent,
-        // meaning empty_root). This supplies every RIGHT authentication sibling — those
-        // ranges are all > the note's position >= base — in O(1). Total build O(matured-base).
-        let mut nodes: Vec<std::collections::HashMap<u64, MerkleHashOrchard>> = Vec::with_capacity(TREE_DEPTH as usize + 1);
-        nodes.push((0..matured_rel).map(|r| (base + r as u64, leaves[r])).collect());
-        for l in 0..TREE_DEPTH {
-            let cur = &nodes[l as usize];
-            let mut parents: Vec<u64> = cur.keys().map(|j| j >> 1).collect();
-            parents.sort_unstable();
-            parents.dedup();
-            let mut up: std::collections::HashMap<u64, MerkleHashOrchard> = std::collections::HashMap::with_capacity(parents.len());
-            for pj in parents {
-                let lidx = pj << 1;
-                let Some(left) = cur.get(&lidx) else { continue }; // left child below/straddling base → left context
-                if (lidx << l) < base {
-                    continue;
+        // The dominant cost at a low base (e.g. base=2 on a note-heavy wallet: ~175 K
+        // leaves) is the O(chain) Sinsemilla work. The original form paid it THREE times
+        // in series — node map, a separate matured-root replay, and a left-context walk —
+        // so witnessing even 2 notes took ~95 s. We now (1) FUSE the matured-root replay
+        // into the left-context walk (one tree yields both the trusted root and the
+        // `from_tree` left siblings) and (2) run the remaining two O(chain) passes
+        // CONCURRENTLY, since each only reads shared immutable state. Wall time drops from
+        // ~3× to ~1× a single replay. The correctness contract is unchanged: the matured
+        // root still comes from an INDEPENDENT `CommitmentTree` replay (never the node
+        // map), and every assembled path is verified to reproduce it or is declined.
+        let base_frontier = &self.base_frontier;
+        let cold_positions: Vec<u64> = cold.iter().map(|(p, _)| *p).collect();
+        type Auth = [MerkleHashOrchard; TREE_DEPTH as usize];
+        let (nodes, left_ctx, matured_root) = std::thread::scope(|s| {
+            // PASS A (own thread): node map over [base, matured): nodes[l] maps an ABSOLUTE
+            // level-l index to the hash of that subtree, for subtrees whose range is fully
+            // >= base (partially filled at the right edge → combined with empty_root; fully
+            // >= matured → absent, meaning empty_root). Supplies every RIGHT authentication
+            // sibling — those ranges are all > the note's position >= base — in O(1).
+            let map_handle = s.spawn(move || {
+                let mut nodes: Vec<std::collections::HashMap<u64, MerkleHashOrchard>> = Vec::with_capacity(TREE_DEPTH as usize + 1);
+                nodes.push((0..matured_rel).map(|r| (base + r as u64, leaves[r])).collect());
+                for l in 0..TREE_DEPTH {
+                    let cur = &nodes[l as usize];
+                    let mut parents: Vec<u64> = cur.keys().map(|j| j >> 1).collect();
+                    parents.sort_unstable();
+                    parents.dedup();
+                    let mut up: std::collections::HashMap<u64, MerkleHashOrchard> = std::collections::HashMap::with_capacity(parents.len());
+                    for pj in parents {
+                        let lidx = pj << 1;
+                        let Some(left) = cur.get(&lidx) else { continue }; // left child below/straddling base → left context
+                        if (lidx << l) < base {
+                            continue;
+                        }
+                        let right = cur.get(&(lidx + 1)).cloned().unwrap_or_else(|| MerkleHashOrchard::empty_root(Level::from(l)));
+                        up.insert(pj, MerkleHashOrchard::combine(Level::from(l), left, &right));
+                    }
+                    nodes.push(up);
                 }
-                let right = cur.get(&(lidx + 1)).cloned().unwrap_or_else(|| MerkleHashOrchard::empty_root(Level::from(l)));
-                up.insert(pj, MerkleHashOrchard::combine(Level::from(l), left, &right));
-            }
-            nodes.push(up);
-        }
+                nodes
+            });
 
-        // The authoritative matured root (root of the tree at exactly `matured_rel`
-        // leaves) — what every assembled path must reproduce.
-        let mut vtree = CommitmentTree::from_frontier(&self.base_frontier);
-        for r in 0..matured_rel {
-            if vtree.append(leaves[r]).is_err() {
-                return out;
-            }
-        }
-        let matured_root = vtree.root();
-
-        // Left context: one shared ascending walk. `from_tree` at position p yields the
-        // correct left siblings (incl. below-base frontier context); we take those and
-        // substitute matured right siblings from the node map.
-        let mut tree = CommitmentTree::from_frontier(&self.base_frontier);
-        let mut walk = 0usize; // relative leaves already appended into `tree`
-        for (pos, idxs) in &cold {
-            let rel = (pos - base) as usize;
-            while walk <= rel {
-                if tree.append(leaves[walk]).is_err() {
+            // PASS B+C (this thread): ONE ascending `CommitmentTree` replay from the base
+            // frontier. `from_tree` at each cold position yields that note's left siblings
+            // (incl. below-base frontier context); after the last one we finish the walk to
+            // `matured_rel` and take `root()` — the authoritative, independent matured root.
+            let mut tree = CommitmentTree::from_frontier(base_frontier);
+            let mut walk = 0usize; // relative leaves already appended into `tree`
+            let mut left_ctx: Vec<Option<Auth>> = vec![None; cold_positions.len()];
+            let mut ok = true;
+            for (ci, &pos) in cold_positions.iter().enumerate() {
+                let rel = (pos - base) as usize;
+                while walk <= rel {
+                    if tree.append(leaves[walk]).is_err() {
+                        ok = false;
+                        break;
+                    }
+                    walk += 1;
+                }
+                if !ok {
                     break;
                 }
-                walk += 1;
+                let Some(w) = IncrementalWitness::<MerkleHashOrchard, TREE_DEPTH>::from_tree(tree.clone()) else { continue };
+                let Some(left_path) = w.path() else { continue };
+                let elems = left_path.path_elems();
+                if let Ok(arr) = <Auth>::try_from(elems) {
+                    left_ctx[ci] = Some(arr);
+                }
             }
-            let Some(w) = IncrementalWitness::<MerkleHashOrchard, TREE_DEPTH>::from_tree(tree.clone()) else { continue };
-            let Some(left_path) = w.path() else { continue };
-            let left_elems = left_path.path_elems();
-            if left_elems.len() != TREE_DEPTH as usize {
-                continue;
-            }
+            let matured_root = if ok {
+                while walk < matured_rel {
+                    if tree.append(leaves[walk]).is_err() {
+                        ok = false;
+                        break;
+                    }
+                    walk += 1;
+                }
+                if ok { Some(tree.root()) } else { None }
+            } else {
+                None
+            };
+            let nodes = map_handle.join().expect("witness node-map thread panicked");
+            (nodes, left_ctx, matured_root)
+        });
+        let Some(matured_root) = matured_root else { return out };
 
+        // Assembly (serial, O(N·depth)): combine left context + node-map right siblings,
+        // verify each path reproduces the trusted matured root, else decline (caller falls
+        // back to the exact per-note replay) — so a wrong witness can never be emitted.
+        for (ci, (pos, idxs)) in cold.iter().enumerate() {
+            let Some(left_elems) = left_ctx[ci] else { continue };
             let p = *pos;
+            let rel = (p - base) as usize;
             let mut auth = [MerkleHashOrchard::empty_leaf(); TREE_DEPTH as usize];
             for l in 0..TREE_DEPTH as usize {
                 if (p >> l) & 1 == 0 {
@@ -1463,8 +1500,7 @@ impl WalletDb {
                 }
             }
 
-            // Verify the assembled path roots to the matured anchor, from the note's own
-            // leaf. If it does not, decline (caller rebuilds) — never emit a bad witness.
+            // Verify the assembled path roots to the matured anchor, from the note's own leaf.
             let leaf = leaves[rel];
             let mut node = leaf;
             for (l, sib) in auth.iter().enumerate() {
