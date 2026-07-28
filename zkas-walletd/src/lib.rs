@@ -769,6 +769,17 @@ const SPEND_CLIMB_INLINE_MAX: u64 = 512;
 /// is already ~5 s per send, which is the point where a send stops feeling instant.
 const SUBTREE_CACHE_MIN_SPAN: u64 = 20_000;
 
+/// Ceiling on the TOTAL leaf span held in subtree caches across every wallet this
+/// daemon serves. Per wallet the cache is ~4 B/leaf, but building it also forces that
+/// wallet's decoded leaf stream to materialise; measured on the hosted daemon the pair
+/// costs ~5 MB per 200 K-leaf wallet. One wallet is nothing — 348 of them is not, on a
+/// box that also runs a node. This caps the aggregate at roughly 300 MB; wallets past
+/// the ceiling keep the replay path, which is correct, just slower.
+const SUBTREE_CACHE_TOTAL_SPAN_MAX: u64 = 12_000_000;
+
+/// Leaf span currently held in subtree caches, summed over all wallets.
+static SUBTREE_CACHE_SPAN_USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Minimum wall-clock gap between two background witness pre-advance steps for the SAME
 /// wallet. The sync loop spins as fast as every 10 ms while any wallet is behind, so
 /// without this a caught-up wallet would fire a `WITNESS_ADVANCE_BUDGET` step ~100×/s and
@@ -1366,6 +1377,10 @@ struct WalletEntry {
     /// few passes instead of crawling; after it, only the cheap ~1-leaf/block incremental
     /// advance runs.
     witnesses_warm: bool,
+    /// Whether this wallet has already taken its decision on the subtree cache (built
+    /// it, or been turned away by the daemon-wide budget). Stops an O(chain) build —
+    /// or a budget probe — from being re-attempted on every sync tick.
+    subtree_span_charged: bool,
     /// Request an immediate checkpoint write on the next `sync_one_wallet` pass, regardless
     /// of the block-count threshold — set the moment the witnesses first warm, so the
     /// expensive-to-rebuild witness state is persisted at once (a restart seconds later
@@ -1442,6 +1457,7 @@ impl WalletEntry {
             unsettled_nulls: HashSet::new(),
             last_witness_advance: None,
             witnesses_warm: false,
+            subtree_span_charged: false,
             force_checkpoint: false,
             blind_below: 0,
         }
@@ -1658,19 +1674,34 @@ impl WalletEntry {
                 // one-hash-per-leaf the tip mirror already costs. Only built once the
                 // replay it replaces is actually slow, so ordinary wallets pay no memory.
                 let span = matured.saturating_sub(self.db.base_size());
-                if span >= SUBTREE_CACHE_MIN_SPAN && !self.db.subtree_cache_ready(matured) {
-                    let t = std::time::Instant::now();
-                    tokio::task::block_in_place(|| self.db.build_subtree_cache());
-                    if self.db.subtree_cache_ready(matured) {
-                        log::info!(
-                            "subtree cache built in {:.1?} ({span} leaves, notes={note_count}) — spends now witness in O(depth), not a full replay",
-                            t.elapsed()
+                if span >= SUBTREE_CACHE_MIN_SPAN && !self.subtree_span_charged && !self.db.subtree_cache_ready(matured) {
+                    use std::sync::atomic::Ordering;
+                    // Claim this wallet's share of the global ceiling before doing the
+                    // work, so concurrent sync tasks cannot together overshoot it.
+                    let used = SUBTREE_CACHE_SPAN_USED.fetch_add(span, Ordering::Relaxed);
+                    if used + span > SUBTREE_CACHE_TOTAL_SPAN_MAX {
+                        SUBTREE_CACHE_SPAN_USED.fetch_sub(span, Ordering::Relaxed);
+                        // Don't retry every tick — this wallet keeps the replay path.
+                        self.subtree_span_charged = true;
+                        log::warn!(
+                            "subtree cache skipped ({span} leaves): daemon-wide cache budget reached ({used}/{SUBTREE_CACHE_TOTAL_SPAN_MAX} leaves); this wallet keeps the replay path"
                         );
                     } else {
-                        log::warn!(
-                            "subtree cache rejected by its root gate after {:.1?} ({span} leaves) — spends keep using the replay path",
-                            t.elapsed()
-                        );
+                        self.subtree_span_charged = true;
+                        let t = std::time::Instant::now();
+                        tokio::task::block_in_place(|| self.db.build_subtree_cache());
+                        if self.db.subtree_cache_ready(matured) {
+                            log::info!(
+                                "subtree cache built in {:.1?} ({span} leaves, notes={note_count}) — spends now witness in O(depth), not a full replay",
+                                t.elapsed()
+                            );
+                        } else {
+                            SUBTREE_CACHE_SPAN_USED.fetch_sub(span, Ordering::Relaxed);
+                            log::warn!(
+                                "subtree cache rejected by its root gate after {:.1?} ({span} leaves) — spends keep using the replay path",
+                                t.elapsed()
+                            );
+                        }
                     }
                 }
                 // Take a warm permit, or leave the heavy catch-up to another tick. This is
