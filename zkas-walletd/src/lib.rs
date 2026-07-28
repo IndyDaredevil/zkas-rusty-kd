@@ -783,6 +783,38 @@ const SUBTREE_CACHE_TOTAL_SPAN_MAX: u64 = 12_000_000;
 /// Leaf span currently held in subtree caches, summed over all wallets.
 static SUBTREE_CACHE_SPAN_USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Payment proofs currently being computed anywhere in this daemon.
+///
+/// Halo 2 proving is the one thing a user is actually waiting on, and it saturates
+/// every core it is given. Any other CPU-bound background work — the witness warm-up
+/// (which is why it was disabled for note-heavy wallets), a subtree-cache build —
+/// competes with it directly and stretches a send. On a 4-core box the cache sweep
+/// across hundreds of wallets pushed a 38-spend proof from ~40 s to ~92 s at load 9.
+/// So background builds check this and stand down while a payment is proving.
+static PROVING_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Marks a payment proof as in flight for as long as it is held — including on an
+/// early return or a panic, which a bare increment/decrement pair would leak.
+struct ProvingGuard;
+
+impl ProvingGuard {
+    fn new() -> Self {
+        PROVING_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for ProvingGuard {
+    fn drop(&mut self) {
+        PROVING_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Whether a payment is being proved right now, i.e. background CPU work should wait.
+fn proving_now() -> bool {
+    PROVING_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
 /// Minimum wall-clock gap between two background witness pre-advance steps for the SAME
 /// wallet. The sync loop spins as fast as every 10 ms while any wallet is behind, so
 /// without this a caught-up wallet would fire a `WITNESS_ADVANCE_BUDGET` step ~100×/s and
@@ -1677,7 +1709,14 @@ impl WalletEntry {
                 // one-hash-per-leaf the tip mirror already costs. Only built once the
                 // replay it replaces is actually slow, so ordinary wallets pay no memory.
                 let span = matured.saturating_sub(self.db.base_size());
-                if span >= SUBTREE_CACHE_MIN_SPAN && !self.subtree_span_charged && !self.db.subtree_cache_ready(matured) {
+                // Stand down while any payment is proving: the build is one-time and can
+                // wait a tick, a user's send cannot. Deliberately does NOT mark the wallet
+                // charged, so it is retried once the daemon is idle again.
+                if span >= SUBTREE_CACHE_MIN_SPAN
+                    && !self.subtree_span_charged
+                    && !self.db.subtree_cache_ready(matured)
+                    && !proving_now()
+                {
                     use std::sync::atomic::Ordering;
                     // Claim this wallet's share of the global ceiling before doing the
                     // work, so concurrent sync tasks cannot together overshoot it.
@@ -3688,6 +3727,7 @@ async fn wallet_send(
         // The memo rides on the first chunk only — one memo per logical payment.
         let chunk_memo = if ci == 0 { memo } else { [0u8; 512] };
         let payload = tokio::task::spawn_blocking(move || {
+            let _proving = ProvingGuard::new();
             build_wallet_payment(seed, inputs, recipient, pay, cfee, &net, &ctx2, recoverable, chunk_memo)
         })
         .await
@@ -3930,6 +3970,7 @@ async fn wallet_send_many(
         let ctx2 = ctx.clone();
         let (payees, inputs, fee) = (b.payees, b.inputs, b.fee);
         let payload = tokio::task::spawn_blocking(move || {
+            let _proving = ProvingGuard::new();
             build_wallet_payment_multi(seed, inputs, &payees, fee, &net, &ctx2, recoverable)
         })
         .await
@@ -4078,6 +4119,7 @@ async fn wallet_consolidate(
     let ctx = payment_tx_context();
     log::info!("consolidate: merging {consolidated} notes ({sum} sompi) into one...");
     let payload = tokio::task::spawn_blocking(move || {
+        let _proving = ProvingGuard::new();
         build_wallet_payment(seed, inputs, own_recipient, value, fee, &net, &ctx, recoverable, [0u8; 512])
     })
     .await
@@ -4448,7 +4490,10 @@ async fn wallet_prepare(
     let memo = memo_bytes(req.memo.as_deref())?;
     let t_proof = std::time::Instant::now();
     let payment =
-        tokio::task::spawn_blocking(move || prepare_payment(&fvk, inputs, recipient, amount, fee, &net, &ctx, recoverable, memo))
+        tokio::task::spawn_blocking(move || {
+            let _proving = ProvingGuard::new();
+            prepare_payment(&fvk, inputs, recipient, amount, fee, &net, &ctx, recoverable, memo)
+        })
             .await
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to prepare payment: {e:?}")))?;
