@@ -30,13 +30,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub mod selfhost;
-pub use selfhost::{run_selfhost, SelfHostConfig};
+pub use selfhost::{SelfHostConfig, run_selfhost};
 
 use axum::{
     Json, Router,
-    extract::{Query, State, Request},
+    extract::{Query, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
-    middleware::{from_fn_with_state, Next},
+    middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -51,8 +51,8 @@ use kaspa_shielded_core::coinbase::derive_coinbase_note_desc;
 use kaspa_shielded_core::message::{FVK_LEN, SIG_LEN, sign_message, verify_message};
 use kaspa_shielded_core::orchard_recipient_bytes;
 use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree};
-use kaspa_shielded_core::wallet::address_bytes_from_seed;
 use kaspa_shielded_core::wallet::CompactActionRecord;
+use kaspa_shielded_core::wallet::address_bytes_from_seed;
 use kaspa_shielded_core::wallet::build::{
     PreparedPayment, build_wallet_payment, build_wallet_payment_multi, finalize_payment, prepare_payment, proving_key,
 };
@@ -543,10 +543,7 @@ pub fn export_backup(dir: &str, token: &str, wallet_secret: Option<&str>, backup
         network: wf.network,
         birthday,
         encrypted_seed_hex: hex(&blob),
-        created_unix: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+        created_unix: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
     };
     serde_json::to_string_pretty(&backup).map_err(|e| format!("serialize backup: {e}"))
 }
@@ -575,8 +572,7 @@ pub fn import_backup(dir: &str, token: &str, json: &str, backup_secret: &str, wa
     }
     let blob = unhex(&backup.encrypted_seed_hex).ok_or("backup is corrupt (bad seed field)")?;
     let seed = decrypt_seed(&blob, backup_secret).map_err(|_| "wrong backup passphrase".to_string())?;
-    save_seed(dir, token, &backup.network, &seed, backup.birthday, Some(wallet_secret))
-        .map_err(|e| format!("write wallet: {e}"))?;
+    save_seed(dir, token, &backup.network, &seed, backup.birthday, Some(wallet_secret)).map_err(|e| format!("write wallet: {e}"))?;
     let _ = std::fs::remove_file(scan_path(dir, token));
     Ok(())
 }
@@ -860,6 +856,38 @@ impl Drop for ProvingGuard {
 /// Whether a payment is being proved right now, i.e. background CPU work should wait.
 fn proving_now() -> bool {
     PROVING_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
+/// Threads to give each proof when several are proven at once.
+///
+/// A single Halo2 proof's parallel efficiency is sublinear — measured on 4 cores at
+/// 38 spends: 91.7 s at 1 thread, 50.1 s at 2 (91.5 % efficient), 37.6 s at 3 (81 %),
+/// 29.7 s at 4 (77 %). Total CPU work is flat at ~92 core-seconds either way, so the
+/// cores given to one proof past the second are partly wasted. Handing each proof a
+/// small pool and running several at once recovers that waste: measured 2x38 spends,
+/// 63.9 s sequentially (each on all 4 cores) vs 52.9 s concurrently (2x2 threads) —
+/// **1.21x**, free, and the gap widens on boxes with more cores.
+///
+/// Two, not one: at one thread a proof is 100 % efficient but a chunked payment would
+/// need as many concurrent proofs as cores, and each in-flight proof costs memory.
+const PROOF_THREADS_EACH: usize = 2;
+
+/// Free memory assumed needed per concurrent proof beyond the first. A 38-spend Halo2
+/// proof holds its whole witness and extended-domain polynomials in RAM, so running
+/// several at once multiplies that. Deliberately generous: the throughput this buys is
+/// ~1.2x, nowhere near worth an OOM on a box that also runs a node.
+const PROOF_MEM_PER_EXTRA_MB: u64 = 2_000;
+
+/// How many chunk proofs to run at once — bounded by BOTH cores and free memory.
+/// A single-core or memory-squeezed box degrades to the old strictly-sequential path.
+fn proof_concurrency() -> usize {
+    let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(1);
+    let by_cores = (cores / PROOF_THREADS_EACH).max(1);
+    // Unknown memory (non-Linux, no /proc) keeps the core-derived answer.
+    match mem_available_mb() {
+        Some(free) => by_cores.min(1 + (free / PROOF_MEM_PER_EXTRA_MB) as usize),
+        None => by_cores,
+    }
 }
 
 /// Background consolidations currently between note selection and broadcast.
@@ -1184,9 +1212,7 @@ fn adopt_twin_checkpoint(
             continue;
         }
         // Freshest donor wins: least catch-up left for the clone.
-        let mtime = std::fs::metadata(scan_path(dir, donor))
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let mtime = std::fs::metadata(scan_path(dir, donor)).and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         if best.as_ref().is_none_or(|(_, _, m)| mtime > *m) {
             best = Some((donor.clone(), donor_birthday, mtime));
         }
@@ -1286,10 +1312,7 @@ pub fn graft_wallet(dir: &str, token: &str, older_scan: &str, secret: Option<&st
     let after = db.stranded_notes().len();
     save_checkpoint(dir, token, &genesis, &low, scanned as u64, &db, &boundaries, sink_blue, blind_below)
         .map_err(|e| format!("write repaired checkpoint: {e}"))?;
-    Ok(format!(
-        "grafted {restored} leaves back (base now {}); stranded notes {before} -> {after}",
-        db.base_size()
-    ))
+    Ok(format!("grafted {restored} leaves back (base now {}); stranded notes {before} -> {after}", db.base_size()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1788,11 +1811,7 @@ impl WalletEntry {
                 // `leaves × budget`, so pinning the budget to a constant for a note-heavy
                 // wallet is what keeps its catch-up bounded — see EAGER_WARM_MAX_NOTES.
                 let note_count = self.db.notes().len() as u64;
-                let budget = if note_count > EAGER_WARM_MAX_NOTES {
-                    SPENDABLE_WITNESS_BUDGET
-                } else {
-                    note_count.max(1) as usize
-                };
+                let budget = if note_count > EAGER_WARM_MAX_NOTES { SPENDABLE_WITNESS_BUDGET } else { note_count.max(1) as usize };
                 self.db.set_witness_budget(budget);
                 // Note-heavy wallets are served at spend time by the batch builder
                 // (`witness_paths_at`, one O(chain) pass for all selected notes), which does
@@ -2523,8 +2542,7 @@ impl AppState {
         let _ = (token, fvk, birthday);
         return None;
         #[allow(unreachable_code)]
-        let candidates: Vec<String> =
-            self.fvk_index.lock().await.get(fvk).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+        let candidates: Vec<String> = self.fvk_index.lock().await.get(fvk).map(|s| s.iter().cloned().collect()).unwrap_or_default();
         if candidates.is_empty() {
             return None;
         }
@@ -2626,8 +2644,7 @@ impl AppState {
         }
         let entry = match restored {
             Some((db, low, scanned, boundaries, sink_blue, blind_below)) => {
-                let mut e =
-                    WalletEntry::from_parts(key, recoverable_history, db, genesis, low, scanned, boundaries, sink_blue);
+                let mut e = WalletEntry::from_parts(key, recoverable_history, db, genesis, low, scanned, boundaries, sink_blue);
                 e.blind_below = blind_below;
                 e
             }
@@ -2782,7 +2799,10 @@ async fn consolidate_loop(state: Arc<AppState>) {
                     merged_any = true;
                     log::info!(
                         "auto-consolidate: merged {} notes into one ({} sompi), {} notes left (was {notes}, ceiling {ceiling}) — tx {}",
-                        r.consolidated, r.value_sompi, r.notes_remaining, r.txid
+                        r.consolidated,
+                        r.value_sompi,
+                        r.notes_remaining,
+                        r.txid
                     );
                 }
                 Err((code, body)) => {
@@ -2876,9 +2896,17 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // it away and re-do the ~30–90 s warm.
     let force = e.force_checkpoint;
     if e.error.is_none() && (advanced >= CHECKPOINT_EVERY || (just_caught_up && advanced > 0) || force) {
-        if let Err(err) =
-            save_checkpoint(&state.wallet_dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue, e.blind_below)
-        {
+        if let Err(err) = save_checkpoint(
+            &state.wallet_dir,
+            &token,
+            &e.genesis,
+            &e.low,
+            e.scanned as u64,
+            &e.db,
+            &e.boundaries,
+            e.sink_blue,
+            e.blind_below,
+        ) {
             eprintln!("checkpoint write failed for {token}: {err}");
         } else {
             e.saved_scanned = e.scanned;
@@ -3226,7 +3254,9 @@ async fn load_new_wallet(
                 state.wallets.lock().await.remove(token);
                 if state.get_wallet(token).await.is_some() {
                     state.index_fvk(token, &key).await;
-                    log::info!("imported wallet for token {token}: adopted checkpoint from twin token {donor} (birthday {keep_birthday})");
+                    log::info!(
+                        "imported wallet for token {token}: adopted checkpoint from twin token {donor} (birthday {keep_birthday})"
+                    );
                     return Ok(());
                 }
                 // The clone failed to load — fall back to the honest scan from the
@@ -3675,10 +3705,7 @@ fn stranded_hint(stranded_value: u64) -> String {
 /// Prove that a loaded wallet's commitment tree is exactly the node's canonical
 /// tree at the wallet cursor. Height/freshness alone cannot establish this: a
 /// legacy checkpoint may be near-tip yet contain bundles consensus dropped.
-async fn ensure_canonical_checkpoint(
-    state: &Arc<AppState>,
-    w: &Wallet,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+async fn ensure_canonical_checkpoint(state: &Arc<AppState>, w: &Wallet) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let (cursor, wallet_size, wallet_anchor) = {
         let e = w.lock().await;
         (e.low, e.db.size(), e.db.anchor())
@@ -3739,18 +3766,12 @@ async fn wallet_send(
         // flight, yet every note they would spend is already matured and spendable.
         // `ensure_canonical_checkpoint` above still rejects a genuinely divergent tree.
         if e.reorged_strikes > 0 {
-            return Err(err(
-                StatusCode::CONFLICT,
-                "wallet checkpoint is being repaired after a reorg; retry shortly",
-            ));
+            return Err(err(StatusCode::CONFLICT, "wallet checkpoint is being repaired after a reorg; retry shortly"));
         }
         if e.matured_leaves().is_none() {
             return Err(err(
                 StatusCode::CONFLICT,
-                format!(
-                    "wallet has not established a matured anchor yet (scanned DAA {}); wait for initial sync",
-                    e.scanned
-                ),
+                format!("wallet has not established a matured anchor yet (scanned DAA {}); wait for initial sync", e.scanned),
             ));
         }
         (e.key.seed()?, e.recoverable_history)
@@ -3907,46 +3928,87 @@ async fn wallet_send(
     let mut txids: Vec<String> = Vec::with_capacity(tx_count);
     let mut sent = 0u64;
     let mut total_fee = 0u64;
-    for (ci, (inputs, pay, positions, cfee)) in chunks.into_iter().enumerate() {
-        log::info!("send: building Orchard proof for tx {}/{tx_count} ({} spends, {pay} sompi + {cfee} fee)...", ci + 1, inputs.len());
-        let ctx2 = ctx.clone();
-        let started = std::time::Instant::now();
-        // The memo rides on the first chunk only — one memo per logical payment.
-        let chunk_memo = if ci == 0 { memo } else { [0u8; 512] };
-        let payload = tokio::task::spawn_blocking(move || {
-            let _proving = ProvingGuard::new();
-            build_wallet_payment(seed, inputs, recipient, pay, cfee, &net, &ctx2, recoverable, chunk_memo)
-        })
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to build payment: {e:?}")))?;
-        log::info!("send: tx {}/{tx_count} proven in {:.0?}", ci + 1, started.elapsed());
+    // Prove in groups rather than one at a time: see `PROOF_THREADS_EACH`. A group of
+    // one keeps the global rayon pool (all cores), so an ordinary single-chunk send is
+    // byte-for-byte the old path and never pays for this.
+    let degree = proof_concurrency();
+    if degree > 1 && tx_count > 1 {
+        log::info!("send: proving {tx_count} txs {} at a time ({PROOF_THREADS_EACH} threads each)", degree.min(tx_count));
+    }
+    let mut pending = chunks;
+    let mut ci = 0usize;
+    while !pending.is_empty() {
+        let take = degree.min(pending.len());
+        let rest = pending.split_off(take);
+        let group = std::mem::replace(&mut pending, rest);
+        // One proof in the group means one proof on the box: give it every core.
+        let threads_each = if group.len() > 1 { Some(PROOF_THREADS_EACH) } else { None };
 
-        let tx: Transaction = payment_tx(payload);
-        match client.submit_transaction(RpcTransaction::from(&tx), false).await {
-            Ok(accepted) => {
-                txids.push(accepted.to_string());
-                sent += pay;
-                total_fee += cfee;
-                let mut e = w.lock().await;
-                // The wallet's scan cursor is its chain clock — available whether or
-                // not the node serves block metadata, unlike WalletDb's own.
-                let now_daa = e.scanned as u64;
-                for p in positions {
-                    e.db.mark_spent(p, accepted.as_bytes(), now_daa);
+        let mut proving = Vec::with_capacity(group.len());
+        for (k, (inputs, pay, positions, cfee)) in group.into_iter().enumerate() {
+            let idx = ci + k;
+            log::info!(
+                "send: building Orchard proof for tx {}/{tx_count} ({} spends, {pay} sompi + {cfee} fee)...",
+                idx + 1,
+                inputs.len()
+            );
+            let ctx2 = ctx.clone();
+            // The memo rides on the first chunk only — one memo per logical payment.
+            let chunk_memo = if idx == 0 { memo } else { [0u8; 512] };
+            proving.push(tokio::task::spawn_blocking(move || {
+                let _proving = ProvingGuard::new();
+                let started = std::time::Instant::now();
+                let build = || build_wallet_payment(seed, inputs, recipient, pay, cfee, &net, &ctx2, recoverable, chunk_memo);
+                // A scoped pool bounds THIS proof's threads; halo2's rayon work nests
+                // inside `install`, so the group shares the box instead of fighting for it.
+                let built = match threads_each.map(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build()) {
+                    Some(Ok(pool)) => pool.install(build),
+                    // No pool wanted, or the OS refused the threads: use the global pool.
+                    _ => build(),
+                };
+                (idx, pay, positions, cfee, built, started.elapsed())
+            }));
+        }
+
+        // Await the whole group, then submit strictly in order so a partial failure
+        // reports exactly which prefix of the payment went through.
+        let mut done = Vec::with_capacity(proving.len());
+        for h in proving {
+            done.push(h.await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?);
+        }
+        done.sort_by_key(|(idx, ..)| *idx);
+        ci += done.len();
+
+        for (idx, pay, positions, cfee, built, took) in done {
+            let payload = built.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to build payment: {e:?}")))?;
+            log::info!("send: tx {}/{tx_count} proven in {:.0?}", idx + 1, took);
+
+            let tx: Transaction = payment_tx(payload);
+            match client.submit_transaction(RpcTransaction::from(&tx), false).await {
+                Ok(accepted) => {
+                    txids.push(accepted.to_string());
+                    sent += pay;
+                    total_fee += cfee;
+                    let mut e = w.lock().await;
+                    // The wallet's scan cursor is its chain clock — available whether or
+                    // not the node serves block metadata, unlike WalletDb's own.
+                    let now_daa = e.scanned as u64;
+                    for p in positions {
+                        e.db.mark_spent(p, accepted.as_bytes(), now_daa);
+                    }
                 }
-            }
-            Err(e) if txids.is_empty() => return Err(err(StatusCode::BAD_GATEWAY, format!("node rejected the payment: {e}"))),
-            Err(e) => {
-                // Partial success: report what actually went through.
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "error": format!("payment partially sent: {}/{tx_count} txs accepted, then the node rejected: {e}", txids.len()),
-                        "txids": txids,
-                        "sent_sompi": sent,
-                    })),
-                ));
+                Err(e) if txids.is_empty() => return Err(err(StatusCode::BAD_GATEWAY, format!("node rejected the payment: {e}"))),
+                Err(e) => {
+                    // Partial success: report what actually went through.
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": format!("payment partially sent: {}/{tx_count} txs accepted, then the node rejected: {e}", txids.len()),
+                            "txids": txids,
+                            "sent_sompi": sent,
+                        })),
+                    ));
+                }
             }
         }
     }
@@ -4072,9 +4134,7 @@ async fn wallet_send_many(
     {
         let mut e = w.lock().await;
         tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded());
-        let matured = e
-            .matured_leaves()
-            .ok_or_else(|| err(StatusCode::CONFLICT, "wallet has no matured anchor yet"))?;
+        let matured = e.matured_leaves().ok_or_else(|| err(StatusCode::CONFLICT, "wallet has no matured anchor yet"))?;
         let (mut candidates, stranded) = matured_candidates(&e.db, matured);
         candidates.sort_by(|a, b| b.value().cmp(&a.value()));
         let have: u64 = candidates.iter().map(|n| n.value()).sum();
@@ -4459,10 +4519,7 @@ async fn wallet_prepare(
     // A duplicate prepare for THIS wallet is a retry or a double-click — reject it fast,
     // since it would select the same notes as the run already in flight.
     let _preparing = {
-        let mut set = state
-            .preparing
-            .lock()
-            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare tracker poisoned"))?;
+        let mut set = state.preparing.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare tracker poisoned"))?;
         if !set.insert(req.fvk_hex.clone()) {
             return Err(err(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -4545,18 +4602,12 @@ async fn wallet_prepare(
                 // busy wallet legitimately trails the live tip while every note it would
                 // spend is already matured and spendable.
                 if e.reorged_strikes > 0 {
-                    return Err(err(
-                        StatusCode::CONFLICT,
-                        "wallet checkpoint is being repaired after a reorg; retry shortly",
-                    ));
+                    return Err(err(StatusCode::CONFLICT, "wallet checkpoint is being repaired after a reorg; retry shortly"));
                 }
                 if e.matured_leaves().is_none() {
                     return Err(err(
                         StatusCode::CONFLICT,
-                        format!(
-                            "wallet has not established a matured anchor yet (scanned DAA {}); wait for initial sync",
-                            e.scanned
-                        ),
+                        format!("wallet has not established a matured anchor yet (scanned DAA {}); wait for initial sync", e.scanned),
                     ));
                 }
                 let matured_leaves = e.matured_leaves().unwrap_or(0);
@@ -4698,14 +4749,13 @@ async fn wallet_prepare(
         .unwrap_or(true);
     let memo = memo_bytes(req.memo.as_deref())?;
     let t_proof = std::time::Instant::now();
-    let payment =
-        tokio::task::spawn_blocking(move || {
-            let _proving = ProvingGuard::new();
-            prepare_payment(&fvk, inputs, recipient, amount, fee, &net, &ctx, recoverable, memo)
-        })
-            .await
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to prepare payment: {e:?}")))?;
+    let payment = tokio::task::spawn_blocking(move || {
+        let _proving = ProvingGuard::new();
+        prepare_payment(&fvk, inputs, recipient, amount, fee, &net, &ctx, recoverable, memo)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to prepare payment: {e:?}")))?;
     log::info!("prepare: Halo2 proof took {:.1?}", t_proof.elapsed());
 
     let spend_auth: Vec<SpendAuthReq> =
@@ -4961,11 +5011,7 @@ async fn bearer_guard(State(expected): State<std::sync::Arc<String>>, req: Reque
     if req.uri().path() == "/health" {
         return next.run(req).await;
     }
-    let presented = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "));
+    let presented = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|s| s.strip_prefix("Bearer "));
     match presented {
         Some(tok) if ct_eq(tok.as_bytes(), expected.as_bytes()) => next.run(req).await,
         _ => (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response(),
@@ -5320,12 +5366,11 @@ mod sdk_api_tests {
 
         // A fresh FVK registration adopts the donor's checkpoint, keeping the
         // EARLIER birthday so a later cold rescan can't skip either wallet's notes.
-        let (donor, birthday) =
-            adopt_twin_checkpoint(&dir, "phone", &fvk, 9999, &genesis, None, &candidates).expect("must adopt");
+        let (donor, birthday) = adopt_twin_checkpoint(&dir, "phone", &fvk, 9999, &genesis, None, &candidates).expect("must adopt");
         assert_eq!(donor, "donor");
         assert_eq!(birthday, 4242, "keeps the earlier of donor/requested birthdays");
-        let restored = load_checkpoint(&dir, "phone", WalletKey::Fvk(fvk), &genesis, None)
-            .expect("clone parses under the FVK key form");
+        let restored =
+            load_checkpoint(&dir, "phone", WalletKey::Fvk(fvk), &genesis, None).expect("clone parses under the FVK key form");
         assert_eq!(restored.2, 777, "scanned-block cursor survives the clone");
 
         // A DIFFERENT key must never adopt, however many donors exist.

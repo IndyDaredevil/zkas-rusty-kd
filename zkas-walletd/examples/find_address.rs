@@ -35,12 +35,7 @@ fn main() {
             .and_then(Value::as_str)
             .and_then(decode_hex::<96>)
             .and_then(|fvk| WalletDb::from_fvk(&fvk))
-            .or_else(|| {
-                file.get("seed_hex")
-                    .and_then(Value::as_str)
-                    .and_then(decode_hex::<32>)
-                    .and_then(WalletDb::from_seed)
-            });
+            .or_else(|| file.get("seed_hex").and_then(Value::as_str).and_then(decode_hex::<32>).and_then(WalletDb::from_seed));
         let Some(db) = db else { continue };
         let address = String::from(&Address::new(Prefix::Mainnet, Version::ShieldedOrchard, &db.my_address_bytes()));
         if address == wanted {

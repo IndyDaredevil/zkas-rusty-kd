@@ -166,7 +166,10 @@ async fn main() {
         std::process::exit(1);
     });
     if !listen.ip().is_loopback() && !cli.allow_remote {
-        log::error!("refusing to bind non-loopback {} without --allow-remote (put a TLS proxy in front, or use --serve-public for built-in TLS)", listen);
+        log::error!(
+            "refusing to bind non-loopback {} without --allow-remote (put a TLS proxy in front, or use --serve-public for built-in TLS)",
+            listen
+        );
         std::process::exit(1);
     }
 

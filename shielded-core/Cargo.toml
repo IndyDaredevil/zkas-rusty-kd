@@ -66,3 +66,8 @@ zcash_note_encryption = "0.4"
 # (Version::ShieldedOrchard, zkas: HRP). kaspa-addresses is a leaf crate, so
 # no dependency cycle with the consensus layer that depends on shielded-core.
 kaspa-addresses.workspace = true
+
+[dev-dependencies]
+# Benchmarks only (`bench_concurrent_vs_sequential_proofs`): scoped rayon pools to
+# give each concurrent proof its own bounded thread count.
+rayon.workspace = true

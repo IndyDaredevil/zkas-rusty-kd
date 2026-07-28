@@ -3436,6 +3436,78 @@ mod circuit_tests {
     use crate::wallet::scan::address_bytes_from_seed;
     use orchard::circuit::ProvingKey;
 
+    /// Does proving several bundles CONCURRENTLY beat proving them one at a time?
+    ///
+    /// A single proof's parallel efficiency is sublinear (measured: 100 % at 1 thread,
+    /// 91.5 % at 2, 78 % at 4), so giving one proof every core wastes some of them.
+    /// This compares N bundles proven sequentially on all cores against the same N
+    /// proven at once, each pinned to its own smaller rayon pool. Ignored by default.
+    #[test]
+    #[ignore]
+    fn bench_concurrent_vs_sequential_proofs() {
+        const N: usize = 2;
+        const SPENDS: usize = 38;
+
+        let miner = [93u8; 32];
+        let net = [0x5au8; 32];
+        let ctx = b"zkas-bench-conc";
+        let addr = address_bytes_from_seed(miner).unwrap();
+        let payee = address_bytes_from_seed([94u8; 32]).unwrap();
+
+        let mut db = WalletDb::from_seed(miner).unwrap();
+        let mut state = ShieldedState::new();
+        let total = SPENDS * N;
+        let descs: Vec<_> = (0..total).map(|i| cb(addr, format!("cblk||{i}").as_bytes(), 5_699_353_195)).collect();
+        let mint = CoinbaseMint::new(
+            descs.iter().map(|d| CoinbaseNote { value: d.1, commitment: coinbase_note_commitment(&d.0, d.1).unwrap() }).collect(),
+        );
+        state.apply_chain_block(Some(&mint), &[]).unwrap();
+        db.ingest_block(&descs, &[]);
+
+        // N independent bundles, each spending its own disjoint slice of notes.
+        let batches: Vec<Vec<(Note, MerklePath)>> = (0..N)
+            .map(|b| {
+                db.notes()[b * SPENDS..(b + 1) * SPENDS]
+                    .iter()
+                    .map(|o| (o.note.clone(), db.witness_path(o.position).unwrap()))
+                    .collect()
+            })
+            .collect();
+        let sum: u64 = db.notes()[..SPENDS].iter().map(|o| o.note.value().inner()).sum();
+        let fee = 3_000_000u64 * SPENDS as u64;
+        let prove = |inputs: Vec<(Note, MerklePath)>| {
+            crate::wallet::build::build_wallet_payment(miner, inputs, payee, sum - fee, fee, &net, ctx, true, [0u8; 512]).unwrap()
+        };
+
+        // Warm any one-time setup so it lands in neither measurement.
+        let _ = prove(batches[0].clone());
+
+        let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(4);
+        let t0 = std::time::Instant::now();
+        for b in &batches {
+            let _ = prove(b.clone());
+        }
+        let seq = t0.elapsed().as_secs_f64();
+
+        let per = (cores / N).max(1);
+        let t1 = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for b in &batches {
+                let prove = &prove;
+                s.spawn(move || {
+                    let pool = rayon::ThreadPoolBuilder::new().num_threads(per).build().unwrap();
+                    pool.install(|| prove(b.clone()))
+                });
+            }
+        });
+        let conc = t1.elapsed().as_secs_f64();
+
+        println!("{N} x {SPENDS}-spend proofs on {cores} cores");
+        println!("  sequential (each uses all cores): {seq:5.1}s");
+        println!("  concurrent ({N} x {per} threads):    {conc:5.1}s");
+        println!("  speedup: {:.2}x", seq / conc);
+    }
+
     /// Measure proving wall-time vs CPU-time at several spend counts.
     ///
     /// `cpu/wall` is the effective core count Halo2 actually uses; it decides

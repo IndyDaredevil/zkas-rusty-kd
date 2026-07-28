@@ -131,14 +131,15 @@ pub fn pairing_uri(cfg: &SelfHostConfig, token: &str, fingerprint: Option<&str>)
 /// Print the pairing URI and an ASCII QR to stdout so the operator can point a phone
 /// camera at their terminal / SSH session and be connected — no copy-paste of secrets.
 fn print_pairing(uri: &str) {
-    use qrcode::render::unicode;
     use qrcode::QrCode;
+    use qrcode::render::unicode;
     println!("\n────────────────────────────────────────────────────────────");
     println!(" ZKas wallet API — scan this in the mobile wallet to pair:");
     println!("────────────────────────────────────────────────────────────");
     match QrCode::new(uri.as_bytes()) {
         Ok(code) => {
-            let rendered = code.render::<unicode::Dense1x2>().dark_color(unicode::Dense1x2::Light).light_color(unicode::Dense1x2::Dark).build();
+            let rendered =
+                code.render::<unicode::Dense1x2>().dark_color(unicode::Dense1x2::Light).light_color(unicode::Dense1x2::Dark).build();
             println!("{rendered}");
         }
         Err(e) => log::warn!("could not render pairing QR ({e}); use the URI below"),

@@ -397,6 +397,7 @@ opt-level = 3
 codegen-units = 1
 overflow-checks = false
 
+
 [profile.release.package.halo2_gadgets]
 opt-level = 3
 codegen-units = 1
