@@ -60,6 +60,18 @@ struct Cli {
     /// receive, and a note-heavy wallet's payments get slower without bound.
     #[arg(long, default_value_t = false)]
     no_auto_consolidate: bool,
+    /// Cap the CPU threads Halo2 proving may use. Default: every core.
+    ///
+    /// This is a THROTTLE, not a tuning knob — lowering it makes payments slower, and
+    /// measurably so (38 spends: 29.7s on 4 threads, 37.6s on 3, 50.1s on 2, 91.7s on 1).
+    /// Its purpose is to stop the wallet daemon starving something else on the same box:
+    /// on a machine also running a node and a pool, `--proof-threads $(( $(nproc) - 2 ))`
+    /// leaves the node headroom at a known, bounded cost to payment latency.
+    ///
+    /// Total CPU *work* is fixed at ~2.4 core-seconds per note spent whatever you set
+    /// here; this only decides how many cores divide it.
+    #[arg(long, value_name = "N")]
+    proof_threads: Option<usize>,
     /// Offline admin: print each wallet's note/base/STRANDED-note report and exit.
     /// Run with the daemon stopped.
     #[arg(long, default_value_t = false)]
@@ -101,6 +113,15 @@ struct Cli {
 async fn main() {
     kaspa_core::log::try_init_logger("info");
     let cli = Cli::parse();
+
+    // Size the rayon pool Halo2 proves in, before anything can touch it — `build_global`
+    // is one-shot and silently loses to whichever code path initialises rayon first.
+    if let Some(n) = cli.proof_threads.filter(|n| *n > 0) {
+        match rayon::ThreadPoolBuilder::new().num_threads(n).build_global() {
+            Ok(()) => log::info!("proving is capped at {n} thread(s) (--proof-threads); payments trade latency for headroom"),
+            Err(e) => log::warn!("could not cap proving threads at {n}: {e}; using every core"),
+        }
+    }
 
     // Offline admin modes: operate on the wallet files directly and exit.
     let admin_secret = cli

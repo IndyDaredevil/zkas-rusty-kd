@@ -115,6 +115,7 @@ lower `fee` does not save money — it just gets corrected.
 | `--public-host`, `--api-token` | — | With `--serve-public`: host baked into the pairing URI / TLS SAN, and a fixed token. |
 | `--auto-consolidate MAX_NOTES` | `500` | **On by default.** Keeps custodial wallets under `MAX_NOTES` by merging their oldest notes in the background. Wallets below the ceiling are never touched. See §4. |
 | `--no-auto-consolidate` | `false` | Turn background consolidation off entirely. |
+| `--proof-threads N` | *(every core)* | **Throttle**, not a tuning knob: caps the threads Halo2 proving may use, so the daemon can't starve a co-located node. Lowering it makes payments slower. See §4. |
 | `--diagnose` | `false` | Offline: print each wallet's note/base/**stranded-note** report, then exit. Run with the daemon stopped. |
 | `--graft TOKEN:/path/older.scan` | — | Offline: repair a stranded wallet from an older snapshot of itself. Daemon stopped. |
 
@@ -374,6 +375,34 @@ A group of one keeps the global pool, so an ordinary single-transaction send is
 unchanged and never pays for this. Concurrency is bounded by cores **and** free memory
 (`PROOF_MEM_PER_EXTRA_MB`), so a squeezed box degrades to the sequential path rather
 than running out of memory.
+
+### Threading: what is and isn't configurable
+
+| Knob | Where | Default | Configurable at runtime |
+| --- | --- | --- | --- |
+| Halo2 proving threads | rayon global pool | every core | **`--proof-threads N`** (or `RAYON_NUM_THREADS`) |
+| Threads per proof when grouped | `PROOF_THREADS_EACH` | 2 | no — rebuild |
+| Concurrent chunk proofs | `proof_concurrency()` | cores ÷ 2, memory-capped | no — automatic |
+| Tokio worker threads | `main.rs` | 8 | no — rebuild |
+| Wallet sync concurrency | `SYNC_CONCURRENCY` | 3 | no — rebuild |
+
+**`--proof-threads` only ever costs you time.** Total CPU work is fixed at ~2.4
+core-seconds per note spent; the flag just decides how many cores divide it:
+
+| `--proof-threads` | 38-spend proof |
+| --- | --- |
+| 4 | 29.7 s |
+| 3 | 37.6 s |
+| 2 | 50.1 s |
+| 1 | 91.7 s |
+
+Use it for one reason: the daemon shares a box with something that must not be starved.
+On a pool machine also running a node, `--proof-threads $(( $(nproc) - 2 ))` buys the node
+headroom at a known, bounded latency cost. Do not set it hoping for a speedup — there
+isn't one, and proving is the thing a user is waiting on.
+
+Note the Tokio worker count (8) is separate and does **not** bound proving: proofs run on
+`spawn_blocking` threads and inside the rayon pool, not on async workers.
 
 ### Sizing
 
