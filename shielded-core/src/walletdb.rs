@@ -3436,6 +3436,53 @@ mod circuit_tests {
     use crate::wallet::scan::address_bytes_from_seed;
     use orchard::circuit::ProvingKey;
 
+    /// Measure proving wall-time vs CPU-time at several spend counts.
+    ///
+    /// `cpu/wall` is the effective core count Halo2 actually uses; it decides
+    /// whether proving several chunks in parallel can win anything on a box
+    /// that a single proof already saturates. Ignored by default (minutes).
+    #[test]
+    #[ignore]
+    fn bench_proof_scaling_and_parallelism() {
+        fn cpu_secs() -> f64 {
+            let st = std::fs::read_to_string("/proc/self/stat").unwrap();
+            let tail = &st[st.rfind(')').unwrap() + 2..];
+            let f: Vec<&str> = tail.split_whitespace().collect();
+            // fields 11,12 after the state char = utime,stime (jiffies, 100Hz)
+            (f[11].parse::<f64>().unwrap() + f[12].parse::<f64>().unwrap()) / 100.0
+        }
+
+        let miner = [91u8; 32];
+        let net = [0x5au8; 32];
+        let ctx = b"zkas-bench";
+        let addr = address_bytes_from_seed(miner).unwrap();
+
+        let mut db = WalletDb::from_seed(miner).unwrap();
+        let mut state = ShieldedState::new();
+        let descs: Vec<_> = (0..38u32).map(|i| cb(addr, format!("blk||{i}").as_bytes(), 5_699_353_195)).collect();
+        let mint = CoinbaseMint::new(
+            descs.iter().map(|d| CoinbaseNote { value: d.1, commitment: coinbase_note_commitment(&d.0, d.1).unwrap() }).collect(),
+        );
+        state.apply_chain_block(Some(&mint), &[]).unwrap();
+        db.ingest_block(&descs, &[]);
+
+        let payee = address_bytes_from_seed([92u8; 32]).unwrap();
+        println!("spends |  wall  |   cpu  | cores | s/spend");
+        for n in [1usize, 4, 12, 38] {
+            let sel: Vec<_> = db.notes()[..n].iter().map(|o| (o.note.clone(), db.witness_path(o.position).unwrap())).collect();
+            let sum: u64 = db.notes()[..n].iter().map(|o| o.note.value().inner()).sum();
+            let fee = 3_000_000u64 * n as u64;
+            let c0 = cpu_secs();
+            let t0 = std::time::Instant::now();
+            let payload =
+                crate::wallet::build::build_wallet_payment(miner, sel, payee, sum - fee, fee, &net, ctx, true, [0u8; 512]).unwrap();
+            let wall = t0.elapsed().as_secs_f64();
+            let cpu = cpu_secs() - c0;
+            assert!(!payload.is_empty());
+            println!("{n:6} | {wall:5.1}s | {cpu:5.1}s | {:4.2}x | {:.2}", cpu / wall, wall / n as f64);
+        }
+    }
+
     fn cb(address: [u8; 43], seed: &[u8], value: u64) -> (CoinbaseNoteDesc, u64) {
         (crate::coinbase::derive_coinbase_note_desc(address, seed), value)
     }

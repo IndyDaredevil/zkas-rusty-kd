@@ -41,6 +41,19 @@ struct Cli {
     /// plaintext (0600 on unix) and a warning is logged at startup.
     #[arg(long)]
     wallet_secret: Option<String>,
+    /// Keep custodial wallets under this many notes by merging their oldest notes in
+    /// the background, one transaction at a time, whenever nothing else is proving.
+    ///
+    /// For mining/pool treasuries. A wallet that takes one coinbase note per block grows
+    /// without bound, and Halo2 proving costs a flat ~0.8 core-seconds PER NOTE SPENT, so
+    /// a payout from a 47,000-note treasury needs thousands of spends — hours of proving
+    /// while somebody waits. Merging relocates that cost into the background and keeps
+    /// each note ~38x larger, so payouts spend ~38x fewer notes. Off by default: it
+    /// spends fees and only works on wallets whose seed this daemon holds.
+    ///
+    /// Suggested: `--auto-consolidate 500`.
+    #[arg(long, value_name = "MAX_NOTES")]
+    auto_consolidate: Option<usize>,
     /// Offline admin: print each wallet's note/base/STRANDED-note report and exit.
     /// Run with the daemon stopped.
     #[arg(long, default_value_t = false)]
@@ -168,6 +181,7 @@ async fn main() {
         // Loopback / proxied deployment: no built-in TLS, no bearer gate.
         tls: None,
         require_bearer: None,
+        auto_consolidate: cli.auto_consolidate,
     };
 
     if let Err(e) = serve(cfg, shutdown_rx).await {

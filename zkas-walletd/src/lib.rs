@@ -184,6 +184,19 @@ pub struct Config {
     /// <token>`. The transport gate for a publicly-bound daemon; the phone gets the token
     /// from the pairing QR. `None` = no bearer gate (loopback-only deployments).
     pub require_bearer: Option<String>,
+    /// Keep custodial wallets below this many notes by merging their oldest notes in
+    /// the background. `None` (default) = off.
+    ///
+    /// Why it exists: Halo2 proving costs a flat ~0.8 core-seconds **per note spent**
+    /// and already saturates every core, so moving value out of a wallet made of many
+    /// tiny notes has a hard time floor of `0.8s x notes`. A mining treasury that takes
+    /// one coinbase note per block reaches tens of thousands of notes and a payout then
+    /// needs thousands of spends — hours of proving, in front of a waiting operator.
+    /// Merging notes does not reduce that total work, it *relocates* it: each merge
+    /// makes one note worth ~38x more, so the eventual payout spends ~38x fewer notes.
+    /// Run continuously the cost is paid a few seconds at a time in the background,
+    /// off the interactive path, and the note count never runs away in the first place.
+    pub auto_consolidate: Option<usize>,
 }
 
 /// Map the `--network` string to the consensus [`NetworkType`] the compile-time
@@ -772,16 +785,50 @@ const SPEND_CLIMB_INLINE_MAX: u64 = 512;
 /// is already ~5 s per send, which is the point where a send stops feeling instant.
 const SUBTREE_CACHE_MIN_SPAN: u64 = 20_000;
 
-/// Ceiling on the TOTAL leaf span held in subtree caches across every wallet this
-/// daemon serves. Per wallet the cache is ~4 B/leaf, but building it also forces that
-/// wallet's decoded leaf stream to materialise; measured on the hosted daemon the pair
-/// costs ~5 MB per 200 K-leaf wallet. One wallet is nothing — 348 of them is not, on a
-/// box that also runs a node. This caps the aggregate at roughly 300 MB; wallets past
-/// the ceiling keep the replay path, which is correct, just slower.
-const SUBTREE_CACHE_TOTAL_SPAN_MAX: u64 = 12_000_000;
+/// Free memory the daemon refuses to build a subtree cache below.
+///
+/// The cache itself is small (~4 B/leaf of span) but building it forces that wallet's
+/// decoded leaf stream to materialise, and the pair measured ~11 MB per 200 K-leaf
+/// wallet on the hosted daemon (32 B/leaf stored + 32 B/leaf decoded). Across hundreds
+/// of wallets that is gigabytes, on a box that also runs a node.
+///
+/// This replaced a fixed daemon-wide leaf budget, which had two faults a live sweep
+/// exposed: the number was a guess unrelated to the box's actual memory, and it was a
+/// **lifetime** counter, so once spent, every wallet loaded afterwards was permanently
+/// stuck on the replay path (observed: 31 wallets skipped, one of them then taking
+/// 16.1 s to witness 3 notes where a cached wallet took 32 ms). Gating on live free
+/// memory is self-regulating — builds stop as memory tightens and resume when it frees
+/// — and it reconsiders a skipped wallet on a later pass instead of writing it off.
+const SUBTREE_CACHE_FREE_FLOOR_MB: u64 = 1_200;
 
-/// Leaf span currently held in subtree caches, summed over all wallets.
-static SUBTREE_CACHE_SPAN_USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// How long a `MemAvailable` reading is reused. The gate is consulted per wallet per
+/// sync pass; re-reading `/proc/meminfo` every time would be pointless syscall traffic,
+/// and memory does not move fast enough for a stale-by-seconds figure to matter.
+const MEM_AVAILABLE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Cached `MemAvailable`, in MB, with the instant it was read.
+static MEM_AVAILABLE_MB: std::sync::Mutex<Option<(u64, std::time::Instant)>> = std::sync::Mutex::new(None);
+
+/// Free memory in MB as the kernel reports it (`MemAvailable`), cached for
+/// [`MEM_AVAILABLE_TTL`]. `None` on any platform or kernel that doesn't publish it —
+/// callers then skip the memory gate rather than refuse to work.
+fn mem_available_mb() -> Option<u64> {
+    let mut slot = MEM_AVAILABLE_MB.lock().ok()?;
+    if let Some((mb, at)) = *slot {
+        if at.elapsed() < MEM_AVAILABLE_TTL {
+            return Some(mb);
+        }
+    }
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: u64 = text
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse().ok())?;
+    let mb = kb / 1024;
+    *slot = Some((mb, std::time::Instant::now()));
+    Some(mb)
+}
 
 /// Payment proofs currently being computed anywhere in this daemon.
 ///
@@ -814,6 +861,64 @@ impl Drop for ProvingGuard {
 fn proving_now() -> bool {
     PROVING_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0
 }
+
+/// Background consolidations currently between note selection and broadcast.
+///
+/// A consolidation spends the wallet's own notes, so it races a user payment over the
+/// same notes: whichever broadcasts second is rejected by the node for reusing a
+/// nullifier (no funds are at risk — it simply fails). The two directions are closed
+/// separately. A consolidation never *starts* during a payment because the payment
+/// holds a [`ProvingGuard`] across its whole select→submit span and the loop checks
+/// [`proving_now`]. This counter closes the other direction: a payment that arrives
+/// mid-consolidation waits for it to finish before selecting notes.
+static CONSOLIDATING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Marks a consolidation in flight for as long as it is held (panic-safe, as [`ProvingGuard`]).
+struct ConsolidateGuard;
+
+impl ConsolidateGuard {
+    fn new() -> Self {
+        CONSOLIDATING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for ConsolidateGuard {
+    fn drop(&mut self) {
+        CONSOLIDATING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Block until no consolidation is mid-flight, so a payment cannot select notes a
+/// background merge is already proving over. Bounded: a consolidation is one
+/// transaction (~35 s at the 38-note cap), so this waits seconds, never minutes, and
+/// gives up rather than hanging a request if something is stuck.
+async fn await_consolidation_clear() {
+    let deadline = std::time::Instant::now() + CONSOLIDATE_WAIT_MAX;
+    let mut logged = false;
+    while CONSOLIDATING.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        if std::time::Instant::now() >= deadline {
+            log::warn!("payment proceeding while a consolidation is still in flight after {CONSOLIDATE_WAIT_MAX:?}");
+            return;
+        }
+        if !logged {
+            log::info!("payment waiting for an in-flight background consolidation to finish...");
+            logged = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// Longest a payment waits behind a background consolidation before going ahead anyway.
+const CONSOLIDATE_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Gap between two background consolidation transactions. Proving one costs ~30 core-
+/// seconds; spacing them keeps the daemon's steady CPU well under one core so HTTP,
+/// scanning and the node all stay responsive on a small box.
+const CONSOLIDATE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Poll interval when every wallet is already under its note ceiling.
+const CONSOLIDATE_IDLE_POLL: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Minimum wall-clock gap between two background witness pre-advance steps for the SAME
 /// wallet. The sync loop spins as fast as every 10 ms while any wallet is behind, so
@@ -1415,7 +1520,9 @@ struct WalletEntry {
     /// Whether this wallet has already taken its decision on the subtree cache (built
     /// it, or been turned away by the daemon-wide budget). Stops an O(chain) build —
     /// or a budget probe — from being re-attempted on every sync tick.
-    subtree_span_charged: bool,
+    /// Whether the "deferred, memory is tight" warning has already been logged for
+    /// this wallet, so the gate reports the squeeze once instead of every sync pass.
+    subtree_low_mem_logged: bool,
     /// Request an immediate checkpoint write on the next `sync_one_wallet` pass, regardless
     /// of the block-count threshold — set the moment the witnesses first warm, so the
     /// expensive-to-rebuild witness state is persisted at once (a restart seconds later
@@ -1492,7 +1599,7 @@ impl WalletEntry {
             unsettled_nulls: HashSet::new(),
             last_witness_advance: None,
             witnesses_warm: false,
-            subtree_span_charged: false,
+            subtree_low_mem_logged: false,
             force_checkpoint: false,
             blind_below: 0,
         }
@@ -1712,37 +1819,35 @@ impl WalletEntry {
                 // Stand down while any payment is proving: the build is one-time and can
                 // wait a tick, a user's send cannot. Deliberately does NOT mark the wallet
                 // charged, so it is retried once the daemon is idle again.
-                if span >= SUBTREE_CACHE_MIN_SPAN
-                    && !self.subtree_span_charged
-                    && !self.db.subtree_cache_ready(matured)
-                    && !proving_now()
-                {
-                    use std::sync::atomic::Ordering;
-                    // Claim this wallet's share of the global ceiling before doing the
-                    // work, so concurrent sync tasks cannot together overshoot it.
-                    let used = SUBTREE_CACHE_SPAN_USED.fetch_add(span, Ordering::Relaxed);
-                    if used + span > SUBTREE_CACHE_TOTAL_SPAN_MAX {
-                        SUBTREE_CACHE_SPAN_USED.fetch_sub(span, Ordering::Relaxed);
-                        // Don't retry every tick — this wallet keeps the replay path.
-                        self.subtree_span_charged = true;
-                        log::warn!(
-                            "subtree cache skipped ({span} leaves): daemon-wide cache budget reached ({used}/{SUBTREE_CACHE_TOTAL_SPAN_MAX} leaves); this wallet keeps the replay path"
-                        );
-                    } else {
-                        self.subtree_span_charged = true;
-                        let t = std::time::Instant::now();
-                        tokio::task::block_in_place(|| self.db.build_subtree_cache());
-                        if self.db.subtree_cache_ready(matured) {
-                            log::info!(
-                                "subtree cache built in {:.1?} ({span} leaves, notes={note_count}) — spends now witness in O(depth), not a full replay",
-                                t.elapsed()
-                            );
-                        } else {
-                            SUBTREE_CACHE_SPAN_USED.fetch_sub(span, Ordering::Relaxed);
-                            log::warn!(
-                                "subtree cache rejected by its root gate after {:.1?} ({span} leaves) — spends keep using the replay path",
-                                t.elapsed()
-                            );
+                if span >= SUBTREE_CACHE_MIN_SPAN && !self.db.subtree_cache_ready(matured) && !proving_now() {
+                    // Only refuse when the kernel says memory is genuinely tight. A wallet
+                    // skipped here is retried on a later pass, so a transient squeeze costs
+                    // this wallet one slow send, not its whole session.
+                    match mem_available_mb() {
+                        Some(free) if free < SUBTREE_CACHE_FREE_FLOOR_MB => {
+                            // Once per wallet per squeeze, not once per sync pass.
+                            if !self.subtree_low_mem_logged {
+                                self.subtree_low_mem_logged = true;
+                                log::warn!(
+                                    "subtree cache deferred ({span} leaves): only {free} MB free, floor is {SUBTREE_CACHE_FREE_FLOOR_MB} MB; this wallet keeps the replay path for now"
+                                );
+                            }
+                        }
+                        _ => {
+                            self.subtree_low_mem_logged = false;
+                            let t = std::time::Instant::now();
+                            tokio::task::block_in_place(|| self.db.build_subtree_cache());
+                            if self.db.subtree_cache_ready(matured) {
+                                log::info!(
+                                    "subtree cache built in {:.1?} ({span} leaves, notes={note_count}) — spends now witness in O(depth), not a full replay",
+                                    t.elapsed()
+                                );
+                            } else {
+                                log::warn!(
+                                    "subtree cache rejected by its root gate after {:.1?} ({span} leaves) — spends keep using the replay path",
+                                    t.elapsed()
+                                );
+                            }
                         }
                     }
                 }
@@ -2055,6 +2160,8 @@ struct AppState {
     /// current by registrations; entries are re-verified against the wallet files
     /// before use, so staleness only ever costs the fast path, never correctness.
     fvk_index: Mutex<HashMap<[u8; 96], HashSet<String>>>,
+    /// Note-count ceiling for background consolidation; see [`Config::auto_consolidate`].
+    auto_consolidate: Option<usize>,
 }
 
 /// Build a status snapshot from a locked wallet entry. Shared by the sync loop and the
@@ -2618,6 +2725,82 @@ async fn mempool_loop(state: Arc<AppState>) {
             }
         }
         tokio::time::sleep(MEMPOOL_POLL).await;
+    }
+}
+
+/// Keep custodial wallets under their note ceiling by merging their oldest notes,
+/// one transaction at a time, whenever nothing else is proving.
+///
+/// This exists because Halo2 proving costs a flat ~0.8 core-seconds **per note spent**
+/// and already uses every core (measured: 3.13x of 4 cores, 0.79 s/spend, linear from
+/// 4 to 38 spends). So the time to move value out of a wallet is set by how many notes
+/// it is made of, and nothing else — not parallelism, not the per-transaction spend cap.
+/// A mining treasury that receives one coinbase note per block reaches tens of thousands
+/// of notes, and a payout then needs thousands of spends: a measured 237-transaction,
+/// ~2-hour payment on the live pool.
+///
+/// Merging does not make that total work smaller — it moves it. Each merge turns
+/// [`max_spends_per_tx`] notes into one worth ~38x more, so a later payment spends ~38x
+/// fewer notes; run continuously the cost is paid ~30 s at a time in the background and
+/// the note count never runs away. `heal: true` (oldest-first) is deliberate: it also
+/// lets the fast-sync base roll forward past the spent notes, shortening every later
+/// witness rebuild.
+async fn consolidate_loop(state: Arc<AppState>) {
+    let Some(ceiling) = state.auto_consolidate else { return };
+    log::info!(
+        "auto-consolidate: ON — custodial wallets are kept under {ceiling} notes \
+         (one merge of up to {} notes per {}s, only while nothing is proving)",
+        max_spends_per_tx(),
+        CONSOLIDATE_COOLDOWN.as_secs()
+    );
+    loop {
+        // Never take cores from a payment somebody is waiting on.
+        if proving_now() {
+            tokio::time::sleep(CONSOLIDATE_COOLDOWN).await;
+            continue;
+        }
+        let wallets: Vec<Wallet> = state.wallets.lock().await.values().cloned().collect();
+        let mut merged_any = false;
+        for w in wallets {
+            if proving_now() {
+                break;
+            }
+            // Cheap pre-check: try_lock so a wallet mid-scan is simply skipped this
+            // pass rather than queueing the loop behind it.
+            let (over, notes) = {
+                let Ok(e) = w.try_lock() else { continue };
+                let notes = e.db.notes().len();
+                // Watch-only wallets hold no seed here and cannot be merged by the
+                // daemon at all; a wallet still catching up has no stable anchor.
+                (e.key.seed().is_ok() && e.caught_up && notes > ceiling, notes)
+            };
+            if !over {
+                continue;
+            }
+            match consolidate_once(&state, &w, DEFAULT_FEE_SOMPI, true).await {
+                Ok(r) => {
+                    merged_any = true;
+                    log::info!(
+                        "auto-consolidate: merged {} notes into one ({} sompi), {} notes left (was {notes}, ceiling {ceiling}) — tx {}",
+                        r.consolidated, r.value_sompi, r.notes_remaining, r.txid
+                    );
+                }
+                Err((code, body)) => {
+                    // Expected and harmless when a wallet is briefly un-mergeable
+                    // (still syncing the maturity window, fewer than 2 matured notes).
+                    let reason = body.0.get("error").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                    if code == StatusCode::CONFLICT {
+                        log::debug!("auto-consolidate: skipping a wallet this pass: {reason}");
+                    } else {
+                        log::warn!("auto-consolidate: merge failed ({code}): {reason}");
+                    }
+                }
+            }
+            tokio::time::sleep(CONSOLIDATE_COOLDOWN).await;
+        }
+        if !merged_any {
+            tokio::time::sleep(CONSOLIDATE_IDLE_POLL).await;
+        }
     }
 }
 
@@ -3540,6 +3723,10 @@ async fn wallet_send(
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     ensure_canonical_checkpoint(&state, &w).await?;
+    // Don't select notes a background merge is already proving over, and — for as long
+    // as this send runs — keep background CPU work (merges, cache builds) off the box.
+    await_consolidation_clear().await;
+    let _proving = ProvingGuard::new();
     let (seed, recoverable) = {
         let e = w.lock().await;
         // A send roots at the MATURED anchor (>= DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK blue
@@ -3825,6 +4012,10 @@ async fn wallet_send_many(
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     ensure_canonical_checkpoint(&state, &w).await?;
+    // Same span guard as `wallet_send`: no merge selects the notes this batch is
+    // about to spend, and no background CPU work runs while the batch is proving.
+    await_consolidation_clear().await;
+    let _proving = ProvingGuard::new();
 
     let (seed, recoverable) = {
         let e = w.lock().await;
@@ -4052,13 +4243,31 @@ async fn wallet_consolidate(
 ) -> Result<Json<ConsolidateResp>, (StatusCode, Json<serde_json::Value>)> {
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
-    let (seed, recoverable) = {
-        let e = w.lock().await;
-        (e.key.seed()?, e.recoverable_history)
-    };
     let (base_fee, heal) = match body {
         Some(Json(b)) => (b.fee.unwrap_or(DEFAULT_FEE_SOMPI), b.heal.unwrap_or(false)),
         None => (DEFAULT_FEE_SOMPI, false),
+    };
+    consolidate_once(&state, &w, base_fee, heal).await.map(Json)
+}
+
+/// One consolidation transaction: select, prove, submit, mark spent.
+///
+/// Shared by the `/api/wallet/consolidate` handler and the background
+/// [`consolidate_loop`], so the manual and automatic paths cannot drift — in
+/// particular they share the anchor-maturity check, the pending-spend-aware
+/// candidate selection, and the byte-proportional fee floor.
+async fn consolidate_once(
+    state: &AppState,
+    w: &Wallet,
+    base_fee: u64,
+    heal: bool,
+) -> Result<ConsolidateResp, (StatusCode, Json<serde_json::Value>)> {
+    // Held until this returns: a payment arriving mid-merge waits rather than
+    // selecting the same notes (see `CONSOLIDATING`).
+    let _merging = ConsolidateGuard::new();
+    let (seed, recoverable) = {
+        let e = w.lock().await;
+        (e.key.seed()?, e.recoverable_history)
     };
     let own_recipient =
         address_bytes_from_seed(seed).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "seed is not a valid spending key"))?;
@@ -4135,7 +4344,7 @@ async fn wallet_consolidate(
                 e.db.mark_spent(p, accepted.as_bytes(), now_daa);
             }
             let notes_remaining = e.db.notes().len();
-            Ok(Json(ConsolidateResp { txid: accepted.to_string(), consolidated, value_sompi: value, notes_remaining }))
+            Ok(ConsolidateResp { txid: accepted.to_string(), consolidated, value_sompi: value, notes_remaining })
         }
         Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("node rejected the consolidation: {e}"))),
     }
@@ -4850,6 +5059,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         prepared: Mutex::new(HashMap::new()),
         snapshots: Mutex::new(HashMap::new()),
         fvk_index: Mutex::new(HashMap::new()),
+        auto_consolidate: cfg.auto_consolidate,
     });
 
     // Index every existing wallet's viewing key in the background (argon2 per
@@ -4880,6 +5090,8 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     // Unmined payments — the instant-payment path. Separate from sync_loop on purpose
     // (see mempool_loop): it must never queue behind block scanning.
     let mempool_task = tokio::spawn(mempool_loop(state.clone()));
+    // No-op unless --auto-consolidate is set; returns immediately when it is not.
+    tokio::spawn(consolidate_loop(state.clone()));
 
     // Keep the cached node tip fresh independently of loaded wallets, so `status` can
     // report node connectivity + chain height without ever calling the node on the
