@@ -1875,8 +1875,13 @@ impl WalletEntry {
                         _ => {
                             self.subtree_low_mem_logged = false;
                             let t = std::time::Instant::now();
-                            tokio::task::block_in_place(|| self.db.build_subtree_cache());
-                            if self.db.subtree_cache_ready(matured) {
+                            // Stand down mid-sweep the moment a payment starts proving —
+                            // refusing to *start* during one is not enough when the sweep
+                            // itself runs for tens of seconds.
+                            let built = tokio::task::block_in_place(|| self.db.build_subtree_cache_until(proving_now));
+                            if !built && !self.db.subtree_cache_ready(matured) {
+                                log::debug!("subtree cache sweep yielded to a payment after {:.1?}; will retry", t.elapsed());
+                            } else if self.db.subtree_cache_ready(matured) {
                                 log::info!(
                                     "subtree cache built in {:.1?} ({span} leaves, notes={note_count}) — spends now witness in O(depth), not a full replay",
                                     t.elapsed()

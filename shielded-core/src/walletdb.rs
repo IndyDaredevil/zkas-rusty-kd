@@ -1518,28 +1518,56 @@ impl WalletDb {
     /// keeps using the replay. So a bug in the mountain range, in the frontier seeding,
     /// or in the indexing cannot produce a wrong witness; it can only fail to help.
     pub fn build_subtree_cache(&mut self) {
+        self.build_subtree_cache_until(|| false);
+    }
+
+    /// As [`Self::build_subtree_cache`], but abandons the sweep as soon as `should_yield`
+    /// returns true. Returns whether the cache was actually built.
+    ///
+    /// The sweep is a tight Sinsemilla loop that runs for tens of seconds on a large
+    /// wallet, and it competes directly with Halo2 proving — the one thing a user is
+    /// waiting on. Refusing to *start* a build while a payment proves is not enough: a
+    /// build already in flight keeps its cores for its whole remaining run, so a payment
+    /// arriving mid-sweep still pays for it (observed live: proofs stretched from 3.6 s
+    /// to 66 s while restarts had every reconnecting wallet rebuilding back-to-back).
+    /// Checking the caller's predicate periodically lets the sweep stand down within a
+    /// fraction of a second instead.
+    ///
+    /// Yielding is **not** failure: the cache is simply left unbuilt and the caller
+    /// retries on a later pass, so the wallet keeps the (correct, slower) replay path in
+    /// the meantime. Only a genuinely unusable sweep marks the cache failed.
+    pub fn build_subtree_cache_until(&mut self, should_yield: impl Fn() -> bool) -> bool {
+        /// Leaves between `should_yield` checks. At ~150–260 µs per Sinsemilla combine
+        /// this bounds how long a proof waits behind a sweep to roughly 0.15–0.27 s,
+        /// while keeping the check itself off the hot path.
+        const YIELD_CHECK_EVERY: usize = 1024;
+
         if self.subtree.failed || (self.subtree.active && self.subtree.upto == self.size) {
-            return;
+            return self.subtree.active;
         }
         let reject = SubtreeCache { failed: true, ..Default::default() };
         let mut c = SubtreeCache::default();
         if !c.seed_from_frontier(&self.base_frontier, self.base_size) {
             self.subtree = reject;
-            return;
+            return false;
         }
         {
             let leaves = self.decoded_leaves();
             let base = self.base_size;
             for (i, leaf) in leaves.iter().enumerate() {
+                if i % YIELD_CHECK_EVERY == 0 && i > 0 && should_yield() {
+                    return false; // stand down; retried later, cache untouched
+                }
                 if !c.push_leaf(base + i as u64, *leaf) {
                     self.subtree = reject;
-                    return;
+                    return false;
                 }
             }
         }
         c.active = true;
         let ok = self.root_from(&c, self.size).is_some_and(|r| r == self.tree.root());
         self.subtree = if ok { c } else { reject };
+        ok
     }
 
     /// Whether the cache can serve witnesses at `matured` (used by callers to decide
