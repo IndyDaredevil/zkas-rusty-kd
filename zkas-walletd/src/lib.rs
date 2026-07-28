@@ -2768,10 +2768,10 @@ async fn mempool_loop(state: Arc<AppState>) {
 /// Keep custodial wallets under their note ceiling by merging their oldest notes,
 /// one transaction at a time, whenever nothing else is proving.
 ///
-/// This exists because Halo2 proving costs a flat ~0.8 core-seconds **per note spent**
-/// and already uses every core (measured: 3.13x of 4 cores, 0.79 s/spend, linear from
-/// 4 to 38 spends). So the time to move value out of a wallet is set by how many notes
-/// it is made of, and nothing else — not parallelism, not the per-transaction spend cap.
+/// This exists because Halo2 proving costs a flat ~2.4 core-seconds of CPU work **per
+/// note spent** — total CPU is 91.7 s at 1 thread and 93.4 s at 4 for 38 spends, so the
+/// work is fixed and only the cores dividing it change. The time to move value out of a
+/// wallet is therefore set by how many notes it is made of, and nothing else.
 /// A mining treasury that receives one coinbase note per block reaches tens of thousands
 /// of notes, and a payout then needs thousands of spends: a measured 237-transaction,
 /// ~2-hour payment on the live pool.
@@ -2790,6 +2790,7 @@ async fn consolidate_loop(state: Arc<AppState>) {
         max_spends_per_tx(),
         CONSOLIDATE_COOLDOWN.as_secs()
     );
+    let mut last_quiet = (usize::MAX, 0usize, 0usize, 0usize);
     loop {
         // Never take cores from a payment somebody is waiting on.
         if proving_now() {
@@ -2797,7 +2798,13 @@ async fn consolidate_loop(state: Arc<AppState>) {
             continue;
         }
         let wallets: Vec<Wallet> = state.wallets.lock().await.values().cloned().collect();
+        let loaded = wallets.len();
         let mut merged_any = false;
+        // Why nothing happened is as important as when something does. Without this
+        // an operator cannot distinguish "no wallet needs merging" from "merging is
+        // silently never eligible", and the docs tell them to watch for merge lines
+        // that would never appear.
+        let (mut over_ceiling, mut skip_watch_only, mut skip_behind, mut skip_busy) = (0usize, 0usize, 0usize, 0usize);
         for w in wallets {
             if proving_now() {
                 break;
@@ -2805,11 +2812,26 @@ async fn consolidate_loop(state: Arc<AppState>) {
             // Cheap pre-check: try_lock so a wallet mid-scan is simply skipped this
             // pass rather than queueing the loop behind it.
             let (over, notes) = {
-                let Ok(e) = w.try_lock() else { continue };
+                let Ok(e) = w.try_lock() else {
+                    skip_busy += 1;
+                    continue;
+                };
                 let notes = e.db.notes().len();
+                if notes <= ceiling {
+                    continue;
+                }
+                over_ceiling += 1;
                 // Watch-only wallets hold no seed here and cannot be merged by the
                 // daemon at all; a wallet still catching up has no stable anchor.
-                (e.key.seed().is_ok() && e.caught_up && notes > ceiling, notes)
+                if e.key.seed().is_err() {
+                    skip_watch_only += 1;
+                    (false, notes)
+                } else if !e.caught_up {
+                    skip_behind += 1;
+                    (false, notes)
+                } else {
+                    (true, notes)
+                }
             };
             if !over {
                 continue;
@@ -2839,7 +2861,18 @@ async fn consolidate_loop(state: Arc<AppState>) {
             tokio::time::sleep(CONSOLIDATE_COOLDOWN).await;
         }
         if !merged_any {
+            // Report a quiet pass only when the picture changes, so a healthy daemon
+            // stays quiet but a stuck one says exactly which gate is holding it.
+            let picture = (over_ceiling, skip_watch_only, skip_behind, skip_busy);
+            if over_ceiling > 0 && picture != last_quiet {
+                log::info!(
+                    "auto-consolidate: nothing merged this pass — {over_ceiling} of {loaded} loaded wallet(s) are over the {ceiling}-note ceiling                      but none were eligible ({skip_watch_only} watch-only, {skip_behind} not caught up to the tip, {skip_busy} locked by sync)"
+                );
+                last_quiet = picture;
+            }
             tokio::time::sleep(CONSOLIDATE_IDLE_POLL).await;
+        } else {
+            last_quiet = (usize::MAX, 0, 0, 0);
         }
     }
 }
