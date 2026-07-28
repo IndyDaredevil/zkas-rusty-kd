@@ -41,7 +41,8 @@ wallet can embed it.
 | `--serve-public ADDR:PORT` | — | Self-hosting mode: auto-provisioned TLS + a pairing QR for the mobile wallet. No proxy, domain, or certbot. Implies a bearer token. |
 | `--insecure` | `false` | With `--serve-public`, plaintext HTTP. **Only** behind a VPN — otherwise viewing keys and balances cross the wire in clear. |
 | `--public-host`, `--api-token` | — | With `--serve-public`: host baked into the pairing URI / TLS SAN, and a fixed token. |
-| `--auto-consolidate MAX_NOTES` | *(off)* | Keep custodial wallets under `MAX_NOTES` by merging their oldest notes in the background. **For treasuries** (pool/mining), not multi-tenant daemons — it spends fees. See §4. Suggested: `500`. |
+| `--auto-consolidate MAX_NOTES` | `500` | **On by default.** Keeps custodial wallets under `MAX_NOTES` by merging their oldest notes in the background. Wallets below the ceiling are never touched. See §4. |
+| `--no-auto-consolidate` | `false` | Turn background consolidation off entirely. |
 | `--diagnose` | `false` | Offline: print each wallet's note/base/**stranded-note** report, then exit. Run with the daemon stopped. |
 | `--graft TOKEN:/path/older.scan` | — | Offline: repair a stranded wallet from an older snapshot of itself. Daemon stopped. |
 
@@ -192,7 +193,14 @@ A wrong cache can only *decline to help*. It cannot mis-witness.
 With the witness fixed, Halo2 proving is the entire cost of a payment, and it obeys one
 measured rule:
 
-> **~0.8 core-seconds per note spent, and it already uses every core.**
+> **~2.4 core-seconds of CPU work per note spent — however you schedule it.**
+
+Total CPU is flat whatever the thread count (91.7 s at 1 thread, 93.4 s at 4, for
+38 spends), so the only honest formula is:
+
+```
+wall time  =  2.4 s  x  notes spent  /  effective cores
+```
 
 Measured (`bench_proof_scaling_and_parallelism` in `shielded-core/src/walletdb.rs`, run
 with `--ignored`), 4 cores of an EPYC 9654:
@@ -204,53 +212,96 @@ with `--ignored`), 4 cores of an EPYC 9654:
 | 12 | 9.6 s | 30.2 s | 3.15× | 0.80 |
 | 38 | 30.0 s | 93.8 s | 3.13× | 0.79 |
 
-Two consequences, both important, both counter-intuitive:
+Consequences, all measured, several counter-intuitive:
 
-- **Proving several transactions in parallel wins nothing.** A single proof already gets
-  3.13 of 4 cores (`orchard/multicore` → rayon). There is no idle CPU to exploit; running
-  chunks concurrently just divides the same cores and adds memory pressure.
-- **Raising the per-transaction spend cap wins nothing either.** Cost per spend is flat
-  from 4 to 38 spends, so 38 notes cost the same to prove whether they go in one
-  transaction or four.
+- **Raising the per-transaction spend cap wins nothing.** Cost per spend is flat from 4
+  to 38 spends, so 38 notes cost the same whether they go in one transaction or four.
+- **Throwing more cores at a *single* proof has diminishing returns** — 77 % efficiency
+  at 4 threads and falling. Running several proofs at once instead recovers part of that
+  (1.21× measured; see "Proving several transactions at once" below), but it is a
+  constant factor, not a fix.
+- **`RUSTFLAGS=-C target-cpu=native` is worth nothing** — 33.3 s vs 32.3 s baseline at
+  38 spends. `pasta_curves` is already hand-optimised; don't re-try this.
+- **Release-profile tuning is already done** (`[profile.release.package.*]` for
+  `halo2_proofs`, `pasta_curves`, `halo2_gadgets`, `orchard`, `ff`, `group`).
 
-**The only lever that matters is spending fewer notes**, i.e. holding fewer, larger ones.
-The total time to move value `V` out of a wallet is `0.8 s × (V ÷ average note value)`,
-full stop.
+**So there are exactly three levers, because the formula has exactly three terms:**
+
+| Lever | Realistic gain | Cost |
+| --- | --- | --- |
+| **Fewer, larger notes** (`--auto-consolidate`) | **up to 38×** | free, on by default |
+| **More cores** | ~8× going 4 → 64 | hardware |
+| **GPU proving** | 3.8–7.2× (published, halo2 on BN254) | months; Orchard is Pasta/IPA, where GPU support barely exists |
 
 This is not academic. A pool treasury takes **one coinbase note per block** — at 1 BPS
 that is up to 86 400 notes/day, each worth ~57 ZKAS. Moving 513 484 ZKAS out of such a
 wallet requires 9 006 spends, which the 38-spend cap splits into **237 transactions and
-~2 hours of proving** — measured on the live pool. Not a bug, not fixable by parallelism
-or a bigger cap: it is the note count.
+~2 hours of proving** — measured on the live pool. Not a bug: it is the note count.
+Consolidated to the 500-note ceiling, the same payment is a handful of spends.
 
-### Keeping note count down: `--auto-consolidate`
+### Keeping note count down: `--auto-consolidate` (on by default)
 
 ```bash
-zkas-walletd ... --auto-consolidate 500
+zkas-walletd ...                          # ceiling 500, already active
+zkas-walletd ... --auto-consolidate 200   # tighter
+zkas-walletd ... --no-auto-consolidate    # off
 ```
 
 Merges each over-ceiling custodial wallet's **oldest** notes, up to 38 at a time, one
-transaction every 20 s, **only while nothing is proving**.
+transaction per minute, **only while nothing is proving**.
 
 Merging does not reduce total proof work — it *relocates* it. Each merge makes one note
-worth ~38× more, so the eventual payout spends ~38× fewer notes. Run continuously the
-cost is paid ~30 s at a time in the background and the note count never runs away. Oldest
--first (`heal`) is deliberate: it also lets the fast-sync base roll forward past the spent
-notes, shortening every later witness rebuild.
+worth ~38× more, so the eventual payment spends ~38× fewer notes. Run continuously, the
+cost is paid ~30 s at a time in the background and the note count never runs away.
+Oldest-first (`heal`) is deliberate: it also lets the fast-sync base roll forward past
+the spent notes, shortening every later witness rebuild.
 
-- **Off by default.** It spends fees (~0.05 % of the merged value) and only works on
-  wallets whose seed this daemon holds — watch-only wallets are skipped entirely.
-- **Intended for treasuries**, not user wallets. Do not enable it on a multi-tenant
-  hosted daemon; enable it on the pool's own `walletd`.
-- It converges and stops: each merge removes 37 notes, so once a wallet is under the
-  ceiling no further merges happen. No perpetual fee drain.
-- Races are closed both ways. A payment holds `PROVING_IN_FLIGHT` across its whole
-  select→submit span so no merge starts during it; a payment arriving mid-merge waits on
-  `CONSOLIDATING` before selecting notes, so the two never pick the same note (which
-  would cost one of them a nullifier rejection, never funds).
+**Why it defaults to on.** The failure it prevents is severe and silent. A wallet that
+receives a coinbase note per block crosses into unusability without any symptom until
+someone tries to spend — and by then the cure costs as much as the disease. There is no
+cheap moment to start except early.
+
+**Why that is safe on a shared daemon.** The ceiling does the work: an ordinary wallet
+holds a handful of notes and is **never touched**, so it never pays a fee. Only wallets
+far past any normal usage — miners and treasuries, precisely the ones that suffer — are
+merged, at roughly **0.05 % of the merged value** in fees.
+
+- **Watch-only wallets are skipped entirely** — the daemon holds no seed and cannot
+  spend for them. Only custodial wallets are eligible.
+- **It converges and stops.** Each merge removes 37 notes, so once a wallet is under the
+  ceiling no further merges happen. There is no perpetual fee drain.
+- **Bounded CPU.** One merge (~30 core-seconds) per 60 s cooldown caps background
+  merging at about a third of the box, and it stands down completely while any payment
+  is proving.
+- **Races are closed both ways.** A payment holds `PROVING_IN_FLIGHT` across its whole
+  select→submit span, so no merge starts during it; a payment arriving mid-merge waits
+  on `CONSOLIDATING` before selecting notes. The two can never pick the same note —
+  which would cost one of them a nullifier rejection, never funds.
 
 `POST /api/wallet/consolidate` does exactly one such merge on demand — same code path
-(`consolidate_once`), so manual and automatic cannot drift.
+(`consolidate_once`), so the manual and automatic paths cannot drift.
+
+### Proving several transactions at once
+
+A chunked payment proves its transactions in groups rather than one at a time, each
+proof in its own rayon pool of `PROOF_THREADS_EACH` (2) threads. This exists because a
+single proof's parallel efficiency is sublinear, so handing one proof every core wastes
+some of them:
+
+| Threads given to one proof | Wall (38 spends) | Efficiency |
+| --- | --- | --- |
+| 1 | 91.7 s | 100 % |
+| 2 | 50.1 s | 91.5 % |
+| 3 | 37.6 s | 81 % |
+| 4 | 29.7 s | 77 % |
+
+Measured: 2 × 38-spend proofs take **63.9 s sequentially** (each on all 4 cores) vs
+**52.9 s grouped** (2 × 2 threads) — **1.21×**, and the gap widens with core count.
+
+A group of one keeps the global pool, so an ordinary single-transaction send is
+unchanged and never pays for this. Concurrency is bounded by cores **and** free memory
+(`PROOF_MEM_PER_EXTRA_MB`), so a squeezed box degrades to the sequential path rather
+than running out of memory.
 
 ### Sizing
 
@@ -311,16 +362,22 @@ payees plus change. **Use `send_many`:**
 
 Also worth doing:
 
-- **Run with `--auto-consolidate 500`. This is the single most important setting for a
-  pool.** A mining treasury accrues one coinbase note per block, and proving costs a flat
-  ~0.8 core-seconds *per note spent* (§4), so a treasury left to fragment turns a payout
+- **Leave `--auto-consolidate` on. This is the single most important thing for a pool.**
+  It is the default, so you get it by upgrading; `--no-auto-consolidate` disables it.
+  A mining treasury accrues one coinbase note per block, and proving costs a flat
+  ~2.4 core-seconds *per note spent* (§4), so a treasury left to fragment turns a payout
   into hundreds of transactions and hours of proving — measured live: 47 000 notes →
-  a 237-transaction, ~2-hour payment. Without this flag nothing else you do will fix that.
+  a 237-transaction, ~2-hour payment. Nothing else you do will fix that.
+  - Expect a **grind-down period** on an already-fragmented treasury: going from 47 000
+    notes to 500 is ~1 250 merges, roughly a day of background work and ~0.3 % of the
+    treasury in fees. The benefit arrives long before that finishes — note selection is
+    value-descending, so payments start drawing on the merged notes immediately.
 - **Run the daemon next to your node** (`--rpc-server 127.0.0.1:…`).
-- **Give it cores.** Proving parallelises at ~3.1/4 efficiency, so cores buy time almost
-  linearly. This is the only other real lever.
-- **Serialise your payout calls.** Running them concurrently does not speed anything up —
-  one proof already saturates every core — and it multiplies memory use.
+- **Give it cores.** Total proving work is ~2.4 core-seconds per note spent regardless of
+  how it is scheduled, so wall time is that divided by cores. After note count, this is
+  the only lever that matters.
+- **Do not run payout calls concurrently to go faster.** Proving is already parallel; the
+  daemon groups transaction proofs itself (see §4). Concurrent calls just multiply memory.
 
 ---
 

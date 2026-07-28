@@ -44,16 +44,22 @@ struct Cli {
     /// Keep custodial wallets under this many notes by merging their oldest notes in
     /// the background, one transaction at a time, whenever nothing else is proving.
     ///
-    /// For mining/pool treasuries. A wallet that takes one coinbase note per block grows
-    /// without bound, and Halo2 proving costs a flat ~0.8 core-seconds PER NOTE SPENT, so
-    /// a payout from a 47,000-note treasury needs thousands of spends — hours of proving
-    /// while somebody waits. Merging relocates that cost into the background and keeps
-    /// each note ~38x larger, so payouts spend ~38x fewer notes. Off by default: it
-    /// spends fees and only works on wallets whose seed this daemon holds.
+    /// ON BY DEFAULT. Halo2 proving costs a flat ~2.4 core-seconds PER NOTE SPENT, so a
+    /// wallet that accrues notes without bound (a miner or pool takes one coinbase note
+    /// per block) eventually cannot be spent from in reasonable time: measured live, a
+    /// 47,000-note treasury needed 237 transactions and ~2 hours for one payment. The
+    /// ceiling is what makes the default safe — an ordinary wallet holds a handful of
+    /// notes and is never touched, so it never pays a fee. Only wallets far past normal
+    /// usage are merged, at ~0.05% of the merged value. Watch-only wallets are skipped
+    /// (the daemon holds no seed and cannot spend for them).
     ///
-    /// Suggested: `--auto-consolidate 500`.
-    #[arg(long, value_name = "MAX_NOTES")]
-    auto_consolidate: Option<usize>,
+    /// Raise it to merge less often, lower it to keep wallets tighter.
+    #[arg(long, value_name = "MAX_NOTES", default_value_t = zkas_walletd::AUTO_CONSOLIDATE_DEFAULT)]
+    auto_consolidate: usize,
+    /// Turn background consolidation off entirely. Wallets then keep every note they
+    /// receive, and a note-heavy wallet's payments get slower without bound.
+    #[arg(long, default_value_t = false)]
+    no_auto_consolidate: bool,
     /// Offline admin: print each wallet's note/base/STRANDED-note report and exit.
     /// Run with the daemon stopped.
     #[arg(long, default_value_t = false)]
@@ -184,7 +190,7 @@ async fn main() {
         // Loopback / proxied deployment: no built-in TLS, no bearer gate.
         tls: None,
         require_bearer: None,
-        auto_consolidate: cli.auto_consolidate,
+        auto_consolidate: (!cli.no_auto_consolidate).then_some(cli.auto_consolidate),
     };
 
     if let Err(e) = serve(cfg, shutdown_rx).await {

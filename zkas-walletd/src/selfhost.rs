@@ -181,8 +181,9 @@ pub async fn run_selfhost(cfg: SelfHostConfig, shutdown: tokio::sync::oneshot::R
         wallet_secret: cfg.wallet_secret,
         tls,
         require_bearer: Some(token),
-        // Self-hosting is a personal wallet, not a treasury: no background merging.
-        auto_consolidate: None,
+        // Same default as the CLI: a self-hosted wallet that mines fragments exactly
+        // like a treasury, and the ceiling leaves an ordinary wallet untouched.
+        auto_consolidate: Some(crate::AUTO_CONSOLIDATE_DEFAULT),
     };
     crate::serve(daemon, shutdown).await
 }

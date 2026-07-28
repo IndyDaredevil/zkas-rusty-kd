@@ -185,7 +185,8 @@ pub struct Config {
     /// from the pairing QR. `None` = no bearer gate (loopback-only deployments).
     pub require_bearer: Option<String>,
     /// Keep custodial wallets below this many notes by merging their oldest notes in
-    /// the background. `None` (default) = off.
+    /// the background. `None` = off; the CLI defaults it to
+    /// [`AUTO_CONSOLIDATE_DEFAULT`] and takes `--no-auto-consolidate` to clear it.
     ///
     /// Why it exists: Halo2 proving costs a flat ~0.8 core-seconds **per note spent**
     /// and already saturates every core, so moving value out of a wallet made of many
@@ -940,10 +941,29 @@ async fn await_consolidation_clear() {
 /// Longest a payment waits behind a background consolidation before going ahead anyway.
 const CONSOLIDATE_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Gap between two background consolidation transactions. Proving one costs ~30 core-
-/// seconds; spacing them keeps the daemon's steady CPU well under one core so HTTP,
-/// scanning and the node all stay responsive on a small box.
-const CONSOLIDATE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(20);
+/// Note ceiling background consolidation keeps custodial wallets under, unless
+/// `--auto-consolidate N` overrides it or `--no-auto-consolidate` turns it off.
+///
+/// On by default because the failure it prevents is severe and silent: proving costs a
+/// flat ~2.4 core-seconds per note spent, so a wallet that accrues notes without bound
+/// (one coinbase note per block) eventually cannot be spent from in reasonable time —
+/// measured live, a 47 000-note treasury needed 237 transactions and ~2 hours to make a
+/// single payment. By the time an operator notices, the cure costs as much as the
+/// disease. Merging early, continuously, in the background is the only cheap moment.
+///
+/// The ceiling is what makes "on by default" safe on a shared daemon: an ordinary
+/// wallet holds a handful of notes and is **never touched**, so it never pays a fee.
+/// Only wallets far past any normal usage — miners and treasuries, exactly the ones
+/// that suffer — are merged, at ~0.05 % of the merged value in fees.
+pub const AUTO_CONSOLIDATE_DEFAULT: usize = 500;
+
+/// Gap between two background consolidation transactions.
+///
+/// A full 38-note merge is ~30 core-seconds of proving, so this sets the duty cycle:
+/// at 60 s, background merging can never take more than about a third of the box, and
+/// it yields entirely while any payment is proving. Tightening this is how you would
+/// re-create the CPU starvation that once stretched a 38-spend proof from 40 s to 92 s.
+const CONSOLIDATE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Poll interval when every wallet is already under its note ceiling.
 const CONSOLIDATE_IDLE_POLL: std::time::Duration = std::time::Duration::from_secs(120);
