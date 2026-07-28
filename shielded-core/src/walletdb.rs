@@ -269,12 +269,170 @@ pub struct WalletDb {
     /// chain clock. Only advances as blocks are actually ingested, so pending-spend
     /// expiry never runs ahead of what the wallet has really seen.
     last_daa: u64,
+    /// Complete subtree roots for this wallet's stream — see [`SubtreeCache`]. Kept in
+    /// step by `append_leaf`; built (and gated) by `build_subtree_cache`. Inactive until
+    /// built, and every consumer falls back to the replay when it cannot serve.
+    subtree: SubtreeCache,
 }
 
 /// How many owned notes keep a live witness. Beyond this, advancing every witness on
 /// every leaf would reintroduce the O(N·k) scan that once made a wallet op take 33
 /// minutes; the excess notes fall back to the on-demand rebuild.
 const MAX_LIVE_WITNESSES: usize = 256;
+
+/// Level at or above which [`SubtreeCache`] retains complete subtree roots. Below it a
+/// note's siblings are folded from its own `2^CACHE_LEVEL`-leaf window at spend time.
+///
+/// The trade is per-note work (`2^CACHE_LEVEL − 1` Sinsemilla hashes) against memory
+/// (`2·N/2^CACHE_LEVEL` hashes). A Sinsemilla combine is ~150–260 µs — it is *the* unit
+/// cost of everything here — so at 4: ~15 hashes ≈ 4 ms per note, and ~780 KB per 200 K
+/// leaves. Measured against the O(chain) replay at 200 K leaves: 29.4 s → 0.36 s.
+const CACHE_LEVEL: u8 = 4;
+
+/// The wallet's **complete subtree roots** — the structure that turns a spend witness
+/// from an O(chain) replay into O(depth) lookups.
+///
+/// The observation it rests on: for a note at position `p` witnessed at anchor `S`,
+/// every authentication sibling is the root of a subtree that is either **entirely
+/// below `S`** (hence complete, hence *immutable for the rest of time*) or **entirely
+/// above `S`** (hence the empty root) — with at most **one** exception, the single
+/// subtree whose range straddles `S`. So all but one sibling can be computed once and
+/// kept, and the straddler is `O(depth)` to derive per anchor.
+///
+/// Roots are accumulated by a Merkle-mountain-range sweep: append a leaf, then merge
+/// equal-level neighbours while the top of [`Self::peaks`] is the true left sibling.
+/// That is exactly **one combine per leaf, amortized** — the same per-leaf cost the tip
+/// mirror [`WalletDb::tree`] already pays — and every merge yields one complete (so
+/// permanently valid) subtree root.
+///
+/// Soundness does not rest on this reasoning being right: a freshly built cache is
+/// gated on reproducing the independently-maintained tip root
+/// ([`WalletDb::build_subtree_cache`]), and every path it serves is re-verified against
+/// the anchor root before use. A wrong cache declines; it cannot mis-witness.
+#[derive(Default, Clone)]
+struct SubtreeCache {
+    /// `levels[l]` holds complete subtree roots at level `l`, dense and in increasing
+    /// index order starting at absolute index `first[l]`. Only `l >= CACHE_LEVEL` is
+    /// populated.
+    levels: Vec<Vec<MerkleHashOrchard>>,
+    first: Vec<u64>,
+    /// Merkle-mountain-range peaks: the maximal complete subtrees not yet merged with a
+    /// right sibling, left to right. Seeded from the fast-sync base frontier so a
+    /// compacted wallet still resolves siblings that reach below its stored stream.
+    peaks: Vec<(u8, u64, MerkleHashOrchard)>,
+    /// Absolute leaf count folded in so far.
+    upto: u64,
+    /// Whether the cache may be used. Cleared whenever anything invalidates it.
+    active: bool,
+    /// A build was attempted and rejected. Prevents re-paying an O(chain) build every
+    /// sync tick for a wallet whose shape the cache cannot serve.
+    failed: bool,
+}
+
+impl SubtreeCache {
+    /// Record a complete subtree root, keeping each level densely indexed. Returns
+    /// `false` if that would leave a gap — the caller then abandons the cache rather
+    /// than serve from a structure it cannot index soundly.
+    fn record(&mut self, level: u8, idx: u64, h: MerkleHashOrchard) -> bool {
+        let l = level as usize;
+        if self.levels.len() <= l {
+            self.levels.resize(l + 1, Vec::new());
+            self.first.resize(l + 1, 0);
+        }
+        if self.levels[l].is_empty() {
+            self.first[l] = idx;
+        } else if self.first[l] + self.levels[l].len() as u64 != idx {
+            return false;
+        }
+        self.levels[l].push(h);
+        true
+    }
+
+    fn get(&self, level: u8, idx: u64) -> Option<MerkleHashOrchard> {
+        let l = level as usize;
+        let lv = self.levels.get(l)?;
+        lv.get(idx.checked_sub(*self.first.get(l)?)? as usize).copied()
+    }
+
+    /// Fold one leaf into the mountain range, recording every subtree it completes.
+    fn push_leaf(&mut self, pos: u64, leaf: MerkleHashOrchard) -> bool {
+        let mut node = (0u8, pos, leaf);
+        while let Some(&(tl, ti, th)) = self.peaks.last() {
+            // Merge only with a genuine left sibling: same level, even index, adjacent.
+            if tl != node.0 || ti % 2 != 0 || ti + 1 != node.1 {
+                break;
+            }
+            self.peaks.pop();
+            let combined = MerkleHashOrchard::combine(Level::from(tl), &th, &node.2);
+            node = (tl + 1, ti >> 1, combined);
+            if node.0 >= CACHE_LEVEL && !self.record(node.0, node.1, node.2) {
+                return false;
+            }
+        }
+        self.peaks.push(node);
+        self.upto = pos + 1;
+        true
+    }
+
+    /// Seed the peaks with the complete subtrees of `[0, size)` summarised by a
+    /// fast-sync base frontier, so a compacted wallet can still resolve the
+    /// left-hand siblings that reach below its stored leaves.
+    ///
+    /// A frontier holds its last leaf plus the left siblings ("ommers") along that
+    /// leaf's path. Folding the leaf upward through the run of set bits of
+    /// `pos = size - 1` yields the rightmost peak; each remaining ommer is itself a
+    /// peak at the level it sits on. Peaks are pushed left to right (highest level
+    /// first), which is the order the mountain range expects.
+    fn seed_from_frontier(&mut self, f: &Frontier<MerkleHashOrchard, TREE_DEPTH>, size: u64) -> bool {
+        let Some(nef) = f.value() else {
+            return size == 0; // an empty frontier can only describe an empty prefix
+        };
+        let pos = size.wrapping_sub(1);
+        if u64::from(nef.position()) != pos {
+            return false;
+        }
+        let ommers = nef.ommers();
+        let mut digest = *nef.leaf();
+        let mut lvl = 0u8;
+        let mut i = 0usize;
+        // Fold up through the trailing run of set bits: each set bit means the left
+        // sibling at that level is a *past* subtree, supplied by the next ommer.
+        while (pos >> lvl) & 1 == 1 {
+            let Some(o) = ommers.get(i) else { return false };
+            digest = MerkleHashOrchard::combine(Level::from(lvl), o, &digest);
+            i += 1;
+            lvl += 1;
+        }
+        let rightmost = (lvl, pos >> lvl, digest);
+        // Every remaining ommer is a peak: the left sibling at a level whose bit is set.
+        let mut rest = Vec::new();
+        for l in (lvl + 1)..=TREE_DEPTH {
+            if i >= ommers.len() {
+                break;
+            }
+            if (pos >> l) & 1 == 1 {
+                rest.push((l, (pos >> l) - 1, ommers[i]));
+                i += 1;
+            }
+        }
+        if i != ommers.len() {
+            return false; // did not account for every ommer — refuse to guess
+        }
+        // Left to right = highest level first, then the rightmost peak.
+        rest.reverse();
+        self.peaks = rest;
+        self.peaks.push(rightmost);
+        // Below-base subtrees are complete too, so they are legitimate cache entries.
+        let seeded: Vec<(u8, u64, MerkleHashOrchard)> = self.peaks.clone();
+        for (l, idx, h) in seeded {
+            if l >= CACHE_LEVEL && !self.record(l, idx, h) {
+                return false;
+            }
+        }
+        self.upto = size;
+        true
+    }
+}
 
 /// History rows kept (oldest dropped beyond this). A pool/miner wallet mints one
 /// row per block, so an uncapped history would grow by ~86K rows/day at 1 BPS;
@@ -314,6 +472,7 @@ impl WalletDb {
             history_enabled: true,
             pending_spends: Vec::new(),
             last_daa: 0,
+            subtree: SubtreeCache::default(),
         })
     }
 
@@ -353,6 +512,7 @@ impl WalletDb {
             history_enabled: true,
             pending_spends: Vec::new(),
             last_daa: 0,
+            subtree: SubtreeCache::default(),
         })
     }
 
@@ -1134,6 +1294,9 @@ impl WalletDb {
         self.leaves = leaves;
         self.base_frontier = older.base_frontier.clone();
         self.base_size = older.base_size;
+        // The stream's prefix and base both moved: the cache was seeded from the frontier
+        // this graft just replaced, so retire it and let it be rebuilt.
+        self.subtree = SubtreeCache::default();
         // The decoded cache mirrors `leaves` index-for-index — rebuild it lazily.
         self.decoded = OnceCell::new();
         Ok(gap as u64)
@@ -1286,6 +1449,12 @@ impl WalletDb {
         }
         // `append` only errors when the tree is full (2^32 leaves) — unreachable.
         let _ = self.tree.append(leaf);
+        // Keep the complete-subtree cache in step: one combine per leaf, amortized. If
+        // the mountain range ever refuses a leaf the cache is dropped, not patched — a
+        // half-updated cache must never be consulted.
+        if self.subtree.active && self.subtree.upto == self.size && !self.subtree.push_leaf(self.size, leaf) {
+            self.subtree = SubtreeCache { failed: true, ..Default::default() };
+        }
         if let Some(note) = owned {
             let nullifier = note.nullifier(&self.fvk).to_bytes();
             self.notes.push(OwnedNote { note, position: self.size, nullifier });
@@ -1336,6 +1505,181 @@ impl WalletDb {
         Some(MerklePath::from_parts(u64::from(path.position()) as u32, auth))
     }
 
+    /// Build the [`SubtreeCache`] over this wallet's whole stream. One Sinsemilla hash
+    /// per leaf, paid **once**; `append_leaf` then keeps it current at that same
+    /// per-leaf cost the tip mirror already pays, so steady-state sync gets no slower.
+    ///
+    /// This is O(chain) — run it off the request path (the daemon warms it on a blocking
+    /// thread, never on the async runtime; see the 2026-07-12 freeze).
+    ///
+    /// **The gate:** the finished cache must reproduce `self.tree`'s root — a value
+    /// maintained by a completely independent code path (one `CommitmentTree::append`
+    /// per ingested leaf). If it does not, the cache is discarded and every consumer
+    /// keeps using the replay. So a bug in the mountain range, in the frontier seeding,
+    /// or in the indexing cannot produce a wrong witness; it can only fail to help.
+    pub fn build_subtree_cache(&mut self) {
+        if self.subtree.failed || (self.subtree.active && self.subtree.upto == self.size) {
+            return;
+        }
+        let reject = SubtreeCache { failed: true, ..Default::default() };
+        let mut c = SubtreeCache::default();
+        if !c.seed_from_frontier(&self.base_frontier, self.base_size) {
+            self.subtree = reject;
+            return;
+        }
+        {
+            let leaves = self.decoded_leaves();
+            let base = self.base_size;
+            for (i, leaf) in leaves.iter().enumerate() {
+                if !c.push_leaf(base + i as u64, *leaf) {
+                    self.subtree = reject;
+                    return;
+                }
+            }
+        }
+        c.active = true;
+        let ok = self.root_from(&c, self.size).is_some_and(|r| r == self.tree.root());
+        self.subtree = if ok { c } else { reject };
+    }
+
+    /// Whether the cache can serve witnesses at `matured` (used by callers to decide
+    /// whether a spend needs the slow path at all).
+    pub fn subtree_cache_ready(&self, matured: u64) -> bool {
+        self.subtree.active && self.subtree.upto >= matured
+    }
+
+    /// Fold the `2^CACHE_LEVEL`-leaf window starting at `start` (which must be window
+    /// aligned), truncated at `cap`, returning its subtree root at `CACHE_LEVEL`. When
+    /// `want` is given, records the authentication siblings of position `p` for every
+    /// level *below* `CACHE_LEVEL` as it goes.
+    fn fold_window(&self, start: u64, cap: u64, p: u64, mut want: Option<&mut [MerkleHashOrchard]>) -> Option<MerkleHashOrchard> {
+        let end = (start + (1u64 << CACHE_LEVEL)).min(cap);
+        let lo = start.checked_sub(self.base_size)? as usize;
+        let hi = end.checked_sub(self.base_size)? as usize;
+        let leaves = self.decoded_leaves();
+        if hi > leaves.len() || hi <= lo {
+            return None;
+        }
+        let mut cur: Vec<MerkleHashOrchard> = leaves[lo..hi].to_vec();
+        for lvl in 0..CACHE_LEVEL {
+            if let Some(w) = want.as_deref_mut() {
+                let sib = (p >> lvl) ^ 1;
+                let origin = start >> lvl;
+                w[lvl as usize] = match sib.checked_sub(origin) {
+                    Some(k) if (k as usize) < cur.len() => cur[k as usize],
+                    _ => MerkleHashOrchard::empty_root(Level::from(lvl)),
+                };
+            }
+            let mut next = Vec::with_capacity(cur.len().div_ceil(2));
+            let mut k = 0;
+            while k < cur.len() {
+                let left = cur[k];
+                let right = cur.get(k + 1).copied().unwrap_or_else(|| MerkleHashOrchard::empty_root(Level::from(lvl)));
+                next.push(MerkleHashOrchard::combine(Level::from(lvl), &left, &right));
+                k += 2;
+            }
+            if next.is_empty() {
+                next.push(MerkleHashOrchard::empty_root(Level::from(lvl + 1)));
+            }
+            cur = next;
+        }
+        cur.first().copied()
+    }
+
+    /// The chain of **straddling** subtree roots at `matured`: `out[l]` is the root of
+    /// the one level-`l` node whose leaf range contains `matured`, for `l >= CACHE_LEVEL`.
+    /// Every other sibling a path needs is complete (cache) or empty. O(depth).
+    fn straddle_chain(&self, c: &SubtreeCache, matured: u64) -> Option<Vec<MerkleHashOrchard>> {
+        let h = CACHE_LEVEL as usize;
+        let mut out = vec![MerkleHashOrchard::empty_leaf(); TREE_DEPTH as usize + 1];
+        let win = (matured >> CACHE_LEVEL) << CACHE_LEVEL;
+        out[h] = if win >= matured {
+            // `matured` is window aligned: the straddler is entirely empty.
+            MerkleHashOrchard::empty_root(Level::from(CACHE_LEVEL))
+        } else {
+            self.fold_window(win, matured, 0, None)?
+        };
+        for l in (h + 1)..=(TREE_DEPTH as usize) {
+            let j = matured >> l;
+            let cl = (l - 1) as u8;
+            out[l] = if (matured >> cl) == 2 * j {
+                // `matured` lies in the left child; the right child is wholly empty.
+                MerkleHashOrchard::combine(Level::from(cl), &out[l - 1], &MerkleHashOrchard::empty_root(Level::from(cl)))
+            } else {
+                MerkleHashOrchard::combine(Level::from(cl), &c.get(cl, 2 * j)?, &out[l - 1])
+            };
+        }
+        Some(out)
+    }
+
+    /// The tree root at exactly `matured` leaves, derived from the cache in O(depth).
+    fn root_from(&self, c: &SubtreeCache, matured: u64) -> Option<MerkleHashOrchard> {
+        self.straddle_chain(c, matured).map(|s| s[TREE_DEPTH as usize])
+    }
+
+    /// Authentication paths for `positions` at `matured`, served from the
+    /// [`SubtreeCache`]: O(depth) lookups plus one `2^CACHE_LEVEL`-leaf fold per note,
+    /// instead of an O(chain) Sinsemilla replay. Returns `None` if the cache cannot
+    /// cover this request at all, in which case the caller uses the replay.
+    ///
+    /// As with the batch builder, each assembled path is verified to reproduce the
+    /// anchor root and declined individually if it does not.
+    fn subtree_paths(&self, positions: &[u64], matured: u64) -> Option<Vec<Option<MerklePath>>> {
+        if !self.subtree_cache_ready(matured) || matured <= self.base_size {
+            return None;
+        }
+        let c = &self.subtree;
+        let straddle = self.straddle_chain(c, matured)?;
+        let root = straddle[TREE_DEPTH as usize];
+        let leaves = self.decoded_leaves();
+        let mut out = vec![None; positions.len()];
+        for (i, &p) in positions.iter().enumerate() {
+            let Some(rel) = p.checked_sub(self.base_size) else { continue };
+            if p >= matured || rel as usize >= leaves.len() {
+                continue;
+            }
+            let mut auth = [MerkleHashOrchard::empty_leaf(); TREE_DEPTH as usize];
+            // Below CACHE_LEVEL: fold the note's own window.
+            if self.fold_window((p >> CACHE_LEVEL) << CACHE_LEVEL, matured, p, Some(&mut auth[..CACHE_LEVEL as usize])).is_none() {
+                continue;
+            }
+            // At and above CACHE_LEVEL: complete (cache), empty, or the straddler.
+            let mut ok = true;
+            for l in (CACHE_LEVEL as usize)..(TREE_DEPTH as usize) {
+                let sib = (p >> l) ^ 1;
+                auth[l] = if ((sib + 1) << l) <= matured {
+                    match c.get(l as u8, sib) {
+                        Some(v) => v,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                } else if (sib << l) >= matured {
+                    MerkleHashOrchard::empty_root(Level::from(l as u8))
+                } else {
+                    straddle[l]
+                };
+            }
+            if !ok {
+                continue;
+            }
+            // Verify against the anchor before handing it to a spend.
+            let mut node = leaves[rel as usize];
+            for (l, sib) in auth.iter().enumerate() {
+                node = if (p >> l) & 1 == 0 {
+                    MerkleHashOrchard::combine(Level::from(l as u8), &node, sib)
+                } else {
+                    MerkleHashOrchard::combine(Level::from(l as u8), sib, &node)
+                };
+            }
+            if node == root {
+                out[i] = Some(MerklePath::from_parts(p as u32, auth));
+            }
+        }
+        Some(out)
+    }
+
     /// Build membership paths for **many** owned notes in a SINGLE pass over the leaf
     /// stream, each rooted at `matured_leaves`. This is the batch form of
     /// [`Self::witness_path_at`]: that rebuilds the tree from the base frontier up to
@@ -1359,6 +1703,15 @@ impl WalletDb {
     /// should rebuild, or a position outside `[base_size, matured_leaves)`.
     pub fn witness_paths_at(&self, positions: &[u64], matured_leaves: u64) -> Vec<Option<MerklePath>> {
         let n = positions.len();
+        // Fastest path: complete subtree roots already retained, so every sibling is a
+        // lookup (see `SubtreeCache`). Serve only if it covers EVERY requested note —
+        // a partial answer would send the caller down the O(chain) replay anyway, and
+        // paying both is worse than paying one.
+        if let Some(cached) = self.subtree_paths(positions, matured_leaves) {
+            if cached.iter().all(|p| p.is_some()) {
+                return cached;
+            }
+        }
         let mut out: Vec<Option<MerklePath>> = vec![None; n];
         let base = self.base_size;
         let leaves = self.decoded_leaves();
@@ -2263,7 +2616,30 @@ mod tests {
                 if sel.is_empty() {
                     continue;
                 }
+                // The same assertions must hold with the complete-subtree cache active:
+                // it is a *third* independent derivation of the same paths, so build it
+                // here and let the shared body below compare all of them. `w2` mirrors
+                // `w` exactly, differing only in having the cache.
+                let mut w2 = WalletDb::from_seed(mine).unwrap();
+                w2.leaves = w.leaves.clone();
+                w2.notes = w.notes.to_vec();
+                w2.size = w.size;
+                w2.tree = w.tree.clone();
+                w2.base_frontier = w.base_frontier.clone();
+                w2.base_size = w.base_size;
+                w2.build_subtree_cache();
+                assert!(w2.subtree.active, "cache must pass its own root gate at base={base}");
+                let cached = w2.witness_paths_at(&sel, cutoff);
+
                 let batch = w.witness_paths_at(&sel, cutoff);
+                for (k, &pos) in sel.iter().enumerate() {
+                    let want = w.witness_path_at(pos, cutoff).expect("per-note witness");
+                    let got = cached[k].clone().expect("cache produced a path");
+                    assert_eq!(got.auth_path(), want.auth_path(), "CACHE auth path base={base} cutoff={cutoff} pos={pos}");
+                    assert_eq!(got.position(), want.position(), "CACHE position base={base} cutoff={cutoff} pos={pos}");
+                    let cm = cmx_of[&pos];
+                    assert_eq!(got.root(cm), want.root(cm), "CACHE root base={base} cutoff={cutoff} pos={pos}");
+                }
                 for (k, &pos) in sel.iter().enumerate() {
                     let want = w.witness_path_at(pos, cutoff).expect("per-note witness");
                     let got = batch[k].clone().expect("batch produced a path");

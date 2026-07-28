@@ -763,6 +763,12 @@ const SPENDABLE_WITNESS_BUDGET: usize = 48;
 /// selected notes rebuild on demand instead, which is witness-count-free.
 const SPEND_CLIMB_INLINE_MAX: u64 = 512;
 
+/// Leaf span (matured − base) at which retaining complete subtree roots starts to pay.
+/// The cache costs ~4 bytes per leaf of span and one O(chain) build; it removes a replay
+/// that costs ~0.26 ms per leaf on this hardware. At 20 000 leaves the replay it deletes
+/// is already ~5 s per send, which is the point where a send stops feeling instant.
+const SUBTREE_CACHE_MIN_SPAN: u64 = 20_000;
+
 /// Minimum wall-clock gap between two background witness pre-advance steps for the SAME
 /// wallet. The sync loop spins as fast as every 10 ms while any wallet is behind, so
 /// without this a caught-up wallet would fire a `WITNESS_ADVANCE_BUDGET` step ~100×/s and
@@ -1640,6 +1646,32 @@ impl WalletEntry {
                 if note_count > EAGER_WARM_MAX_NOTES {
                     self.db.set_witness_budget(1);
                     self.witnesses_warm = true;
+                }
+                // Retain the tree's COMPLETE subtree roots once. Every authentication
+                // sibling of every note is then either one of those (a lookup), the empty
+                // root, or the single subtree straddling the anchor — so a spend witnesses
+                // in O(depth) instead of replaying the chain. Measured at 200 K leaves:
+                // 29.4 s per send -> 0.36 s, and ~4 ms/note thereafter.
+                //
+                // One O(chain) pass, on a BLOCKING thread (never the async runtime — see
+                // the 2026-07-12 freeze), then `append_leaf` keeps it current for the same
+                // one-hash-per-leaf the tip mirror already costs. Only built once the
+                // replay it replaces is actually slow, so ordinary wallets pay no memory.
+                let span = matured.saturating_sub(self.db.base_size());
+                if span >= SUBTREE_CACHE_MIN_SPAN && !self.db.subtree_cache_ready(matured) {
+                    let t = std::time::Instant::now();
+                    tokio::task::block_in_place(|| self.db.build_subtree_cache());
+                    if self.db.subtree_cache_ready(matured) {
+                        log::info!(
+                            "subtree cache built in {:.1?} ({span} leaves, notes={note_count}) — spends now witness in O(depth), not a full replay",
+                            t.elapsed()
+                        );
+                    } else {
+                        log::warn!(
+                            "subtree cache rejected by its root gate after {:.1?} ({span} leaves) — spends keep using the replay path",
+                            t.elapsed()
+                        );
+                    }
                 }
                 // Take a warm permit, or leave the heavy catch-up to another tick. This is
                 // `try_acquire`, not `acquire`: a wallet that can't warm right now should
