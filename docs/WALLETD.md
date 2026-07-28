@@ -17,6 +17,78 @@ wallet can embed it.
 
 ---
 
+## 0. Read this first: payments are sized in **notes**, not coins
+
+Almost every surprise operators hit comes from one fact:
+
+> **A transaction can spend at most 38 notes. That is a count of notes, not an amount
+> of ZKAS.** How much value one transaction can move is `38 × your average note size`.
+
+Two wallets holding the same balance behave completely differently:
+
+| Wallet | Avg. note | Max per transaction | Moving 100 000 ZKAS |
+| --- | --- | --- | --- |
+| Pool treasury, raw coinbase notes | ~57 ZKAS | **~2 166 ZKAS** | 1 754 notes → **47 transactions** |
+| Same treasury, consolidated | ~2 166 ZKAS | **~82 300 ZKAS** | 47 notes → **2 transactions** |
+
+And proving cost follows the note count, not the amount:
+
+```
+wall time  =  2.4 core-seconds  ×  notes spent  ÷  effective cores
+```
+
+So a fragmented wallet is slow *no matter how small the payment*, and consolidating is
+the only thing that changes the outcome by an order of magnitude. This is why
+`--auto-consolidate` is **on by default** (§4).
+
+### Where 38 comes from
+
+It is a **bytes** limit, not an economic one. Kaspa charges transient mass at 4 per
+serialized byte and caps a standard transaction at 500 000 mass, so the bundle must fit
+`500 000 / 4 − 256 = 124 744` bytes. Each Orchard action costs:
+
+| Part | Bytes per action |
+| --- | --- |
+| Action data (`ActionWire`) | 884 |
+| Its slice of the Halo2 proof | 2 272 |
+| **Total** | **3 156** |
+
+Plus a fixed 117-byte header and a 2 720-byte proof preamble, so
+`wire_len(n) = 2 837 + 3 156 n`:
+
+- `n = 38` → 122 765 bytes ✓
+- `n = 39` → 125 921 bytes ✗
+
+Hence **38**. Raising it would need a consensus change to the mass cap, and it would buy
+nothing anyway — proving cost per spend is flat from 4 to 38, so the same notes cost the
+same whether they ride in one transaction or four (§4).
+
+### The three caps, and which one applies
+
+| Cap | Value | Applies to |
+| --- | --- | --- |
+| `max_spends_per_tx()` | **38** | notes consumed (inputs) |
+| `max_actions_per_tx()` | **38** | `max(spends, outputs)` — what mass is charged on |
+| `max_payees_per_tx()` | **37** | recipients in one `send_many` (+1 output for change) |
+
+A bundle carries `max(spends, outputs)` actions. So one transaction can spend 38 notes
+to pay 1 recipient, **or** spend 2 notes to pay 37 recipients — same mass ceiling, very
+different proving cost, because cost tracks *spends*.
+
+### Fees are per-byte, so per-action
+
+Minimum relay fee is charged on size, which means on action count:
+
+| Actions | Min relay fee |
+| --- | --- |
+| 1–2 | 1 855 400 sompi (0.0186 ZKAS) |
+| 38 | 24 578 600 sompi (0.2458 ZKAS) |
+
+The wallet raises any fee you pass to this floor automatically (`chunk_fee`). Passing a
+lower `fee` does not save money — it just gets corrected.
+
+---
+
 ## 1. Running it
 
 ```bash
@@ -339,7 +411,40 @@ than running out of memory.
 
 ---
 
-## 6. Integrating a mining pool or payout service
+## 6. Integration playbooks
+
+Two operator shapes dominate and they want opposite things. A **mining pool** has one
+fragmenting treasury and pays many recipients at once. An **exchange** has many customer
+balances, pays one recipient at a time, and must never be slow at it.
+
+Both are governed by §0: cost tracks **notes spent**, and one transaction spends 38.
+
+### Key material: there are no mnemonics in ZKas
+
+Worth stating plainly before either playbook, because integrators assume otherwise:
+**ZKas has no seed phrase / BIP-39 anywhere** — not in `zkas-walletd`, not in
+`shielded-core`, not in the SDK, not in the wallet apps. The unit of key material is a
+**raw 32-byte seed, hex-encoded**:
+
+```jsonc
+POST /api/wallet/create            // daemon generates 32 random bytes (OsRng)
+POST /api/wallet/import            // { "seed_hex": "<64 hex chars>", "birthday": 0 }
+GET  /api/wallet/reveal            // returns seed_hex — treat as the private key it is
+```
+
+You **can** derive that seed from a BIP-39 mnemonic on your own side and post the result
+as `seed_hex` — that is a perfectly good way to get a human-transcribable cold backup.
+But understand what you are doing: ZKas defines no derivation standard, so the mnemonic
+is **your private convention**. The official ZKas wallet cannot restore from it. For an
+exchange hot wallet that never needs to be opened in the consumer app, that is fine;
+just document your derivation and test the round-trip before you fund anything.
+
+`birthday` is the block height to start scanning from. Set it to the tip when creating a
+fresh wallet — omitting it scans the whole chain for funds that do not exist.
+
+---
+
+### 6a. Mining pool / payout service
 
 The single-recipient shape is the wrong one for payouts. Paying N miners with N calls to
 `/api/wallet/send` means N bundles: **N Halo 2 proofs, N witness sets, N relay fees,
@@ -378,6 +483,160 @@ Also worth doing:
   the only lever that matters.
 - **Do not run payout calls concurrently to go faster.** Proving is already parallel; the
   daemon groups transaction proofs itself (see §4). Concurrent calls just multiply memory.
+
+#### Recommended pool configuration
+
+```bash
+zkas-walletd \
+  --network mainnet \
+  --rpc-server 127.0.0.1:16110 \
+  --listen 127.0.0.1:8501 \
+  --wallet-dir /var/lib/zkas/wallets \
+  --wallet-secret "$ZKAS_WALLET_SECRET" \
+  --auto-consolidate 300
+```
+
+`--auto-consolidate` is already on at 500; 300 is tighter because a treasury churns hard.
+Do **not** pass `--no-auto-consolidate`.
+
+#### Worked example: paying 500 miners, 100 000 ZKAS total
+
+The treasury holds raw coinbase notes (~57 ZKAS each), so 100 000 ZKAS needs **1 754
+notes** — and that note count, not the amount, decides everything:
+
+| Approach | Transactions | Proving (4 cores) | Fees |
+| --- | --- | --- | --- |
+| 500 × `send`, one call per miner | 500+ | 500+ proofs, serial | 500 × 0.019–0.246 ZKAS |
+| 1 × `send_many`, unconsolidated | **47** (spend-bound: 1 754 ÷ 38) | 1 754 spends ≈ **70 min** | 47 × 0.246 ≈ 11.6 ZKAS |
+| 1 × `send_many`, **consolidated** | **14** (payee-bound: 500 ÷ 37) | ~47 spends ≈ **2 min** | 14 × 0.246 ≈ 3.4 ZKAS |
+
+Consolidated, the batch stops being spend-bound and becomes payee-bound — the cheap
+direction, since cost tracks spends and not outputs.
+
+```bash
+curl -X POST -H "X-Wallet-Token: $TOK" -H 'Content-Type: application/json' \
+  -d '{"payees":[
+        {"to":"zkas:...miner1...","amount_fc":12.5},
+        {"to":"zkas:...miner2...","amount_fc":8.25}
+      ]}' \
+  http://127.0.0.1:8501/api/wallet/send_many
+```
+
+Batches past 37 payees are split for you; the response carries `txids` and `tx_count`.
+
+#### Pool health checks
+
+```bash
+# the number that decides your payout time
+curl -s -H "X-Wallet-Token: $TOK" http://127.0.0.1:8501/api/status | jq '.notes'
+
+grep "auto-consolidate: merged" walletd.log | tail -5      # merging keeping up?
+grep -E "send: (building|tx .* proven)" walletd.log | tail  # payout in progress
+```
+
+If `notes` climbs steadily while `auto-consolidate: merged` lines are rare, merging is
+being starved — check whether something keeps a payment permanently in flight.
+
+---
+
+### 6b. Exchange / custodial service
+
+#### The deposit-attribution problem — read before designing anything
+
+**One wallet has exactly one address.** `/api/wallet/address` returns
+`address_at(0, External)` and always the same string; there is no endpoint that mints a
+fresh per-customer address. So there are two workable designs, and one of them does not
+scale:
+
+| Design | How | Verdict |
+| --- | --- | --- |
+| **One wallet per customer** | a token per customer, each its own `.scan` file | **Does not scale.** Every wallet syncs independently; 350 loaded wallets already strain a 4-core box. Fine for hundreds, not for hundreds of thousands. |
+| **One deposit wallet + memo** | every customer gets the same address plus a unique memo/payment-id | **Use this.** The XRP/XLM destination-tag pattern. One wallet, one scan. |
+
+Memos survive on the receive side and are readable per transaction:
+
+```bash
+# enable the readable record first — off by default
+curl -X POST -H "X-Wallet-Token: $TOK" -H 'Content-Type: application/json' \
+  -d '{"recoverable_history":true}' http://127.0.0.1:8501/api/wallet/settings
+
+curl -s -H "X-Wallet-Token: $TOK" http://127.0.0.1:8501/api/wallet/history \
+  | jq '.[] | select(.kind=="received") | {txid, amount, memo}'
+```
+
+Memos are up to 512 bytes and are **encrypted to the recipient** — nobody but your wallet
+sees them on-chain. Two caveats: a customer who forgets the memo produces an
+unattributable deposit (have a manual reconciliation path, as XRP exchanges do), and
+`recoverable_history` must be on or no memo is recorded to read back.
+
+#### Recommended exchange configuration
+
+```bash
+zkas-walletd \
+  --network mainnet \
+  --rpc-server 127.0.0.1:16110 \
+  --listen 127.0.0.1:8501 \
+  --wallet-dir /var/lib/zkas/wallets \
+  --wallet-secret "$ZKAS_WALLET_SECRET" \   # MANDATORY: seeds are plaintext without it
+  --auto-consolidate 200
+```
+
+Never pass `--allow-default-token` on a custodial daemon: it makes a request carrying no
+`X-Wallet-Token` resolve to a shared "default" wallet.
+
+#### Yes, an exchange needs consolidation — more than a pool does
+
+This is the part integrators get wrong. **Every customer deposit is one note.** A hot
+wallet taking 10 000 deposits holds 10 000 notes, which is exactly the pool treasury
+failure with a different cause: a withdrawal then needs hundreds of spends and minutes of
+proving, and it gets worse every day you operate. `--auto-consolidate` is what keeps a
+withdrawal at 1–3 spends (~2–7 s) instead of drifting into minutes. Leave it on, and set
+the ceiling **lower** than a pool would (200), because withdrawal latency is customer-
+visible in a way a payout run is not.
+
+#### Deposits
+
+Poll `/api/status`. Two fields matter and they are not the same:
+
+| Field | Meaning |
+| --- | --- |
+| `balance` | everything the wallet has seen |
+| `spendable` | notes past the maturity anchor — what a withdrawal can actually use |
+
+**Credit on `spendable`, not `balance`.** A note needs ~10 minutes
+(`DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK` blue blocks) before it can be spent. Crediting on
+`balance` lets a customer withdraw against value the daemon cannot yet move, and the
+withdrawal fails with `insufficient matured funds`.
+
+The mempool loop surfaces an incoming payment within about a second of the sender hitting
+send, so a zero-confirmation preview exists — treat it as a UI hint, never as credit.
+
+#### Withdrawals
+
+```bash
+curl -X POST -H "X-Wallet-Token: $TOK" -H 'Content-Type: application/json' \
+  -d '{"to":"zkas:...customer...","amount_sompi":25000000000,"memo":"withdrawal 88213"}' \
+  http://127.0.0.1:8501/api/wallet/send
+```
+
+- **`tx_count` may be > 1.** A payment needing more than 38 notes is split across
+  transactions; every id is in `txids`. Record all of them, not just `txid`.
+- **Handle the partial-failure shape.** If the node rejects a later chunk you get
+  HTTP 502 with `{"error": …, "txids": [...], "sent_sompi": N}` — money **did** move.
+  Reconcile against `txids`; never assume all-or-nothing.
+- **Serialise withdrawals per wallet.** Two concurrent sends on one wallet can select the
+  same notes and the second is rejected for reusing a nullifier. Across *different*
+  wallets, concurrency is fine.
+- **Prefer `amount_sompi`** (integer) to `amount_fc` (float). `amount_sompi_exact` in the
+  response is the authoritative string form.
+
+#### Cold storage
+
+Sweep hot → cold with an ordinary `send`. Because cost tracks notes, sweeping a large
+balance out of a *fragmented* wallet is the worst case in the entire system — which is
+the same reason to keep the hot wallet consolidated. Back the cold seed up as `seed_hex`
+(or your own mnemonic encoding of it, per the note above) and verify the restore before
+funding.
 
 ---
 
