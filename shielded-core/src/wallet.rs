@@ -569,14 +569,61 @@ pub mod build {
         recoverable: bool,
         memo: [u8; 512],
     ) -> Result<Vec<u8>, BuildError> {
+        build_wallet_payment_multi(
+            owner_seed,
+            inputs,
+            &[(recipient_addr, amount, memo)],
+            fee,
+            network_domain,
+            tx_context,
+            recoverable,
+        )
+    }
+
+    /// As [`build_wallet_payment`], but paying **several recipients from one
+    /// transaction**.
+    ///
+    /// A payout run — a mining pool crediting its miners — otherwise costs one bundle
+    /// per payee: one Halo 2 proof, one witness set and one relay fee each, serially.
+    /// Batched, the whole run costs one. An Orchard bundle carries
+    /// `max(spends, outputs)` actions, so `k` payees means `k + 1` outputs (the payees
+    /// plus change) and therefore at least `k + 1` actions — the caller plans against
+    /// the same standard-mass ceiling it already uses for spends.
+    ///
+    /// Each payee's note is encrypted to that payee alone, so recipients learn nothing
+    /// about each other's amounts; `recoverable` governs only the *sender's* later
+    /// ability to recover the batch through its own OVK. Fails if `payees` is empty, if
+    /// any address is malformed, or if the inputs do not cover `sum(amounts) + fee`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_wallet_payment_multi(
+        owner_seed: [u8; 32],
+        inputs: Vec<(Note, MerklePath)>,
+        payees: &[([u8; 43], u64, [u8; 512])],
+        fee: u64,
+        network_domain: &[u8; 32],
+        tx_context: &[u8],
+        recoverable: bool,
+    ) -> Result<Vec<u8>, BuildError> {
         let (first_note, first_path) = inputs.first().ok_or(BuildError::Empty)?;
+        if payees.is_empty() {
+            return Err(BuildError::Empty);
+        }
         let keys = ShieldedKeys::from_seed(owner_seed).ok_or(BuildError::Empty)?;
-        let recipient = Option::<Address>::from(Address::from_raw_address_bytes(&recipient_addr)).ok_or(BuildError::Empty)?;
         let change_addr = keys.address();
         let ovk = recoverable.then(|| keys.fvk.to_ovk(Scope::External));
 
+        // Resolve every payee before touching the builder, so a malformed address
+        // fails the whole batch rather than emitting a partial one.
+        let mut paid: u64 = 0;
+        let mut recipients = Vec::with_capacity(payees.len());
+        for (addr, amount, memo) in payees {
+            let r = Option::<Address>::from(Address::from_raw_address_bytes(addr)).ok_or(BuildError::Empty)?;
+            paid = paid.checked_add(*amount).ok_or(BuildError::Empty)?;
+            recipients.push((r, *amount, *memo));
+        }
+
         let total_in: u64 = inputs.iter().map(|(n, _)| n.value().inner()).sum();
-        let change = total_in.checked_sub(amount).and_then(|v| v.checked_sub(fee)).ok_or(BuildError::Empty)?;
+        let change = total_in.checked_sub(paid).and_then(|v| v.checked_sub(fee)).ok_or(BuildError::Empty)?;
 
         // The shared anchor: all supplied witnesses were taken at one tree state.
         let anchor = first_path.root(ExtractedNoteCommitment::from(first_note.commitment()));
@@ -584,9 +631,11 @@ pub mod build {
         for (note, merkle_path) in inputs {
             builder.add_spend(keys.fvk.clone(), note, merkle_path).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         }
-        builder
-            .add_output(ovk.clone(), recipient, NoteValue::from_raw(amount), memo)
-            .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        for (recipient, amount, memo) in recipients {
+            builder
+                .add_output(ovk.clone(), recipient, NoteValue::from_raw(amount), memo)
+                .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
+        }
         builder
             .add_output(ovk, change_addr, NoteValue::from_raw(change), [0u8; 512])
             .map_err(|e| BuildError::Builder(format!("{e:?}")))?;

@@ -53,7 +53,9 @@ use kaspa_shielded_core::orchard_recipient_bytes;
 use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree};
 use kaspa_shielded_core::wallet::address_bytes_from_seed;
 use kaspa_shielded_core::wallet::CompactActionRecord;
-use kaspa_shielded_core::wallet::build::{PreparedPayment, build_wallet_payment, finalize_payment, prepare_payment, proving_key};
+use kaspa_shielded_core::wallet::build::{
+    PreparedPayment, build_wallet_payment, build_wallet_payment_multi, finalize_payment, prepare_payment, proving_key,
+};
 use kaspa_shielded_core::walletdb::{BlockMeta, HistoryKind, OwnedNote, Preview, WalletDb};
 use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
 use serde::{Deserialize, Serialize};
@@ -64,7 +66,8 @@ use zkas_sdk::{
     SpendAuthRequest as SdkSpendAuthRequest,
 };
 use zkas_wallet_engine::{
-    DEFAULT_FEE_SOMPI, chunk_fee, max_spends_per_tx, plan_payment, select_spend_count as engine_select_spend_count,
+    DEFAULT_FEE_SOMPI, chunk_fee, max_payees_per_tx, max_spends_per_tx, min_relay_fee_for_actions, plan_payment,
+    select_spend_count as engine_select_spend_count,
 };
 
 /// 1 FC = 10^8 sompi.
@@ -3732,6 +3735,245 @@ async fn wallet_send(
     }))
 }
 
+/// One recipient of a batched payout.
+#[derive(Deserialize)]
+struct Payee {
+    /// Recipient `zkas:` shielded address.
+    to: String,
+    amount_sompi: Option<u64>,
+    amount_fc: Option<f64>,
+    /// Optional memo, carried inside THIS payee's encrypted note only.
+    memo: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SendManyReq {
+    payees: Vec<Payee>,
+    /// Fee floor per transaction; raised to the node's byte-proportional minimum.
+    fee: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct SendManyResp {
+    txids: Vec<String>,
+    tx_count: usize,
+    payees: usize,
+    paid_sompi: u64,
+    fee_sompi: u64,
+    paid_sompi_exact: String,
+    fee_sompi_exact: String,
+}
+
+/// Pay **many recipients in as few transactions as possible**.
+///
+/// The single-recipient [`wallet_send`] is the wrong shape for a payout run: a pool
+/// crediting N miners pays N separate bundles, and each one carries its own Halo 2
+/// proof, its own witness set and its own relay fee — serially. That is the 45-minute
+/// payout. An Orchard bundle carries `max(spends, outputs)` actions, so one bundle can
+/// hold `max_payees_per_tx()` recipients plus change; batching collapses the run to
+/// `ceil(N / max_payees_per_tx())` proofs.
+///
+/// Selection happens ONCE, under a single lock, across all batches, so two batches can
+/// never select the same note. Witnesses for every selected note are built in one pass.
+/// Each batch is then proven and submitted in turn, marking its notes spent on
+/// acceptance exactly as `wallet_send` does.
+async fn wallet_send_many(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<SendManyReq>,
+) -> Result<Json<SendManyResp>, (StatusCode, Json<serde_json::Value>)> {
+    let token = token_from(&headers, state.allow_default_token)?;
+    let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
+    ensure_canonical_checkpoint(&state, &w).await?;
+
+    let (seed, recoverable) = {
+        let e = w.lock().await;
+        if e.reorged_strikes > 0 {
+            return Err(err(StatusCode::CONFLICT, "wallet checkpoint is being repaired after a reorg; retry shortly"));
+        }
+        if e.matured_leaves().is_none() {
+            return Err(err(
+                StatusCode::CONFLICT,
+                format!("wallet has not established a matured anchor yet (scanned DAA {}); wait for initial sync", e.scanned),
+            ));
+        }
+        (e.key.seed()?, e.recoverable_history)
+    };
+
+    if req.payees.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "payees must not be empty"));
+    }
+    // Resolve every payee up front: one bad address fails the batch before any proving.
+    let mut resolved: Vec<([u8; 43], u64, [u8; 512])> = Vec::with_capacity(req.payees.len());
+    let mut requested: u64 = 0;
+    for (i, p) in req.payees.iter().enumerate() {
+        let amount = match (p.amount_sompi, p.amount_fc) {
+            (Some(s), _) => s,
+            (None, Some(fc)) => (fc * SOMPI_PER_ZKAS as f64).round() as u64,
+            (None, None) => return Err(err(StatusCode::BAD_REQUEST, format!("payee {i}: specify amount_sompi or amount_fc"))),
+        };
+        if amount == 0 {
+            return Err(err(StatusCode::BAD_REQUEST, format!("payee {i}: amount must be positive")));
+        }
+        let addr = Address::try_from(p.to.as_str())
+            .map_err(|e| err(StatusCode::BAD_REQUEST, format!("payee {i}: invalid recipient address: {e}")))?;
+        let recipient = orchard_recipient_bytes(&addr)
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("payee {i}: not a shielded Orchard address")))?;
+        requested = requested.checked_add(amount).ok_or_else(|| err(StatusCode::BAD_REQUEST, "payee amounts overflow"))?;
+        resolved.push((recipient, amount, memo_bytes(p.memo.as_deref())?));
+    }
+
+    let base_fee = req.fee.unwrap_or(DEFAULT_FEE_SOMPI);
+    let per_tx = max_payees_per_tx();
+    let groups: Vec<Vec<([u8; 43], u64, [u8; 512])>> = resolved.chunks(per_tx).map(|c| c.to_vec()).collect();
+    let net: [u8; 32] = state.genesis.as_bytes();
+    let client = &state.client;
+
+    // Select notes and build witnesses for EVERY group under one lock, so no note is
+    // selected twice and all witnesses share one matured anchor.
+    struct Batch {
+        payees: Vec<([u8; 43], u64, [u8; 512])>,
+        inputs: Vec<(kaspa_shielded_core::Note, kaspa_shielded_core::MerklePath)>,
+        positions: Vec<u64>,
+        fee: u64,
+    }
+    let mut batches: Vec<Batch> = Vec::with_capacity(groups.len());
+    {
+        let mut e = w.lock().await;
+        tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded());
+        let matured = e
+            .matured_leaves()
+            .ok_or_else(|| err(StatusCode::CONFLICT, "wallet has no matured anchor yet"))?;
+        let (mut candidates, stranded) = matured_candidates(&e.db, matured);
+        candidates.sort_by(|a, b| b.value().cmp(&a.value()));
+        let have: u64 = candidates.iter().map(|n| n.value()).sum();
+
+        // Walk the groups, consuming value-descending notes as each is covered. The
+        // per-tx fee is priced on the bundle's ACTION count — `max(spends, payees+1)` —
+        // because that, not the spend count alone, is what the node charges mass for.
+        let mut taken = 0usize;
+        let mut plan: Vec<(usize, usize, u64)> = Vec::with_capacity(groups.len()); // (start, n_notes, fee)
+        for g in &groups {
+            let pay: u64 = g.iter().map(|(_, a, _)| *a).sum();
+            let start = taken;
+            let mut sum = 0u64;
+            let mut fee = base_fee.max(min_relay_fee_for_actions(g.len() + 1));
+            loop {
+                let n = taken - start;
+                if sum >= pay.saturating_add(fee) && n > 0 {
+                    break;
+                }
+                if taken >= candidates.len() {
+                    return Err(err(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "insufficient matured funds: have {have}, need {}+ across {} payees (funds must be ~10 min old to spend){}",
+                            requested.saturating_add(fee),
+                            resolved.len(),
+                            stranded_hint(stranded)
+                        ),
+                    ));
+                }
+                if n >= max_spends_per_tx() {
+                    return Err(err(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "a batch of {} payees needs more than {} note spends to cover {pay} sompi; split the payout or consolidate first",
+                            g.len(),
+                            max_spends_per_tx()
+                        ),
+                    ));
+                }
+                sum += candidates[taken].value();
+                taken += 1;
+                // Re-price: the fee floor grows with the action count.
+                fee = base_fee.max(min_relay_fee_for_actions((taken - start).max(g.len() + 1)));
+            }
+            plan.push((start, taken - start, fee));
+        }
+
+        // One witness pass for every note across every batch.
+        let all_positions: Vec<u64> = candidates[..taken].iter().map(|n| n.position).collect();
+        let paths = tokio::task::block_in_place(|| e.db.witness_paths_at(&all_positions, matured));
+        for (gi, (start, n_notes, fee)) in plan.into_iter().enumerate() {
+            let mut inputs = Vec::with_capacity(n_notes);
+            let mut positions = Vec::with_capacity(n_notes);
+            for k in 0..n_notes {
+                let note = &candidates[start + k];
+                let path = match paths[start + k].clone() {
+                    Some(p) => p,
+                    None => tokio::task::block_in_place(|| e.db.witness_path_at(note.position, matured))
+                        .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "matured note has no witness path"))?,
+                };
+                inputs.push((note.note.clone(), path));
+                positions.push(note.position);
+            }
+            batches.push(Batch { payees: groups[gi].clone(), inputs, positions, fee });
+        }
+    }
+
+    let ctx = payment_tx_context();
+    let tx_count = batches.len();
+    let mut txids: Vec<String> = Vec::with_capacity(tx_count);
+    let mut paid = 0u64;
+    let mut total_fee = 0u64;
+    for (bi, b) in batches.into_iter().enumerate() {
+        let group_pay: u64 = b.payees.iter().map(|(_, a, _)| *a).sum();
+        log::info!(
+            "send_many: building Orchard proof for tx {}/{tx_count} ({} payees, {} spends, {group_pay} sompi + {} fee)...",
+            bi + 1,
+            b.payees.len(),
+            b.inputs.len(),
+            b.fee
+        );
+        let started = std::time::Instant::now();
+        let ctx2 = ctx.clone();
+        let (payees, inputs, fee) = (b.payees, b.inputs, b.fee);
+        let payload = tokio::task::spawn_blocking(move || {
+            build_wallet_payment_multi(seed, inputs, &payees, fee, &net, &ctx2, recoverable)
+        })
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("proof task failed: {e}")))?
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to build payment: {e:?}")))?;
+        log::info!("send_many: tx {}/{tx_count} proven in {:.0?}", bi + 1, started.elapsed());
+
+        let tx: Transaction = payment_tx(payload);
+        match client.submit_transaction(RpcTransaction::from(&tx), false).await {
+            Ok(accepted) => {
+                txids.push(accepted.to_string());
+                paid += group_pay;
+                total_fee += fee;
+                let mut e = w.lock().await;
+                let now_daa = e.scanned as u64;
+                for p in b.positions {
+                    e.db.mark_spent(p, accepted.as_bytes(), now_daa);
+                }
+            }
+            Err(e) if txids.is_empty() => return Err(err(StatusCode::BAD_GATEWAY, format!("node rejected the payout: {e}"))),
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": format!("payout partially sent: {}/{tx_count} txs accepted, then the node rejected: {e}", txids.len()),
+                        "txids": txids,
+                        "paid_sompi": paid,
+                    })),
+                ));
+            }
+        }
+    }
+
+    Ok(Json(SendManyResp {
+        tx_count: txids.len(),
+        payees: resolved.len(),
+        paid_sompi: paid,
+        fee_sompi: total_fee,
+        paid_sompi_exact: paid.to_string(),
+        fee_sompi_exact: total_fee.to_string(),
+        txids,
+    }))
+}
+
 #[derive(Deserialize, Default)]
 struct ConsolidateReq {
     fee: Option<u64>,
@@ -4651,6 +4893,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         .route("/api/wallet/settings", post(wallet_settings))
         .route("/api/wallet/rescan", post(wallet_rescan))
         .route("/api/wallet/send", post(wallet_send))
+        .route("/api/wallet/send_many", post(wallet_send_many))
         .route("/api/wallet/consolidate", post(wallet_consolidate))
         .route("/api/wallet/prepare", post(wallet_prepare))
         .route("/api/wallet/submit", post(wallet_submit))

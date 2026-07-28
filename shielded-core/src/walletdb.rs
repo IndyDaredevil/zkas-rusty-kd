@@ -3547,6 +3547,73 @@ mod circuit_tests {
         assert_eq!(db.balance(), 2_000, "balance == change after the multi-note spend");
     }
 
+    /// A BATCHED payout: one transaction paying THREE different recipients from two
+    /// owned notes. This is the shape a mining pool needs — one bundle, one proof, one
+    /// fee for the whole run instead of one per payee.
+    ///
+    /// Asserts the properties that make batching safe rather than merely fast: the
+    /// bundle verifies against consensus, its public value balance is exactly the fee
+    /// (so no value is created or destroyed across three outputs plus change),
+    /// consensus accepts it, each payee can decrypt its OWN note and only that note,
+    /// and the sender ends up holding just the change.
+    #[test]
+    fn batched_payout_pays_many_recipients_in_one_tx() {
+        let miner = [61u8; 32];
+        let net = [0x5au8; 32];
+        let ctx = b"zkas-walletdb-batch";
+
+        let mut db = WalletDb::from_seed(miner).unwrap();
+        let mut state = ShieldedState::new();
+
+        let n0 = cb(address_bytes_from_seed(miner).unwrap(), b"blk1||0", 4_000);
+        let n1 = cb(address_bytes_from_seed(miner).unwrap(), b"blk1||1", 4_000);
+        let mint = CoinbaseMint::new(vec![
+            CoinbaseNote { value: n0.1, commitment: coinbase_note_commitment(&n0.0, n0.1).unwrap() },
+            CoinbaseNote { value: n1.1, commitment: coinbase_note_commitment(&n1.0, n1.1).unwrap() },
+        ]);
+        state.apply_chain_block(Some(&mint), &[]).unwrap();
+        db.ingest_block(&[n0, n1], &[]);
+        assert_eq!(db.balance(), 8_000);
+
+        // Three payees with DIFFERENT amounts, paid from both notes; fee 1_000.
+        let seeds = [[71u8; 32], [72u8; 32], [73u8; 32]];
+        let amounts = [1_500u64, 2_500, 2_000];
+        let payees: Vec<([u8; 43], u64, [u8; 512])> =
+            seeds.iter().zip(amounts).map(|(s, a)| (address_bytes_from_seed(*s).unwrap(), a, [0u8; 512])).collect();
+        let paid_total: u64 = amounts.iter().sum(); // 6_000
+        let fee = 1_000u64;
+
+        let sel: Vec<_> = db.notes().iter().map(|o| (o.note.clone(), o.position)).collect();
+        let inputs: Vec<_> = sel.into_iter().map(|(note, pos)| (note, db.witness_path(pos).unwrap())).collect();
+        let payload = crate::wallet::build::build_wallet_payment_multi(miner, inputs, &payees, fee, &net, ctx, true)
+            .expect("batched payout builds");
+        let wire = ShieldedBundle::from_bytes(&payload).expect("payload decodes");
+
+        // Real proof + signatures over the shared anchor.
+        let msg = sighash(&wire, &net, ctx);
+        verify_bundle(&wire, &msg).expect("batched payout verifies");
+        assert_eq!(wire.value_balance, fee as i64, "public value balance is exactly the fee across 3 payees + change");
+        // 2 spends vs 4 outputs (3 payees + change) => the bundle is output-bound.
+        assert_eq!(wire.actions.len(), 4, "actions = max(spends, outputs) = 4");
+
+        // Consensus accepts it.
+        let stx = ShieldedTx::from_bundle(&wire).unwrap();
+        assert_eq!(state.apply_chain_block(None, &[stx]).unwrap().accepted, vec![0], "batched payout accepted");
+
+        // Each payee recovers exactly its own note — and none of the others'.
+        for (i, s) in seeds.iter().enumerate() {
+            let mut payee = WalletDb::from_seed(*s).unwrap();
+            payee.ingest_block(&[], &[&wire]);
+            assert_eq!(payee.notes().len(), 1, "payee {i} sees exactly one note");
+            assert_eq!(payee.balance(), amounts[i] as u128, "payee {i} is paid its own amount, not another's");
+        }
+
+        // The sender keeps only the change.
+        db.ingest_block(&[], &[&wire]);
+        assert_eq!(db.notes().len(), 1, "only the change note remains");
+        assert_eq!(db.balance(), (8_000 - paid_total - fee) as u128, "change = in - paid - fee");
+    }
+
     /// End-to-end chain-derived history: mint → OVK send with a memo → receive.
     /// The sender's row recovers the recipient/amount/memo via its own OVK; the
     /// receiver's row carries the amount+memo from IVK decryption; a checkpoint

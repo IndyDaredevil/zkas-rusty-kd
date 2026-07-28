@@ -77,6 +77,32 @@ pub fn max_spends_per_tx() -> usize {
     n
 }
 
+/// Largest number of Orchard **actions** whose bundle fits the standard transient-mass
+/// budget. A bundle carries `max(spends, outputs)` actions, so this is the one ceiling
+/// both a many-spend payment and a many-payee batch are planned against. Kept separate
+/// from [`max_spends_per_tx`], whose (deliberately conservative) `n + 1` accounting is
+/// load-bearing for every existing caller and must not shift.
+pub fn max_actions_per_tx() -> usize {
+    let budget = (STANDARD_TX_MASS_CAP / TRANSIENT_BYTE_TO_MASS_FACTOR) as usize - TX_ENVELOPE_MARGIN;
+    let mut a = 2usize;
+    while expected_wire_len(a + 1) <= budget {
+        a += 1;
+    }
+    a
+}
+
+/// Largest number of recipients one batched payment can pay: the bundle needs one
+/// output per payee plus one for change, and actions are `max(spends, outputs)`.
+pub fn max_payees_per_tx() -> usize {
+    max_actions_per_tx().saturating_sub(1).max(1)
+}
+
+/// Minimum fee expected to clear the node relay policy for a bundle of `n_actions`.
+pub fn min_relay_fee_for_actions(n_actions: usize) -> u64 {
+    let bytes = expected_wire_len(n_actions.max(2)) as u64 + TX_ENVELOPE_BYTES_FEE;
+    bytes * TRANSIENT_BYTE_TO_MASS_FACTOR / 2 * RELAY_FEE_PER_KG / 1000
+}
+
 /// Minimum fee expected to clear the node relay policy for `n_spends` notes.
 pub fn min_relay_fee_for_spends(n_spends: usize) -> u64 {
     let bytes = expected_wire_len(n_spends.max(2)) as u64 + TX_ENVELOPE_BYTES_FEE;
@@ -196,5 +222,24 @@ mod tests {
     fn rejects_zero_and_insufficient_payments() {
         assert_eq!(plan_payment(vec![10], 0, 1, 6), Err(PlanError::ZeroAmount));
         assert_eq!(plan_payment(vec![10], 10, 1, 6), Err(PlanError::InsufficientFunds));
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    /// The spend cap is consensus-adjacent planning: a wallet that plans more spends
+    /// than the node will relay simply cannot send. Pin it, and pin that adding the
+    /// batch-payee accounting did not move it.
+    #[test]
+    fn spend_cap_is_unchanged_by_action_accounting() {
+        assert_eq!(max_spends_per_tx(), 38, "spend cap must stay 38");
+        assert!(max_actions_per_tx() >= max_spends_per_tx(), "actions bound spends");
+        assert!(max_payees_per_tx() >= 2, "batching must be able to pay more than one payee");
+        // A bundle of the advertised size must actually fit the mass budget.
+        let budget = (STANDARD_TX_MASS_CAP / TRANSIENT_BYTE_TO_MASS_FACTOR) as usize - TX_ENVELOPE_MARGIN;
+        assert!(expected_wire_len(max_actions_per_tx()) <= budget, "advertised action count must fit");
+        assert!(expected_wire_len(max_payees_per_tx() + 1) <= budget, "payees + change must fit");
     }
 }
