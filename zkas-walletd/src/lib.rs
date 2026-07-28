@@ -859,6 +859,55 @@ fn proving_now() -> bool {
     PROVING_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0
 }
 
+/// Set while any wallet is still working through its initial scan / rescan.
+///
+/// Subtree-cache builds are a LATENCY optimization for a future send: they cost
+/// 30–70 s of one core each, and only caught-up wallets run them. A wallet
+/// rebuilding from genesis is doing user-visible work — somebody is watching a
+/// progress bar — and it competes for the same `SYNC_CONCURRENCY` slots. On
+/// 2026-07-28 a pool wallet rescanning from genesis sat at 9,901 of 184,000
+/// blocks for five minutes straight while the daemon ran back-to-back cache
+/// builds for other wallets; it was starved, not stuck. Optional work waits for
+/// the visible work.
+/// Unix-millis of the last moment a wallet was seen materially behind the tip.
+///
+/// Deliberately a TIMESTAMP, not a flag flipped at the end of a sync lap. The
+/// first version stored `any_behind` when the lap finished, which never fired
+/// during the storm it exists to stop: the lap could not finish *because* the
+/// cache builds were holding every sync slot, so the flag stayed false and the
+/// builds kept running. Stamped per wallet visit and read with a short expiry,
+/// it goes true within one visit and clears itself once nothing is rebuilding —
+/// no lap coupling, and no way for one permanently-behind wallet to suppress
+/// every other wallet's cache forever.
+static LAST_BACKFILL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How far behind the tip counts as "rebuilding" rather than "following". A
+/// wallet at the tip flips `caught_up` constantly on a 1 BPS chain, so keying
+/// off that flag would suppress cache builds permanently.
+const BACKFILL_BEHIND_BLOCKS: u64 = 5_000;
+
+/// How long one sighting keeps the brakes on. Long enough to bridge the gap
+/// between a rebuilding wallet's turns, short enough to release promptly.
+const BACKFILL_STICKY_MS: u64 = 30_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+fn note_backfilling() {
+    LAST_BACKFILL_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn backfilling_now() -> bool {
+    let last = LAST_BACKFILL_MS.load(std::sync::atomic::Ordering::Relaxed);
+    last > 0 && now_ms().saturating_sub(last) < BACKFILL_STICKY_MS
+}
+
+/// Cache sweeps stand down for either kind of work that a user is waiting on.
+fn cache_build_should_yield() -> bool {
+    proving_now() || backfilling_now()
+}
+
 /// Threads to give each proof when several are proven at once.
 ///
 /// A single Halo2 proof's parallel efficiency is sublinear — measured on 4 cores at
@@ -1858,7 +1907,7 @@ impl WalletEntry {
                 // Stand down while any payment is proving: the build is one-time and can
                 // wait a tick, a user's send cannot. Deliberately does NOT mark the wallet
                 // charged, so it is retried once the daemon is idle again.
-                if span >= SUBTREE_CACHE_MIN_SPAN && !self.db.subtree_cache_ready(matured) && !proving_now() {
+                if span >= SUBTREE_CACHE_MIN_SPAN && !self.db.subtree_cache_ready(matured) && !cache_build_should_yield() {
                     // Only refuse when the kernel says memory is genuinely tight. A wallet
                     // skipped here is retried on a later pass, so a transient squeeze costs
                     // this wallet one slow send, not its whole session.
@@ -1878,9 +1927,12 @@ impl WalletEntry {
                             // Stand down mid-sweep the moment a payment starts proving —
                             // refusing to *start* during one is not enough when the sweep
                             // itself runs for tens of seconds.
-                            let built = tokio::task::block_in_place(|| self.db.build_subtree_cache_until(proving_now));
+                            let built = tokio::task::block_in_place(|| self.db.build_subtree_cache_until(cache_build_should_yield));
                             if !built && !self.db.subtree_cache_ready(matured) {
-                                log::debug!("subtree cache sweep yielded to a payment after {:.1?}; will retry", t.elapsed());
+                                log::debug!(
+                                    "subtree cache sweep stood down after {:.1?} (a payment or a wallet rebuild needs the core); will retry",
+                                    t.elapsed()
+                                );
                             } else if self.db.subtree_cache_ready(matured) {
                                 log::info!(
                                     "subtree cache built in {:.1?} ({span} leaves, notes={note_count}) — spends now witness in O(depth), not a full replay",
@@ -2929,6 +2981,12 @@ enum SyncOutcome {
 async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_len: u64) -> SyncOutcome {
     let mut e = w.lock().await;
     e.chain_len = chain_len;
+    // Stamp "a wallet is rebuilding" the moment we see one, not at the end of the
+    // lap: optional cache sweeps read this and stand down, and they are exactly
+    // what stops the lap from ending.
+    if chain_len.saturating_sub(e.scanned as u64) > BACKFILL_BEHIND_BLOCKS {
+        note_backfilling();
+    }
     // Advance one chunk from `low` (also the cheap tip catch-up once already synced).
     let was_caught_up = e.caught_up;
     e.caught_up = false;
