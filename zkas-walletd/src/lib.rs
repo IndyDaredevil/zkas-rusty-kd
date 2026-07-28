@@ -2485,18 +2485,47 @@ impl AppState {
         None
     }
 
-    /// Full-history wallet entry: the tree is anchored at the **pruning-point
-    /// frontier** (all recoverable history, correct absolute leaf positions even
-    /// after pruning advances past genesis) and every later chain block is
-    /// scanned. Used when the wallet may hold funds older than the fast-sync
-    /// checkpoint (birthday 0 / early birthday).
+    /// Full-history wallet entry: the tree is anchored as far back as the node can
+    /// serve — **genesis** on an archival node, the pruning-point frontier
+    /// otherwise — and every later chain block is scanned. Used when the wallet may
+    /// hold funds older than the fast-sync checkpoint (birthday 0 / early birthday).
+    ///
+    /// Anchoring at the pruning point unconditionally was the 2026-07-28 "20K ZKAS
+    /// vanished after I rescanned" bug. `--archival` stops a node DELETING blocks;
+    /// it does not hold `pruning_point_hash` at genesis, so on a two-day-old chain
+    /// the pruning point had already advanced to DAA 43,248 and a rescan silently
+    /// dropped every note minted below it — 18,354 ZKAS in that report. An archival
+    /// node serves the genesis tree state (an empty frontier) and the full block
+    /// stream from genesis, so the correct anchor is genesis whenever it is offered.
     async fn full_scan_entry(&self, key: WalletKey, recoverable: bool, guard: RpcHash, birthday: u64) -> Option<WalletEntry> {
-        let start = self.client.get_block_dag_info().await.ok()?.pruning_point_hash;
-        let ts = self.client.get_shielded_tree_state(Some(start)).await.ok()?;
-        if ts.block_hash != start {
-            log::error!("node ignored the explicit tree-state checkpoint (update the node)");
-            return None;
-        }
+        // Prefer genesis. A node that has pruned answers for a block it no longer
+        // holds with an error or a different hash; both fall through to the
+        // pruning point, which is the most history that node can honestly offer.
+        let genesis_ts = match self.client.get_shielded_tree_state(Some(guard)).await {
+            Ok(ts) if ts.block_hash == guard => Some(ts),
+            _ => None,
+        };
+        let (start, ts) = match genesis_ts {
+            Some(ts) => {
+                log::info!("full scan anchored at GENESIS — this node serves the complete shielded history");
+                (guard, ts)
+            }
+            None => {
+                let start = self.client.get_block_dag_info().await.ok()?.pruning_point_hash;
+                let ts = self.client.get_shielded_tree_state(Some(start)).await.ok()?;
+                if ts.block_hash != start {
+                    log::error!("node ignored the explicit tree-state checkpoint (update the node)");
+                    return None;
+                }
+                log::warn!(
+                    "full scan anchored at the PRUNING POINT (daa {}, tree position {}) — this node cannot serve \
+                     genesis, so notes minted below that point are invisible to this wallet",
+                    ts.daa_score,
+                    ts.size
+                );
+                (start, ts)
+            }
+        };
         let fs = FrontierState {
             size: ts.size,
             leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
@@ -3676,19 +3705,43 @@ async fn wallet_rescan(
     if !wallet_exists(&state.wallet_dir, &token) {
         return Err(err(StatusCode::NOT_FOUND, "no such wallet"));
     }
-    // NOTE: this deployment's nodes run with --archival, so a rescan re-reads the
-    // full shielded history from genesis and loses nothing — the old "rescan
-    // refused: N notes pruned" guard was a false positive that only ever blocked
-    // legitimate recovery rescans (and, worse, defended STALE notes a fresh scan
-    // proves are already spent). Rescan now always proceeds; `force` is accepted
-    // for API compatibility but no longer gates anything. If this is ever pointed
-    // at a genuinely pruned node, a birthday-0 wallet's rescan can drop notes below
-    // the pruning point — run it against an archival node (which is the norm here).
-    let _ = &body;
+    // A rescan rebuilds the wallet from whatever the node can serve, so it is only
+    // lossless if the node can serve GENESIS. The previous version of this guard
+    // assumed `--archival` guaranteed that; it does not — archival stops deletion
+    // but the pruning point still advances, and on 2026-07-28 a user rescanned
+    // against an archival node whose pruning point had reached DAA 43,248 and lost
+    // 18,354 ZKAS of notes minted below it. So: probe the node for genesis, and if
+    // it cannot answer, refuse rather than quietly amputate the wallet.
+    let force = body.as_ref().map(|b| b.force).unwrap_or(false);
+    if !force {
+        let serves_genesis = matches!(
+            state.client.get_shielded_tree_state(Some(state.genesis)).await,
+            Ok(ts) if ts.block_hash == state.genesis
+        );
+        if !serves_genesis {
+            let pp = state.client.get_block_dag_info().await.ok().map(|d| d.pruning_point_hash);
+            let below = match pp {
+                Some(pp) => state.client.get_shielded_tree_state(Some(pp)).await.ok().map(|ts| (ts.daa_score, ts.size)),
+                None => None,
+            };
+            let detail = match below {
+                Some((daa, size)) => format!(
+                    "this node cannot serve the chain from genesis — its history starts at the pruning point \
+                     (DAA {daa}, tree position {size}). Rescanning against it would permanently drop every note \
+                     your wallet holds from below that point"
+                ),
+                None => "this node cannot serve the chain from genesis, so a rescan would drop older notes".to_string(),
+            };
+            return Err(err(
+                StatusCode::CONFLICT,
+                format!("rescan refused: {detail}. Point the wallet at an archival node and try again, or pass force=true to rescan anyway and accept the loss."),
+            ));
+        }
+    }
     // A rescan is the "find my funds" recovery action, so it must not trust the
     // stored birthday — fast-syncing from a birthday set later than the wallet's
     // real notes skips those older blocks and the balance returns ZERO. Force a
-    // full scan from genesis (archival node → nothing is lost).
+    // full scan from genesis, which the check above has just proven is available.
     match reset_wallet_birthday(&state.wallet_dir, &token) {
         Ok(()) => log::info!("wallet '{token}': rescan reset birthday to 0 — reload will full-scan from genesis"),
         Err(e) => log::warn!("wallet '{token}': could not reset birthday for rescan ({e}); reload uses stored birthday"),
