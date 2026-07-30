@@ -4362,6 +4362,7 @@ dependencies = [
  "orchard",
  "pasta_curves",
  "rand 0.8.6",
+ "rayon",
  "serde",
  "sha2",
  "zcash_note_encryption",
@@ -9898,18 +9899,23 @@ name = "zkas-api"
 version = "2.0.1"
 dependencies = [
  "axum 0.7.9",
+ "borsh",
  "clap",
  "kaspa-addresses",
  "kaspa-consensus-core",
  "kaspa-core",
  "kaspa-grpc-client",
+ "kaspa-p2p-lib",
  "kaspa-rpc-core",
  "kaspa-shielded-core",
+ "kaspa-utils",
  "log",
  "serde",
  "serde_json",
  "tokio",
+ "tonic",
  "tower-http",
+ "uuid",
 ]
 
 [[package]]

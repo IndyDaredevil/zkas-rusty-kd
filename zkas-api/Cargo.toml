@@ -21,6 +21,10 @@ kaspa-addresses.workspace = true
 kaspa-grpc-client.workspace = true
 kaspa-rpc-core.workspace = true
 kaspa-consensus-core.workspace = true
+# Circulating supply is read from the SAME emission schedule consensus uses to build
+# coinbases (`CoinbaseManager::calc_block_subsidy`), so the explorer cannot drift from
+# the chain's actual monetary policy.
+kaspa-consensus.workspace = true
 kaspa-core.workspace = true
 # Shielded bundle decoding for the shielded-pool aggregation.
 kaspa-shielded-core = { workspace = true }
@@ -32,3 +36,10 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 log.workspace = true
 clap.workspace = true
+# auxpow_probe example: AuxPow travels over RPC as borsh-encoded hex.
+borsh.workspace = true
+# Merged-mining probe: Kaspa p2p handshake against a peer's own address.
+kaspa-p2p-lib.workspace = true
+kaspa-utils.workspace = true
+tonic.workspace = true
+uuid.workspace = true

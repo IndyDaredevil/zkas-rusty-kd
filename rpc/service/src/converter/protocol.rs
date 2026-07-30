@@ -25,11 +25,15 @@ impl ProtocolConverter {
             user_agent: properties.user_agent.clone(),
             advertised_protocol_version: properties.advertised_protocol_version,
             time_connected: peer.time_connected(),
+            blocks_relayed: self.flow_context.relay_credit(&peer.key()),
         }
     }
 
     pub fn get_peers_info(&self, peers: &[Peer]) -> Vec<RpcPeerInfo> {
         let ibd_peer_key = self.flow_context.ibd_peer_key();
+        // Reading the peer list is also the only regular signal of who is still
+        // connected, so take the chance to drop tallies for peers that are gone.
+        self.flow_context.prune_relay_credit(&peers.iter().map(|p| p.key()).collect::<Vec<_>>());
         peers.iter().map(|x| self.get_peer_info(x, &ibd_peer_key)).collect()
     }
 }

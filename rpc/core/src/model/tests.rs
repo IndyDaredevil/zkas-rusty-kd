@@ -495,6 +495,7 @@ mod mockery {
                 advertised_protocol_version: mock(),
                 time_connected: mock(),
                 is_ibd_peer: mock(),
+                blocks_relayed: mock(),
             }
         }
     }

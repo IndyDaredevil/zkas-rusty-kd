@@ -281,6 +281,14 @@ pub struct FlowContextInner {
     // Special sampling logger used only for high-bps networks where logs must be throttled
     block_event_logger: Option<BlockEventLogger>,
 
+    /// Per-peer tally of blocks that peer was the FIRST to relay to us.
+    ///
+    /// The p2p layer otherwise forgets where a block came from the moment it is
+    /// handed to consensus, so without this the question "which peers keep us
+    /// supplied?" has no answer at all. Keyed by `PeerKey` and pruned when a
+    /// peer is no longer connected, so it cannot grow without bound.
+    relay_credit: Mutex<HashMap<PeerKey, u64>>,
+
     bps: usize,
 
     // Orphan parameters
@@ -389,6 +397,7 @@ impl FlowContext {
                 notification_root,
                 user_agent_rules,
                 block_event_logger: Some(BlockEventLogger::new(bps, CountdownActivation::toccata(config.toccata_activation))),
+                relay_credit: Default::default(),
                 bps,
                 orphan_resolution_range,
                 max_orphans,
@@ -454,6 +463,30 @@ impl FlowContext {
     }
 
     /// If IBD is running, returns the IBD peer we are syncing from
+    /// Credit a peer for being the first to hand us a block body.
+    ///
+    /// Called from the relay flow once consensus has accepted the block, so a
+    /// peer only earns credit for blocks that turned out to be valid.
+    pub fn credit_relay(&self, peer: PeerKey) {
+        *self.relay_credit.lock().entry(peer).or_default() += 1;
+    }
+
+    /// Blocks a peer was the first to relay to us since this node started.
+    pub fn relay_credit(&self, peer: &PeerKey) -> u64 {
+        self.relay_credit.lock().get(peer).copied().unwrap_or(0)
+    }
+
+    /// Drop tallies for peers that are no longer connected, so a node churning
+    /// through peers over weeks does not accumulate a map of dead keys.
+    pub fn prune_relay_credit(&self, connected: &[PeerKey]) {
+        let mut credit = self.relay_credit.lock();
+        if credit.len() <= connected.len() {
+            return;
+        }
+        let live: std::collections::HashSet<PeerKey> = connected.iter().copied().collect();
+        credit.retain(|k, _| live.contains(k));
+    }
+
     pub fn ibd_peer_key(&self) -> Option<PeerKey> {
         if self.is_ibd_running() { self.ibd_metadata.read().map(|md| md.peer) } else { None }
     }

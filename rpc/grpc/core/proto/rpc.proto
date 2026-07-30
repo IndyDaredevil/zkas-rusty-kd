@@ -350,6 +350,10 @@ message GetConnectedPeerInfoMessage {
 
   // Whether this peer is the IBD peer (if IBD is running)
   bool isIbdPeer = 11;
+
+  // Blocks this peer was the first to relay to us, since this node started.
+  // Gossip is a race, so this is "who supplies us first", not "who mined it".
+  uint64 blocksRelayed = 12;
 }
 
 // AddPeerRequestMessage adds a peer to kaspad's outgoing connection list.

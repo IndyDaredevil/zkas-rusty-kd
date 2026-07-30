@@ -10,18 +10,23 @@
 //! the meaningful surface is blocks/DAG/coinbase plus the ZKas-specific
 //! `/info/shielded` endpoint — all servable straight from the node.
 
+mod geo;
+mod merged;
+
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
 };
 use clap::Parser;
-use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+use kaspa_consensus::processes::coinbase::CoinbaseManager;
+use kaspa_consensus_core::{config::params::Params, network::NetworkType, tx::TX_VERSION_SHIELDED};
 use kaspa_grpc_client::GrpcClient;
 use kaspa_rpc_core::{RpcBlock, RpcHash, api::rpc::RpcApi, notify::mode::NotificationMode};
 use kaspa_shielded_core::bundle::ShieldedBundle;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
@@ -46,6 +51,7 @@ const HALVING_INTERVAL_BLOCKS: u64 = 90 * 86_400 * BPS;
 /// live-feed response separately.
 const RECENT_CAP: usize = 6_000;
 const RECENT_PUBLIC_CAP: usize = 200;
+const WORK_HISTORY_CAP: usize = 100_000;
 /// How many transactions the id→location index retains. The live feed ring only
 /// covers RECENT_CAP blocks (~3 min at 1 BPS), which made EVERY transaction older
 /// than a few minutes report "not found" — the explorer had no tx index at all.
@@ -66,6 +72,11 @@ struct Cli {
     /// every transaction linkable instead of losing everything but the last ~3 min.
     #[arg(long, default_value = "/root/zkas/txindex.tsv")]
     tx_index: String,
+    /// This node's own public address, used only to place it on the network map.
+    /// The node's gRPC cannot report its own external address, so it has to be
+    /// supplied; without it the explorer's node is still counted, just unplaced.
+    #[arg(long)]
+    self_ip: Option<String>,
 }
 
 /// Where a transaction lives, so it can be served long after it left the live ring.
@@ -99,12 +110,17 @@ struct TxSummary {
     outputs: Vec<[String; 2]>,
 }
 
+#[derive(Clone, Serialize)]
+struct WorkPoint {
+    timestamp: u64,
+    difficulty: f64,
+}
+
 /// Running shielded-pool aggregate, advanced as the follower ingests blocks.
 #[derive(Default, Clone)]
 struct ShieldedAgg {
     note_count: u64,
     nullifier_count: u64,
-    turnstile_in_sompi: u128,
     emission_per_block_fc: f64,
     state_root: String,
     blue_score: u64,
@@ -113,12 +129,57 @@ struct ShieldedAgg {
 struct AppState {
     client: GrpcClient,
     recent: RwLock<VecDeque<BlockSummary>>,
+    work_history: RwLock<VecDeque<WorkPoint>>,
     shielded: RwLock<ShieldedAgg>,
     network_name: String,
     /// txid → where it landed. Survives the live ring so a transaction stays
     /// linkable forever (see TX_INDEX_CAP).
     tx_index: RwLock<(std::collections::HashMap<String, TxLoc>, VecDeque<String>)>,
     tx_index_path: String,
+    /// This node's own public address, for placing it on the network map.
+    self_ip: Option<std::net::IpAddr>,
+    /// Cached merged-mining scan: peer id -> what answered on its Kaspa port.
+    /// Refreshed on a timer by `scan_merged`; see `merged` for why it is cached.
+    merged: RwLock<MergedScan>,
+    /// Circulating supply, derived from the consensus emission schedule rather than
+    /// by summing coinbases. See `SupplyCache` and `info_coinsupply`.
+    supply: RwLock<SupplyCache>,
+}
+
+/// Running total of issued ZKas, memoised by DAA score.
+///
+/// Supply must NOT be accumulated by adding up the coinbase outputs a follower happens
+/// to see. On a BlockDAG every block carries a coinbase paying its whole mergeset, but
+/// only the accepted chain block's coinbase actually mints — so summing every block
+/// counts unaccepted coinbases, and counts each merged block's reward twice (once in
+/// the merging block's coinbase, once in its own). Measured live 2026-07-30: the
+/// explorer reported 27,814,508 ZKAS against 21,964,860 actually issued, and was still
+/// diverging at 161.79 ZKAS per block against a 60 ZKAS subsidy.
+///
+/// `calc_block_subsidy` is the same function consensus uses to build coinbases, so this
+/// total is exact by construction and cannot drift. The cache advances by the new blocks
+/// only, keeping the cost proportional to chain growth rather than chain length.
+#[derive(Default)]
+struct SupplyCache {
+    /// Highest DAA score included in `total_sompi`.
+    daa_score: u64,
+    total_sompi: u128,
+}
+
+/// Result of the most recent merged-mining sweep.
+#[derive(Default)]
+struct MergedScan {
+    /// Unix seconds of the last completed sweep; 0 until one finishes.
+    scanned_at: u64,
+    /// Short peer id -> every Kaspa node found at that peer's address.
+    found: std::collections::HashMap<String, Vec<merged::Found>>,
+    /// Short peer ids checked in the last sweep (so "not found" is distinguishable
+    /// from "never checked").
+    checked: std::collections::HashSet<String>,
+    /// Short peer ids that answered a TCP knock on at least one swept port. A peer
+    /// that was checked but is NOT here is unreachable — firewalled / inbound-only —
+    /// which is not the same as "runs no Kaspa".
+    reachable: std::collections::HashSet<String>,
 }
 
 /// Read the persisted index back at startup: one `txid\tblock_hash\tblue\ttime` row
@@ -250,7 +311,11 @@ fn ingest(block: &RpcBlock, agg: &mut ShieldedAgg) -> BlockSummary {
                 let is_shielded = out.script_public_key.script().len() == ORCHARD_SCRIPT_LEN;
                 if is_shielded {
                     agg.note_count += 1;
-                    agg.turnstile_in_sompi += out.value as u128;
+                    // NB: deliberately NOT accumulating value here. A block's coinbase pays
+                    // its whole mergeset, and `ingest` runs on every block the follower sees
+                    // — accepted or not — so adding these outputs counts unaccepted coinbases
+                    // and double-counts every merged reward. Circulating supply comes from
+                    // the consensus emission schedule instead; see `SupplyCache`.
                 }
                 outputs.push([out.value.to_string(), if is_shielded { "shielded".into() } else { "transparent".into() }]);
             }
@@ -293,8 +358,8 @@ fn ingest(block: &RpcBlock, agg: &mut ShieldedAgg) -> BlockSummary {
 /// Follow the chain tip: pre-seed from near the sink, then poll for new blocks,
 /// updating the recent-block ring and the shielded aggregate.
 async fn follow(state: Arc<AppState>) {
-    let sink = match state.client.get_block_dag_info().await {
-        Ok(dag) => dag.sink,
+    let (sink, _pruning_point) = match state.client.get_block_dag_info().await {
+        Ok(dag) => (dag.sink, dag.pruning_point_hash),
         Err(e) => {
             log::warn!("get_block_dag_info failed at startup: {e}");
             return;
@@ -321,6 +386,24 @@ async fn follow(state: Arc<AppState>) {
     }
     backfill.reverse(); // oldest → newest
 
+    // Recover compact timestamp/difficulty samples for the last 24 hours. Keep
+    // only WorkPoint values so the scan cannot retain hundreds of megabytes of
+    // full RPC blocks.
+    let mut work_backfill: Vec<WorkPoint> = Vec::new();
+    let mut work_cursor = backfill.first().and_then(|b| b.verbose_data.as_ref().map(|v| v.selected_parent_hash));
+    let cutoff_ms = now_secs().saturating_sub(24 * 60 * 60) * 1_000;
+    while work_backfill.len() + backfill.len() < WORK_HISTORY_CAP {
+        let Some(cursor) = work_cursor else { break };
+        if cursor == RpcHash::default() { break; }
+        let Ok(block) = state.client.get_block(cursor, false).await else { break; };
+        work_cursor = block.verbose_data.as_ref().map(|v| v.selected_parent_hash);
+        let difficulty = block.verbose_data.as_ref().map(|v| v.difficulty).unwrap_or(0.0);
+        let old_enough = block.header.timestamp <= cutoff_ms;
+        work_backfill.push(WorkPoint { timestamp: block.header.timestamp, difficulty });
+        if old_enough { break; }
+    }
+    work_backfill.reverse();
+
     // Seed cumulative counters from chain totals so history is right without
     // replaying every block: on a shielded chain every block mints one coinbase
     // note, so noteCount ≈ blueScore and value-shielded ≈ blueScore × subsidy.
@@ -334,7 +417,6 @@ async fn follow(state: Arc<AppState>) {
                 if let Ok(dag) = state.client.get_block_dag_info().await {
                     agg.blue_score = dag.virtual_daa_score;
                     agg.note_count = dag.virtual_daa_score;
-                    agg.turnstile_in_sompi = dag.virtual_daa_score as u128 * sub as u128;
                 }
             }
             if let Some(root) = coinbase_state_root(sink_block) {
@@ -345,10 +427,20 @@ async fn follow(state: Arc<AppState>) {
         let mut recent = state.recent.write().await;
         for b in &backfill {
             let summary = ingest(b, &mut scratch);
+            {
+                let mut work = state.work_history.write().await;
+                work.push_back(WorkPoint { timestamp: b.header.timestamp, difficulty: summary.difficulty });
+                while work.len() > WORK_HISTORY_CAP { work.pop_front(); }
+            }
             recent.push_front(summary);
             if recent.len() > RECENT_CAP {
                 recent.pop_back();
             }
+        }
+        for point in &work_backfill {
+            let mut work = state.work_history.write().await;
+            work.push_back(point.clone());
+            while work.len() > WORK_HISTORY_CAP { work.pop_front(); }
         }
     }
     // Index the seeded blocks too, so a just-restarted API can still serve the
@@ -394,6 +486,11 @@ async fn follow(state: Arc<AppState>) {
             let mut agg = state.shielded.write().await;
             let summary = ingest(block, &mut agg);
             drop(agg);
+            {
+                let mut work = state.work_history.write().await;
+                work.push_back(WorkPoint { timestamp: block.header.timestamp, difficulty: summary.difficulty });
+                while work.len() > WORK_HISTORY_CAP { work.pop_front(); }
+            }
             {
                 let mut recent = state.recent.write().await;
                 recent.push_front(summary);
@@ -472,6 +569,370 @@ async fn info_network(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
+/// One node as the map page renders it. No address ever leaves this struct —
+/// only the country an address is *allocated to* and a masked network label.
+#[derive(serde::Serialize)]
+struct MapNode {
+    id: String,
+    country: Option<String>,
+    #[serde(rename = "countryName")]
+    country_name: Option<String>,
+    lat: Option<f32>,
+    lon: Option<f32>,
+    net: Option<String>,
+    #[serde(rename = "userAgent")]
+    user_agent: String,
+    #[serde(rename = "protocolVersion")]
+    protocol_version: u32,
+    #[serde(rename = "pingMs")]
+    ping_ms: Option<u64>,
+    outbound: Option<bool>,
+    /// How long the connection has been up, in seconds. The node reports elapsed
+    /// time since the connection started — NOT a wall-clock timestamp — so this
+    /// stays a duration rather than being turned into a date.
+    #[serde(rename = "connectedForSec")]
+    connected_for_sec: Option<u64>,
+    /// Blocks this peer was the first to hand us, since the node started.
+    /// Gossip is a race, so this is "who supplies us first", not "who mined it".
+    #[serde(rename = "blocksRelayed")]
+    blocks_relayed: u64,
+    ibd: bool,
+    #[serde(rename = "self")]
+    is_self: bool,
+}
+
+/// Spread nodes that share a country centroid into a small deterministic spiral
+/// around it, so a country holding several nodes renders as a cluster of
+/// distinct dots instead of one dot hiding the rest. The offset depends only on
+/// the node's identity and its index within the country, so dots stay put
+/// between polls.
+fn scatter(lat: f32, lon: f32, seed: u64, index: usize) -> (f32, f32) {
+    if index == 0 {
+        return (lat, lon);
+    }
+    // Golden-angle placement keeps successive nodes well separated.
+    let angle = (seed % 360) as f32 * std::f32::consts::PI / 180.0 + index as f32 * 2.399_963;
+    let radius = 1.1 + (index as f32).sqrt() * 1.2; // degrees
+    let out_lat = (lat + radius * angle.sin()).clamp(-84.0, 84.0);
+    // Widen the longitude offset as latitude rises so the cluster stays roughly
+    // circular on the globe rather than collapsing near the poles.
+    let lon_scale = (1.0 / out_lat.to_radians().cos().max(0.35)).min(2.5);
+    let out_lon = (lon + radius * angle.cos() * lon_scale + 180.0).rem_euclid(360.0) - 180.0;
+    (out_lat, out_lon)
+}
+
+/// Stable, non-reversible row key for a peer. A node id is public p2p data, but
+/// the UI only needs something stable to key rows and dots on.
+fn short_id(node_id: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    node_id.hash(&mut h);
+    format!("{:08x}", h.finish() as u32)
+}
+
+/// Mask an address to the granularity `/info/network` has always published:
+/// /24 for IPv4, /48 for IPv6 — enough to tell rows apart, not enough to locate.
+/// The truncated form is shown as-is (no `.x` placeholder), which reads cleanly
+/// as "the network this peer is on" rather than as a broken address.
+fn masked_net(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            format!("{}.{}.{}", o[0], o[1], o[2])
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}::/48", s[0], s[1], s[2])
+        }
+    }
+}
+
+/// `/info/nodes` — the network map.
+///
+/// Reports every peer this explorer's node is currently connected to, resolved
+/// to a **country** (never an address) through the embedded RIR allocation
+/// tables, plus the aggregates the map page renders: country distribution,
+/// client versions, and the protocol/direction split.
+///
+/// This is one vantage point — the peers of a single node — not a crawl of the
+/// whole network, and the page says so.
+async fn info_nodes(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    let peers = match s.client.get_connected_peer_info().await {
+        Ok(resp) => resp.peer_info,
+        Err(e) => return err(e.to_string()),
+    };
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    // code → (display name, centroid, count so far)
+    let mut per_country: std::collections::HashMap<String, (String, (f32, f32), usize)> = Default::default();
+    let mut agents: std::collections::HashMap<String, usize> = Default::default();
+    let mut nodes: Vec<MapNode> = Vec::with_capacity(peers.len() + 1);
+    let (mut ipv4, mut ipv6, mut inbound, mut outbound) = (0usize, 0usize, 0usize, 0usize);
+
+    // Place a node: resolve its country, claim the next slot in that country's
+    // cluster, and record it. Returns nothing — everything lands in `nodes`.
+    let mut place = |ip: Option<std::net::IpAddr>,
+                     id: String,
+                     user_agent: String,
+                     protocol_version: u32,
+                     ping_ms: Option<u64>,
+                     outbound: Option<bool>,
+                     connected_for_sec: Option<u64>,
+                     blocks_relayed: u64,
+                     ibd: bool,
+                     is_self: bool| {
+        let country = ip.and_then(geo::lookup);
+        let placed = country.map(|c| {
+            let slot = per_country
+                .entry(c.code.clone())
+                .or_insert_with(|| (c.name.clone(), (c.lat, c.lon), 0));
+            slot.2 += 1;
+            let seed = u64::from_str_radix(&id, 16).unwrap_or_else(|_| id.len() as u64);
+            (c, scatter(c.lat, c.lon, seed, slot.2 - 1))
+        });
+        nodes.push(MapNode {
+            id,
+            country: placed.map(|(c, _)| c.code.clone()),
+            country_name: placed.map(|(c, _)| c.name.clone()),
+            lat: placed.map(|(_, p)| p.0),
+            lon: placed.map(|(_, p)| p.1),
+            net: ip.map(masked_net),
+            user_agent,
+            protocol_version,
+            ping_ms,
+            outbound,
+            connected_for_sec,
+            blocks_relayed,
+            ibd,
+            is_self,
+        });
+    };
+
+    // The explorer's own node leads the list.
+    let self_agent = format!("/zkas-explorer:{}/", env!("CARGO_PKG_VERSION"));
+    place(s.self_ip, "explorer".to_string(), self_agent.clone(), 0, None, None, None, 0, false, true);
+    *agents.entry(self_agent).or_default() += 1;
+    match s.self_ip {
+        Some(std::net::IpAddr::V4(_)) => ipv4 += 1,
+        Some(std::net::IpAddr::V6(_)) => ipv6 += 1,
+        None => {}
+    }
+
+    for p in &peers {
+        let ip = p.address.ip.to_string().parse::<std::net::IpAddr>().ok();
+        match ip {
+            Some(std::net::IpAddr::V4(_)) => ipv4 += 1,
+            Some(std::net::IpAddr::V6(_)) => ipv6 += 1,
+            None => {}
+        }
+        if p.is_outbound { outbound += 1 } else { inbound += 1 }
+        *agents.entry(p.user_agent.clone()).or_default() += 1;
+        // The node reports `time_connected` as milliseconds ELAPSED since the
+        // connection was established, not as a timestamp.
+        let connected_for = (p.time_connected > 0).then_some(p.time_connected / 1_000);
+        place(
+            ip,
+            short_id(&p.id.to_string()),
+            p.user_agent.clone(),
+            p.advertised_protocol_version,
+            Some(p.last_ping_duration),
+            Some(p.is_outbound),
+            connected_for,
+            p.blocks_relayed,
+            p.is_ibd_peer,
+            false,
+        );
+    }
+
+    let located = nodes.iter().filter(|n| n.country.is_some()).count();
+    let total = nodes.len().max(1);
+    let mut countries: Vec<Value> = per_country
+        .iter()
+        .map(|(code, (name, centroid, count))| {
+            json!({
+                "code": code,
+                "name": name,
+                "count": count,
+                "share": *count as f64 / total as f64,
+                "lat": centroid.0,
+                "lon": centroid.1,
+            })
+        })
+        .collect();
+    countries.sort_by(|a, b| {
+        let (ca, cb) = (a["count"].as_u64().unwrap_or(0), b["count"].as_u64().unwrap_or(0));
+        cb.cmp(&ca).then_with(|| a["code"].as_str().unwrap_or("").cmp(b["code"].as_str().unwrap_or("")))
+    });
+
+    let mut user_agents: Vec<Value> =
+        agents.into_iter().map(|(agent, count)| json!({ "agent": agent, "count": count })).collect();
+    user_agents.sort_by(|a, b| {
+        let (ca, cb) = (a["count"].as_u64().unwrap_or(0), b["count"].as_u64().unwrap_or(0));
+        cb.cmp(&ca).then_with(|| a["agent"].as_str().unwrap_or("").cmp(b["agent"].as_str().unwrap_or("")))
+    });
+
+    Json(json!({
+        "updatedAt": now,
+        "totals": {
+            "nodes": nodes.len(),
+            "peers": peers.len(),
+            "countries": per_country.len(),
+            "located": located,
+            "inbound": inbound,
+            "outbound": outbound,
+            "ipv4": ipv4,
+            "ipv6": ipv6,
+            "blocksRelayed": peers.iter().map(|p| p.blocks_relayed).sum::<u64>(),
+        },
+        "nodes": nodes,
+        "countries": countries,
+        "userAgents": user_agents,
+    }))
+    .into_response()
+}
+
+/// Node-level relay telemetry: what this node has actually ingested and what it
+/// has published itself.
+///
+/// This is deliberately NODE-wide, not per peer. The p2p layer does not record
+/// which peer a given block arrived from — `BlockLogEvent` distinguishes only
+/// *relay* from *submit block* — and nothing in `GetConnectedPeerInfo` counts
+/// blocks. So "block X came from IP Y" is not a fact this node possesses, and we
+/// do not publish peer addresses in any case (see `geo`: country level only).
+///
+/// What IS true and useful is this node's own throughput. Note the counter
+/// names: `blocks_submitted` in consensus means "handed to the processing
+/// pipeline" from ANY source (see `Consensus::validate_and_insert_block`), not
+/// "mined here" — so it is published as `blocksIngested` and the frontend must
+/// not call it mining. Counters reset when the node restarts.
+async fn info_relay(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    let m = match s.client.get_metrics(false, true, false, true, false, false).await {
+        Ok(m) => m,
+        Err(e) => return err(e.to_string()),
+    };
+    let c = m.consensus_metrics;
+    let n = m.connection_metrics;
+    Json(json!({
+        "updatedAt": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        "blocksIngested": c.as_ref().map(|c| c.node_blocks_submitted_count),
+        "headersProcessed": c.as_ref().map(|c| c.node_headers_processed_count),
+        "bodiesProcessed": c.as_ref().map(|c| c.node_bodies_processed_count),
+        "chainBlocksProcessed": c.as_ref().map(|c| c.node_chain_blocks_processed_count),
+        "transactionsProcessed": c.as_ref().map(|c| c.node_transactions_processed_count),
+        "databaseBlocks": c.as_ref().map(|c| c.node_database_blocks_count),
+        "mempoolSize": c.as_ref().map(|c| c.network_mempool_size),
+        "tipHashes": c.as_ref().map(|c| c.network_tip_hashes_count),
+        "virtualDaaScore": c.as_ref().map(|c| c.network_virtual_daa_score),
+        "difficulty": c.as_ref().map(|c| c.network_difficulty),
+        "activePeers": n.as_ref().map(|n| n.active_peers),
+    }))
+    .into_response()
+}
+
+/// Sweep every connected peer for a co-located Kaspa node.
+///
+/// See `merged` for why this identifies merged miners. Runs on a long timer: the
+/// answer changes only when an operator reconfigures, and probing peers is a
+/// courtesy-bounded activity — one connect per peer per sweep, nothing more.
+async fn scan_merged(state: Arc<AppState>) {
+    const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+    // Let the node settle its peer set before the first sweep.
+    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+    loop {
+        let peers = match state.client.get_connected_peer_info().await {
+            Ok(r) => r.peer_info,
+            Err(e) => {
+                log::warn!("merged scan: peer list unavailable: {e}");
+                tokio::time::sleep(SWEEP_INTERVAL).await;
+                continue;
+            }
+        };
+
+        let mut found = std::collections::HashMap::new();
+        let mut checked = std::collections::HashSet::new();
+        let mut reachable = std::collections::HashSet::new();
+        for p in &peers {
+            let Ok(ip) = p.address.ip.to_string().parse::<std::net::IpAddr>() else { continue };
+            let id = short_id(&p.id.to_string());
+            checked.insert(id.clone());
+            let sweep = merged::probe_kaspa_all(ip, p.address.port).await;
+            if sweep.reachable {
+                reachable.insert(id.clone());
+            }
+            if !sweep.found.is_empty() {
+                for h in &sweep.found {
+                    log::info!("merged scan: peer {id} also runs {} at {}", h.network, h.address);
+                }
+                found.insert(id, sweep.found);
+            }
+        }
+        log::info!(
+            "merged scan: {}/{} peers run Kaspa; {} unreachable (firewalled/inbound)",
+            found.len(),
+            checked.len(),
+            checked.len().saturating_sub(reachable.len())
+        );
+        {
+            let mut m = state.merged.write().await;
+            m.scanned_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            m.found = found;
+            m.checked = checked;
+            m.reachable = reachable;
+        }
+        tokio::time::sleep(SWEEP_INTERVAL).await;
+    }
+}
+
+/// Which peers demonstrably run BOTH chains — the merged-mining view.
+///
+/// `kaspa` is present only when that peer's own address answered a Kaspa p2p
+/// handshake. `checked=false` means the sweep has not reached it yet, which is not
+/// the same as a negative result and must not be rendered as one.
+async fn info_merged(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    let peers = match s.client.get_connected_peer_info().await {
+        Ok(r) => r.peer_info,
+        Err(e) => return err(e.to_string()),
+    };
+    let scan = s.merged.read().await;
+
+    let rows: Vec<Value> = peers
+        .iter()
+        .map(|p| {
+            let id = short_id(&p.id.to_string());
+            let ip = p.address.ip.to_string().parse::<std::net::IpAddr>().ok();
+            let country = ip.and_then(geo::lookup);
+            json!({
+                "id": id,
+                "country": country.map(|c| c.code.clone()),
+                "countryName": country.map(|c| c.name.clone()),
+                "net": ip.map(masked_net),
+                // The port the peer listens on for ZKas. A non-default value here
+                // next to a Kaspa node on 16111 is the merged-mining signature.
+                "zkasPort": p.address.port,
+                "userAgent": p.user_agent.clone(),
+                "blocksRelayed": p.blocks_relayed,
+                "checked": scan.checked.contains(&id),
+                // Reachable = at least one swept port accepted a connection. False on
+                // a checked peer means firewalled / inbound-only: unprobeable.
+                "reachable": scan.reachable.contains(&id),
+                "kaspa": scan.found.get(&id),
+                "kaspaAddress": scan.found.get(&id).and_then(|v| v.first()).map(|f| f.address.clone()),
+            })
+        })
+        .collect();
+
+    let merged_count = rows.iter().filter(|r| !r["kaspa"].is_null()).count();
+    Json(json!({
+        "scannedAt": scan.scanned_at,
+        "peers": peers.len(),
+        "merged": merged_count,
+        "checked": scan.checked.len(),
+        "ports": merged::KASPA_PORTS,
+        "nodes": rows,
+    }))
+    .into_response()
+}
+
 async fn info_blockdag(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     match s.client.get_block_dag_info().await {
         Ok(d) => Json(json!({
@@ -491,11 +952,51 @@ async fn info_blockdag(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
+/// The consensus emission schedule, built once from the mainnet params. This is the
+/// exact object consensus uses to decide each block's subsidy.
+fn coinbase_manager() -> CoinbaseManager {
+    let p = Params::from(NetworkType::Mainnet);
+    CoinbaseManager::new(
+        p.coinbase_payload_script_public_key_max_len,
+        p.max_coinbase_payload_len,
+        p.deflationary_phase_daa_score,
+        p.pre_deflationary_phase_base_subsidy,
+        p.bps_history(),
+        p.toccata_activation,
+        p.dev_fee_permille,
+        p.dev_fee_recipient,
+    )
+}
+
+/// Total ZKas issued through `daa_score`, summed from the consensus subsidy schedule.
+///
+/// Memoised: only blocks added since the last call are summed, so a running explorer
+/// pays for chain growth, not chain length.
+async fn circulating_sompi(s: &AppState, daa_score: u64) -> u128 {
+    let mut cache = s.supply.write().await;
+    if daa_score <= cache.daa_score {
+        return cache.total_sompi;
+    }
+    let cbm = coinbase_manager();
+    let mut total = cache.total_sompi;
+    for daa in (cache.daa_score + 1)..=daa_score {
+        total += cbm.calc_block_subsidy(daa) as u128;
+    }
+    cache.daa_score = daa_score;
+    cache.total_sompi = total;
+    total
+}
+
 async fn info_coinsupply(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     // On a shielded chain the node's UTXO-based coin supply is 0 (no transparent
-    // outputs); the real circulating supply is the value that has entered the
-    // shielded pool via coinbase (the turnstile-in total).
-    let circulating = { s.shielded.read().await.turnstile_in_sompi };
+    // outputs), so the explorer has to derive it. Derive it from the EMISSION SCHEDULE,
+    // never by summing the coinbases a follower saw: on a DAG that counts unaccepted
+    // coinbases and double-counts every merged reward (see `SupplyCache`).
+    let daa = match s.client.get_block_dag_info().await {
+        Ok(d) => d.virtual_daa_score,
+        Err(e) => return err(e.to_string()),
+    };
+    let circulating = circulating_sompi(&s, daa).await;
     // ZKas emission has a PERPETUAL TAIL (the subsidy floors at 3 FC/s and never
     // reaches zero — see the consensus `tail_subsidy`), so there is no terminal
     // supply. Reporting a finite `maxSupply` here was simply false. `null` is the
@@ -532,12 +1033,19 @@ async fn info_halving(State(s): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn info_shielded(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    // `turnstileIn` is the value minted into the shielded pool, which on this chain is
+    // exactly the issued supply — so it comes from the emission schedule for the same
+    // reason `circulatingSupply` does, and the two can never disagree.
+    let turnstile_in = match s.client.get_block_dag_info().await {
+        Ok(d) => circulating_sompi(&s, d.virtual_daa_score).await,
+        Err(_) => 0,
+    };
     let agg = s.shielded.read().await;
     Json(json!({
         "anchor": if agg.state_root.is_empty() { Value::Null } else { json!(agg.state_root) },
         "nullifierCount": agg.nullifier_count,
         "noteCount": agg.note_count,
-        "turnstileIn": agg.turnstile_in_sompi.to_string(),
+        "turnstileIn": turnstile_in.to_string(),
         "turnstileOut": "0",
         "emissionPerBlock": agg.emission_per_block_fc,
         "blueScore": agg.blue_score.to_string(),
@@ -578,7 +1086,13 @@ async fn blocks_recent(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     Json(recent.iter().take(RECENT_PUBLIC_CAP).cloned().collect::<Vec<_>>())
 }
 
-async fn info_pulse(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+#[derive(Debug, Deserialize)]
+struct PulseQuery {
+    /// Work-chart window: 15m, 1h, 12h, or 24h. Defaults to 15m.
+    window: Option<String>,
+}
+
+async fn info_pulse(State(s): State<Arc<AppState>>, Query(query): Query<PulseQuery>) -> impl IntoResponse {
     const FIFTEEN_MIN_MS: u64 = 15 * 60 * 1_000;
     const HOUR_MS: u64 = 60 * 60 * 1_000;
     const BIN_MS: u64 = 15_000;
@@ -591,6 +1105,8 @@ async fn info_pulse(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     let mut transactions_1h = 0_u64;
     let mut block_bins = vec![0_u64; BINS];
     let mut transaction_bins = vec![0_u64; BINS];
+    let mut difficulty_bins = vec![0.0_f64; BINS];
+    let mut difficulty_counts = vec![0_u64; BINS];
     let mut daa_15m = Vec::new();
     let mut daa_1h = Vec::new();
 
@@ -611,6 +1127,10 @@ async fn info_pulse(State(s): State<Arc<AppState>>) -> impl IntoResponse {
             let bin = BINS - 1 - (age / BIN_MS) as usize;
             block_bins[bin] += 1;
             transaction_bins[bin] = transaction_bins[bin].saturating_add(block.tx_count);
+            if block.difficulty.is_finite() && block.difficulty > 0.0 {
+                difficulty_bins[bin] += block.difficulty;
+                difficulty_counts[bin] += 1;
+            }
             daa_15m.push(daa);
         }
     }
@@ -625,6 +1145,47 @@ async fn info_pulse(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     let non_coinbase_1h = transactions_1h.saturating_sub(daa_1h.len() as u64);
     transactions_1h = dag_blocks_1h.saturating_add(non_coinbase_1h);
     blocks_15m = dag_blocks_15m;
+    for i in 0..BINS {
+        if difficulty_counts[i] > 0 {
+            difficulty_bins[i] /= difficulty_counts[i] as f64;
+        }
+    }
+    // Network work estimate follows the consensus difficulty convention:
+    // hashrate = difficulty × 2 hashes/sec.
+    let hashrate_bins: Vec<f64> = difficulty_bins.iter().map(|d| d * 2.0).collect();
+
+    let work_window_seconds = match query.window.as_deref() {
+        Some("1h") => 3_600_u64,
+        Some("12h") => 43_200_u64,
+        Some("24h") => 86_400_u64,
+        Some("7d") => 604_800_u64,
+        Some("30d") => 2_592_000_u64,
+        _ => 900_u64,
+    };
+    let work_bins = (work_window_seconds / 15).clamp(60, 240) as usize;
+    let work_bin_seconds = (work_window_seconds / work_bins as u64).max(15);
+    let work_now_ms = now_ms;
+    let work = s.work_history.read().await;
+    let mut work_sum = vec![0.0_f64; work_bins];
+    let mut work_count = vec![0_u64; work_bins];
+    for point in work.iter() {
+        if point.timestamp > work_now_ms { continue; }
+        let age = work_now_ms - point.timestamp;
+        if age >= work_window_seconds * 1_000 { continue; }
+        let bin = work_bins - 1 - ((age / (work_bin_seconds * 1_000)) as usize).min(work_bins - 1);
+        if point.difficulty > 0.0 && point.difficulty.is_finite() {
+            work_sum[bin] += point.difficulty;
+            work_count[bin] += 1;
+        }
+    }
+    for i in 0..work_bins {
+        if work_count[i] > 0 { work_sum[i] /= work_count[i] as f64; }
+    }
+    let fallback_difficulty = work_sum.iter().rev().copied().find(|d| *d > 0.0)
+        .or_else(|| recent.iter().find(|b| b.difficulty > 0.0).map(|b| b.difficulty))
+        .unwrap_or(0.0);
+    for value in &mut work_sum { if *value <= 0.0 { *value = fallback_difficulty; } }
+    let work_hashrate: Vec<f64> = work_sum.iter().map(|d| d * 2.0).collect();
 
     Json(json!({
         "windowSeconds": 900,
@@ -636,6 +1197,12 @@ async fn info_pulse(State(s): State<Arc<AppState>>) -> impl IntoResponse {
         "binSeconds": 15,
         "blockBins": block_bins,
         "transactionBins": transaction_bins,
+        "difficultyBins": difficulty_bins,
+        "hashrateBins": hashrate_bins,
+        "workWindowSeconds": work_window_seconds,
+        "workBinSeconds": work_bin_seconds,
+        "workDifficultyBins": work_sum,
+        "workHashrateBins": work_hashrate,
         "timestamp": now_ms,
     }))
 }
@@ -967,19 +1534,33 @@ async fn main() {
     let state = Arc::new(AppState {
         client,
         recent: RwLock::new(VecDeque::with_capacity(RECENT_CAP)),
+        work_history: RwLock::new(VecDeque::with_capacity(WORK_HISTORY_CAP)),
         shielded: RwLock::new(ShieldedAgg::default()),
         network_name,
         tx_index: RwLock::new(load_tx_index(&cli.tx_index)),
         tx_index_path: cli.tx_index.clone(),
+        self_ip: cli.self_ip.as_deref().and_then(|s| match s.parse() {
+            Ok(ip) => Some(ip),
+            Err(e) => {
+                log::warn!("ignoring --self-ip {s}: {e}");
+                None
+            }
+        }),
+        merged: RwLock::new(MergedScan::default()),
+        supply: RwLock::new(SupplyCache::default()),
     });
 
     tokio::spawn(follow(state.clone()));
+    tokio::spawn(scan_merged(state.clone()));
 
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
     let app = Router::new()
         .route("/info/blockdag", get(info_blockdag))
         .route("/info/pulse", get(info_pulse))
         .route("/info/network", get(info_network))
+        .route("/info/nodes", get(info_nodes))
+        .route("/info/relay", get(info_relay))
+        .route("/info/merged-mining", get(info_merged))
         .route("/info/coinsupply", get(info_coinsupply))
         .route("/info/blockreward", get(info_blockreward))
         .route("/info/halving", get(info_halving))
