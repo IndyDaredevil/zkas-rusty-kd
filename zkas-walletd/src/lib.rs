@@ -3091,9 +3091,16 @@ async fn sync_loop(state: Arc<AppState>) {
         if !wallets.is_empty() {
             // Timed out for the same reason as the page fetch: this runs once per pass on
             // the shared loop, so a hang here freezes every wallet.
+            // A timed-out dag-info must NOT be reported as "the chain is 0 blocks long".
+            // This value is stamped into EVERY wallet swept this pass, and `synced`
+            // compares `scanned + margin >= chain_len` — so a zero here makes every
+            // wallet claim to be synced, and one still halfway through its scan then
+            // presents a PARTIAL balance as final. Observed live 2026-07-30: one wallet
+            // under four tokens reporting 2,038,348 / 1,902,767 / 1,902,767 / 0.00 ZKAS,
+            // all four "synced". Fall back to the last tip actually observed.
             let chain_len = match tokio::time::timeout(SYNC_RPC_TIMEOUT, state.sync_client.get_block_dag_info()).await {
                 Ok(Ok(d)) => d.virtual_daa_score,
-                _ => 0,
+                _ => state.node_tip.lock().await.0,
             };
             if chain_len > 0 {
                 *state.node_tip.lock().await = (chain_len, std::time::Instant::now());
@@ -3585,7 +3592,11 @@ async fn wallet_balance(
     Ok(Json(BalanceResp {
         balance_sompi: e.db.balance().to_string(),
         balance_fc: fmt_fc(e.db.balance()),
-        synced: e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= e.chain_len,
+        // Same `tip > 0` guard `status` carries: an unknown tip is NOT evidence of being
+        // synced. Without it, `scanned + margin >= 0` is trivially true and a wallet that
+        // has not yet been swept (or was swept on a pass whose dag-info timed out) reports
+        // a partial balance as final — the shape every "my coins vanished" report takes.
+        synced: e.chain_len > 0 && (e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= e.chain_len),
         scanned_blocks: e.scanned,
         chain_len: e.chain_len,
         notes,
