@@ -1906,8 +1906,24 @@ impl ConsensusApi for Consensus {
     }
 
     fn is_consensus_in_transitional_ibd_state(&self) -> bool {
-        let pruning_meta_read = self.pruning_meta_stores.read();
-        pruning_meta_read.is_in_transitional_ibd_state()
+        if self.pruning_meta_stores.read().is_in_transitional_ibd_state() {
+            return true;
+        }
+        // Corroborate the shielded half against the data, for the same reason
+        // `is_pruning_shielded_stable` does — but here it is what makes recovery *fire*.
+        //
+        // The relay flow re-triggers IBD as soon as this returns true ("if in a transitional ibd
+        // state, do not wait, sync immediately"). The store-level answer depends on the shielded
+        // stable flag, which is only lowered by two specific disqualification variants
+        // (`BadCoinbaseTransaction` / `InvalidShieldedState`). A node that wedges through any other
+        // path therefore never lowers the flag, never looks transitional, and so never re-enters
+        // IBD — it is header-synced, so nothing else triggers one either. Observed live: a node
+        // disqualifying every chain block for 75+ minutes straight (17:45 → 19:02) with a
+        // successfully-completed IBD behind it and no recovery attempt.
+        //
+        // Asking whether the pruning point actually has shielded state makes recovery independent
+        // of which error variant fired.
+        !self.is_pruning_shielded_stable()
     }
 
     fn get_n_last_pruning_points(&self, n: usize) -> Vec<Hash> {
