@@ -380,6 +380,56 @@ fn verify(address: String, message: String, sig: String) {
     }
 }
 
+/// Pick the deepest checkpoint this node can actually serve, and return it with its
+/// tree frontier: **genesis** when the node holds the whole chain, the pruning point
+/// otherwise.
+///
+/// Anchoring at the pruning point unconditionally is wrong and silently loses money.
+/// `--archival` does NOT hold `pruning_point_hash` at genesis — that hash advances on
+/// every node — but it does pin the *retention root*, which is what block serving is
+/// actually gated on (`consensus/mod.rs`, `get_virtual_chain_from_block`). The shielded
+/// stores (tree frontiers, scan archive, nullifiers) are never pruned at all. So an
+/// archival node serves genesis and the complete note history, and a scan that starts
+/// at the pruning point throws it away for nothing: measured live on 2026-07-31, the
+/// pruning point sat at tree position 589,776 of 792,715 — **74% of every note ever
+/// minted was below the anchor and never looked at**. A wallet then reports a partial
+/// balance as its whole balance, and a spend cannot select the notes it can't see.
+///
+/// Same fix, and the same reasoning, as `zkas-walletd`'s `full_scan_entry`.
+async fn scan_anchor(client: &GrpcClient) -> (RpcHash, kaspa_rpc_core::GetShieldedTreeStateResponse) {
+    // Probe genesis first. A node that has pruned it answers with an error or with a
+    // different block hash; either way we fall through to the pruning point, which is
+    // the most history that node can honestly offer.
+    let genesis = resolve_genesis(client).await;
+    if let Ok(ts) = client.get_shielded_tree_state(Some(genesis)).await
+        && ts.block_hash == genesis
+    {
+        log::info!("scan anchored at GENESIS — this node serves the complete shielded history");
+        return (genesis, ts);
+    }
+
+    let dag = client.get_block_dag_info().await.unwrap_or_else(|e| fatal(format!("get_block_dag_info failed: {e}")));
+    let start = dag.pruning_point_hash;
+    let ts = client
+        .get_shielded_tree_state(Some(start))
+        .await
+        .unwrap_or_else(|e| fatal(format!("get_shielded_tree_state({start}) failed: {e} — node too old? update it")));
+    if ts.block_hash != start {
+        fatal("node ignored the explicit tree-state checkpoint (update the node)".into());
+    }
+    // Not a footnote: any note this wallet received below here is unrecoverable through
+    // this node, and the balance printed afterwards is a partial one. Say so loudly
+    // rather than let the user read it as the truth.
+    log::warn!(
+        "scan anchored at the PRUNING POINT (daa {}, tree position {}) — this node cannot serve genesis, so \
+         every note minted below that point is INVISIBLE and the balance shown will be PARTIAL. Point --rpc-server \
+         at a node started with --archival to see the full history.",
+        ts.daa_score,
+        ts.size
+    );
+    (start, ts)
+}
+
 /// Build a [`WalletDb`] by replaying the accepted chain's shielded effects in
 /// consensus order (PLAN §2.9/§2.10). For every accepted chain block it feeds the
 /// coinbase notes (each output's `(recipient, txid||index)` derivation, exactly as
@@ -396,25 +446,15 @@ fn verify(address: String, message: String, sig: String) {
 /// order. Handling wide-DAG mergeset acceptance order is the remaining item in the
 /// real-wallet task.
 async fn scan_chain(client: &GrpcClient, seed: [u8; 32], matured_margin: Option<u64>) -> (WalletDb, usize) {
-    let dag = client.get_block_dag_info().await.unwrap_or_else(|e| fatal(format!("get_block_dag_info failed: {e}")));
-    let start = dag.pruning_point_hash;
+    let (start, ts) = scan_anchor(client).await;
 
     let mut db = WalletDb::from_seed(seed).unwrap_or_else(|| fatal("seed is not a valid Orchard spending key".into()));
-    // Anchor the tree at the pruning-point frontier so absolute leaf positions are
-    // right even after pruning advances past genesis.
-    let ts = client
-        .get_shielded_tree_state(Some(start))
-        .await
-        .unwrap_or_else(|e| fatal(format!("get_shielded_tree_state({start}) failed: {e} — node too old? update it")));
-    if ts.block_hash != start {
-        fatal("node ignored the explicit tree-state checkpoint (update the node)".into());
-    }
     let fs = FrontierState {
         size: ts.size,
         leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
         ommers: ts.ommers.iter().map(|h| h.as_bytes()).collect(),
     };
-    db.apply_frontier(&fs).unwrap_or_else(|| fatal("inconsistent pruning-point frontier".into()));
+    db.apply_frontier(&fs).unwrap_or_else(|| fatal("inconsistent scan-anchor frontier".into()));
 
     let mut low = start;
     let mut count = 0usize;

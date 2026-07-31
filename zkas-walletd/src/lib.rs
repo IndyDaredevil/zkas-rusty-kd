@@ -2134,24 +2134,51 @@ fn ingest_shielded_chain_block(db: &mut WalletDb, blk: &RpcShieldedChainBlock) {
 }
 
 /// One-off replay of the settled **matured** chain prefix into a fresh wallet
-/// view (send fallback + non-custodial `/prepare`): anchors the tree at the
-/// pruning-point frontier (all recoverable history, correct absolute positions),
-/// then ingests chain blocks up to `sink_blue − (anchor_depth + slack)` — so
+/// view (send fallback + non-custodial `/prepare`): anchors the tree as far back as
+/// the node can serve — genesis on an archival node, the pruning-point frontier
+/// otherwise — then ingests chain blocks up to `sink_blue − (anchor_depth + slack)` — so
 /// every recovered note is matured and `witness_path` roots at a matured,
 /// canonical chain-block anchor. `db` must be freshly constructed (seed or FVK).
-async fn replay_matured(client: &GrpcClient, mut db: WalletDb) -> Result<WalletDb, String> {
-    let dag = client.get_block_dag_info().await.map_err(|e| format!("get_block_dag_info failed: {e}"))?;
-    let start = dag.pruning_point_hash;
-    let ts = client.get_shielded_tree_state(Some(start)).await.map_err(|e| format!("get_shielded_tree_state({start}) failed: {e}"))?;
-    if ts.block_hash != start {
-        return Err("node does not support explicit tree-state checkpoints (update the node)".into());
-    }
+async fn replay_matured(client: &GrpcClient, genesis: RpcHash, mut db: WalletDb) -> Result<WalletDb, String> {
+    // Probe genesis first, exactly like `full_scan_entry`. Anchoring at the pruning
+    // point unconditionally was this function's version of the 2026-07-28 amputation
+    // bug: `--archival` pins the RETENTION ROOT (what block serving is gated on), not
+    // `pruning_point_hash`, which advances on every node — and the shielded stores are
+    // never pruned at all. So an archival node serves genesis, and starting at the
+    // pruning point discards real history for nothing. Measured live 2026-07-31: the
+    // pruning point sat at tree position 589,776 of 792,715, i.e. 74% of every note
+    // ever minted was below the anchor. Here that is worse than a wrong balance —
+    // both callers are SPEND paths, so an unseen note is a note the plan cannot select
+    // and the user gets "insufficient funds" while holding the coins.
+    let (start, ts) = match client.get_shielded_tree_state(Some(genesis)).await {
+        Ok(ts) if ts.block_hash == genesis => {
+            log::info!("matured replay anchored at GENESIS — this node serves the complete shielded history");
+            (genesis, ts)
+        }
+        _ => {
+            let dag = client.get_block_dag_info().await.map_err(|e| format!("get_block_dag_info failed: {e}"))?;
+            let start = dag.pruning_point_hash;
+            let ts =
+                client.get_shielded_tree_state(Some(start)).await.map_err(|e| format!("get_shielded_tree_state({start}) failed: {e}"))?;
+            if ts.block_hash != start {
+                return Err("node does not support explicit tree-state checkpoints (update the node)".into());
+            }
+            log::warn!(
+                "matured replay anchored at the PRUNING POINT (daa {}, tree position {}) — this node cannot serve \
+                 genesis, so notes minted below that point are invisible to this spend and it may report \
+                 insufficient funds against a wallet that in fact holds enough",
+                ts.daa_score,
+                ts.size
+            );
+            (start, ts)
+        }
+    };
     let fs = FrontierState {
         size: ts.size,
         leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
         ommers: ts.ommers.iter().map(|h| h.as_bytes()).collect(),
     };
-    db.apply_frontier(&fs).ok_or("inconsistent pruning-point frontier")?;
+    db.apply_frontier(&fs).ok_or("inconsistent scan-anchor frontier")?;
 
     let mut low = start;
     loop {
@@ -4065,7 +4092,7 @@ async fn wallet_send(
         _ => {
             log::warn!("send: fast path unavailable/insufficient; falling back to a matured chain replay (slow, one-off)");
             let fresh = WalletDb::from_seed(seed).ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "bad seed"))?;
-            let db = replay_matured(client, fresh).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let db = replay_matured(client, state.genesis, fresh).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
             let mut candidates = db.notes().to_vec();
             candidates.sort_by(|a, b| b.value().cmp(&a.value()));
             let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
@@ -4861,7 +4888,7 @@ async fn wallet_prepare(
         let db =
             WalletDb::from_fvk(&fvk_bytes).ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex is not a valid full viewing key"))?;
         log::info!("non-custodial prepare: watch-only matured chain replay...");
-        let db = replay_matured(client, db).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let db = replay_matured(client, state.genesis, db).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
         let mut candidates = db.notes().to_vec();
         candidates.sort_by(|a, b| b.value().cmp(&a.value()));
         have_total = Some(candidates.iter().map(|n| n.value()).sum());
