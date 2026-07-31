@@ -459,6 +459,25 @@ impl DbAnchorBlockStore {
     pub fn set_batch(&self, batch: &mut WriteBatch, anchor: [u8; 32], block: Hash) -> StoreResult<()> {
         self.access.write(BatchDbWriter::new(batch), AnchorKey(anchor), block)
     }
+
+    /// Every `(anchor, source block)` pair this node has indexed.
+    ///
+    /// Used by the shielded IBD export to hand a syncee the anchors below the pruning point that
+    /// spends may still legitimately prove against. The obvious alternative — walking the chain and
+    /// calling `anchor_at(block)` per block — recomputes a `GlobalTree` root from each stored
+    /// frontier, and at `max_shielded_anchor_age` (27,000 blocks at 1 BPS) that overran the 120s IBD
+    /// timeout, so the whole import failed. The pairs are already stored here; read them instead of
+    /// deriving them.
+    pub fn iter_all(&self) -> impl Iterator<Item = StoreResult<([u8; 32], Hash)>> + '_ {
+        self.access.iterator().map(|res| match res {
+            Ok((key, block)) => {
+                let mut anchor = [0u8; 32];
+                anchor.copy_from_slice(&key);
+                Ok((anchor, block))
+            }
+            Err(e) => Err(StoreError::DataInconsistency(format!("anchor-block index iteration failed: {e}"))),
+        })
+    }
 }
 
 impl AnchorBlockStoreReader for DbAnchorBlockStore {

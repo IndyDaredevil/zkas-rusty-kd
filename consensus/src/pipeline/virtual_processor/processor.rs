@@ -368,21 +368,22 @@ impl VirtualStateProcessor {
         // far (a node that itself fast-synced), since anything we cannot resolve we simply do not
         // claim — the receiver is no worse off than today.
         let window = self.max_shielded_anchor_age;
-        let sc_read = self.selected_chain_store.read();
-        if let Some(pp_index) = sc_read.get_by_hash(pp).optional()? {
-            let low_index = pp_index.saturating_sub(window);
-            let mut anchors = Vec::with_capacity((pp_index - low_index) as usize);
-            for index in low_index..pp_index {
-                let Some(hash) = sc_read.get_by_index(index).optional()? else { continue };
-                // `anchor_at` reads the retained per-block frontier; a block with no shielded
-                // state yet has none to offer and is skipped.
-                if let Ok(anchor) = self.shielded_state_manager.anchor_at(hash) {
-                    anchors.push((anchor, hash));
+        let window_blocks: BlockHashSet = {
+            let sc_read = self.selected_chain_store.read();
+            match sc_read.get_by_hash(pp).optional()? {
+                Some(pp_index) => {
+                    let low_index = pp_index.saturating_sub(window);
+                    (low_index..pp_index).filter_map(|i| sc_read.get_by_index(i).optional().ok().flatten()).collect()
                 }
+                None => BlockHashSet::default(),
             }
-            md.in_window_anchors = anchors;
+        };
+        if !window_blocks.is_empty() {
+            // Read the pairs out of the stored index rather than recomputing a tree root per
+            // block: the derive-per-block version overran the 120s IBD timeout at 27,000 blocks
+            // and made every shielded import fail. Observed live 2026-07-31.
+            md.in_window_anchors = self.shielded_state_manager.anchors_for_blocks(&window_blocks)?;
         }
-        drop(sc_read);
         let nullifier_count = self.pruning_point_nullifier_set(pp)?.len() as u64;
         Ok(Some(kaspa_consensus_core::api::ShieldedExportMetadata { data: md.to_wire_bytes(), nullifier_count }))
     }

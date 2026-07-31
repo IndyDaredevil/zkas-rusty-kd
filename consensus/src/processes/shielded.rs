@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use kaspa_consensus_core::BlockHashSet;
 use kaspa_consensus_core::tx::Transaction;
 use kaspa_database::prelude::{CachePolicy, DB, StoreError, StoreResult};
 use kaspa_hashes::Hash;
@@ -323,6 +324,21 @@ impl ShieldedStateManager {
     /// F-04/F-05). `None` means the anchor is not a real tree root of any block.
     pub fn anchor_source_block(&self, anchor: &[u8; 32]) -> StoreResult<Option<Hash>> {
         self.anchor_block.get(anchor)
+    }
+
+    /// The `(anchor, source block)` pairs whose source is in `blocks` — the in-window anchors a
+    /// syncee needs so that spends anchored below the pruning point remain resolvable. One pass
+    /// over the stored index; see [`DbAnchorBlockStore::iter_all`] for why this is not derived
+    /// per block.
+    pub fn anchors_for_blocks(&self, blocks: &BlockHashSet) -> StoreResult<Vec<([u8; 32], Hash)>> {
+        let mut out = Vec::with_capacity(blocks.len());
+        for entry in self.anchor_block.iter_all() {
+            let (anchor, source) = entry?;
+            if blocks.contains(&source) {
+                out.push((anchor, source));
+            }
+        }
+        Ok(out)
     }
 
     fn load_tree(&self, block: Hash) -> StoreResult<GlobalTree> {
