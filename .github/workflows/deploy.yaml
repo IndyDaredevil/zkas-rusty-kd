@@ -14,8 +14,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macos-latest = Apple Silicon (arm64); macos-13 = Intel (x86_64) so Intel Macs get a working build.
-        os: [ ubuntu-latest, windows-latest, macos-latest, macos-13 ]
+        # macos-latest = Apple Silicon (arm64); macos-15-intel = Intel (x86_64) so Intel Macs get a
+        # working build. NB: `macos-13` was GitHub's Intel image and has been retired — a job asking
+        # for it queues forever instead of failing, which is why zkas-v1.0.1 shipped without an
+        # Intel-macOS archive (4 of 5 build jobs succeeded; that one sat queued for 16h).
+        os: [ ubuntu-latest, windows-latest, macos-latest, macos-15-intel ]
     name: Building, ${{ matrix.os }}
     steps:
       - name: Fix CRLF on Windows
@@ -142,7 +145,7 @@ jobs:
           cp target/release/shielded-pay bin/
           cp target/release/stratum-bridge bin/
           cp docs/RELEASE_README.txt bin/README.txt
-          # arch-tagged so the arm64 (macos-latest) and x86_64 (macos-13/Intel) archives don't collide.
+          # arch-tagged so the arm64 (macos-latest) and x86_64 (macos-15-intel) archives don't collide.
           archive="bin/zkas-${{ github.event.release.tag_name }}-osx-$(uname -m).zip"
           zip -r "${archive}" ./bin/*
           echo "archive=${archive}" >> $GITHUB_ENV
