@@ -1311,3 +1311,102 @@ async fn overaged_shielded_anchor_spend_is_dropped() {
         - (after.cumulative_fees - before.cumulative_fees) as i128;
     assert_eq!(pool_delta, note_value as i128, "the pool must grow by exactly the subsidy when a spend is dropped");
 }
+
+/// A **pruned** node must still be able to enumerate the whole selected chain for a wallet scan.
+///
+/// On an all-shielded chain a wallet cannot rebuild from the UTXO set — it replays the per-chain-block
+/// shielded scan archive, which the pruner retains forever. But the enumeration it needed
+/// (`get_virtual_chain_from_block` → `calculate_chain_path`) walks reachability, which pruning deletes
+/// below the retention root. The result was a node physically holding every note commitment back to
+/// genesis while refusing to serve them, so a restore-from-seed reported a partial balance.
+///
+/// `get_shielded_chain_range` reads the retained `index -> hash` chain index instead. This test pins the
+/// three properties the wallet path depends on: it walks from genesis, it agrees block-for-block with the
+/// reachability path it replaces, and it reports "re-anchor" (rather than a bogus range) for a hash that
+/// is not on the selected chain.
+#[tokio::test]
+async fn shielded_chain_range_enumerates_from_genesis_without_reachability() {
+    let config = inactivity_shortcut_config(); // toccata=always
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+
+    // A short linear chain plus a merge, so the range covers a non-trivial (wide) shape too.
+    for _ in 0..4 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    ctx.build_block_template_row(0..2).validate_and_insert_row().await;
+    ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+
+    let genesis = config.genesis.hash;
+    let sink = ctx.consensus.get_sink();
+
+    // 1. It enumerates from genesis, in chain order, ending at the sink.
+    let range = ctx.consensus.get_shielded_chain_range(genesis, 1000).unwrap().expect("genesis is on the selected chain");
+    assert!(!range.is_empty(), "a chain with blocks must yield a non-empty range from genesis");
+    assert!(!range.contains(&genesis), "the range is strictly *after* low");
+    assert_eq!(*range.last().unwrap(), sink, "the range must reach the current sink");
+
+    // 2. It agrees exactly with the reachability path it replaces — same blocks, same order.
+    //    This is the substitution the RPC makes, so a divergence here is a wallet-visible divergence.
+    let via_reachability = ctx.consensus.get_virtual_chain_from_block(genesis, Some(1000)).unwrap().added;
+    assert_eq!(range, via_reachability, "index enumeration must match the reachability chain path block-for-block");
+
+    // 3. `limit` is honoured, and resuming from the last returned block continues without a gap or overlap
+    //    — the exact paging loop a wallet runs.
+    let page = ctx.consensus.get_shielded_chain_range(genesis, 2).unwrap().unwrap();
+    assert_eq!(page.len(), 2, "limit must bound the page");
+    assert_eq!(page[..], range[..2], "the first page is the head of the full range");
+    let next = ctx.consensus.get_shielded_chain_range(page[1], 1000).unwrap().unwrap();
+    assert_eq!(next, range[2..], "resuming from the page's last block continues exactly where it left off");
+
+    // 4. A hash that is not a selected-chain block yields `None` (= re-anchor), never a wrong range.
+    //    `apply_changes` deletes the index entry of any block it removes from the chain, so this is
+    //    also how a reorged-out anchor is detected.
+    assert!(
+        ctx.consensus.get_shielded_chain_range(Hash::from_bytes([0xab; 32]), 10).unwrap().is_none(),
+        "an unknown/off-chain anchor must report re-anchor rather than an arbitrary range"
+    );
+
+    // 5. Every block the range yields is servable, i.e. the enumerator never hands the wallet a
+    //    hash the scan stream then chokes on.
+    for hash in &range {
+        let data = ctx.consensus.get_shielded_chain_block_data(*hash).expect("scan data for a chain block");
+        assert_eq!(data.hash, *hash);
+    }
+}
+
+/// The pruned-node guarantee, on the network shape that actually ships: `shielded_coinbase`.
+///
+/// The companion test above runs on `transparent_mainnet()`, where a chain block with no shielded
+/// activity records nothing in the scan archive — `persist` only writes when there are coinbase
+/// outputs or accepted actions — so serving it after pruning would still need the (pruned) header
+/// and ghostdag stores. On a shielded-coinbase network that hole cannot occur: every chain block
+/// mints its reward as coinbase notes, so every chain block has a scan record, and
+/// `shielded_chain_block_data` answers it entirely from the retained archive. That is what makes
+/// "a pruned node can still rebuild a wallet from genesis" true for ZKas mainnet specifically.
+#[tokio::test]
+async fn shielded_chain_range_is_fully_servable_from_the_retained_archive() {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.toccata_activation = ForkActivation::always();
+    let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let recipient = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).expect("valid orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&recipient)), vec![]);
+
+    for _ in 0..5 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+
+    let range = ctx.consensus.get_shielded_chain_range(config.genesis.hash, 1000).unwrap().expect("genesis is on chain");
+    assert_eq!(*range.last().unwrap(), ctx.consensus.get_sink());
+
+    // The property the wallet depends on: for EVERY enumerated block the scan archive alone
+    // carries the coinbase mint, so the note stream survives losing bodies, headers and reachability.
+    for hash in &range {
+        let data = ctx.consensus.get_shielded_chain_block_data(*hash).expect("scan data for a chain block");
+        assert_eq!(data.hash, *hash);
+        assert!(!data.coinbase_outputs.is_empty(), "a shielded-coinbase chain block always mints coinbase notes");
+        assert_ne!(data.coinbase_txid, kaspa_hashes::Hash::default(), "a real coinbase txid, not the empty-record sentinel");
+    }
+}

@@ -263,6 +263,12 @@ impl ConsensusSessionOwned {
         self.clone().spawn_blocking(move |c| c.get_shielded_chain_block_data(block)).await
     }
 
+    /// The next `limit` selected-chain hashes after `low`, read from the retained chain
+    /// index so a pruned node can still enumerate full history. `None` = re-anchor.
+    pub async fn async_get_shielded_chain_range(&self, low: Hash, limit: usize) -> ConsensusResult<Option<Vec<Hash>>> {
+        self.clone().spawn_blocking(move |c| c.get_shielded_chain_range(low, limit)).await
+    }
+
     pub async fn async_get_sink_timestamp(&self) -> u64 {
         self.clone().spawn_blocking(|c| c.get_sink_timestamp()).await
     }

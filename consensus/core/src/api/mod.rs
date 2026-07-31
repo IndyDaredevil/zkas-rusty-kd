@@ -511,6 +511,23 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// The next `limit` selected-chain block hashes strictly after `low`, resolved
+    /// through the retained chain index rather than a reachability walk.
+    ///
+    /// This is the enumeration half of a wallet scan, and it exists so that a **pruned**
+    /// node can still serve one. `get_virtual_chain_from_block` answers the same question
+    /// via `calculate_chain_path`, which walks reachability and therefore fails below the
+    /// retention root — even though the shielded scan archive the wallet actually needs is
+    /// retained forever. Reading the `index -> hash` map instead needs no reachability, no
+    /// headers and no block bodies, so history stays scannable for the life of the chain.
+    ///
+    /// `Ok(None)` means `low` is not on the current selected chain — it was reorged out, or
+    /// this node pruned its index before the retention change. Callers should treat that as
+    /// "re-anchor" and fall back to the reachability path to obtain a precise error.
+    fn get_shielded_chain_range(&self, _low: Hash, _limit: usize) -> ConsensusResult<Option<Vec<Hash>>> {
+        unimplemented!()
+    }
+
     /// Open a live canonical-lane stream for the pruning point. The returned
     /// iterator yields every canonical lane once, holds its own owned
     /// pruning-lock guard internally so data stays pinned for its full

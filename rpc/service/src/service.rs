@@ -748,13 +748,26 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             l => l.min(MAX_LIMIT),
         };
         let session = self.consensus_manager.consensus().session().await;
-        let chain_path = session.async_get_virtual_chain_from_block(request.start_hash, Some(limit)).await?;
-        let reorged = !chain_path.removed.is_empty();
+        // Enumerate through the retained chain index first. `get_virtual_chain_from_block` walks
+        // reachability, which pruning deletes below the retention root, so on a pruned node it
+        // refuses to serve scan history the node is still physically holding — the "restored my
+        // seed and my balance is partial" failure. The index path needs neither reachability nor
+        // headers, so it answers from genesis for the life of the chain. `None` means `start_hash`
+        // is not on the current selected chain; fall back so the reachability path can distinguish
+        // a genuine reorg from an unknown/too-low block and produce the precise error.
+        let (added, reorged) = match session.async_get_shielded_chain_range(request.start_hash, limit).await? {
+            Some(added) => (added, false),
+            None => {
+                let chain_path = session.async_get_virtual_chain_from_block(request.start_hash, Some(limit)).await?;
+                let reorged = !chain_path.removed.is_empty();
+                (chain_path.added, reorged)
+            }
+        };
         let sink = session.async_get_sink().await;
         let sink_blue_score = session.async_get_ghostdag_data(sink).await?.blue_score;
         let mut blocks = Vec::new();
         if !reorged {
-            for hash in chain_path.added.iter().take(limit) {
+            for hash in added.iter().take(limit) {
                 let d = session.async_get_shielded_chain_block_data(*hash).await?;
                 blocks.push(RpcShieldedChainBlock {
                     hash: d.hash,

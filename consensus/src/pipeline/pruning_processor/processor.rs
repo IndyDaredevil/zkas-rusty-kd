@@ -15,7 +15,6 @@ use crate::{
             pruning_samples::PruningSamplesStoreReader,
             reachability::{DbReachabilityStore, ReachabilityStoreReader, StagingReachabilityStore},
             relations::StagingRelationsStore,
-            selected_chain::{SelectedChainStore, SelectedChainStoreReader},
             statuses::StatusesStoreReader,
             tips::{TipsStore, TipsStoreReader},
             utxo_diffs::UtxoDiffsStoreReader,
@@ -395,7 +394,8 @@ impl PruningProcessor {
         let mut reachability_read = self.reachability_store.upgradable_read();
 
         {
-            // Start with a batch for pruning body tips and selected chain stores
+            // Start with a batch for pruning body tips (the selected chain index is retained,
+            // see the note below)
             let mut batch = WriteBatch::default();
 
             // Prune tips which can no longer be merged by virtual.
@@ -420,22 +420,36 @@ impl PruningProcessor {
                 )
             }
 
-            // Prune the selected chain index below the pruning point
-            let mut selected_chain_write = self.selected_chain_store.write();
-            // Temp — bug fix upgrade logic: the prev wrong logic might have pruned the new retention period root from the selected chain store,
-            //                               hence we verify its existence first and only then proceed.
-            // TODO (in upcoming versions): remove this temp condition
-            if retention_period_root == new_pruning_point
-                || selected_chain_write.get_by_hash(retention_period_root).optional().unwrap().is_some()
-            {
-                selected_chain_write.prune_below_point(BatchDbWriter::new(&mut batch), retention_period_root).unwrap();
-            }
+            // NOTE (ZKas): upstream prunes the selected chain index below the retention root
+            // here. We deliberately do not, and the reason is user funds.
+            //
+            // On an all-shielded chain a wallet cannot rebuild itself from the UTXO set — it
+            // recovers its notes by replaying the per-chain-block shielded scan archive, which
+            // this pruner already retains forever (see `ShieldedScanBlockStore`: nothing in
+            // `prune` touches it). But the only way to *enumerate* those blocks in chain order
+            // was `calculate_chain_path`, which walks reachability — and reachability IS pruned.
+            // So a pruned node ended up physically holding every note commitment, nullifier and
+            // coinbase recipient back to genesis while refusing to serve them, and a
+            // restore-from-seed against it silently returned a partial balance.
+            //
+            // This index is the missing enumerator, and it is by far the cheapest thing we could
+            // keep: `index -> hash` plus `hash -> index`, ~40 bytes per chain block each way.
+            // Retaining it lets `get_shielded_chain_range` stream full history from a *pruned*
+            // node with no reachability, no headers and no block bodies — so wallet recovery no
+            // longer depends on an archival node existing somewhere in the network.
+            //
+            // Safety of keeping more than upstream: every other reader bounds its own range
+            // explicitly rather than assuming the lowest retained index is the retention root —
+            // `find_accepting_chain_block_hash_at_daa_score` clamps with
+            // `.max(retention_period_root_index)`, `get_chain_block_samples` starts from the last
+            // pruning point, and the sync locator resolves both endpoints by hash. Reorg handling
+            // is unaffected: `apply_changes` still deletes the index entries of removed blocks, so
+            // "present in the index" continues to mean "on the current selected chain".
 
             // Flush the batch to the DB
             self.db.write(batch).unwrap();
 
             // Calling the drops explicitly after the batch is written in order to avoid possible errors.
-            drop(selected_chain_write);
             drop(tips_write);
         }
 

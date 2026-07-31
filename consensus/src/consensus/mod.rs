@@ -670,6 +670,31 @@ impl ConsensusApi for Consensus {
         self.virtual_processor.shielded_chain_block_data(block).map_err(ConsensusError::GeneralOwned)
     }
 
+    fn get_shielded_chain_range(&self, low: Hash, limit: usize) -> ConsensusResult<Option<Vec<Hash>>> {
+        // Hold the pruning lock for the whole read so the index cannot be mutated between
+        // resolving `low` and reading the range above it.
+        let _guard = self.pruning_lock.blocking_read();
+        let sc_read = self.storage.selected_chain_store.read();
+
+        // `apply_changes` deletes the index entry of every block it removes from the selected
+        // chain, so a hit here means `low` is on the chain *now*. A miss is a reorg (or a legacy
+        // DB that pruned its index) — either way the caller must re-anchor.
+        let Some(low_index) = sc_read.get_by_hash(low).optional().unwrap() else {
+            return Ok(None);
+        };
+        let tip_index = sc_read.get_tip().unwrap().0;
+
+        let high_index = tip_index.min(low_index.saturating_add(limit as u64));
+        let mut hashes = Vec::with_capacity((high_index.saturating_sub(low_index)) as usize);
+        for index in (low_index + 1)..=high_index {
+            // A hole cannot occur while the pruning lock is held, but the index is also written
+            // by reorgs; stop cleanly rather than panicking if one is observed.
+            let Some(hash) = sc_read.get_by_index(index).optional().unwrap() else { break };
+            hashes.push(hash);
+        }
+        Ok(Some(hashes))
+    }
+
     fn validate_and_insert_trusted_block(&self, tb: TrustedBlock) -> BlockValidationFutures {
         let (block_task, virtual_state_task) = self.validate_and_insert_block_impl(BlockTask::Trusted { block: tb.block });
         BlockValidationFutures { block_task: Box::pin(block_task), virtual_state_task: Box::pin(virtual_state_task) }
