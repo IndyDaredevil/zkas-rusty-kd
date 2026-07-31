@@ -1401,12 +1401,33 @@ async fn shielded_chain_range_is_fully_servable_from_the_retained_archive() {
     let range = ctx.consensus.get_shielded_chain_range(config.genesis.hash, 1000).unwrap().expect("genesis is on chain");
     assert_eq!(*range.last().unwrap(), ctx.consensus.get_sink());
 
-    // The property the wallet depends on: for EVERY enumerated block the scan archive alone
-    // carries the coinbase mint, so the note stream survives losing bodies, headers and reachability.
+    // The property the wallet depends on: once a block actually mints, the scan archive alone
+    // carries the mint, so the note stream survives losing bodies, headers and reachability.
+    //
+    // Genesis' own child is the documented exception and the reason this loop skips the head of
+    // the range: its only mergeset member is genesis, which is outside the DAA window, so
+    // `expected_coinbase_transaction` emits no outputs, `persist` writes no scan record, and
+    // `shielded_chain_block_data` answers from the (prunable) header/ghostdag stores instead.
+    // That block mints nothing, so no wallet can hold a note from it and nothing is lost — but
+    // it is the one block of the chain that is NOT servable from the retained archive alone.
+    // EVERY block must resolve out of the scan archive, not out of the header/ghostdag fallback —
+    // that fallback reads stores pruning deletes, so a block relying on it becomes a hole in the
+    // wallet's scan stream the moment the node prunes. A real archive record always carries the
+    // block's own coinbase txid; the fallback yields the zero-hash sentinel, so that is the
+    // discriminator. Genesis' child mints nothing (its only mergeset member is genesis, outside
+    // the DAA window) and is exactly the block that used to be skipped by `persist`.
+    let mut minting = 0usize;
     for hash in &range {
         let data = ctx.consensus.get_shielded_chain_block_data(*hash).expect("scan data for a chain block");
         assert_eq!(data.hash, *hash);
-        assert!(!data.coinbase_outputs.is_empty(), "a shielded-coinbase chain block always mints coinbase notes");
-        assert_ne!(data.coinbase_txid, kaspa_hashes::Hash::default(), "a real coinbase txid, not the empty-record sentinel");
+        assert_ne!(
+            data.coinbase_txid,
+            kaspa_hashes::Hash::default(),
+            "every chain block must be served from the retained archive, not the prunable fallback"
+        );
+        if !data.coinbase_outputs.is_empty() {
+            minting += 1;
+        }
     }
+    assert!(minting >= 3, "expected several minting blocks in the range, got {minting}");
 }

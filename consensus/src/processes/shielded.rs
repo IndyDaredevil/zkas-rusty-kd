@@ -458,9 +458,17 @@ impl ShieldedStateManager {
         // scannable after the body prunes. Written whenever the block had shielded
         // effects (coinbase notes or accepted actions).
         if let Some(scan) = &computed.scan_block {
-            if !scan.coinbase_outputs.is_empty() || !scan.accepted.is_empty() {
-                self.scan_block.set_batch(batch, block, scan.clone())?;
-            }
+            // Write the record for EVERY chain block, including one that minted nothing and
+            // accepted nothing. It is tempting to skip those, but the archive is what makes a
+            // pruned node able to serve a wallet scan: `shielded_chain_block_data` falls back to
+            // the ghostdag/header stores when a record is absent, and pruning deletes both. A
+            // skipped block therefore becomes a hole in the scan stream the moment it prunes —
+            // the wallet's paging loop asks for it and gets an error, not an empty block.
+            // An empty record is a few dozen bytes and on a shielded-coinbase network it is rare
+            // anyway (every block mints its reward); paying it unconditionally buys "the whole
+            // chain is always servable from the archive alone", which is the property the wallet
+            // depends on. See [`Self::scan_block`] and `get_shielded_chain_range`.
+            self.scan_block.set_batch(batch, block, scan.clone())?;
         }
         Ok(())
     }

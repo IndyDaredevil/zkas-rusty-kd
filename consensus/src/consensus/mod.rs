@@ -506,6 +506,17 @@ impl Consensus {
         let mut pruning_meta_write = self.pruning_meta_stores.write();
         pruning_meta_write.set_pruning_utxoset_stable_flag(&mut batch, false).unwrap();
         pruning_meta_write.set_pruning_smt_stable_flag(&mut batch, false).unwrap();
+        // The shielded flag MUST be lowered here too. Adopting a syncer's pruning point
+        // invalidates the shielded state exactly as it invalidates the UTXO set and the SMT:
+        // this node holds no frontier, nullifier set, supply totals or anchor index for the new
+        // pruning point. Omitting it meant the flag kept its fail-open default of `true`
+        // (`pruning_meta.rs`), so `IbdType::Sync` took the `else` branch at `ibd/flow.rs` and
+        // *marked the missing state stable* instead of downloading it. The node then disqualified
+        // every chain block above the pruning point — "N disqualified vs 0 valid chain blocks",
+        // virtual frozen, headers still flowing — with no retry path, because it had recorded the
+        // absent state as complete. Reported live 2026-07-31 by a node stuck at DAA 260,547
+        // against a pruning point at 260,461.
+        pruning_meta_write.set_pruning_shielded_stable_flag(&mut batch, false).unwrap();
         drop(pruning_meta_write);
         // Store the currently bodyless anticone from the POV of the syncer, for trusted body validation at a later stage.
         let mut anticone = self.services.dag_traversal_manager.anticone(new_pruning_point, [syncer_sink].into_iter(), None)?;
@@ -1835,7 +1846,35 @@ impl ConsensusApi for Consensus {
     }
 
     fn is_pruning_shielded_stable(&self) -> bool {
-        self.pruning_meta_stores.read().pruning_shielded_stable_flag()
+        if !self.pruning_meta_stores.read().pruning_shielded_stable_flag() {
+            return false;
+        }
+        // The flag alone is not trusted, because it is fail-open: a missing key reads back as
+        // `true` (correct for upgrading nodes, which genuinely had no shielded state to fetch),
+        // and any path that adopts a new pruning point without lowering it leaves a node
+        // *claiming* a shielded state it does not have. That failure is silent and terminal —
+        // every chain block above the pruning point is disqualified and nothing ever retries,
+        // because the node believes it is already synced.
+        //
+        // So corroborate the claim against the data. On a shielded-coinbase network every chain
+        // block mints coinbase notes, so a pruning point that is not genesis MUST have a
+        // non-empty commitment-tree frontier. An empty one means the state was never seeded and
+        // the flag is lying; report unstable so the IBD flow downloads it. Self-healing: an
+        // already-wedged node repairs itself on restart instead of needing its database wiped.
+        if !self.config.shielded_coinbase {
+            return true;
+        }
+        let pruning_point = self.pruning_point_store.read().pruning_point().unwrap();
+        if pruning_point == self.config.genesis.hash {
+            return true;
+        }
+        match self.virtual_processor.shielded_frontier_at(pruning_point) {
+            // A seeded pruning point always has leaves; size 0 here is missing state, not an empty pool.
+            Ok(fs) => fs.size > 0,
+            // Unreadable frontier is likewise "not seeded" — fail toward re-downloading, never
+            // toward silently validating against state we do not hold.
+            Err(_) => false,
+        }
     }
 
     /// The usual flow consists of the pruning point naturally updating during pruning, and hence maintains consistency by default
