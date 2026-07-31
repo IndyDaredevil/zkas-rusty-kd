@@ -118,6 +118,28 @@ pub struct PruningPointShieldedMetadata {
     /// Declared shielded state root at the pruning point (anchor + nullifier-set
     /// accumulator + turnstile totals + burn root), recomputed and cross-checked on import.
     pub state_root: [u8; 32],
+    /// `(anchor, source block)` for the selected-chain blocks in
+    /// `[pruning_point - max_shielded_anchor_age, pruning_point)` — the anchors a spend mined
+    /// just above the pruning point is still allowed to prove against.
+    ///
+    /// **Without these a fast-synced node cannot join the network at all.** Anchor finality is
+    /// decided by `anchor_source_block(anchor)`, and an unknown anchor fails CLOSED
+    /// (`is_shielded_anchor_final` → `false`, the F-04 anti-inflation choice). A syncee builds
+    /// that index only for blocks it validates itself, i.e. from the pruning point forward, so
+    /// every spend anchored below the pruning point is judged non-final and DROPPED. The real
+    /// chain applied it, so the real coinbase re-mints its fee and the syncee's expected coinbase
+    /// does not — `BadCoinbaseTransaction`, block disqualified, virtual frozen, permanently.
+    ///
+    /// Reproduced on a clean node 2026-07-31: pruning point at DAA 303,680, first disqualified
+    /// block at DAA 303,686 — the 6th block after it, and the first whose mergeset carried an
+    /// applied spend (coinbase 57.06905 + 3.0 ZKAS, i.e. subsidy plus fees).
+    ///
+    /// The window is bounded by consensus (`max_shielded_anchor_age`, 27,000 blocks at 1 BPS), so
+    /// this is ~1.7 MB of `(32B, 32B)` pairs — anchors older than the window are provably
+    /// unusable and are deliberately not sent. `#[serde(default)]` keeps the wire backward
+    /// compatible with peers that predate the field.
+    #[serde(default)]
+    pub in_window_anchors: Vec<([u8; 32], Hash)>,
 }
 
 impl PruningPointShieldedMetadata {
@@ -510,7 +532,7 @@ impl ShieldedStateManager {
         let burns = self.burn_store.get(block)?;
         let state_root = PruningPointShieldedMetadata::recompute_state_root(&frontier, &supply, &nullifier_muhash, &burns)
             .map_err(|e| StoreError::DataInconsistency(format!("stored shielded frontier at {block} is corrupt: {e:?}")))?;
-        Ok(Some(PruningPointShieldedMetadata { frontier, supply, nullifier_muhash, burns, state_root }))
+        Ok(Some(PruningPointShieldedMetadata { frontier, supply, nullifier_muhash, burns, state_root, in_window_anchors: Vec::new() }))
     }
 
     /// Snapshot of the current global spent-nullifier set (append-only; reflects the
@@ -604,6 +626,12 @@ impl ShieldedStateManager {
             .anchor()
             .to_bytes();
         self.anchor_block.set_batch(batch, anchor, block)?;
+        // Seed the in-window historical anchors too. Without these the node drops every spend
+        // anchored below the pruning point and disqualifies the block that merged it; see
+        // [`PruningPointShieldedMetadata::in_window_anchors`].
+        for (hist_anchor, source) in md.in_window_anchors.iter() {
+            self.anchor_block.set_batch(batch, *hist_anchor, *source)?;
+        }
         if md.supply.cumulative_coinbase > 0 || md.supply.cumulative_fees > 0 {
             self.supply_store.set_batch(batch, block, md.supply)?;
         }

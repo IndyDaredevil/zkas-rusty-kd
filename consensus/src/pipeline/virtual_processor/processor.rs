@@ -27,7 +27,7 @@ use crate::{
             pruning_samples::DbPruningSamplesStore,
             reachability::DbReachabilityStore,
             relations::{DbRelationsStore, RelationsStoreReader},
-            selected_chain::{DbSelectedChainStore, SelectedChainStore},
+            selected_chain::{DbSelectedChainStore, SelectedChainStore, SelectedChainStoreReader},
             statuses::{DbStatusesStore, StatusesStore, StatusesStoreBatchExtensions, StatusesStoreReader},
             tips::{DbTipsStore, TipsStoreReader},
             utxo_diffs::{DbUtxoDiffsStore, UtxoDiffsStoreReader},
@@ -357,9 +357,32 @@ impl VirtualStateProcessor {
         &self,
         pp: kaspa_hashes::Hash,
     ) -> Result<Option<kaspa_consensus_core::api::ShieldedExportMetadata>, kaspa_database::prelude::StoreError> {
-        let Some(md) = self.shielded_state_manager.export_pruning_point_shielded(pp)? else {
+        let Some(mut md) = self.shielded_state_manager.export_pruning_point_shielded(pp)? else {
             return Ok(None);
         };
+        // Attach the anchors a spend mined just above `pp` may still legitimately prove against.
+        // The syncee builds its anchor→block index only for blocks it validates itself, so without
+        // these it drops every such spend and disqualifies the block that merged it. See
+        // [`PruningPointShieldedMetadata::in_window_anchors`]. Walk the selected chain back from
+        // `pp` over exactly the consensus window; stop early if the chain index does not reach that
+        // far (a node that itself fast-synced), since anything we cannot resolve we simply do not
+        // claim — the receiver is no worse off than today.
+        let window = self.max_shielded_anchor_age;
+        let sc_read = self.selected_chain_store.read();
+        if let Some(pp_index) = sc_read.get_by_hash(pp).optional()? {
+            let low_index = pp_index.saturating_sub(window);
+            let mut anchors = Vec::with_capacity((pp_index - low_index) as usize);
+            for index in low_index..pp_index {
+                let Some(hash) = sc_read.get_by_index(index).optional()? else { continue };
+                // `anchor_at` reads the retained per-block frontier; a block with no shielded
+                // state yet has none to offer and is skipped.
+                if let Ok(anchor) = self.shielded_state_manager.anchor_at(hash) {
+                    anchors.push((anchor, hash));
+                }
+            }
+            md.in_window_anchors = anchors;
+        }
+        drop(sc_read);
         let nullifier_count = self.pruning_point_nullifier_set(pp)?.len() as u64;
         Ok(Some(kaspa_consensus_core::api::ShieldedExportMetadata { data: md.to_wire_bytes(), nullifier_count }))
     }
