@@ -661,7 +661,7 @@ mod mockery {
 
     impl Mock for SubmitBlockResponse {
         fn mock() -> Self {
-            SubmitBlockResponse { report: SubmitBlockReport::Success }
+            SubmitBlockResponse::success()
         }
     }
 

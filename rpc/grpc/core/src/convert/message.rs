@@ -151,7 +151,7 @@ from!(item: RpcResult<&kaspa_rpc_core::SubmitBlockResponse>, protowire::SubmitBl
         kaspa_rpc_core::SubmitBlockReport::Success => None,
         kaspa_rpc_core::SubmitBlockReport::Reject(reason) => Some(RpcError::SubmitBlockError(reason).into())
     };
-    Self { reject_reason: RejectReason::from(&item.report) as i32, error }
+    Self { reject_reason: RejectReason::from(&item.report) as i32, reject_detail: item.reject_detail.clone(), error }
 });
 
 from!(item: &kaspa_rpc_core::GetBlockTemplateRequest, protowire::GetBlockTemplateRequestMessage, {
@@ -255,6 +255,53 @@ from!(item: &kaspa_rpc_core::RpcShieldedChainBlock, protowire::RpcShieldedChainB
 });
 from!(item: RpcResult<&kaspa_rpc_core::GetShieldedBlocksResponse>, protowire::GetShieldedBlocksResponseMessage, {
     Self { blocks: item.blocks.iter().map(|b| b.into()).collect(), reorged: item.reorged, sink_blue_score: item.sink_blue_score, error: None }
+});
+
+from!(item: &kaspa_rpc_core::GetShieldedSupplyRequest, protowire::GetShieldedSupplyRequestMessage, {
+    Self { block_hash: item.block_hash.map(|h| h.to_string()).unwrap_or_default() }
+});
+from!(item: RpcResult<&kaspa_rpc_core::GetShieldedSupplyResponse>, protowire::GetShieldedSupplyResponseMessage, {
+    Self {
+        block_hash: item.block_hash.to_string(),
+        daa_score: item.daa_score,
+        blue_score: item.blue_score,
+        cumulative_coinbase: item.cumulative_coinbase,
+        cumulative_fees: item.cumulative_fees,
+        cumulative_burns: item.cumulative_burns,
+        pool_value: item.pool_value,
+        note_count: item.note_count,
+        error: None,
+    }
+});
+
+from!(item: &kaspa_rpc_core::GetShieldedCoinbaseRewardsRequest, protowire::GetShieldedCoinbaseRewardsRequestMessage, {
+    Self {
+        recipients: item.recipients.iter().map(|r| r.to_rpc_hex()).collect(),
+        start_hash: item.start_hash.to_string(),
+        limit: item.limit,
+    }
+});
+from!(item: &kaspa_rpc_core::RpcShieldedCoinbaseReward, protowire::RpcShieldedCoinbaseReward, {
+    Self {
+        block_hash: item.block_hash.to_string(),
+        blue_score: item.blue_score,
+        daa_score: item.daa_score,
+        timestamp: item.timestamp,
+        coinbase_txid: item.coinbase_txid.to_string(),
+        output_index: item.output_index,
+        recipient: item.recipient.to_rpc_hex(),
+        value: item.value,
+    }
+});
+from!(item: RpcResult<&kaspa_rpc_core::GetShieldedCoinbaseRewardsResponse>, protowire::GetShieldedCoinbaseRewardsResponseMessage, {
+    Self {
+        rewards: item.rewards.iter().map(|r| r.into()).collect(),
+        next_cursor: item.next_cursor.to_string(),
+        scanned_blocks: item.scanned_blocks,
+        reorged: item.reorged,
+        sink_blue_score: item.sink_blue_score,
+        error: None,
+    }
 });
 
 from!(item: &kaspa_rpc_core::GetMempoolEntryRequest, protowire::GetMempoolEntryRequestMessage, {
@@ -686,15 +733,18 @@ impl TryFrom<&protowire::SubmitBlockResponseMessage> for kaspa_rpc_core::SubmitB
             match report {
                 SubmitBlockReport::Success => {
                     if err.message == RpcError::SubmitBlockError(SubmitBlockRejectReason::RouteIsFull).to_string() {
-                        Ok(Self { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::RouteIsFull) })
+                        Ok(Self {
+                            report: SubmitBlockReport::Reject(SubmitBlockRejectReason::RouteIsFull),
+                            reject_detail: item.reject_detail.clone(),
+                        })
                     } else {
                         Err(err.into())
                     }
                 }
-                SubmitBlockReport::Reject(_) => Ok(Self { report }),
+                SubmitBlockReport::Reject(_) => Ok(Self { report, reject_detail: item.reject_detail.clone() }),
             }
         } else {
-            Ok(Self { report })
+            Ok(Self { report, reject_detail: item.reject_detail.clone() })
         }
     }
 }
@@ -809,6 +859,51 @@ try_from!(item: &protowire::RpcShieldedChainBlock, kaspa_rpc_core::RpcShieldedCh
 try_from!(item: &protowire::GetShieldedBlocksResponseMessage, RpcResult<kaspa_rpc_core::GetShieldedBlocksResponse>, {
     Self {
         blocks: item.blocks.iter().map(kaspa_rpc_core::RpcShieldedChainBlock::try_from).collect::<Result<Vec<_>, _>>()?,
+        reorged: item.reorged,
+        sink_blue_score: item.sink_blue_score,
+    }
+});
+
+try_from!(item: &protowire::GetShieldedSupplyRequestMessage, kaspa_rpc_core::GetShieldedSupplyRequest, {
+    Self { block_hash: if item.block_hash.is_empty() { None } else { Some(RpcHash::from_str(&item.block_hash)?) } }
+});
+try_from!(item: &protowire::GetShieldedSupplyResponseMessage, RpcResult<kaspa_rpc_core::GetShieldedSupplyResponse>, {
+    Self {
+        block_hash: RpcHash::from_str(&item.block_hash)?,
+        daa_score: item.daa_score,
+        blue_score: item.blue_score,
+        cumulative_coinbase: item.cumulative_coinbase,
+        cumulative_fees: item.cumulative_fees,
+        cumulative_burns: item.cumulative_burns,
+        pool_value: item.pool_value,
+        note_count: item.note_count,
+    }
+});
+
+try_from!(item: &protowire::GetShieldedCoinbaseRewardsRequestMessage, kaspa_rpc_core::GetShieldedCoinbaseRewardsRequest, {
+    Self {
+        recipients: item.recipients.iter().map(|r| Vec::from_rpc_hex(r)).collect::<Result<Vec<_>, _>>()?,
+        start_hash: RpcHash::from_str(&item.start_hash)?,
+        limit: item.limit,
+    }
+});
+try_from!(item: &protowire::RpcShieldedCoinbaseReward, kaspa_rpc_core::RpcShieldedCoinbaseReward, {
+    Self {
+        block_hash: RpcHash::from_str(&item.block_hash)?,
+        blue_score: item.blue_score,
+        daa_score: item.daa_score,
+        timestamp: item.timestamp,
+        coinbase_txid: RpcHash::from_str(&item.coinbase_txid)?,
+        output_index: item.output_index,
+        recipient: Vec::from_rpc_hex(&item.recipient)?,
+        value: item.value,
+    }
+});
+try_from!(item: &protowire::GetShieldedCoinbaseRewardsResponseMessage, RpcResult<kaspa_rpc_core::GetShieldedCoinbaseRewardsResponse>, {
+    Self {
+        rewards: item.rewards.iter().map(kaspa_rpc_core::RpcShieldedCoinbaseReward::try_from).collect::<Result<Vec<_>, _>>()?,
+        next_cursor: RpcHash::from_str(&item.next_cursor)?,
+        scanned_blocks: item.scanned_blocks,
         reorged: item.reorged,
         sink_blue_score: item.sink_blue_score,
     }
@@ -1281,31 +1376,32 @@ mod tests {
         }
         let tests = vec![
             Test::new(
-                Ok(SubmitBlockResponse { report: SubmitBlockReport::Success }),
-                SubmitBlockResponseMessage { reject_reason: RejectReason::None as i32, error: None },
+                Ok(SubmitBlockResponse { report: SubmitBlockReport::Success, reject_detail: String::new() }),
+                SubmitBlockResponseMessage { reject_reason: RejectReason::None as i32, reject_detail: String::new(), error: None },
             ),
             Test::new(
-                Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::BlockInvalid) }),
+                Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::BlockInvalid), reject_detail: String::new() }),
                 SubmitBlockResponseMessage {
-                    reject_reason: RejectReason::BlockInvalid as i32,
+                    reject_reason: RejectReason::BlockInvalid as i32, reject_detail: String::new(),
                     error: Some(protowire::RpcError {
                         message: RpcError::SubmitBlockError(SubmitBlockRejectReason::BlockInvalid).to_string(),
                     }),
                 },
             ),
             Test::new(
-                Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::IsInIBD) }),
+                Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::IsInIBD), reject_detail: String::new() }),
                 SubmitBlockResponseMessage {
-                    reject_reason: RejectReason::IsInIbd as i32,
+                    reject_reason: RejectReason::IsInIbd as i32, reject_detail: String::new(),
                     error: Some(protowire::RpcError {
                         message: RpcError::SubmitBlockError(SubmitBlockRejectReason::IsInIBD).to_string(),
                     }),
                 },
             ),
             Test::new(
-                Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::RouteIsFull) }),
+                Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::RouteIsFull), reject_detail: String::new() }),
                 SubmitBlockResponseMessage {
                     reject_reason: RejectReason::None as i32, // This rpc core reject reason has no matching protowire variant
+                    reject_detail: String::new(),
                     error: Some(protowire::RpcError {
                         message: RpcError::SubmitBlockError(SubmitBlockRejectReason::RouteIsFull).to_string(),
                     }),

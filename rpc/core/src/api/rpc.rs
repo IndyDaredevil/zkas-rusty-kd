@@ -184,6 +184,40 @@ pub trait RpcApi: Sync + Send + AnySync {
         Err(crate::RpcError::General("get_shielded_blocks is not implemented for this RPC client".to_string()))
     }
 
+    /// The shielded turnstile totals (minted / fees / burned / pool value) as of a
+    /// chain block, defaulting to the sink. Lets anyone verify that the pool holds
+    /// exactly what was minted into it minus what left.
+    async fn get_shielded_supply(&self, block_hash: Option<RpcHash>) -> RpcResult<GetShieldedSupplyResponse> {
+        self.get_shielded_supply_call(None, GetShieldedSupplyRequest { block_hash }).await
+    }
+    async fn get_shielded_supply_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetShieldedSupplyRequest,
+    ) -> RpcResult<GetShieldedSupplyResponse> {
+        let _ = (connection, request);
+        Err(crate::RpcError::General("get_shielded_supply is not implemented for this RPC client".to_string()))
+    }
+
+    /// Coinbase payments made to the given shielded recipients by the chain blocks
+    /// after `start_hash` — the income view a pool credits from.
+    async fn get_shielded_coinbase_rewards(
+        &self,
+        recipients: Vec<Vec<u8>>,
+        start_hash: RpcHash,
+        limit: u64,
+    ) -> RpcResult<GetShieldedCoinbaseRewardsResponse> {
+        self.get_shielded_coinbase_rewards_call(None, GetShieldedCoinbaseRewardsRequest { recipients, start_hash, limit }).await
+    }
+    async fn get_shielded_coinbase_rewards_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetShieldedCoinbaseRewardsRequest,
+    ) -> RpcResult<GetShieldedCoinbaseRewardsResponse> {
+        let _ = (connection, request);
+        Err(crate::RpcError::General("get_shielded_coinbase_rewards is not implemented for this RPC client".to_string()))
+    }
+
     /// Requests information about a specific transaction in the mempool.
     async fn get_mempool_entry(
         &self,

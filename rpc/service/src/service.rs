@@ -66,7 +66,9 @@ use kaspa_rpc_core::{
     model::*,
     notify::connection::ChannelConnection,
 };
+use crate::shielded_rewards::{RECIPIENT_LEN, match_coinbase_outputs};
 use kaspa_system_info::SystemInfo;
+use kaspa_consensus_core::tx::{ScriptPublicKey as RpcScriptPublicKey, ScriptVec};
 use kaspa_txscript::{extract_script_pub_key_address, pay_to_address_script};
 use kaspa_utils::expiring_cache::ExpiringCache;
 use kaspa_utils::{channel::Channel, triggers::SingleTrigger};
@@ -306,15 +308,16 @@ impl RpcApi for RpcCoreService {
         let is_synced = self.mining_rule_engine.should_mine(sink_daa_score_timestamp);
 
         if !self.config.enable_unsynced_mining && !is_synced {
-            // error = "Block not submitted - node is not synced"
-            return Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::IsInIBD) });
+            return Ok(SubmitBlockResponse::reject(
+                SubmitBlockRejectReason::IsInIBD,
+                "node is not synced; it would build on a stale tip (start with --enable-unsynced-mining to override)",
+            ));
         }
 
         let try_block: RpcResult<Block> = request.block.try_into();
         if let Err(err) = &try_block {
             trace!("incoming SubmitBlockRequest with block conversion error: {}", err);
-            // error = format!("Could not parse block: {0}", err)
-            return Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::BlockInvalid) });
+            return Ok(SubmitBlockResponse::reject(SubmitBlockRejectReason::BlockInvalid, format!("could not parse block: {err}")));
         }
         let block = try_block?;
         let hash = block.hash();
@@ -328,14 +331,19 @@ impl RpcApi for RpcCoreService {
             if virtual_daa_score > difficulty_window_duration
                 && block.header.daa_score < virtual_daa_score - difficulty_window_duration
             {
-                // error = format!("Block rejected. Reason: block DAA score {0} is too far behind virtual's DAA score {1}", block.header.daa_score, virtual_daa_score)
-                return Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::BlockInvalid) });
+                return Ok(SubmitBlockResponse::reject(
+                    SubmitBlockRejectReason::BlockInvalid,
+                    format!(
+                        "block DAA score {} is too far behind virtual's DAA score {virtual_daa_score} (window {difficulty_window_duration})",
+                        block.header.daa_score
+                    ),
+                ));
             }
         }
 
         trace!("incoming SubmitBlockRequest for block {}", hash);
         match self.flow_context.submit_rpc_block(&session, block.clone()).await {
-            Ok(_) => Ok(SubmitBlockResponse { report: SubmitBlockReport::Success }),
+            Ok(_) => Ok(SubmitBlockResponse::success()),
             Err(ProtocolError::RuleError(RuleError::BadMerkleRoot(h1, h2))) => {
                 warn!(
                     "The RPC submitted block {} triggered a {} error: {}.
@@ -347,11 +355,19 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                 if self.config.net.is_mainnet() {
                     warn!("Printing the full block for debug purposes:\n{:?}", block);
                 }
-                Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::BlockInvalid) })
+                Ok(SubmitBlockResponse::reject(
+                    SubmitBlockRejectReason::BlockInvalid,
+                    format!(
+                        "{}: this usually means an RPC conversion error between node and miner (unsupported miner)",
+                        RuleError::BadMerkleRoot(h1, h2)
+                    ),
+                ))
             }
             Err(err) => {
                 warn!("The RPC submitted block triggered an error: {}\nPrinting the full block for debug purposes:\n{:?}", err, block);
-                Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::BlockInvalid) })
+                // The concrete rule error travels back to the submitter: a pool whose node is
+                // producing blocks the network rejects otherwise sees only a shortfall, never a cause.
+                Ok(SubmitBlockResponse::reject(SubmitBlockRejectReason::BlockInvalid, err.to_string()))
             }
         }
     }
@@ -469,14 +485,30 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             let queried_ghostdag = session.async_get_ghostdag_data(request.hash).await?;
             let queried_coinbase = &queried_block.transactions[COINBASE_TRANSACTION_INDEX];
 
-            // only a chain block has its own red-reward coinbase output, as an extra output
-            // see CoinbaseManager::expected_coinbase_transaction
-            if queried_coinbase.outputs.len() == queried_ghostdag.mergeset_blues.len() + 1 {
-                let own_red_reward_output =
-                    queried_coinbase.outputs.last().ok_or_else(|| RpcError::General("missing own red reward output".to_string()))?;
-                reward_amount = reward_amount
-                    .checked_add(own_red_reward_output.value)
-                    .ok_or_else(|| RpcError::General("total reward amount overflowed u64 while adding own red reward".to_string()))?;
+            // Only a chain block has its own red-reward coinbase output, appended after the
+            // per-blue rewards (see CoinbaseManager::expected_coinbase_transaction).
+            //
+            // Upstream Kaspa identifies it as "outputs.len() == blues + 1, take the last".
+            // That is FALSE on ZKas, where a dev-fee note is appended *after* the red reward:
+            // a block with a dev note and no red reward satisfies the count exactly, and
+            // `outputs.last()` is then the dev fee — so the miner's reward was reported
+            // including money that went to the dev fund. Dev-fee accrual changes only how
+            // often that misfires, not whether it does.
+            //
+            // Locate it positionally instead — the red reward, when present, sits directly
+            // after the blue rewards — and exclude the dev-fee recipient explicitly.
+            let dev_spk = self
+                .config
+                .params
+                .dev_fee_recipient
+                .map(|recipient| RpcScriptPublicKey::new(0, ScriptVec::from_slice(&recipient)));
+            let red_reward_index = queried_ghostdag.mergeset_blues.len();
+            if let Some(own_red_reward_output) = queried_coinbase.outputs.get(red_reward_index) {
+                if dev_spk.as_ref() != Some(&own_red_reward_output.script_public_key) {
+                    reward_amount = reward_amount.checked_add(own_red_reward_output.value).ok_or_else(|| {
+                        RpcError::General("total reward amount overflowed u64 while adding own red reward".to_string())
+                    })?;
+                }
             }
         }
 
@@ -786,6 +818,125 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             }
         }
         Ok(GetShieldedBlocksResponse { blocks, reorged, sink_blue_score })
+    }
+
+    /// The turnstile totals as of a chain block (default: the sink).
+    ///
+    /// `pool_value` is derived here from the cumulative counters rather than read
+    /// from one, and an underflow is reported as an error instead of being
+    /// saturated away: `minted - fees - burns < 0` means value left the pool that
+    /// was never minted into it, which is precisely the condition this call exists
+    /// to make visible.
+    async fn get_shielded_supply_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetShieldedSupplyRequest,
+    ) -> RpcResult<GetShieldedSupplyResponse> {
+        fn sompi(value: u128, field: &str) -> RpcResult<u64> {
+            u64::try_from(value).map_err(|_| RpcError::General(format!("shielded {field} ({value}) exceeds u64 sompi")))
+        }
+
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let block_hash = match request.block_hash {
+            Some(h) => h,
+            None => session.async_get_sink().await,
+        };
+        let daa_score = session.async_get_header(block_hash).await?.daa_score;
+        let blue_score = session.async_get_ghostdag_data(block_hash).await?.blue_score;
+        let (cumulative_coinbase, cumulative_fees, cumulative_burns) =
+            session.async_get_shielded_supply_totals(block_hash).await?;
+        // The frontier's leaf count is the number of notes ever created, which is
+        // read from the same per-block snapshot as the totals — so all the numbers
+        // in one response describe exactly one point on the chain.
+        let (note_count, _leaf, _ommers) = session.async_get_shielded_tree_frontier(block_hash).await?;
+
+        let pool_value = cumulative_coinbase
+            .checked_sub(cumulative_fees)
+            .and_then(|v| v.checked_sub(cumulative_burns))
+            .ok_or_else(|| {
+                RpcError::General(format!(
+                    "turnstile violation at {block_hash}: minted {cumulative_coinbase} < fees {cumulative_fees} + burns {cumulative_burns}"
+                ))
+            })?;
+
+        Ok(GetShieldedSupplyResponse {
+            block_hash,
+            daa_score,
+            blue_score,
+            cumulative_coinbase: sompi(cumulative_coinbase, "cumulative coinbase")?,
+            cumulative_fees: sompi(cumulative_fees, "cumulative fees")?,
+            cumulative_burns: sompi(cumulative_burns, "cumulative burns")?,
+            pool_value: sompi(pool_value, "pool value")?,
+            note_count,
+        })
+    }
+
+    /// Coinbase payments to given recipients on the selected chain after a cursor.
+    ///
+    /// `limit` bounds blocks **scanned**, not rewards returned, and `next_cursor`
+    /// advances over scanned blocks whether or not anything matched — so a caller
+    /// that persists the cursor makes forward progress through quiet chain instead
+    /// of rescanning it forever.
+    async fn get_shielded_coinbase_rewards_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetShieldedCoinbaseRewardsRequest,
+    ) -> RpcResult<GetShieldedCoinbaseRewardsResponse> {
+        const DEFAULT_LIMIT: usize = 500;
+        const MAX_LIMIT: usize = 2000;
+
+        if request.recipients.is_empty() {
+            return Err(RpcError::General("at least one recipient is required".to_string()));
+        }
+        if let Some(bad) = request.recipients.iter().find(|r| r.len() != RECIPIENT_LEN) {
+            return Err(RpcError::General(format!(
+                "recipient must be exactly {RECIPIENT_LEN} bytes (a raw Orchard recipient); got {}",
+                bad.len()
+            )));
+        }
+        let limit = match request.limit as usize {
+            0 => DEFAULT_LIMIT,
+            l => l.min(MAX_LIMIT),
+        };
+
+        let session = self.consensus_manager.consensus().session().await;
+        // Same two-path resolution as `get_shielded_blocks`: the retained chain index
+        // answers below the pruning retention root, and the reachability walk is the
+        // fallback that can tell a genuine reorg from an unknown block.
+        let (added, reorged) = match session.async_get_shielded_chain_range(request.start_hash, limit).await? {
+            Some(added) => (added, false),
+            None => {
+                let chain_path = session.async_get_virtual_chain_from_block(request.start_hash, Some(limit)).await?;
+                let reorged = !chain_path.removed.is_empty();
+                (chain_path.added, reorged)
+            }
+        };
+        let sink = session.async_get_sink().await;
+        let sink_blue_score = session.async_get_ghostdag_data(sink).await?.blue_score;
+
+        let mut rewards = Vec::new();
+        let mut next_cursor = request.start_hash;
+        let mut scanned_blocks = 0u64;
+        if !reorged {
+            for hash in added.iter().take(limit) {
+                let d = session.async_get_shielded_chain_block_data(*hash).await?;
+                for m in match_coinbase_outputs(&d.coinbase_outputs, &request.recipients) {
+                    rewards.push(RpcShieldedCoinbaseReward {
+                        block_hash: d.hash,
+                        blue_score: d.blue_score,
+                        daa_score: d.daa_score,
+                        timestamp: d.timestamp,
+                        coinbase_txid: d.coinbase_txid,
+                        output_index: m.output_index,
+                        recipient: m.recipient,
+                        value: m.value,
+                    });
+                }
+                next_cursor = *hash;
+                scanned_blocks += 1;
+            }
+        }
+        Ok(GetShieldedCoinbaseRewardsResponse { rewards, next_cursor, scanned_blocks, reorged, sink_blue_score })
     }
 
     async fn get_sink_blue_score_call(

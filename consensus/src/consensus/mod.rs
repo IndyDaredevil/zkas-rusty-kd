@@ -677,6 +677,18 @@ impl ConsensusApi for Consensus {
         Ok((fs.size, fs.leaf, fs.ommers))
     }
 
+    fn get_shielded_supply_totals(&self, block: Hash) -> ConsensusResult<(u128, u128, u128)> {
+        let totals = self
+            .virtual_processor
+            .shielded_supply_totals_at(block)
+            .map_err(|e| ConsensusError::GeneralOwned(format!("shielded supply for {block}: {e}")))?;
+        let burns = self
+            .virtual_processor
+            .shielded_burn_total_at(block)
+            .map_err(|e| ConsensusError::GeneralOwned(format!("shielded burns for {block}: {e}")))?;
+        Ok((totals.cumulative_coinbase, totals.cumulative_fees, burns))
+    }
+
     fn get_shielded_chain_block_data(&self, block: Hash) -> ConsensusResult<kaspa_consensus_core::api::ShieldedChainBlockData> {
         self.virtual_processor.shielded_chain_block_data(block).map_err(ConsensusError::GeneralOwned)
     }

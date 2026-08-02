@@ -14,7 +14,7 @@ use crate::{
 use kaspa_grpc_core::protowire::{kaspad_request::Payload, *};
 use kaspa_grpc_core::{ops::KaspadPayloadOps, protowire::NotifyFinalityConflictResponseMessage};
 use kaspa_notify::{scope::FinalityConflictResolvedScope, subscriber::SubscriptionManager};
-use kaspa_rpc_core::{SubmitBlockRejectReason, SubmitBlockReport, SubmitBlockResponse};
+use kaspa_rpc_core::{SubmitBlockRejectReason, SubmitBlockResponse};
 use kaspa_rpc_macros::build_grpc_server_interface;
 
 pub struct Factory {}
@@ -52,6 +52,8 @@ impl Factory {
                 GetSink,
                 GetShieldedTreeState,
                 GetShieldedBlocks,
+                GetShieldedSupply,
+                GetShieldedCoinbaseRewards,
                 GetMempoolEntry,
                 GetMempoolEntries,
                 GetConnectedPeerInfo,
@@ -157,7 +159,7 @@ impl Factory {
             submit_block_tasks,
             submit_block_queue,
             KaspadRoutingPolicy::DropIfFull(Arc::new(Box::new(|_: &KaspadRequest| {
-                Ok(Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::RouteIsFull) }).into())
+                Ok(Ok(SubmitBlockResponse::reject(SubmitBlockRejectReason::RouteIsFull, "the node's block-processing route is full")).into())
             }))),
         );
 

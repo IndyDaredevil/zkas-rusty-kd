@@ -148,6 +148,10 @@ pub enum RpcApiOps {
     GetShieldedTreeState = 154,
     /// Get the per-chain-block shielded effects (coinbase mint + accepted bundles) for wallet sync
     GetShieldedBlocks = 155,
+    /// Get the shielded turnstile totals (minted / fees / burned / pool value)
+    GetShieldedSupply = 156,
+    /// Get the coinbase payments made to given shielded recipients by the selected chain
+    GetShieldedCoinbaseRewards = 157,
 }
 
 impl RpcApiOps {

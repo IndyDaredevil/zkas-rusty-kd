@@ -1487,6 +1487,8 @@ declare! {
      */
     export interface ISubmitBlockResponse {
         report : ISubmitBlockReport;
+        /** The node's concrete reason for rejecting the block; empty on success. */
+        rejectDetail : string;
     }
     "#,
 }
