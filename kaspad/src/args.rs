@@ -55,6 +55,12 @@ pub struct Args {
     pub user_agent_comments: Vec<String>,
     pub ua_rule: Vec<String>,
     pub utxoindex: bool,
+    /// Directory for consensus-divergence reports. `Some("")` means "use the default
+    /// location under appdir". See `kaspa_consensus::processes::shielded_diag`.
+    pub consensus_diag: Option<String>,
+    /// File of pinned anchor→source-block mappings. See
+    /// `kaspa_consensus::processes::shielded::load_anchor_overrides`.
+    pub shielded_anchor_overrides: Option<String>,
     pub reset_db: bool,
     #[serde(rename = "outpeers")]
     pub outbound_target: usize,
@@ -120,6 +126,8 @@ impl Default for Args {
             unsafe_rpc: false,
             async_threads: num_cpus::get(),
             utxoindex: false,
+            consensus_diag: None,
+            shielded_anchor_overrides: None,
             reset_db: false,
             outbound_target: 8,
             inbound_limit: 128,
@@ -359,6 +367,33 @@ pub fn cli() -> Command {
         )
         .arg(arg!(--utxoindex "Enable the UTXO index").env("KASPAD_UTXOINDEX"))
         .arg(
+            Arg::new("shielded-anchor-overrides")
+                .long("shielded-anchor-overrides")
+                .value_name("file")
+                .require_equals(true)
+                .env("ZKAS_SHIELDED_ANCHOR_OVERRIDES")
+                .help(
+                    "Pin shielded anchor->source-block mappings from a file (zkas-anchor-dump format). \
+                     The anchor index is order-dependent and not derivable from the canonical chain, so a \
+                     node syncing from scratch can resolve an anchor differently from the chain and reject \
+                     a valid block. Pinning the chain's mappings repairs that without changing any rule.",
+                ),
+        )
+        .arg(
+            Arg::new("consensus-diag")
+                .long("consensus-diag")
+                .value_name("dir")
+                .num_args(0..=1)
+                .default_missing_value("")
+                .require_equals(true)
+                .env("ZKAS_CONSENSUS_DIAG")
+                .help(
+                    "Write a JSON report explaining every block this node rejects for a consensus disagreement \
+                     (default: <appdir>/consensus-diag). Use this instead of adding temporary log lines when a \
+                     node refuses to sync past a block the network accepted.",
+                ),
+        )
+        .arg(
             Arg::new("max-tracked-addresses")
                 .long("max-tracked-addresses")
                 .env("KASPAD_MAX_TRACKED_ADDRESSES")
@@ -549,6 +584,8 @@ impl Args {
             enable_unsynced_mining: arg_match_unwrap_or::<bool>(&m, "enable-unsynced-mining", defaults.enable_unsynced_mining),
             enable_mainnet_mining: arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", defaults.enable_mainnet_mining),
             utxoindex: arg_match_unwrap_or::<bool>(&m, "utxoindex", defaults.utxoindex),
+            consensus_diag: m.get_one::<String>("consensus-diag").cloned(),
+            shielded_anchor_overrides: m.get_one::<String>("shielded-anchor-overrides").cloned(),
             testnet: arg_match_unwrap_or::<bool>(&m, "testnet", defaults.testnet),
             testnet_suffix: arg_match_unwrap_or::<u32>(&m, "netsuffix", defaults.testnet_suffix),
             devnet: arg_match_unwrap_or::<bool>(&m, "devnet", defaults.devnet),

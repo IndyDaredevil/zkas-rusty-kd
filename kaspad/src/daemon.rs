@@ -345,6 +345,24 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
         }
     }
 
+    // Consensus-divergence diagnostics (`--consensus-diag`). Must be initialised before the
+    // consensus threads start, since the setting is read once and then latched.
+    kaspa_consensus::processes::shielded_diag::init(args.consensus_diag.as_ref().map(|d| {
+        if d.is_empty() { app_dir.join(network.to_prefixed()).join("consensus-diag") } else { PathBuf::from(d) }
+    }));
+    if let Some(d) = args.consensus_diag.as_ref() {
+        info!("Consensus divergence diagnostics ON; reports will be written to {}", if d.is_empty() { "<appdir>/consensus-diag" } else { d });
+    }
+
+    // Pinned anchor mappings must be loaded before consensus starts: the map is latched on
+    // first read, and the virtual processor reads it while validating the very first block.
+    if let Some(path) = args.shielded_anchor_overrides.as_ref() {
+        match kaspa_consensus::processes::shielded::load_anchor_overrides(std::path::Path::new(path)) {
+            Ok(n) => info!("Pinned {n} shielded anchor->source mappings from {path}"),
+            Err(e) => panic!("--shielded-anchor-overrides: {e}"),
+        }
+    }
+
     let consensus_db_dir = db_dir.join(CONSENSUS_DB);
     let utxoindex_db_dir = db_dir.join(UTXOINDEX_DB);
     let meta_db_dir = db_dir.join(META_DB);

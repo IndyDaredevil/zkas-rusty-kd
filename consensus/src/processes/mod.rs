@@ -9,6 +9,7 @@ pub mod pruning_proof;
 pub mod reachability;
 pub mod relations;
 pub mod shielded;
+pub mod shielded_diag;
 pub mod sync;
 pub mod transaction_validator;
 pub mod traversal_manager;
