@@ -1158,8 +1158,12 @@ pub const DEVNET_PARAMS: Params = Params {
 
     crescendo_activation: ForkActivation::always(),
     toccata_activation: ForkActivation::never(),
-    shielded_anchor_multi_activation: ForkActivation::never(),
-    shielded_coinbase_seed_activation: ForkActivation::new(200),
+    shielded_anchor_multi_activation: ForkActivation::new(200),
+    // F-02 is held for upgrade 2 (it forces every wallet client to ship a gated
+    // scanner). Devnet therefore models UPGRADE 1 exactly: multi-producer anchors +
+    // dev-fee accrual, both at DAA 200, F-02 off. Its own rehearsal was run and
+    // recorded separately (1aug.md §11.2, two-binary boundary test).
+    shielded_coinbase_seed_activation: ForkActivation::never(),
     dev_fee_accrual_activation: ForkActivation::new(200),
     // ~17 minutes at 1 BPS: short enough that the dev fund is never far behind,
     // long enough to cut per-block dev notes by three orders of magnitude.
