@@ -57,6 +57,12 @@ pub enum PruningProcessingMessage {
     Process { sink_ghostdag_data: CompactGhostdagData },
 }
 
+/// DAA-score spacing of the shielded tree-frontier checkpoints kept below the pruning
+/// point. A wallet fast-syncs from `GetShieldedTreeState`, so some frontier must survive
+/// down there; one every ~1,000 DAA (~17 minutes at 1 BPS) bounds the store at a few
+/// hundred rows a year while keeping a usable anchor near any point a caller asks for.
+const SHIELDED_FRONTIER_CHECKPOINT_INTERVAL: u64 = 1_000;
+
 /// A processor dedicated for moving the pruning point and pruning any possible data in its past
 pub struct PruningProcessor {
     // Channels
@@ -73,6 +79,11 @@ pub struct PruningProcessor {
     pruning_point_manager: DbPruningPointManager,
     pruning_proof_manager: Arc<PruningProofManager>,
     parents_manager: DbParentsManager,
+
+    /// Store handles for the shielded per-block snapshots. Built here rather than shared
+    /// with the virtual processor because it is only ever used to DELETE — the pruner has
+    /// no business computing shielded state.
+    shielded_state_manager: crate::processes::shielded::ShieldedStateManager,
 
     // Pruning lock
     pruning_lock: SessionLock,
@@ -104,6 +115,10 @@ impl PruningProcessor {
     ) -> Self {
         Self {
             receiver,
+            shielded_state_manager: crate::processes::shielded::ShieldedStateManager::new(
+                Arc::clone(&db),
+                kaspa_database::prelude::CachePolicy::Empty,
+            ),
             db,
             storage: storage.clone(),
             reachability_service: services.reachability_service.clone(),
@@ -502,6 +517,25 @@ impl PruningProcessor {
                 self.acceptance_data_store.delete_batch(&mut batch, current).unwrap();
                 self.block_transactions_store.delete_batch(&mut batch, current).unwrap();
                 self.smt_metadata_store.delete_batch(&mut batch, current).unwrap();
+
+                // Shielded per-block snapshots. Measured on mainnet these are the only
+                // consensus state that grew without bound — the pruner never touched them —
+                // at ~1.6 KB per chain block, about 16 GB a year. They are safe to drop
+                // exactly here: they exist to recompute a block from its selected parent and
+                // to rebuild a chain after a reorg, reorgs cannot cross `finality_depth`, and
+                // this walk is below `pruning_depth`, which is deeper still.
+                //
+                // A sparse frontier checkpoint is kept so `GetShieldedTreeState` still has
+                // fast-sync anchors down here, and past pruning points always keep theirs.
+                // The compact scan archive and the global nullifier set are never touched.
+                let keep_checkpoint = keep_headers.contains(&current)
+                    || self
+                        .headers_store
+                        .get_compact_header_data(current)
+                        .optional()
+                        .unwrap()
+                        .is_some_and(|h| h.daa_score % SHIELDED_FRONTIER_CHECKPOINT_INTERVAL == 0);
+                self.shielded_state_manager.prune_block_snapshots(&mut batch, current, keep_checkpoint).unwrap();
 
                 if let Some(&affiliated_proof_level) = keep_relations.get(&current) {
                     if statuses_write.get(current).optional().unwrap().is_some_and(|s| s.is_valid()) {

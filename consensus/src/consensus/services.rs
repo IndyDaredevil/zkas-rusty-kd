@@ -132,6 +132,8 @@ impl ConsensusServices {
             params.toccata_activation,
             params.dev_fee_permille,
             params.dev_fee_recipient,
+            params.dev_fee_accrual_activation,
+            params.dev_fee_payout_interval,
         );
 
         let mass_calculator =

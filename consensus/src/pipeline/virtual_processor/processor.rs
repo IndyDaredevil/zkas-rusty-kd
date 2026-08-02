@@ -104,6 +104,22 @@ use std::{
     sync::{Arc, atomic::Ordering},
 };
 
+/// The outcome of an anchor-finality decision, with the reasoning kept rather than
+/// collapsed to a bool.
+///
+/// `is_final` is the only field validation reads; the rest exists so a divergence report
+/// can state *why* a spend was kept or dropped without re-deriving it (a re-derivation can
+/// drift from what validation actually did, which is how several wrong diagnoses happened).
+#[derive(Default, Clone, Debug)]
+pub(super) struct AnchorVerdict {
+    pub is_final: bool,
+    pub source: Option<Hash>,
+    pub source_blue_score: Option<u64>,
+    pub is_chain_ancestor: Option<bool>,
+    pub age: Option<u64>,
+    pub reject_reason: Option<&'static str>,
+}
+
 pub struct VirtualStateProcessor {
     // Channels
     receiver: CrossbeamReceiver<VirtualStateProcessingMessage>,
@@ -189,6 +205,10 @@ pub struct VirtualStateProcessor {
 
     // Toccata activation
     pub(crate) toccata_activation: ForkActivation,
+    /// See `Params::shielded_anchor_multi_activation`.
+    pub(crate) shielded_anchor_multi_activation: ForkActivation,
+    /// See `Params::shielded_coinbase_seed_activation` (F-02).
+    pub(crate) shielded_coinbase_seed_activation: ForkActivation,
     pub(crate) toccata_logger: ForkLogger,
 
     // SMT stores
@@ -303,6 +323,8 @@ impl VirtualStateProcessor {
             notification_root,
             counters,
             toccata_activation: params.toccata_activation,
+            shielded_anchor_multi_activation: params.shielded_anchor_multi_activation,
+            shielded_coinbase_seed_activation: params.shielded_coinbase_seed_activation,
             shielded_coinbase: params.shielded_coinbase,
             toccata_logger: ForkLogger::new("virtual state processing rules", true),
             smt_stores: storage.smt_stores.clone(),
@@ -341,6 +363,13 @@ impl VirtualStateProcessor {
         block: kaspa_hashes::Hash,
     ) -> Result<crate::model::stores::shielded::SupplyTotals, kaspa_database::prelude::StoreError> {
         self.shielded_state_manager.supply_totals_at(block)
+    }
+
+    /// Total value burned out of the shielded pool as of a chain block (dormant
+    /// bridge seam: `0` on the live chain). Completes the turnstile identity
+    /// `pool = coinbase - fees - burns` for supply queries.
+    pub fn shielded_burn_total_at(&self, block: kaspa_hashes::Hash) -> Result<u128, kaspa_database::prelude::StoreError> {
+        self.shielded_state_manager.burn_total_at(block)
     }
 
     // ------------------ Pruning-point shielded-state IBD transfer ------------------
@@ -721,19 +750,64 @@ impl VirtualStateProcessor {
     ///
     /// The empty-tree anchor is genesis (always canonical and mature); a spend can
     /// never actually prove a note into it, so its proof fails elsewhere.
+    /// Validation calls [`Self::resolve_shielded_anchor`] directly so it can record the
+    /// reasoning; this bool-only spelling is kept because the finality tests read far better
+    /// against it.
+    #[cfg(test)]
     pub(super) fn is_shielded_anchor_final(&self, anchor: &[u8; 32], selected_parent: Hash, block_blue_score: u64) -> bool {
+        // Tests predate the activation; resolve with the pre-fork path (daa 0).
+        self.resolve_shielded_anchor(anchor, selected_parent, block_blue_score, 0).is_final
+    }
+
+    /// [`is_shielded_anchor_final`] with its reasoning preserved instead of collapsed to a
+    /// bool. The verdict is decided here and nowhere else, so a diagnostic built from an
+    /// [`AnchorVerdict`] reports what validation actually did rather than a re-derivation
+    /// that can drift from it.
+    pub(super) fn resolve_shielded_anchor(
+        &self,
+        anchor: &[u8; 32],
+        selected_parent: Hash,
+        block_blue_score: u64,
+        block_daa_score: u64,
+    ) -> AnchorVerdict {
         if *anchor == self.empty_shielded_anchor {
-            return true;
+            return AnchorVerdict { is_final: true, ..Default::default() };
+        }
+        // Post-activation: consider EVERY block that produced this root, not just the last one
+        // written to the single-valued index. An orphan can no longer destroy the canonical
+        // producer's mapping, so the verdict follows from canonical data alone and is identical
+        // on every node regardless of which reorgs it happened to witness.
+        if self.shielded_anchor_multi_activation.is_active(block_daa_score) {
+            let producers = self.shielded_state_manager.anchor_producer_blocks(anchor).unwrap_or_default();
+            if producers.is_empty() {
+                return AnchorVerdict { reject_reason: Some("anchor is not a known tree root"), ..Default::default() };
+            }
+            let mut last = AnchorVerdict { reject_reason: Some("no producer is a matured chain ancestor"), ..Default::default() };
+            for source in producers {
+                let v = self.judge_anchor_source(source, selected_parent, block_blue_score);
+                if v.is_final {
+                    return v;
+                }
+                last = v; // keep the most informative rejection for diagnostics
+            }
+            return last;
         }
         let Some(source) = self.shielded_state_manager.anchor_source_block(anchor).unwrap() else {
-            return false; // not a real tree root of any block
+            // not a real tree root of any block this node has indexed
+            return AnchorVerdict { reject_reason: Some("anchor is not a known tree root"), ..Default::default() };
         };
+        self.judge_anchor_source(source, selected_parent, block_blue_score)
+    }
+
+    /// Decide whether one candidate source block makes an anchor final: it must be a selected-chain
+    /// ancestor of the spending block and lie inside the maturity window.
+    fn judge_anchor_source(&self, source: Hash, selected_parent: Hash, block_blue_score: u64) -> AnchorVerdict {
         // F-04: a source block below the pruning point has had its ghostdag data
         // pruned. With the age window above, such a source is necessarily older
         // than any acceptable anchor (or abandoned) — fail CLOSED. (Fail-open was
         // the F-04 inflation vector; see the doc comment.)
         let Ok(source_blue_score) = self.ghostdag_store.get_blue_score(source) else {
-            return false;
+            return AnchorVerdict { source: Some(source), reject_reason: Some("source ghostdag data pruned"), ..Default::default() };
         };
         // Canonical: the source block is on this block's selected chain. Use the
         // pruning-aware `try_is_chain_ancestor_of` (not the panicking `is_chain_ancestor_of`)
@@ -741,13 +815,84 @@ impl VirtualStateProcessor {
         // never crash the virtual processor here either. With the age window, an in-window
         // source's reachability is never pruned, so `Err` means out-of-window/abandoned —
         // fail closed (F-04); only an explicit `Ok(true)` is canonical.
-        if source != selected_parent && !matches!(self.reachability_service.try_is_chain_ancestor_of(source, selected_parent), Ok(true)) {
-            return false;
+        let is_chain_ancestor =
+            source == selected_parent || matches!(self.reachability_service.try_is_chain_ancestor_of(source, selected_parent), Ok(true));
+        if !is_chain_ancestor {
+            return AnchorVerdict {
+                source: Some(source),
+                source_blue_score: Some(source_blue_score),
+                is_chain_ancestor: Some(false),
+                age: Some(block_blue_score.saturating_sub(source_blue_score)),
+                reject_reason: Some("source block is not on this block's selected chain"),
+                ..Default::default()
+            };
         }
         // In-window: at least `shielded_anchor_depth` deep (maturity, PLAN §2.5) and
         // at most `max_shielded_anchor_age` old (F-04/F-05 fail-closed bound).
         let age = block_blue_score.saturating_sub(source_blue_score);
-        age >= self.shielded_anchor_depth && age <= self.max_shielded_anchor_age
+        let verdict = age >= self.shielded_anchor_depth && age <= self.max_shielded_anchor_age;
+        AnchorVerdict {
+            is_final: verdict,
+            source: Some(source),
+            source_blue_score: Some(source_blue_score),
+            is_chain_ancestor: Some(true),
+            age: Some(age),
+            reject_reason: (!verdict).then_some("age outside [shielded_anchor_depth, max_shielded_anchor_age]"),
+        }
+    }
+
+    /// The siblings of an anchor's source block, and whether each is known to carry the same
+    /// shielded root.
+    ///
+    /// An anchor is a tree *root*, not a block identity. Sibling blocks can mint identical
+    /// notes and so carry an identical root, and `anchor_block` keeps only the last one
+    /// written — so which block a node resolves an anchor to depends on the order it validated
+    /// them, orphans included. That is a consensus non-determinism.
+    ///
+    /// Crucially this reports siblings whose shielded state was NEVER persisted, rather than
+    /// skipping them. A node persists shielded state only for chain candidates, so on the node
+    /// that *rejects* a block the guilty orphan has no stored root and silently vanishes from
+    /// any scan that requires one — which is precisely the case that needs reporting. An
+    /// unpersisted sibling is recorded with `root_matches_anchor: None`, meaning "unknown from
+    /// here, go ask a node that accepted the block".
+    ///
+    /// Siblings are the children of `source`'s selected parent, so this is a short bounded
+    /// scan. Diagnostic path only — never consulted by validation.
+    pub(super) fn source_sibling_blocks(
+        &self,
+        anchor: &[u8; 32],
+        source: Hash,
+        selected_parent: Hash,
+    ) -> Vec<crate::processes::shielded_diag::SiblingBlock> {
+        use crate::model::stores::relations::RelationsStoreReader;
+        let mut out = Vec::new();
+        let Ok(source_sp) = self.ghostdag_store.get_selected_parent(source) else { return out };
+        let Ok(children) = self.relations_service.get_children(source_sp) else { return out };
+        let indexed = self.shielded_state_manager.anchor_source_block(anchor).ok().flatten();
+        for &sibling in children.read().iter() {
+            if sibling == source {
+                continue;
+            }
+            // `anchor_at` answers Ok(empty-tree root) for a block whose shielded state was never
+            // stored, so it cannot distinguish "stored and different" from "never computed".
+            // Treating the two alike is what made this scan report `ambiguity: none` on the very
+            // node that needed the warning. `persist` writes only when the frontier is non-empty,
+            // so a non-empty stored frontier is the honest test for "this node computed it".
+            let persisted = self.shielded_state_manager.frontier_at(sibling).map(|f| f.size > 0).unwrap_or(false);
+            let root_matches_anchor =
+                if persisted { self.shielded_state_manager.anchor_at(sibling).ok().map(|a| &a == anchor) } else { None };
+            let is_chain_ancestor = sibling == selected_parent
+                || matches!(self.reachability_service.try_is_chain_ancestor_of(sibling, selected_parent), Ok(true));
+            out.push(crate::processes::shielded_diag::SiblingBlock {
+                block: sibling.to_string(),
+                blue_score: self.ghostdag_store.get_blue_score(sibling).unwrap_or_default(),
+                is_chain_ancestor,
+                shielded_state_persisted: persisted,
+                root_matches_anchor,
+                indexed_as_source: indexed == Some(sibling),
+            });
+        }
+        out
     }
 
     /// Calculates the UTXO state of `to` starting from the state of `from`.
@@ -810,8 +955,9 @@ impl VirtualStateProcessor {
         // must observe the abandoned branch's nullifiers as unspent.
         self.db.write(shielded_revert_batch).unwrap();
 
-        // Fresh batch for the up-walk re-applies (committed at the end of the walk, as before).
-        let mut shielded_batch = WriteBatch::default();
+        // NOTE: the up-walk no longer defers shielded writes into a batch — each re-apply is
+        // committed inline (see below), because validation of new blocks in this same loop reads
+        // the nullifier store directly and must observe them.
 
         let split_point = split_point.expect("chain iterator was expected to reach the reorg split point");
         debug!("VIRTUAL PROCESSOR, found split point: {split_point}");
@@ -841,9 +987,26 @@ impl VirtualStateProcessor {
                     diff_point = current;
 
                     // This already-validated chain block is (re)joining the selected chain, so
-                    // re-add the nullifiers it added from its stored per-block diff (accumulated
-                    // into the up-walk batch committed at the end of the walk). No-op when it has none.
-                    self.shielded_state_manager.apply_nullifiers_from_store(&mut shielded_batch, current).unwrap();
+                    // re-add the nullifiers it added from its stored per-block diff.
+                    //
+                    // Commit each re-apply IMMEDIATELY, for exactly the reason the down-walk
+                    // commits its reverts immediately: RocksDB writes staged in a batch are
+                    // invisible to store reads until written. This same loop also *validates new
+                    // blocks* in the `KeyNotFound` arm below, and that path runs
+                    // `partition_applied`, which resolves nullifier conflicts by reading the global
+                    // store. With the re-applies still sitting unwritten in a batch, a freshly
+                    // validated block sees their nullifiers as UNSPENT, accepts a spend that should
+                    // have conflicted, and keeps its fee — so its expected coinbase carries a fee
+                    // the chain never re-minted and the block is disqualified, permanently.
+                    //
+                    // Diagnosed live 2026-07-31: a fast-syncing node wedged at DAA 371,851 wanting
+                    // out[0]=5724578600 where the chain had 5700000000 — one 24,578,600 sompi fee,
+                    // from a spend whose 21 nullifiers were re-applied earlier in the same walk.
+                    // The down-walk carries the same hazard and was already fixed this way; the
+                    // up-walk was not.
+                    let mut apply_batch = WriteBatch::default();
+                    self.shielded_state_manager.apply_nullifiers_from_store(&mut apply_batch, current).unwrap();
+                    self.db.write(apply_batch).unwrap();
                 }
                 Err(StoreError::KeyNotFound(_)) => {
                     if self.statuses_store.read().get(current).unwrap() == StatusDisqualifiedFromChain {
@@ -905,6 +1068,7 @@ impl VirtualStateProcessor {
                             }
                             // Commit UTXO + SMT + shielded data for current chain block
                             let shielded_computed = ctx.shielded_computed.take();
+                            let dev_accrued = ctx.dev_accrued;
                             self.commit_utxo_state(
                                 current,
                                 ctx.mergeset_diff,
@@ -914,6 +1078,7 @@ impl VirtualStateProcessor {
                                 smt_build,
                                 header.blue_score,
                                 shielded_computed,
+                                dev_accrued,
                             );
                             // Count the number of UTXO-processed chain blocks
                             chain_block_counter += 1;
@@ -933,7 +1098,6 @@ impl VirtualStateProcessor {
         // Commit the up-walk's nullifier re-applies atomically at the end of the walk (batch 2 of
         // the two-batch F-01 scheme; the down-walk reverts were already committed before the
         // up-walk). Empty (no shielded nullifiers touched) is a cheap no-op write.
-        self.db.write(shielded_batch).unwrap();
 
         diff_point
     }
@@ -948,6 +1112,7 @@ impl VirtualStateProcessor {
         smt_build: Option<kaspa_smt_store::processor::SmtBuild>,
         blue_score: u64,
         shielded_computed: Option<crate::processes::shielded::ComputedBlockShielded>,
+        dev_accrued: u64,
     ) {
         let mut batch = WriteBatch::default();
         self.utxo_diffs_store.insert_batch(&mut batch, current, Arc::new(mergeset_diff)).unwrap();
@@ -970,6 +1135,12 @@ impl VirtualStateProcessor {
         // shielded activity add nothing.
         if let Some(computed) = shielded_computed {
             self.shielded_state_manager.persist(&mut batch, current, &computed).unwrap();
+        }
+        // Dev-fee accrual rides the same atomic batch, so a crash can never leave a
+        // block whose coinbase paid out but whose accrual still says it owes. Zero is
+        // the store's default for a missing key, so pre-activation blocks write nothing.
+        if dev_accrued > 0 {
+            self.shielded_state_manager.set_dev_accrued(&mut batch, current, dev_accrued).unwrap();
         }
         let write_guard = self.statuses_store.set_batch(&mut batch, current, StatusUTXOValid).unwrap();
         self.db.write(batch).unwrap();
@@ -1890,6 +2061,9 @@ impl VirtualStateProcessor {
         // Commit to the selected parent's shielded state root (PLAN §2.10) so the template's
         // coinbase matches what `verify_coinbase_transaction` will expect for this block.
         let shielded_commitment = self.shielded_state_manager.state_root_at(virtual_state.ghostdag_data.selected_parent).unwrap();
+        let parent_daa_score = self.headers_store.get_daa_score(virtual_state.ghostdag_data.selected_parent).unwrap();
+        let dev_accrued_parent =
+            self.shielded_state_manager.dev_accrued_at(virtual_state.ghostdag_data.selected_parent).unwrap();
         let coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -1899,6 +2073,8 @@ impl VirtualStateProcessor {
                 &virtual_state.mergeset_rewards,
                 &virtual_state.mergeset_non_daa,
                 shielded_commitment,
+                parent_daa_score,
+                dev_accrued_parent,
             )
             .unwrap();
         txs.insert(0, coinbase.tx);
@@ -1981,6 +2157,7 @@ impl VirtualStateProcessor {
             None,
             0,
             None,
+            0,
         );
 
         // Init the virtual selected chain store

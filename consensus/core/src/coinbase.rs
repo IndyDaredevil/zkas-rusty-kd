@@ -44,4 +44,9 @@ impl BlockRewardData {
 pub struct CoinbaseTransactionTemplate {
     pub tx: Transaction,
     pub has_red_reward: bool, // Does the last output contain reward for red blocks
+    /// Dev fee carried forward by this block: what its selected parent had accrued
+    /// plus this block's cut, minus anything paid out here. `0` before dev-fee
+    /// accrual activates (the fee is minted every block) and `0` on a payout block
+    /// (the balance just went out as a note).
+    pub dev_accrued: u64,
 }

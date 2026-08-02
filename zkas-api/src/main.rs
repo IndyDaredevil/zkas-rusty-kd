@@ -965,6 +965,8 @@ fn coinbase_manager() -> CoinbaseManager {
         p.toccata_activation,
         p.dev_fee_permille,
         p.dev_fee_recipient,
+        p.dev_fee_accrual_activation,
+        p.dev_fee_payout_interval,
     )
 }
 

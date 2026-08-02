@@ -431,6 +431,64 @@ pub struct Params {
     pub crescendo_activation: ForkActivation,
 
     pub toccata_activation: ForkActivation,
+    /// Activation of the reorg-safe shielded anchor resolution (multi-producer index).
+    ///
+    /// Before: an anchor resolves through the single-valued, last-write-wins `anchor_block`
+    /// index, so a block that was briefly on the selected chain and then reorged out can
+    /// overwrite the canonical producer's entry and make every node that witnessed that reorg
+    /// drop spends the rest of the network keeps. After: an anchor is final if ANY block that
+    /// produced it is a chain ancestor in the maturity window, which is derivable from
+    /// canonical data alone and therefore identical on every node.
+    ///
+    /// This changes the validity of historical blocks, so it must be scheduled: nodes disagree
+    /// across the boundary unless they upgrade. Set to `never()` until a height is chosen.
+    pub shielded_anchor_multi_activation: ForkActivation,
+
+    /// Dev-fee accrual activation DAA score.
+    ///
+    /// Before this score the dev fee is minted as its own coinbase note in **every**
+    /// block. Measured on mainnet, that is exactly 1.00 note per chain block and
+    /// **32.8% of all note creation** — the single largest contributor to permanent
+    /// note-commitment-tree growth, and why a dev treasury accumulates one note per
+    /// second (a payout of 47,159 such notes needed 9,006 spends).
+    ///
+    /// At/after this score the cut is carried in the per-block accrual
+    /// (`ShieldedDevAccrued`) and paid as one note whenever the block's DAA score
+    /// crosses a multiple of [`Self::dev_fee_payout_interval`]. Total emission is
+    /// unchanged — the same value is paid, just batched — but it is *minted later*,
+    /// so cumulative supply lags by at most one interval's worth of dev fee.
+    ///
+    /// Changes the coinbase of every block, so it must be scheduled: nodes disagree
+    /// across the boundary unless they upgrade. `never()` until a height is chosen.
+    /// Shielded coinbase note-seed activation DAA score (defect **F-02**).
+    ///
+    /// Before this score a coinbase note is derived from `coinbase_txid || output_index`
+    /// alone. Two *sibling* blocks — same selected parent, same mergeset, same miner —
+    /// build a byte-identical coinbase (the payload carries blue score, subsidy, the
+    /// **parent's** shielded commitment and the miner script; all four match), so they
+    /// share a txid, mint identical notes and therefore produce an **identical shielded
+    /// tree root**. Measured on mainnet: canonical `da8dfb9d` and orphan `e6f50b47`
+    /// share coinbase txid `6035c646…`. That collision is what made `anchor_block`
+    /// order-dependent and wedged fresh nodes (§1).
+    ///
+    /// At/after this score the block's own hash is mixed into the seed, so no two blocks
+    /// can produce the same root and the anchor index is injective by construction. No
+    /// circularity: a block's coinbase commits its *parent's* shielded root, never its
+    /// own notes.
+    ///
+    /// Changes note derivation, so **every** re-derivation site must gate on the same
+    /// score — consensus, `shielded-wallet::effects`, walletd and shielded-pay. Scanning
+    /// a pre-fork block must keep using the old seed forever, or a wallet silently
+    /// mis-derives historical mining rewards.
+    pub shielded_coinbase_seed_activation: ForkActivation,
+
+    pub dev_fee_accrual_activation: ForkActivation,
+
+    /// DAA-score interval between dev-fee payouts once accrual is active. A payout
+    /// happens in the first block whose DAA score crosses a multiple of this value,
+    /// judged against its selected parent's score — so the rule is per-block and
+    /// deterministic even though a DAG block's score can jump by more than one.
+    pub dev_fee_payout_interval: u64,
 
     /// Merged-mining (AuxPoW) activation DAA score. Before this score a block must
     /// clear the native kHeavyHash PoW; at/after it a block may instead carry a valid
@@ -727,6 +785,10 @@ impl Params {
 
             crescendo_activation: overrides.crescendo_activation.unwrap_or(self.crescendo_activation),
             toccata_activation: overrides.toccata_activation.unwrap_or(self.toccata_activation),
+            shielded_anchor_multi_activation: self.shielded_anchor_multi_activation,
+            shielded_coinbase_seed_activation: self.shielded_coinbase_seed_activation,
+            dev_fee_accrual_activation: self.dev_fee_accrual_activation,
+            dev_fee_payout_interval: self.dev_fee_payout_interval,
             merged_mining_activation: overrides.merged_mining_activation.unwrap_or(self.merged_mining_activation),
 
             // Consensus-critical launch schedule; not exposed as a CLI override.
@@ -868,6 +930,13 @@ pub const MAINNET_PARAMS: Params = Params {
     // bridge's trust root dormant. `always()` matches the neighboring crescendo /
     // merged_mining launch values and must ride the genesis re-cut. CONSENSUS-BREAKING.
     toccata_activation: ForkActivation::always(),
+    // Scheduled separately once a height is agreed; see the field doc.
+    shielded_anchor_multi_activation: ForkActivation::never(),
+    shielded_coinbase_seed_activation: ForkActivation::never(),
+    dev_fee_accrual_activation: ForkActivation::never(),
+    // ~17 minutes at 1 BPS: short enough that the dev fund is never far behind,
+    // long enough to cut per-block dev notes by three orders of magnitude.
+    dev_fee_payout_interval: 1_000,
     // LAUNCH VALUE (decided 2026-07-22, reset bundle): merged mining active from
     // genesis. This is ZKas's production model — the chain merge-mines Kaspa from
     // block 0 (~20-25 KAS blocks/h in production), so aux-PoW acceptance is a launch
@@ -959,6 +1028,12 @@ pub const TESTNET_PARAMS: Params = Params {
 
     // ~16:00 UTC, May 18, 2026
     toccata_activation: ForkActivation::new(467_579_632),
+    shielded_anchor_multi_activation: ForkActivation::never(),
+    shielded_coinbase_seed_activation: ForkActivation::never(),
+    dev_fee_accrual_activation: ForkActivation::never(),
+    // ~17 minutes at 1 BPS: short enough that the dev fund is never far behind,
+    // long enough to cut per-block dev notes by three orders of magnitude.
+    dev_fee_payout_interval: 1_000,
     // On testnet, merged mining is available from genesis for testing.
     merged_mining_activation: ForkActivation::always(),
 
@@ -1015,6 +1090,13 @@ pub const SIMNET_PARAMS: Params = Params {
 
     crescendo_activation: ForkActivation::always(),
     toccata_activation: ForkActivation::always(),
+    // Scheduled separately once a height is agreed; see the field doc.
+    shielded_anchor_multi_activation: ForkActivation::never(),
+    shielded_coinbase_seed_activation: ForkActivation::never(),
+    dev_fee_accrual_activation: ForkActivation::never(),
+    // ~17 minutes at 1 BPS: short enough that the dev fund is never far behind,
+    // long enough to cut per-block dev notes by three orders of magnitude.
+    dev_fee_payout_interval: 1_000,
     merged_mining_activation: ForkActivation::always(),
 
     // Launch difficulty schedule disabled on simnet.
@@ -1076,6 +1158,12 @@ pub const DEVNET_PARAMS: Params = Params {
 
     crescendo_activation: ForkActivation::always(),
     toccata_activation: ForkActivation::never(),
+    shielded_anchor_multi_activation: ForkActivation::never(),
+    shielded_coinbase_seed_activation: ForkActivation::new(200),
+    dev_fee_accrual_activation: ForkActivation::new(200),
+    // ~17 minutes at 1 BPS: short enough that the dev fund is never far behind,
+    // long enough to cut per-block dev notes by three orders of magnitude.
+    dev_fee_payout_interval: 20,
     merged_mining_activation: ForkActivation::always(),
 
     // Pin difficulty to the (easy) genesis target for the first 50k blocks so the
@@ -1086,8 +1174,11 @@ pub const DEVNET_PARAMS: Params = Params {
     difficulty_ramp_blocks: 200_000,
 
     // No dev fee on devnet.
-    dev_fee_permille: 0,
-    dev_fee_recipient: None,
+    // Devnet carries the dev fee AND activates accrual early, so the fork can be
+    // rehearsed end-to-end on a throwaway chain: blocks below DAA 200 mint a dev note
+    // each (the pre-fork shape), blocks above it accrue and pay one note per 20 DAA.
+    dev_fee_permille: ZKAS_DEV_FEE_PERMILLE,
+    dev_fee_recipient: Some(ZKAS_DEV_FEE_RECIPIENT),
 };
 
 #[cfg(test)]

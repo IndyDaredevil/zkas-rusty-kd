@@ -114,6 +114,19 @@ pub enum DatabaseStorePrefixes {
     /// tree frontier and supply totals) so a reorg reloads the selected parent's
     /// accumulator rather than replaying from genesis.
     ShieldedBurns = 88,
+    /// **All** blocks that produced a given shielded tree root, not just the last one
+    /// written (`ShieldedAnchors` keeps one and is therefore order-dependent — see
+    /// `DbAnchorProducersStore`). Append-only and reorg-safe by construction.
+    ShieldedAnchorProducers = 89,
+    /// Dev-fee value accrued but not yet paid out, as of each chain block.
+    ///
+    /// A separate store rather than a field on `SupplyTotals` on purpose: these
+    /// stores are bincode-encoded and bincode is not self-describing, so growing
+    /// an existing value type makes every already-written row undecodable
+    /// (`#[serde(default)]` cannot help — the bytes simply run out). A fresh
+    /// prefix has no such problem: a missing key reads as zero, which is exactly
+    /// the right answer for every block mined before dev-fee accrual activates.
+    ShieldedDevAccrued = 90,
 
     // ---- Separator ----
     /// Reserved as a separator

@@ -272,6 +272,62 @@ impl ShieldedSupplyStoreReader for DbShieldedSupplyStore {
     }
 }
 
+// ------------------------------ Dev-fee accrual --------------------------------
+
+/// Dev-fee value accrued but not yet paid out, as of a chain block.
+///
+/// Before the accrual fork the dev fee is minted as its own coinbase note in
+/// **every** block — measured on mainnet as exactly 1.00 note per chain block,
+/// 32.8% of all note creation, and the reason a treasury accumulates one note per
+/// second. After activation the cut is carried here and paid as a single note once
+/// per payout interval.
+///
+/// Kept in its own store, not as a new field on [`SupplyTotals`]: values are
+/// bincode-encoded, bincode is not self-describing, and so widening an existing
+/// value type makes every already-written row fail to decode. A separate prefix
+/// sidesteps that entirely — an absent key reads as `0`, which is the correct
+/// accrual for every block mined before activation.
+///
+/// It is deliberately **not** part of the shielded state root: that formula is
+/// committed by every coinbase, and gating it would touch the most delicate code
+/// in the node. It needs no commitment of its own, because the accrued value
+/// determines the payout output, and the coinbase is compared byte-for-byte —
+/// a node that disagrees about the accrual disagrees about the coinbase and
+/// rejects the block.
+#[derive(Clone)]
+pub struct DbShieldedDevAccruedStore {
+    db: Arc<DB>,
+    access: CachedDbAccess<Hash, u64, BlockHasher>,
+}
+
+impl DbShieldedDevAccruedStore {
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
+        Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedDevAccrued.into()) }
+    }
+
+    pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
+        Self::new(Arc::clone(&self.db), cache_policy)
+    }
+
+    pub fn set_batch(&self, batch: &mut WriteBatch, block: Hash, accrued: u64) -> StoreResult<()> {
+        self.access.write(BatchDbWriter::new(batch), block, accrued)
+    }
+
+    pub fn delete_batch(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
+        self.access.delete(BatchDbWriter::new(batch), block)
+    }
+
+    /// Accrual as of `block`; `0` for any block that never wrote one (every
+    /// pre-activation block, and every block on a chain with no dev fee).
+    pub fn get(&self, block: Hash) -> StoreResult<u64> {
+        match self.access.read(block) {
+            Ok(v) => Ok(v),
+            Err(StoreError::KeyNotFound(_)) => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 // --------------------------- Bridge burn accumulator ---------------------------
 
 /// Persisted bridge burn accumulator at a chain block: the ordered exit receipts burned out of the
@@ -428,6 +484,75 @@ pub trait AnchorBlockStoreReader {
     /// The chain block whose shielded tree root equals `anchor`, if any block ever
     /// produced it. `None` means no block did (the anchor is not a real tree root).
     fn get(&self, anchor: &[u8; 32]) -> StoreResult<Option<Hash>>;
+}
+
+/// **Every** block known to have produced a given shielded tree root.
+///
+/// # Why this exists
+///
+/// [`DbAnchorBlockStore`] stores one block per root and is written last-write-wins. Its doc
+/// comment argues the index needs no reorg reverting because "an anchor from an abandoned
+/// branch simply fails the ancestor check" — which is sound for a MULTI-valued index and
+/// false for a single-valued one. A block that is briefly on the selected chain writes its
+/// root, then gets reorged out, and its entry *overwrites* rather than accompanies the
+/// canonical producer's. The canonical mapping is destroyed, so the ancestor check now fails
+/// for everyone, and the merging block's coinbase drops a fee it should have kept.
+///
+/// It is the only shielded store written on reorg-apply and never reverted on reorg-revert
+/// (contrast `revert_nullifiers_from_store`). Measured on mainnet: 360 roots produced by a
+/// canonical block resolved to a non-canonical one, wedging every freshly synced node.
+///
+/// Keeping ALL producers restores the original intent. Orphan entries become inert instead of
+/// destructive — they simply fail the ancestor check — and the store stays append-only, so no
+/// revert logic is needed. It is also deterministic across nodes without any coordination:
+/// every node necessarily has the canonical producer (it is a chain block it validated), and
+/// extra orphan entries one node happened to witness cannot change an existential test that
+/// only accepts chain ancestors.
+pub trait AnchorProducersStoreReader {
+    /// All blocks that produced `anchor`. Empty when no block did.
+    fn get_producers(&self, anchor: &[u8; 32]) -> StoreResult<Vec<Hash>>;
+}
+
+#[derive(Clone)]
+pub struct DbAnchorProducersStore {
+    db: Arc<DB>,
+    access: CachedDbAccess<AnchorKey, Vec<Hash>>,
+}
+
+impl DbAnchorProducersStore {
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
+        Self {
+            db: Arc::clone(&db),
+            access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedAnchorProducers.into()),
+        }
+    }
+
+    pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
+        Self::new(Arc::clone(&self.db), cache_policy)
+    }
+
+    /// Record `block` as a producer of `anchor`, idempotently.
+    ///
+    /// Re-applying the same block after a reorg must not duplicate it, and the list stays
+    /// tiny in practice (producers of one root are blocks sharing a mergeset).
+    pub fn add_producer_batch(&self, batch: &mut WriteBatch, anchor: [u8; 32], block: Hash) -> StoreResult<()> {
+        let mut producers = self.get_producers(&anchor)?;
+        if producers.contains(&block) {
+            return Ok(());
+        }
+        producers.push(block);
+        self.access.write(BatchDbWriter::new(batch), AnchorKey(anchor), producers)
+    }
+}
+
+impl AnchorProducersStoreReader for DbAnchorProducersStore {
+    fn get_producers(&self, anchor: &[u8; 32]) -> StoreResult<Vec<Hash>> {
+        match self.access.read(AnchorKey(*anchor)) {
+            Ok(v) => Ok(v),
+            Err(StoreError::KeyNotFound(_)) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Maps each shielded tree root (anchor) to the block that produced it (PLAN §2.5).

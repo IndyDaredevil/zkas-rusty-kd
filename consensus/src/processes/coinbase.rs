@@ -92,6 +92,10 @@ pub struct CoinbaseManager {
     dev_fee_permille: u64,
     /// ZKas dev fee recipient: raw 43-byte Orchard address. None disables the dev fee.
     dev_fee_recipient: Option<[u8; 43]>,
+    /// DAA score at which the dev fee stops being minted every block and starts accruing.
+    dev_fee_accrual_activation: ForkActivation,
+    /// DAA-score interval between dev-fee payouts once accrual is active.
+    dev_fee_payout_interval: u64,
 
     /// Precomputed subsidy by month tables (for before and after the Crescendo hardfork)
     subsidy_by_month_table_before: SubsidyByMonthTable,
@@ -131,6 +135,8 @@ impl CoinbaseManager {
         toccata_activation: ForkActivation,
         dev_fee_permille: u64,
         dev_fee_recipient: Option<[u8; 43]>,
+        dev_fee_accrual_activation: ForkActivation,
+        dev_fee_payout_interval: u64,
     ) -> Self {
         // Precomputed subsidy by month table for the actual block per second rate.
         // Values are rounded up per BPS (keeping the same number of rewarding months as the original
@@ -148,6 +154,11 @@ impl CoinbaseManager {
             toccata_activation,
             dev_fee_permille,
             dev_fee_recipient,
+            dev_fee_accrual_activation,
+            // A zero interval would make every block a payout block (x % 0 panics, and
+            // "always pay" is the pre-fork behaviour anyway); clamp so a misconfigured
+            // network degrades to the old shape instead of dividing by zero.
+            dev_fee_payout_interval: dev_fee_payout_interval.max(1),
             subsidy_by_month_table_before,
             subsidy_by_month_table_after,
             crescendo_activation_daa_score: bps_history.activation().daa_score(),
@@ -171,6 +182,25 @@ impl CoinbaseManager {
         self.bps_history
     }
 
+    /// Does a block with `daa_score` pay out the accrued dev fee, given its selected
+    /// parent's `parent_daa_score`?
+    ///
+    /// The test is "crossed a multiple of the interval", not "is a multiple of it":
+    /// on a DAG the score advances by the number of blocks merged, so it routinely
+    /// steps over the boundary rather than landing on it. Comparing interval indices
+    /// makes the rule exact for any step size, and it is judged per block against its
+    /// own parent, so every node reaches the same answer for the same block.
+    #[inline]
+    fn is_dev_fee_payout(&self, parent_daa_score: u64, daa_score: u64) -> bool {
+        daa_score / self.dev_fee_payout_interval > parent_daa_score / self.dev_fee_payout_interval
+    }
+
+    /// Build the expected coinbase for a block.
+    ///
+    /// `parent_daa_score` / `dev_accrued_parent` describe the block's **selected
+    /// parent** and are only consulted once dev-fee accrual has activated; before
+    /// that the output is byte-identical to the pre-fork shape regardless of what
+    /// they contain.
     pub fn expected_coinbase_transaction<T: AsRef<[u8]>>(
         &self,
         daa_score: u64,
@@ -179,6 +209,8 @@ impl CoinbaseManager {
         mergeset_rewards: &BlockHashMap<BlockRewardData>,
         mergeset_non_daa: &BlockHashSet,
         shielded_commitment: [u8; 32],
+        parent_daa_score: u64,
+        dev_accrued_parent: u64,
     ) -> CoinbaseResult<CoinbaseTransactionTemplate> {
         let mut outputs = Vec::with_capacity(ghostdag_data.mergeset_blues.len() + 1); // + 1 for possible red reward
 
@@ -219,14 +251,27 @@ impl CoinbaseManager {
             outputs.push(TransactionOutput::new(red_reward, miner_data.script_public_key.clone()));
         }
 
-        // Append the accumulated dev fee as a final coinbase output to the dev-fund Orchard
-        // recipient. On a shielded_coinbase network build_coinbase_mint mints it as a coinbase
-        // note (its script's first 43 bytes are the recipient); ordering is deterministic
-        // because this is always the last output.
+        // Dev fee. Pre-accrual: every block mints its own cut as a final coinbase output
+        // to the dev-fund Orchard recipient (build_coinbase_mint turns it into a coinbase
+        // note; ordering is deterministic because it is always the last output).
+        //
+        // Post-accrual: the cut is added to what the selected parent carried and the whole
+        // balance is paid as ONE note on payout blocks only. Value is conserved either way
+        // — the same sompi are paid, just batched — but on a non-payout block nothing is
+        // minted, so cumulative supply lags by at most one interval of dev fee.
+        let accrual_active = self.dev_fee_accrual_activation.is_active(daa_score);
+        let dev_accrued_after = if accrual_active { dev_accrued_parent.saturating_add(dev_fee_accum) } else { 0 };
+        let (dev_fee_paid, dev_accrued_after) = if !accrual_active {
+            (dev_fee_accum, 0)
+        } else if self.is_dev_fee_payout(parent_daa_score, daa_score) {
+            (dev_accrued_after, 0)
+        } else {
+            (0, dev_accrued_after)
+        };
         if let Some(recipient) = self.dev_fee_recipient {
-            if dev_fee_accum > 0 {
+            if dev_fee_paid > 0 {
                 let dev_spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&recipient));
-                outputs.push(TransactionOutput::new(dev_fee_accum, dev_spk));
+                outputs.push(TransactionOutput::new(dev_fee_paid, dev_spk));
             }
         }
 
@@ -245,6 +290,7 @@ impl CoinbaseManager {
         Ok(CoinbaseTransactionTemplate {
             tx: Transaction::new(tx_version, vec![], outputs, 0, subnets::SUBNETWORK_ID_COINBASE, 0, payload),
             has_red_reward: red_reward > 0,
+            dev_accrued: dev_accrued_after,
         })
     }
 
@@ -757,10 +803,10 @@ mod tests {
         let mergeset_non_daa = Default::default();
 
         let pre_activation = cbm
-            .expected_coinbase_transaction(99, miner_data.clone(), &ghostdag_data, &mergeset_rewards, &mergeset_non_daa, [0u8; 32])
+            .expected_coinbase_transaction(99, miner_data.clone(), &ghostdag_data, &mergeset_rewards, &mergeset_non_daa, [0u8; 32], 0, 0)
             .unwrap();
         let post_activation = cbm
-            .expected_coinbase_transaction(100, miner_data, &ghostdag_data, &mergeset_rewards, &mergeset_non_daa, [0u8; 32])
+            .expected_coinbase_transaction(100, miner_data, &ghostdag_data, &mergeset_rewards, &mergeset_non_daa, [0u8; 32], 0, 0)
             .unwrap();
 
         assert_eq!(pre_activation.tx.version, constants::TX_VERSION);
@@ -793,7 +839,7 @@ mod tests {
 
         let miner_data = MinerData::new(ScriptPublicKey::new(0, scriptvec![1, 2, 3]), vec![]);
         let tx = cbm
-            .expected_coinbase_transaction(0, miner_data, &ghostdag_data, &mergeset_rewards, &non_daa, [0u8; 32])
+            .expected_coinbase_transaction(0, miner_data, &ghostdag_data, &mergeset_rewards, &non_daa, [0u8; 32], 0, 0)
             .unwrap()
             .tx;
 
@@ -815,13 +861,117 @@ mod tests {
         kaspa_shielded_core::coinbase::coinbase_note(&desc, dev_cut).expect("dev recipient must be a canonical Orchard address");
 
         // With no recipient the manager produces no dev output and pays the full reward to the miner.
-        let no_fee = CoinbaseManager::new(150, 204, 0, 50_000_000_000, ForkedParam::new_const(1), ForkActivation::never(), 50, None);
+        let no_fee = CoinbaseManager::new(150, 204, 0, 50_000_000_000, ForkedParam::new_const(1), ForkActivation::never(), 50, None, ForkActivation::never(), 1_000);
         let tx2 = no_fee
-            .expected_coinbase_transaction(0, MinerData::new(ScriptPublicKey::new(0, scriptvec![1, 2, 3]), vec![]), &ghostdag_data, &mergeset_rewards, &non_daa, [0u8; 32])
+            .expected_coinbase_transaction(
+                0,
+                MinerData::new(ScriptPublicKey::new(0, scriptvec![1, 2, 3]), vec![]),
+                &ghostdag_data,
+                &mergeset_rewards,
+                &non_daa,
+                [0u8; 32],
+                0,
+                0,
+            )
             .unwrap()
             .tx;
         assert_eq!(tx2.outputs.len(), 1, "no dev recipient => no dev output");
         assert_eq!(tx2.outputs[0].value, subsidy + fees, "full reward to miner when dev fee disabled");
+    }
+
+    /// Dev-fee accrual: before activation every block mints its own cut; after it the
+    /// cut is carried and paid as one note per interval. The property that matters is
+    /// conservation — the same sompi reach the dev fund either way, so the change is a
+    /// batching change, not an emission change.
+    #[test]
+    fn dev_fee_accrual_batches_the_same_value_it_used_to_mint_every_block() {
+        use kaspa_consensus_core::BlockHashSet;
+        use kaspa_consensus_core::config::params::{MAINNET_PARAMS, ZKAS_DEV_FEE_RECIPIENT};
+        use kaspa_hashes::Hash;
+        use std::sync::Arc;
+
+        const INTERVAL: u64 = 10;
+        const ACTIVATION: u64 = 100;
+        let mut params = MAINNET_PARAMS.clone();
+        params.dev_fee_accrual_activation = ForkActivation::new(ACTIVATION);
+        params.dev_fee_payout_interval = INTERVAL;
+        let cbm = create_manager(&params);
+
+        let subsidy = 1_000_000_000u64;
+        let dev_cut = subsidy * 50 / 1000;
+        let blue = Hash::from_bytes([7u8; 32]);
+        let blue_script = ScriptPublicKey::new(0, ScriptVec::from_slice(&[9u8, 9, 9]));
+        let mut ghostdag_data = GhostdagData::default();
+        ghostdag_data.mergeset_blues = Arc::new(vec![blue]);
+        ghostdag_data.blue_score = 1;
+        let mut mergeset_rewards: BlockHashMap<BlockRewardData> = Default::default();
+        mergeset_rewards.insert(blue, BlockRewardData::new(subsidy, 0, blue_script.clone()));
+        let non_daa: BlockHashSet = Default::default();
+        let dev_spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&ZKAS_DEV_FEE_RECIPIENT));
+
+        let build = |daa: u64, parent_daa: u64, accrued: u64| {
+            cbm.expected_coinbase_transaction(
+                daa,
+                MinerData::new(ScriptPublicKey::new(0, scriptvec![1, 2, 3]), vec![]),
+                &ghostdag_data,
+                &mergeset_rewards,
+                &non_daa,
+                [0u8; 32],
+                parent_daa,
+                accrued,
+            )
+            .unwrap()
+        };
+
+        // Before activation: a dev note in every block, nothing accrues.
+        let before = build(ACTIVATION - 1, ACTIVATION - 2, 0);
+        assert_eq!(before.tx.outputs.len(), 2, "pre-activation shape is unchanged");
+        assert_eq!(before.tx.outputs[1].value, dev_cut);
+        assert_eq!(before.dev_accrued, 0, "nothing is carried before activation");
+
+        // After activation, walk a whole interval one block at a time and total up
+        // both what was paid out and what remains carried.
+        let (mut accrued, mut paid_out, mut payout_blocks) = (0u64, 0u64, 0usize);
+        let first = ACTIVATION;
+        let last = ACTIVATION + 2 * INTERVAL;
+        for daa in first..last {
+            let t = build(daa, daa - 1, accrued);
+            let dev_outputs: Vec<_> = t.tx.outputs.iter().filter(|o| o.script_public_key == dev_spk).collect();
+            if cbm.is_dev_fee_payout(daa - 1, daa) {
+                assert_eq!(dev_outputs.len(), 1, "a payout block pays exactly one dev note (daa {daa})");
+                paid_out += dev_outputs[0].value;
+                payout_blocks += 1;
+                assert_eq!(t.dev_accrued, 0, "the balance resets after paying out");
+            } else {
+                assert!(dev_outputs.is_empty(), "a non-payout block mints no dev note (daa {daa})");
+                assert_eq!(t.dev_accrued, accrued + dev_cut, "the cut is carried, not dropped");
+            }
+            accrued = t.dev_accrued;
+        }
+
+        // Conservation: every sompi the old scheme would have minted is either paid or
+        // still carried. This is the invariant the whole change rests on.
+        let blocks = (last - first) as u64;
+        assert_eq!(paid_out + accrued, dev_cut * blocks, "accrual must neither mint nor burn dev fee");
+        assert_eq!(payout_blocks, 2, "one payout per interval crossed");
+    }
+
+    /// The payout test is "crossed an interval boundary", not "landed on one". A DAG
+    /// block's DAA score advances by however many blocks it merged, so it routinely
+    /// steps over the boundary — and a rule written as `daa % interval == 0` would skip
+    /// the payout entirely, silently stranding the fee forever.
+    #[test]
+    fn dev_fee_payout_triggers_on_crossing_not_on_landing() {
+        use kaspa_consensus_core::config::params::MAINNET_PARAMS;
+        let mut params = MAINNET_PARAMS.clone();
+        params.dev_fee_payout_interval = 10;
+        let cbm = create_manager(&params);
+
+        assert!(cbm.is_dev_fee_payout(9, 10), "landing exactly on the boundary pays");
+        assert!(cbm.is_dev_fee_payout(8, 13), "stepping over the boundary pays");
+        assert!(!cbm.is_dev_fee_payout(11, 13), "a step inside one interval does not");
+        assert!(!cbm.is_dev_fee_payout(10, 10), "no advance, no payout");
+        assert!(cbm.is_dev_fee_payout(5, 25), "a multi-interval jump still pays once");
     }
 
     fn create_manager(params: &Params) -> CoinbaseManager {
@@ -834,11 +984,24 @@ mod tests {
             params.toccata_activation,
             params.dev_fee_permille,
             params.dev_fee_recipient,
+            params.dev_fee_accrual_activation,
+            params.dev_fee_payout_interval,
         )
     }
 
     /// Return a CoinbaseManager with legacy golang 1 BPS properties
     fn create_legacy_manager() -> CoinbaseManager {
-        CoinbaseManager::new(150, 204, 15778800 - 259200, 50000000000, ForkedParam::new_const(1), ForkActivation::never(), 0, None)
+        CoinbaseManager::new(
+            150,
+            204,
+            15778800 - 259200,
+            50000000000,
+            ForkedParam::new_const(1),
+            ForkActivation::never(),
+            0,
+            None,
+            ForkActivation::never(),
+            1_000,
+        )
     }
 }
