@@ -1,5 +1,6 @@
 use super::{VirtualStateProcessor, bounds::SeqCommitBounds};
 use crate::processes::shielded::ComputedBlockShielded;
+use crate::processes::shielded_diag;
 use crate::{
     errors::{
         BlockProcessResult,
@@ -102,6 +103,17 @@ pub(super) struct UtxoProcessingContext<'a> {
     /// The validated shielded transition for this block, computed during
     /// verification and persisted at commit.
     pub shielded_computed: Option<ComputedBlockShielded>,
+    /// Dev fee this block carries forward (parent's accrual + this block's cut, minus
+    /// any payout). Produced while rebuilding the expected coinbase — the only place
+    /// the per-block cuts are known — and persisted at commit alongside the shielded
+    /// state. Always `0` before dev-fee accrual activates.
+    pub dev_accrued: u64,
+    /// Per-transaction keep/drop detail, populated only when `--consensus-diag` is on and
+    /// read only if this block goes on to fail. Empty otherwise, so the cost is one atomic
+    /// load per block with shielded activity.
+    pub diag_decisions: Vec<shielded_diag::ShieldedDecision>,
+    /// Anchor resolutions behind those decisions, deduplicated by anchor.
+    pub diag_anchors: Vec<shielded_diag::AnchorResolution>,
 }
 
 impl<'a> UtxoProcessingContext<'a> {
@@ -120,6 +132,9 @@ impl<'a> UtxoProcessingContext<'a> {
             shielded_txs: Vec::new(),
             shielded_scan: Vec::new(),
             shielded_computed: None,
+            dev_accrued: 0,
+            diag_decisions: Vec::new(),
+            diag_anchors: Vec::new(),
         }
     }
 
@@ -224,6 +239,11 @@ impl VirtualStateProcessor {
                     } else {
                         // The transition will never apply this tx, so its fee never
                         // leaves the pool — the coinbase must not re-mint it.
+                        kaspa_core::warn!(
+                            "shielded: bundle of {} in {} failed to parse after full validation; fee refunded",
+                            validated_tx.id(),
+                            merged_block
+                        );
                         block_fee -= validated_tx.calculated_fee;
                     }
                 }
@@ -263,9 +283,64 @@ impl VirtualStateProcessor {
         if !ctx.shielded_txs.is_empty() {
             let selected_parent = ctx.selected_parent();
             let block_blue_score = ctx.ghostdag_data.blue_score;
-            let keep = self.shielded_state_manager.partition_applied(&ctx.shielded_txs, |stx| {
-                self.is_shielded_anchor_final(&stx.anchor, selected_parent, block_blue_score)
+            let diag = shielded_diag::enabled();
+            // Anchor resolutions recorded straight from the predicate validation used, so a
+            // report describes the decision that was actually made rather than a re-derivation.
+            let mut anchor_records: Vec<shielded_diag::AnchorResolution> = Vec::new();
+            let outcomes = self.shielded_state_manager.partition_applied(&ctx.shielded_txs, |stx| {
+                let verdict = self.resolve_shielded_anchor(&stx.anchor, selected_parent, block_blue_score, pov_daa_score);
+                if diag && !anchor_records.iter().any(|a| a.anchor == shielded_diag::hex32(&stx.anchor)) {
+                    // The sibling scan is the expensive part; only worth it for a resolved anchor.
+                    let siblings =
+                        verdict.source.map(|s| self.source_sibling_blocks(&stx.anchor, s, selected_parent)).unwrap_or_default();
+                    // Confirmed beats unverifiable: a sibling proven to carry the same root
+                    // settles it, while one we simply never computed only raises the question.
+                    let ambiguity = if siblings.iter().any(|b| b.root_matches_anchor == Some(true)) {
+                        shielded_diag::Ambiguity::Confirmed
+                    } else if siblings.iter().any(|b| !b.shielded_state_persisted) {
+                        shielded_diag::Ambiguity::Unverifiable
+                    } else {
+                        shielded_diag::Ambiguity::None
+                    };
+                    anchor_records.push(shielded_diag::AnchorResolution {
+                        anchor: shielded_diag::hex32(&stx.anchor),
+                        source: verdict.source.map(shielded_diag::hash_str),
+                        source_blue_score: verdict.source_blue_score,
+                        is_chain_ancestor: verdict.is_chain_ancestor,
+                        age: verdict.age,
+                        window_min: self.shielded_anchor_depth,
+                        window_max: self.max_shielded_anchor_age,
+                        verdict: verdict.is_final,
+                        reject_reason: verdict.reject_reason.map(str::to_string),
+                        ambiguity,
+                        source_siblings: siblings,
+                    });
+                }
+                verdict.is_final
             });
+            if diag {
+                ctx.diag_anchors = anchor_records;
+                ctx.diag_decisions = ctx
+                    .shielded_txs
+                    .iter()
+                    .zip(outcomes.iter())
+                    .enumerate()
+                    .map(|(i, (stx, o))| shielded_diag::ShieldedDecision {
+                        txid: ctx.shielded_scan.get(i).map(|s| s.txid.to_string()).unwrap_or_default(),
+                        source_block: shielded_diag::hash_str(shielded_tx_sources[i]),
+                        is_selected_parent: shielded_tx_sources[i] == selected_parent,
+                        fee: stx.fee,
+                        nullifier_count: stx.nullifiers.len(),
+                        anchor: shielded_diag::hex32(&stx.anchor),
+                        anchor_ok: o.anchor_ok,
+                        conflict_ok: o.conflict_ok,
+                        kept: o.kept(),
+                        drop_reason: o.drop_reason().map(str::to_string),
+                    })
+                    .collect();
+            }
+
+            let keep: Vec<bool> = outcomes.iter().map(|o| o.kept()).collect();
             let UtxoProcessingContext { shielded_txs, shielded_scan, mergeset_rewards, .. } = ctx;
             let mut idx = 0usize;
             let mut dropped = 0usize;
@@ -336,7 +411,7 @@ impl VirtualStateProcessor {
         // so this enforces that the coinbase re-mints only fees the shielded
         // transition actually collects (PLAN §2.6).
         let mergeset_non_daa = self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap();
-        self.verify_coinbase_transaction(&txs[0], header.daa_score, &ctx.ghostdag_data, &ctx.mergeset_rewards, &mergeset_non_daa)?;
+        ctx.dev_accrued = self.verify_coinbase_transaction(&txs[0], header.hash, header.daa_score, ctx, &mergeset_non_daa)?;
 
         // Verify the header pruning point
         let reply = self.verify_header_pruning_point(header, ctx.ghostdag_data.to_compact())?;
@@ -402,7 +477,13 @@ impl VirtualStateProcessor {
         // This is the block's OWN coinbase, so a malformed one correctly disqualifies
         // it (a competing block with a valid coinbase wins) — it cannot halt the chain.
         let coinbase_mint = if self.shielded_coinbase {
-            match crate::processes::shielded::build_coinbase_mint(&txs[0]) {
+            // F-02: from the activation score on, the block's own hash goes into the note
+            // seed so sibling blocks can no longer mint identical notes (and therefore can
+            // no longer produce the same tree root). Gated on THIS block's DAA score, never
+            // on the tip, so a block is always judged by the rule in force when it was mined
+            // — which is also what keeps a reorg across the boundary deterministic.
+            let seed_block = self.shielded_coinbase_seed_activation.is_active(header.daa_score).then_some(header.hash);
+            match crate::processes::shielded::build_coinbase_mint(&txs[0], seed_block) {
                 Ok(mint) => Some(mint),
                 Err(e) => return Err(InvalidShieldedState(header.hash, format!("coinbase mint: {e:?}"))),
             }
@@ -487,10 +568,26 @@ impl VirtualStateProcessor {
                     expected_delta += ctx.mergeset_rewards.get(red).unwrap().subsidy as i128;
                 }
             }
+            // Dev-fee accrual moves value across the block boundary without changing
+            // what is ultimately issued, so the invariant becomes "the pool grew by the
+            // subsidy MINUS what this block deferred, PLUS what a previous block
+            // deferred and this one paid out". Both terms are zero before activation,
+            // leaving the rule byte-identical to the pre-fork check.
+            //
+            // Getting this wrong is not a rounding error: the first accrual block mints
+            // only the miner's 95%, the un-adjusted check reads that as unbacked supply
+            // and disqualifies the block, and the chain stops. (Observed exactly that on
+            // the rehearsal chain: "pool delta 570000000 != expected 600000000".)
+            let parent_accrued = self.shielded_state_manager.dev_accrued_at(ctx.selected_parent()).unwrap() as i128;
+            let this_accrued = ctx.dev_accrued as i128;
+            expected_delta -= this_accrued - parent_accrued;
             if actual_delta != expected_delta {
                 return Err(InvalidShieldedState(
                     header.hash,
-                    format!("shielded pool delta {actual_delta} != expected subsidy-only delta {expected_delta}"),
+                    format!(
+                        "shielded pool delta {actual_delta} != expected subsidy delta {expected_delta} \
+                         (dev accrual {parent_accrued} -> {this_accrued})"
+                    ),
                 ));
             }
         }
@@ -513,18 +610,26 @@ impl VirtualStateProcessor {
     fn verify_coinbase_transaction(
         &self,
         coinbase: &Transaction,
+        block: Hash,
         daa_score: u64,
-        ghostdag_data: &GhostdagData,
-        mergeset_rewards: &BlockHashMap<BlockRewardData>,
+        ctx: &UtxoProcessingContext,
         mergeset_non_daa: &BlockHashSet,
-    ) -> BlockProcessResult<()> {
+    ) -> BlockProcessResult<u64> {
+        let ghostdag_data: &GhostdagData = &ctx.ghostdag_data;
+        let mergeset_rewards = &ctx.mergeset_rewards;
         // Extract only miner data from the provided coinbase
         let miner_data = self.coinbase_manager.deserialize_coinbase_payload(&coinbase.payload).unwrap().miner_data;
         // The coinbase must commit to the shielded state root of this block's selected parent
         // (PLAN §2.10). Rebuilding the expected coinbase with that root means a wrong or missing
         // commitment fails the tx-hash comparison below as `BadCoinbaseTransaction`.
         let shielded_commitment = self.shielded_state_manager.state_root_at(ghostdag_data.selected_parent).unwrap();
-        let expected_coinbase = self
+        // Dev-fee accrual carries along the selected-parent chain, exactly like the
+        // shielded state root above, and is read from the same block for the same
+        // reason: the expected coinbase must be rebuilt from what THIS block's parent
+        // committed, not from the tip.
+        let parent_daa_score = self.headers_store.get_daa_score(ghostdag_data.selected_parent).unwrap();
+        let dev_accrued_parent = self.shielded_state_manager.dev_accrued_at(ghostdag_data.selected_parent).unwrap();
+        let expected = self
             .coinbase_manager
             .expected_coinbase_transaction(
                 daa_score,
@@ -533,10 +638,106 @@ impl VirtualStateProcessor {
                 mergeset_rewards,
                 mergeset_non_daa,
                 shielded_commitment,
+                parent_daa_score,
+                dev_accrued_parent,
             )
-            .unwrap()
-            .tx;
-        if hashing::tx::hash(coinbase) != hashing::tx::hash(&expected_coinbase) { Err(BadCoinbaseTransaction) } else { Ok(()) }
+            .unwrap();
+        let expected_coinbase = expected.tx;
+        if hashing::tx::hash(coinbase) != hashing::tx::hash(&expected_coinbase) {
+            // A single tx-hash comparison says nothing about WHICH input diverged, and the
+            // inputs fail for very different reasons: a different applied-spend set shows up in
+            // the outputs (a fee re-minted or not), while a diverged shielded state shows up only
+            // in the payload commitment. Diagnosing that by reading code has repeatedly picked
+            // the wrong one, so emit the whole decision instead.
+            self.emit_coinbase_divergence_report(coinbase, &expected_coinbase, block, daa_score, ctx, &shielded_commitment);
+            Err(BadCoinbaseTransaction)
+        } else {
+            Ok(expected.dev_accrued)
+        }
+    }
+
+    /// Write a self-contained account of a rejected block's coinbase decision.
+    ///
+    /// No-op unless `--consensus-diag` is set, apart from one summary log line. See
+    /// [`crate::processes::shielded_diag`] for why this exists.
+    fn emit_coinbase_divergence_report(
+        &self,
+        actual: &Transaction,
+        expected: &Transaction,
+        block: Hash,
+        daa_score: u64,
+        ctx: &UtxoProcessingContext,
+        shielded_commitment: &[u8; 32],
+    ) {
+        let payload_equal = actual.payload == expected.payload;
+        let value_delta: i128 = expected.outputs.iter().map(|o| i128::from(o.value)).sum::<i128>()
+            - actual.outputs.iter().map(|o| i128::from(o.value)).sum::<i128>();
+        kaspa_core::warn!(
+            "coinbase mismatch at daa {daa_score} (block {block}): expected total differs from actual by {value_delta} sompi; payload_equal={payload_equal}"
+        );
+        if !shielded_diag::enabled() {
+            kaspa_core::warn!("consensus-diag is off — rerun with `--consensus-diag` to get a full divergence report for this block");
+            return;
+        }
+
+        let spk_prefix = |o: &kaspa_consensus_core::tx::TransactionOutput| {
+            let s = o.script_public_key.script();
+            faster_hex::hex_string(&s[..8.min(s.len())])
+        };
+        let coinbase_outputs = (0..expected.outputs.len().max(actual.outputs.len()))
+            .map(|i| {
+                let e = expected.outputs.get(i);
+                let a = actual.outputs.get(i);
+                shielded_diag::CoinbaseOutputDiff {
+                    index: i,
+                    expected_value: e.map(|o| o.value),
+                    actual_value: a.map(|o| o.value),
+                    expected_script_prefix: e.map(spk_prefix),
+                    actual_script_prefix: a.map(spk_prefix),
+                    matches: match (e, a) {
+                        (Some(e), Some(a)) => e.value == a.value && e.script_public_key == a.script_public_key,
+                        _ => false,
+                    },
+                }
+            })
+            .collect();
+
+        let selected_parent = ctx.selected_parent();
+        let (global_set_matches_snapshot, global_nullifier_count) =
+            match self.shielded_state_manager.global_set_matches_snapshot(selected_parent) {
+                Ok((ok, count)) => (Some(ok), Some(count as u64)),
+                Err(_) => (None, None),
+            };
+
+        shielded_diag::write_report(shielded_diag::BlockDivergenceReport {
+            schema: shielded_diag::BlockDivergenceReport::SCHEMA,
+            kind: "coinbase_mismatch",
+            block: block.to_string(),
+            daa_score,
+            blue_score: ctx.ghostdag_data.blue_score,
+            selected_parent: selected_parent.to_string(),
+            mergeset: ctx.ghostdag_data.unordered_mergeset().map(|h| h.to_string()).collect(),
+            payload_equal,
+            shielded_commitment_at_selected_parent: Some(faster_hex::hex_string(shielded_commitment)),
+            shielded_tree_size_at_selected_parent: self.shielded_state_manager.frontier_at(selected_parent).ok().map(|f| f.size),
+            global_nullifier_count,
+            global_set_matches_snapshot,
+            coinbase_outputs,
+            value_delta,
+            mergeset_rewards: ctx
+                .mergeset_rewards
+                .iter()
+                .map(|(h, r)| shielded_diag::MergesetReward {
+                    block: h.to_string(),
+                    subsidy: r.subsidy,
+                    total_fees: r.total_fees,
+                    is_selected_parent: *h == selected_parent,
+                })
+                .collect(),
+            shielded_decisions: ctx.diag_decisions.clone(),
+            anchors: ctx.diag_anchors.clone(),
+            verdict_hint: Vec::new(), // filled by write_report
+        });
     }
 
     /// Validates transactions against the provided `utxo_view` and returns a vector with all transactions

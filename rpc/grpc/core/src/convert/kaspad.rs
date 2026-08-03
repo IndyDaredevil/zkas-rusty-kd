@@ -33,6 +33,8 @@ pub mod kaspad_request_convert {
     impl_into_kaspad_request!(GetSink);
     impl_into_kaspad_request!(GetShieldedTreeState);
     impl_into_kaspad_request!(GetShieldedBlocks);
+    impl_into_kaspad_request!(GetShieldedSupply);
+    impl_into_kaspad_request!(GetShieldedCoinbaseRewards);
     impl_into_kaspad_request!(GetMempoolEntry);
     impl_into_kaspad_request!(GetMempoolEntries);
     impl_into_kaspad_request!(GetConnectedPeerInfo);
@@ -176,6 +178,8 @@ pub mod kaspad_response_convert {
     impl_into_kaspad_response!(GetSink);
     impl_into_kaspad_response!(GetShieldedTreeState);
     impl_into_kaspad_response!(GetShieldedBlocks);
+    impl_into_kaspad_response!(GetShieldedSupply);
+    impl_into_kaspad_response!(GetShieldedCoinbaseRewards);
     impl_into_kaspad_response!(GetMempoolEntry);
     impl_into_kaspad_response!(GetMempoolEntries);
     impl_into_kaspad_response!(GetConnectedPeerInfo);

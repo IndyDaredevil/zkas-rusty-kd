@@ -170,6 +170,7 @@ message SubmitBlockResponseMessage {
     IS_IN_IBD = 2;
   }
   RejectReason rejectReason = 1;
+  string rejectDetail = 2;              // the concrete rule error; empty on success
   RPCError error = 1000;
 }
 
@@ -284,6 +285,57 @@ message GetShieldedBlocksResponseMessage {
   repeated RpcShieldedChainBlock blocks = 1;
   bool reorged = 2;                     // true: startHash reorged out; caller must rescan
   uint64 sinkBlueScore = 3;             // lets the wallet hold back a maturity margin
+  RPCError error = 1000;
+}
+
+// GetShieldedSupplyRequestMessage requests the shielded turnstile totals as of a
+// chain block: every sompi in the pool entered as a coinbase mint and leaves only
+// as a fee (or a bridge burn), so poolValue is derived, never a stored counter.
+message GetShieldedSupplyRequestMessage {
+  string blockHash = 1;                 // optional chain block (hex); empty = the sink
+}
+
+message GetShieldedSupplyResponseMessage {
+  string blockHash = 1;                 // the chain block these totals are as of
+  uint64 daaScore = 2;
+  uint64 blueScore = 3;
+  uint64 cumulativeCoinbase = 4;        // total subsidy ever minted into the pool
+  uint64 cumulativeFees = 5;            // total fees ever removed (re-minted to miners)
+  uint64 cumulativeBurns = 6;           // bridge peg-out; 0 while the seam is dormant
+  uint64 poolValue = 7;                 // cumulativeCoinbase - cumulativeFees - cumulativeBurns
+  uint64 noteCount = 8;                 // notes ever added to the commitment tree
+  RPCError error = 1000;
+}
+
+// GetShieldedCoinbaseRewardsRequestMessage requests the coinbase payments made to
+// the given shielded recipients by the chain blocks after startHash — the income
+// view. A block's own coinbase pays its MERGESET, not its finder, and only a
+// selected-chain block's coinbase is ever applied, so a pool that sums the outputs
+// of a block it mined credits money it will not receive. This answers the only
+// question that matters: what the chain actually paid the recipient.
+message GetShieldedCoinbaseRewardsRequestMessage {
+  repeated string recipients = 1;       // hex 43-byte Orchard recipients; at least one
+  string startHash = 2;                 // resume cursor (exclusive); must be a chain block
+  uint64 limit = 3;                     // max chain blocks SCANNED (0 = server default)
+}
+
+message RpcShieldedCoinbaseReward {
+  string blockHash = 1;
+  uint64 blueScore = 2;
+  uint64 daaScore = 3;
+  uint64 timestamp = 4;                 // chain block header timestamp (ms since epoch)
+  string coinbaseTxid = 5;
+  uint32 outputIndex = 6;               // (coinbaseTxid, outputIndex) is the payment identity
+  string recipient = 7;                 // hex; the matched 43-byte recipient
+  uint64 value = 8;
+}
+
+message GetShieldedCoinbaseRewardsResponseMessage {
+  repeated RpcShieldedCoinbaseReward rewards = 1;   // matched payments, oldest first
+  string nextCursor = 2;                // next startHash; advances even when nothing matched
+  uint64 scannedBlocks = 3;             // chain blocks scanned by this call
+  bool reorged = 4;                     // true: startHash reorged out; caller must rescan
+  uint64 sinkBlueScore = 5;             // lets the caller hold back a maturity margin
   RPCError error = 1000;
 }
 

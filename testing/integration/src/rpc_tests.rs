@@ -842,6 +842,65 @@ async fn sanity_test() {
                     assert!(!response.reorged, "genesis cursor must not be reported as reorged");
                 })
             }
+
+            KaspadPayloadOps::GetShieldedSupply => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    // Default block (the sink). This simnet harness is transparent-coinbase,
+                    // so nothing is ever minted into the pool and every total is zero — which
+                    // still exercises the full path and the derived `pool_value`.
+                    let response =
+                        rpc_client.get_shielded_supply_call(None, GetShieldedSupplyRequest { block_hash: None }).await.unwrap();
+                    assert_eq!(response.cumulative_coinbase, 0, "transparent-coinbase simnet mints nothing into the pool");
+                    assert_eq!(
+                        response.pool_value,
+                        response.cumulative_coinbase - response.cumulative_fees - response.cumulative_burns,
+                        "pool value must be the derived turnstile identity"
+                    );
+                    assert_eq!(response.note_count, 0);
+                })
+            }
+
+            KaspadPayloadOps::GetShieldedCoinbaseRewards => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    // Resume from genesis with a recipient that is paid nothing: the call
+                    // must still advance its cursor over the blocks it scanned, which is the
+                    // property that keeps a quiet chain from being rescanned forever.
+                    let response = rpc_client
+                        .get_shielded_coinbase_rewards_call(
+                            None,
+                            GetShieldedCoinbaseRewardsRequest {
+                                recipients: vec![vec![0u8; 43]],
+                                start_hash: SIMNET_GENESIS.hash,
+                                limit: 0,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert!(!response.reorged, "genesis cursor must not be reported as reorged");
+                    assert!(response.rewards.is_empty(), "an unpaid recipient must match nothing");
+                    if response.scanned_blocks > 0 {
+                        assert_ne!(response.next_cursor, SIMNET_GENESIS.hash, "cursor must advance over scanned blocks");
+                    }
+
+                    // An empty recipient list is a caller error, not an empty result.
+                    assert!(
+                        rpc_client
+                            .get_shielded_coinbase_rewards_call(
+                                None,
+                                GetShieldedCoinbaseRewardsRequest {
+                                    recipients: vec![],
+                                    start_hash: SIMNET_GENESIS.hash,
+                                    limit: 0
+                                },
+                            )
+                            .await
+                            .is_err(),
+                        "an empty recipient list must be rejected"
+                    );
+                })
+            }
         };
         tasks.push(task);
     }

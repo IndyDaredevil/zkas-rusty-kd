@@ -56,12 +56,21 @@ impl BlockShieldedEffects {
 }
 
 /// Derive the coinbase note descriptions a shielded coinbase transaction mints,
-/// mirroring consensus `build_coinbase_mint` **exactly**: for output `i`, the seed
-/// is `coinbase_txid || (i as u32 little-endian)`, the recipient is the first 43
-/// bytes of the output script, and the public value is `output.value` (the
+/// mirroring consensus `build_coinbase_mint` **exactly**: for output `i` the seed is
+/// `[block_hash ||] coinbase_txid || (i as u32 little-endian)`, the recipient is the
+/// first 43 bytes of the output script, and the public value is `output.value` (the
 /// emission- and fee-checked reward). See the module docs for why byte-parity here
 /// is mandatory.
-pub fn coinbase_note_descs(coinbase_tx: &Transaction) -> Result<Vec<(CoinbaseNoteDesc, u64)>, EffectsError> {
+///
+/// `block_hash` is the **F-02 fork gate**, and the caller must decide it per block:
+/// `Some(hash)` for blocks at or after `shielded_coinbase_seed_activation`, `None`
+/// below it. Scanning a pre-fork block with `Some` (or a post-fork block with `None`)
+/// derives the wrong notes and the wallet silently misses its own mining rewards —
+/// hence the explicit argument rather than a default.
+pub fn coinbase_note_descs(
+    coinbase_tx: &Transaction,
+    block_hash: Option<kaspa_hashes::Hash>,
+) -> Result<Vec<(CoinbaseNoteDesc, u64)>, EffectsError> {
     let txid = coinbase_tx.id();
     let mut out = Vec::with_capacity(coinbase_tx.outputs.len());
     for (i, output) in coinbase_tx.outputs.iter().enumerate() {
@@ -71,8 +80,12 @@ pub fn coinbase_note_descs(coinbase_tx: &Transaction) -> Result<Vec<(CoinbaseNot
         }
         let recipient: [u8; ORCHARD_ADDRESS_LEN] =
             script[..ORCHARD_ADDRESS_LEN].try_into().expect("checked len >= ORCHARD_ADDRESS_LEN");
-        // Unique per-note seed: coinbase tx id || output index (must match consensus).
-        let mut seed = Vec::with_capacity(32 + 4);
+        // Per-note seed: [block hash ||] coinbase tx id || output index (must match
+        // consensus `build_coinbase_mint` byte for byte).
+        let mut seed = Vec::with_capacity(32 + 32 + 4);
+        if let Some(h) = block_hash {
+            seed.extend_from_slice(&h.as_bytes());
+        }
         seed.extend_from_slice(&txid.as_bytes());
         seed.extend_from_slice(&(i as u32).to_le_bytes());
         out.push((derive_coinbase_note_desc(recipient, &seed), output.value));
@@ -99,8 +112,15 @@ pub fn shielded_bundle(tx: &Transaction) -> Option<ShieldedBundle> {
 /// order consensus applied them — only the shielded (version-2) ones contribute a
 /// bundle, the rest are skipped. Pass an empty `accepted_txs` (or a coinbase with
 /// no outputs) for a block with no such activity.
-pub fn block_effects(coinbase_tx: &Transaction, accepted_txs: &[&Transaction]) -> Result<BlockShieldedEffects, EffectsError> {
-    let coinbase = if coinbase_tx.outputs.is_empty() { Vec::new() } else { coinbase_note_descs(coinbase_tx)? };
+///
+/// `block_hash` carries the F-02 gate through to [`coinbase_note_descs`] — `Some` for
+/// blocks at or after `shielded_coinbase_seed_activation`, `None` below it.
+pub fn block_effects(
+    coinbase_tx: &Transaction,
+    accepted_txs: &[&Transaction],
+    block_hash: Option<kaspa_hashes::Hash>,
+) -> Result<BlockShieldedEffects, EffectsError> {
+    let coinbase = if coinbase_tx.outputs.is_empty() { Vec::new() } else { coinbase_note_descs(coinbase_tx, block_hash)? };
     let bundles = accepted_txs.iter().filter_map(|tx| shielded_bundle(tx)).collect();
     Ok(BlockShieldedEffects { coinbase, bundles })
 }
@@ -131,13 +151,13 @@ mod tests {
     #[test]
     fn coinbase_descs_are_deterministic_and_per_output_unique() {
         let tx = coinbase_tx(&[(raw_addr(7), 500), (raw_addr(7), 500)]);
-        let a = coinbase_note_descs(&tx).unwrap();
+        let a = coinbase_note_descs(&tx, None).unwrap();
         assert_eq!(a.len(), 2);
         // Same recipient, but different output index => different (rho, rseed).
         assert_ne!(a[0].0, a[1].0, "per-output seed makes each coinbase note unique");
         assert_eq!(a[0].1, 500);
         // Deterministic: re-extracting the same tx yields identical descriptions.
-        assert_eq!(coinbase_note_descs(&tx).unwrap(), a);
+        assert_eq!(coinbase_note_descs(&tx, None).unwrap(), a);
     }
 
     #[test]
@@ -151,7 +171,7 @@ mod tests {
             0,
             vec![],
         );
-        assert_eq!(coinbase_note_descs(&tx), Err(EffectsError::ShortCoinbaseScript { output_index: 0, len: 20 }));
+        assert_eq!(coinbase_note_descs(&tx, None), Err(EffectsError::ShortCoinbaseScript { output_index: 0, len: 20 }));
     }
 
     #[test]
@@ -180,18 +200,44 @@ mod tests {
         let r1 = address_bytes_from_seed([22u8; 32]).unwrap();
         let tx = coinbase_tx(&[(r0, 5_000_000_000), (r1, 1_234_567)]);
 
-        let mint = build_coinbase_mint(&tx).expect("consensus builds the mint");
-        let descs = coinbase_note_descs(&tx).expect("wallet extracts the descs");
+        // Parity must hold on BOTH sides of the F-02 boundary: a wallet scanning a
+        // pre-fork block derives with `None`, a post-fork block with `Some(block hash)`,
+        // and either mismatch silently loses the miner's own rewards.
+        let post_fork_block = kaspa_hashes::Hash::from_bytes([0xab; 32]);
+        for seed_block in [None, Some(post_fork_block)] {
+            let mint = build_coinbase_mint(&tx, seed_block).expect("consensus builds the mint");
+            let descs = coinbase_note_descs(&tx, seed_block).expect("wallet extracts the descs");
 
-        assert_eq!(descs.len(), mint.notes.len(), "same number of coinbase notes");
-        for ((desc, value), note) in descs.iter().zip(mint.notes.iter()) {
-            assert_eq!(*value, note.value, "same public value per note");
-            let cmx = coinbase_note_commitment(desc, *value).expect("canonical note");
-            assert_eq!(
-                cmx.to_bytes(),
-                note.commitment.to_bytes(),
-                "wallet-extracted coinbase note commitment matches consensus byte-for-byte"
-            );
+            assert_eq!(descs.len(), mint.notes.len(), "same number of coinbase notes");
+            for ((desc, value), note) in descs.iter().zip(mint.notes.iter()) {
+                assert_eq!(*value, note.value, "same public value per note");
+                let cmx = coinbase_note_commitment(desc, *value).expect("canonical note");
+                assert_eq!(
+                    cmx.to_bytes(),
+                    note.commitment.to_bytes(),
+                    "wallet-extracted coinbase note commitment matches consensus byte-for-byte ({seed_block:?})"
+                );
+            }
         }
+
+        // The point of F-02: the SAME coinbase transaction mined into two different
+        // blocks must mint different notes, so two sibling blocks can no longer produce
+        // an identical shielded tree root. Pre-fork it does exactly the opposite, which
+        // is the collision that wedged fresh nodes.
+        let other_block = kaspa_hashes::Hash::from_bytes([0xcd; 32]);
+        let a = build_coinbase_mint(&tx, Some(post_fork_block)).unwrap();
+        let b = build_coinbase_mint(&tx, Some(other_block)).unwrap();
+        let legacy_a = build_coinbase_mint(&tx, None).unwrap();
+        let legacy_b = build_coinbase_mint(&tx, None).unwrap();
+        assert_ne!(
+            a.notes[0].commitment.to_bytes(),
+            b.notes[0].commitment.to_bytes(),
+            "post-fork: identical coinbase in different blocks must mint different notes"
+        );
+        assert_eq!(
+            legacy_a.notes[0].commitment.to_bytes(),
+            legacy_b.notes[0].commitment.to_bytes(),
+            "pre-fork: identical coinbase mints identical notes — the F-02 collision, pinned so the fix is demonstrably a fix"
+        );
     }
 }

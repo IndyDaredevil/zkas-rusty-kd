@@ -93,22 +93,45 @@ impl SubmitBlockReport {
 #[serde(rename_all = "camelCase")]
 pub struct SubmitBlockResponse {
     pub report: SubmitBlockReport,
+    /// Why the block was rejected, in the node's own words — the concrete rule
+    /// error, not just its category.
+    ///
+    /// `report` alone collapses every possible defect into `BlockInvalid`, which
+    /// leaves a miner or pool unable to tell "your node is wedged and producing
+    /// blocks nobody will accept" from "you raced and lost". Empty on success and
+    /// from a node too old to send it.
+    pub reject_detail: String,
+}
+
+impl SubmitBlockResponse {
+    /// The block was accepted.
+    pub fn success() -> Self {
+        Self { report: SubmitBlockReport::Success, reject_detail: String::new() }
+    }
+
+    /// The block was rejected, with the node's reason for it.
+    pub fn reject(reason: SubmitBlockRejectReason, detail: impl Into<String>) -> Self {
+        Self { report: SubmitBlockReport::Reject(reason), reject_detail: detail.into() }
+    }
 }
 
 impl Serializer for SubmitBlockResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
         store!(SubmitBlockReport, &self.report, writer)?;
+        store!(String, &self.reject_detail, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for SubmitBlockResponse {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let report = load!(SubmitBlockReport, reader)?;
+        // v2 appended the detail; a v1 blob simply lacks it.
+        let reject_detail = if version >= 2 { load!(String, reader)? } else { String::new() };
 
-        Ok(Self { report })
+        Ok(Self { report, reject_detail })
     }
 }
 
@@ -648,6 +671,227 @@ impl Deserializer for GetShieldedBlocksResponse {
         let reorged = load!(bool, reader)?;
         let sink_blue_score = load!(u64, reader)?;
         Ok(Self { blocks, reorged, sink_blue_score })
+    }
+}
+
+/// Request the shielded turnstile totals as of a chain block.
+///
+/// This is the public form of the PLAN §2.7 turnstile: every sompi in the
+/// shielded pool entered as a coinbase mint and leaves only as a fee (or a
+/// bridge burn). `pool_value` in the response is *derived* from the cumulative
+/// counters, never itself a counter, so a node that minted unbacked value
+/// cannot report a consistent set of numbers here.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetShieldedSupplyRequest {
+    /// Optional explicit chain block to report as of; `None` = the current sink.
+    pub block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetShieldedSupplyRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Option<RpcHash>, &self.block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetShieldedSupplyRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let block_hash = load!(Option<RpcHash>, reader)?;
+        Ok(Self { block_hash })
+    }
+}
+
+/// The shielded supply as of `block_hash`, in sompi.
+///
+/// The peg-in seam ([`kaspa_shielded_core::pegin`]) is dormant and never
+/// persisted, so it contributes nothing and has no field here; if it is ever
+/// activated this response gains a `cumulative_pegged_in` and `pool_value`
+/// starts including it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetShieldedSupplyResponse {
+    /// The chain block these totals are as of.
+    pub block_hash: RpcHash,
+    pub daa_score: u64,
+    pub blue_score: u64,
+    /// Total subsidy ever minted into the shielded pool.
+    pub cumulative_coinbase: u64,
+    /// Total fees ever removed from the pool (re-minted to miners in coinbases).
+    pub cumulative_fees: u64,
+    /// Total value ever burned out of the pool to another chain. The bridge seam
+    /// is deactivated, so this is `0` on the live chain.
+    pub cumulative_burns: u64,
+    /// `cumulative_coinbase − cumulative_fees − cumulative_burns`: value currently
+    /// held in shielded notes. This is the circulating supply of the pool.
+    pub pool_value: u64,
+    /// Notes ever added to the commitment tree (its leaf count).
+    pub note_count: u64,
+}
+
+impl Serializer for GetShieldedSupplyResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcHash, &self.block_hash, writer)?;
+        store!(u64, &self.daa_score, writer)?;
+        store!(u64, &self.blue_score, writer)?;
+        store!(u64, &self.cumulative_coinbase, writer)?;
+        store!(u64, &self.cumulative_fees, writer)?;
+        store!(u64, &self.cumulative_burns, writer)?;
+        store!(u64, &self.pool_value, writer)?;
+        store!(u64, &self.note_count, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetShieldedSupplyResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let block_hash = load!(RpcHash, reader)?;
+        let daa_score = load!(u64, reader)?;
+        let blue_score = load!(u64, reader)?;
+        let cumulative_coinbase = load!(u64, reader)?;
+        let cumulative_fees = load!(u64, reader)?;
+        let cumulative_burns = load!(u64, reader)?;
+        let pool_value = load!(u64, reader)?;
+        let note_count = load!(u64, reader)?;
+        Ok(Self { block_hash, daa_score, blue_score, cumulative_coinbase, cumulative_fees, cumulative_burns, pool_value, note_count })
+    }
+}
+
+/// Request the coinbase payments made to specific shielded recipients by the
+/// selected-chain blocks after `start_hash` — the **income** view.
+///
+/// This exists so a pool never has to derive income from blocks it mined. A
+/// block's own coinbase pays the miners of its *mergeset*, not its finder, and
+/// only a selected-chain block's coinbase is ever applied; summing the outputs
+/// of a block you submitted therefore counts money you will not receive. This
+/// call answers the only question that matters — "what did the chain actually
+/// pay this recipient" — server-side.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetShieldedCoinbaseRewardsRequest {
+    /// Raw 43-byte Orchard recipients to match against the leading 43 bytes of
+    /// each coinbase output's script. At least one is required.
+    pub recipients: Vec<Vec<u8>>,
+    /// Resume cursor (exclusive); must be a chain block known to the node.
+    pub start_hash: RpcHash,
+    /// Max chain blocks **scanned** (0 = server default). Bounds server work;
+    /// it is not a cap on returned rewards.
+    pub limit: u64,
+}
+
+impl Serializer for GetShieldedCoinbaseRewardsRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Vec<Vec<u8>>, &self.recipients, writer)?;
+        store!(RpcHash, &self.start_hash, writer)?;
+        store!(u64, &self.limit, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetShieldedCoinbaseRewardsRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let recipients = load!(Vec<Vec<u8>>, reader)?;
+        let start_hash = load!(RpcHash, reader)?;
+        let limit = load!(u64, reader)?;
+        Ok(Self { recipients, start_hash, limit })
+    }
+}
+
+/// One coinbase payment to a matched recipient. `(coinbase_txid, output_index)`
+/// is the payment's stable identity — dedupe on it, never on `(block, value)`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcShieldedCoinbaseReward {
+    pub block_hash: RpcHash,
+    pub blue_score: u64,
+    pub daa_score: u64,
+    /// Chain block header timestamp, ms since epoch.
+    pub timestamp: u64,
+    pub coinbase_txid: RpcHash,
+    pub output_index: u32,
+    /// The matched 43-byte recipient (echoed so a multi-recipient caller can
+    /// attribute without re-deriving it).
+    pub recipient: Vec<u8>,
+    pub value: u64,
+}
+
+impl Serializer for RpcShieldedCoinbaseReward {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcHash, &self.block_hash, writer)?;
+        store!(u64, &self.blue_score, writer)?;
+        store!(u64, &self.daa_score, writer)?;
+        store!(u64, &self.timestamp, writer)?;
+        store!(RpcHash, &self.coinbase_txid, writer)?;
+        store!(u32, &self.output_index, writer)?;
+        store!(Vec<u8>, &self.recipient, writer)?;
+        store!(u64, &self.value, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for RpcShieldedCoinbaseReward {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let block_hash = load!(RpcHash, reader)?;
+        let blue_score = load!(u64, reader)?;
+        let daa_score = load!(u64, reader)?;
+        let timestamp = load!(u64, reader)?;
+        let coinbase_txid = load!(RpcHash, reader)?;
+        let output_index = load!(u32, reader)?;
+        let recipient = load!(Vec<u8>, reader)?;
+        let value = load!(u64, reader)?;
+        Ok(Self { block_hash, blue_score, daa_score, timestamp, coinbase_txid, output_index, recipient, value })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetShieldedCoinbaseRewardsResponse {
+    /// Matched payments, oldest first.
+    pub rewards: Vec<RpcShieldedCoinbaseReward>,
+    /// The last chain block scanned — the caller's next `start_hash`. It advances
+    /// even when nothing matched, so a quiet stretch of chain is scanned once
+    /// rather than forever. Equals the request's `start_hash` if nothing was
+    /// scanned (caller is at the tip) or if `reorged` is set.
+    pub next_cursor: RpcHash,
+    /// Chain blocks scanned by this call.
+    pub scanned_blocks: u64,
+    /// True when `start_hash` was reorged off the selected chain — the caller's
+    /// view is stale and it must roll back / rescan. No rewards are returned.
+    pub reorged: bool,
+    /// The sink's blue score at reply time, so a caller can hold back a maturity
+    /// margin and ingest only payments a safe depth below the tip.
+    pub sink_blue_score: u64,
+}
+
+impl Serializer for GetShieldedCoinbaseRewardsResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        serialize!(Vec<RpcShieldedCoinbaseReward>, &self.rewards, writer)?;
+        store!(RpcHash, &self.next_cursor, writer)?;
+        store!(u64, &self.scanned_blocks, writer)?;
+        store!(bool, &self.reorged, writer)?;
+        store!(u64, &self.sink_blue_score, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetShieldedCoinbaseRewardsResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let rewards = deserialize!(Vec<RpcShieldedCoinbaseReward>, reader)?;
+        let next_cursor = load!(RpcHash, reader)?;
+        let scanned_blocks = load!(u64, reader)?;
+        let reorged = load!(bool, reader)?;
+        let sink_blue_score = load!(u64, reader)?;
+        Ok(Self { rewards, next_cursor, scanned_blocks, reorged, sink_blue_score })
     }
 }
 

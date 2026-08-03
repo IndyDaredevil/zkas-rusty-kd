@@ -23,6 +23,7 @@ impl CoinbaseManagerMock {
             self.serialize_coinbase_payload(&CoinbaseData { blue_score: 1, subsidy: SUBSIDY, shielded_commitment: [0u8; 32], miner_data });
 
         CoinbaseTransactionTemplate {
+            dev_accrued: 0,
             tx: Transaction::new(TX_VERSION, vec![], vec![output], 0, SUBNETWORK_ID_COINBASE, 0, payload),
             has_red_reward: false,
         }

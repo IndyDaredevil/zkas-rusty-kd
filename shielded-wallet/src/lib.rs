@@ -77,7 +77,7 @@ mod circuit_tests {
         );
 
         // Consensus applies the mint; the wallet extracts the SAME effects and scans.
-        let eff = block_effects(&cb_tx, &[]).unwrap();
+        let eff = block_effects(&cb_tx, &[], None).unwrap();
         let mut state = ShieldedState::new();
         state.apply_chain_block(Some(&coinbase_mint(&eff.coinbase).unwrap()), &[]).unwrap();
         ingest_block_effects(&mut alice, &eff);
@@ -107,7 +107,7 @@ mod circuit_tests {
         assert_eq!(out.accepted, vec![0], "the payment is accepted by the §2.4 transition");
 
         // --- Both wallets ingest block 2 (extracted from its transactions). ---
-        let eff2 = block_effects(&coinbase_txless(), &[&payment]).unwrap();
+        let eff2 = block_effects(&coinbase_txless(), &[&payment], None).unwrap();
         ingest_block_effects(&mut bob, &eff2);
         ingest_block_effects(&mut alice, &eff2);
 

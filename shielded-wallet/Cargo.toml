@@ -19,6 +19,7 @@ circuit = ["kaspa-shielded-core/circuit"]
 [dependencies]
 # Transaction shape (version-2 shielded tx, coinbase outputs, sighash context).
 kaspa-consensus-core.workspace = true
+kaspa-hashes.workspace = true
 # The shielded primitives + wallet facade this crate wires to the chain: coinbase
 # note derivation, bundle wire format, and the ShieldedAccount facade.
 kaspa-shielded-core.workspace = true

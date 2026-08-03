@@ -254,6 +254,10 @@ impl ConsensusSessionOwned {
         self.clone().spawn_blocking(move |c| c.get_shielded_tree_frontier(block)).await
     }
 
+    pub async fn async_get_shielded_supply_totals(&self, block: Hash) -> ConsensusResult<(u128, u128, u128)> {
+        self.clone().spawn_blocking(move |c| c.get_shielded_supply_totals(block)).await
+    }
+
     /// The shielded effects one chain block applied (coinbase mint + accepted
     /// post-retain bundles, consensus order) — the wallet-sync stream.
     pub async fn async_get_shielded_chain_block_data(

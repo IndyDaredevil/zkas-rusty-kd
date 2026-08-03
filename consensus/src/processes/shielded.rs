@@ -33,8 +33,10 @@ use rocksdb::WriteBatch;
 use kaspa_muhash::MuHash;
 
 use crate::model::stores::shielded::{
+    AnchorProducersStoreReader, DbAnchorProducersStore,
     AnchorBlockStoreReader, DbAnchorBlockStore, DbNullifierDiffStore, DbNullifierSetStore, DbShieldedNullifierMuHashStore,
-    BurnReceipts, DbShieldedBurnStore, DbShieldedScanBlockStore, DbShieldedSupplyStore, DbShieldedTreeStore,
+    BurnReceipts, DbShieldedBurnStore, DbShieldedDevAccruedStore, DbShieldedScanBlockStore, DbShieldedSupplyStore,
+    DbShieldedTreeStore,
     NullifierDiffStoreReader, NullifierSetStore, NullifierSetStoreReader, ShieldedBurnStoreReader,
     ShieldedNullifierMuHashStoreReader, ShieldedScanBlockData, ShieldedScanBlockStoreReader, ShieldedSupplyStoreReader,
     ShieldedTreeStoreReader, SupplyTotals,
@@ -141,6 +143,49 @@ pub struct PruningPointShieldedMetadata {
     /// compatible with peers that predate the field.
     #[serde(default)]
     pub in_window_anchors: Vec<([u8; 32], Hash)>,
+
+    /// Dev fee accrued but unpaid at the pruning point.
+    ///
+    /// A fast-syncing node must start with the exact value, or its very first coinbase
+    /// check disagrees with the chain and it makes no progress (fail-closed, same shape
+    /// as a wrong frontier). Zero before dev-fee accrual activates, so this is inert on
+    /// every pre-fork sync.
+    ///
+    /// Wire compatibility: bincode is positional, so a peer that predates the field
+    /// sends a shorter blob — [`Self::from_wire_bytes`] falls back to the legacy layout
+    /// rather than failing. The other direction is already safe because
+    /// `bincode::deserialize` allows trailing bytes, so an older peer simply ignores it.
+    #[serde(default)]
+    pub dev_accrued: u64,
+}
+
+/// The pre-accrual wire layout, kept only so [`PruningPointShieldedMetadata::from_wire_bytes`]
+/// can still decode a blob from a peer that has not upgraded yet. Field order and types must
+/// stay byte-identical to the current struct minus `dev_accrued`.
+#[derive(serde::Deserialize)]
+struct LegacyPruningPointShieldedMetadata {
+    frontier: FrontierState,
+    supply: SupplyTotals,
+    nullifier_muhash: MuHash,
+    #[serde(default)]
+    burns: BurnReceipts,
+    state_root: [u8; 32],
+    #[serde(default)]
+    in_window_anchors: Vec<([u8; 32], Hash)>,
+}
+
+impl From<LegacyPruningPointShieldedMetadata> for PruningPointShieldedMetadata {
+    fn from(v: LegacyPruningPointShieldedMetadata) -> Self {
+        Self {
+            frontier: v.frontier,
+            supply: v.supply,
+            nullifier_muhash: v.nullifier_muhash,
+            burns: v.burns,
+            state_root: v.state_root,
+            in_window_anchors: v.in_window_anchors,
+            dev_accrued: 0,
+        }
+    }
 }
 
 impl PruningPointShieldedMetadata {
@@ -149,9 +194,19 @@ impl PruningPointShieldedMetadata {
         bincode::serialize(self).expect("shielded pruning-point metadata is serializable")
     }
 
-    /// Decode from the wire.
+    /// Decode from the wire, tolerating a peer that predates `dev_accrued`.
+    ///
+    /// bincode is positional and not self-describing, so an older peer's blob is simply
+    /// shorter and fails the primary decode; the legacy layout then reads it and defaults
+    /// the accrual to zero — which is the correct value for any chain that has not yet
+    /// activated accrual, i.e. exactly the chains an older peer can be serving.
     pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, String> {
-        bincode::deserialize(bytes).map_err(|e| format!("malformed shielded pruning-point metadata: {e}"))
+        match bincode::deserialize::<Self>(bytes) {
+            Ok(md) => Ok(md),
+            Err(primary) => bincode::deserialize::<LegacyPruningPointShieldedMetadata>(bytes)
+                .map(Into::into)
+                .map_err(|_| format!("malformed shielded pruning-point metadata: {primary}")),
+        }
     }
 
     /// The shielded state root implied by (frontier, supply, nullifier_muhash, burns).
@@ -224,7 +279,20 @@ impl From<StoreError> for ShieldedManagerError {
 /// node computes the identical note commitment and the recipient's wallet can
 /// recompute the note to spend it. No transparent value is created — these outputs
 /// are diverted into the shielded pool instead of the UTXO set.
-pub fn build_coinbase_mint(coinbase_tx: &Transaction) -> Result<CoinbaseMint, ShieldedManagerError> {
+///
+/// `block_hash` selects the seed rule and is **not optional information** — it is the
+/// F-02 fork gate made explicit in the signature, so no caller can silently inherit the
+/// wrong one:
+///
+/// - `None`  → pre-fork seed `coinbase_txid || output_index`
+/// - `Some(h)` → post-fork seed `h || coinbase_txid || output_index`
+///
+/// Sibling blocks build byte-identical coinbases (same parent, mergeset, miner, and the
+/// payload commits the *parent's* shielded root), so the pre-fork seed makes them mint
+/// identical notes and produce the same tree root — the collision behind the wedge.
+/// Mixing the block hash in makes the root unique per block. There is no circularity:
+/// a block's coinbase commits its parent's shielded state, never its own notes.
+pub fn build_coinbase_mint(coinbase_tx: &Transaction, block_hash: Option<Hash>) -> Result<CoinbaseMint, ShieldedManagerError> {
     let txid = coinbase_tx.id();
     let mut notes = Vec::with_capacity(coinbase_tx.outputs.len());
     for (i, out) in coinbase_tx.outputs.iter().enumerate() {
@@ -233,8 +301,11 @@ pub fn build_coinbase_mint(coinbase_tx: &Transaction) -> Result<CoinbaseMint, Sh
             return Err(ShieldedManagerError::MalformedCoinbaseNote("coinbase reward script too short for an Orchard address"));
         }
         let recipient: [u8; 43] = script[..43].try_into().expect("checked length >= 43");
-        // Unique per-note seed: coinbase tx id || output index.
-        let mut seed = Vec::with_capacity(32 + 4);
+        // Per-note seed: [block hash ||] coinbase tx id || output index.
+        let mut seed = Vec::with_capacity(32 + 32 + 4);
+        if let Some(h) = block_hash {
+            seed.extend_from_slice(&h.as_bytes());
+        }
         seed.extend_from_slice(&txid.as_bytes());
         seed.extend_from_slice(&(i as u32).to_le_bytes());
         let desc = derive_coinbase_note_desc(recipient, &seed);
@@ -262,6 +333,90 @@ impl NullifierSet for LayeredNullifierSet<'_> {
     }
 }
 
+static ANCHOR_OVERRIDE_MAP: std::sync::OnceLock<std::collections::HashMap<[u8; 32], Hash>> = std::sync::OnceLock::new();
+
+/// Anchor→source-block mappings pinned from an external file, consulted BEFORE the local index.
+///
+/// # Why this is necessary
+///
+/// `anchor_block` maps a shielded tree root to a block, and `persist` writes it last-write-wins.
+/// Sibling blocks can carry a byte-identical root (measured on mainnet: canonical `da8dfb9d` and
+/// orphan `e6f50b47` share size, leaf and all 8 ommers), so the entry a node ends up with depends
+/// on the order it happened to validate them — orphans included. `is_shielded_anchor_final` then
+/// rejects a non-canonical source, so two nodes with identical canonical state legitimately
+/// disagree about whether a spend applied, and therefore about a block's coinbase.
+///
+/// That makes this index consensus-relevant state that is NOT derivable from the canonical chain.
+/// A node syncing from scratch rebuilds it from the blocks it happens to see and cannot reproduce
+/// the entry an orphan won on the live chain. Measured on mainnet: of 39,228 anchors known to both
+/// a live node and a fresh sync, 34 disagreed — every one of them chain=orphan / fresh=canonical,
+/// and one of those 34 wedges every fresh node at DAA 371,851 permanently.
+///
+/// Pinning the chain's own mappings is the repair. It changes no validation rule: the predicate is
+/// untouched, only the index it reads is corrected to what the chain actually used.
+///
+/// The overrides must live OUTSIDE `anchor_block` and take precedence over it. Seeding the store
+/// instead would not work — a syncing node validates the canonical producer of a contested root
+/// before it reaches the block that spends against it, and `persist` would overwrite the seeded
+/// entry with its own value long before it mattered.
+fn anchor_overrides() -> &'static std::collections::HashMap<[u8; 32], Hash> {
+    ANCHOR_OVERRIDE_MAP.get_or_init(Default::default)
+}
+
+/// Load pinned anchor mappings. Call once at startup, before consensus starts.
+///
+/// Accepts the `zkas-anchor-dump` format: `<anchor-hex>\t<block-hash>[\t<flag>]` per line, `#`
+/// comments and blank lines ignored. Returns how many mappings were pinned.
+pub fn load_anchor_overrides(path: &std::path::Path) -> Result<usize, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut map = std::collections::HashMap::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut it = line.split('\t');
+        let (Some(a), Some(b)) = (it.next(), it.next()) else {
+            return Err(format!("{}:{}: expected <anchor>\\t<block>", path.display(), n + 1));
+        };
+        let mut anchor = [0u8; 32];
+        faster_hex::hex_decode(a.as_bytes(), &mut anchor).map_err(|e| format!("{}:{}: bad anchor: {e}", path.display(), n + 1))?;
+        let block: Hash = b.parse().map_err(|_| format!("{}:{}: bad block hash '{b}'", path.display(), n + 1))?;
+        map.insert(anchor, block);
+    }
+    let n = map.len();
+    ANCHOR_OVERRIDE_MAP.set(map).map_err(|_| "anchor overrides already loaded".to_string())?;
+    Ok(n)
+}
+
+/// Why one shielded transaction was kept or dropped.
+///
+/// The two flags are the two independent drop reasons, deliberately not collapsed: a spend
+/// lost to a non-final anchor and a spend lost to a nullifier conflict look identical in the
+/// resulting coinbase but indicate completely different faults.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PartitionOutcome {
+    /// The spend's anchor resolved to a mature, canonical tree state.
+    pub anchor_ok: bool,
+    /// No nullifier of this spend was already claimed. Only evaluated when `anchor_ok`.
+    pub conflict_ok: bool,
+}
+
+impl PartitionOutcome {
+    pub fn kept(&self) -> bool {
+        self.anchor_ok && self.conflict_ok
+    }
+
+    /// A short reason for a drop, or `None` when the spend was kept.
+    pub fn drop_reason(&self) -> Option<&'static str> {
+        match (self.anchor_ok, self.conflict_ok) {
+            (true, true) => None,
+            (false, _) => Some("anchor not final (unresolved, non-canonical source, or out of the maturity window)"),
+            (true, false) => Some("nullifier already claimed (double spend, or a duplicate copy of an earlier-accepted tx)"),
+        }
+    }
+}
+
 /// Drives and persists the shielded state transition, reorg-safely.
 #[derive(Clone)]
 pub struct ShieldedStateManager {
@@ -269,8 +424,11 @@ pub struct ShieldedStateManager {
     nullifier_diffs: DbNullifierDiffStore,
     tree_store: DbShieldedTreeStore,
     supply_store: DbShieldedSupplyStore,
+    dev_accrued_store: DbShieldedDevAccruedStore,
     nullifier_muhash: DbShieldedNullifierMuHashStore,
     anchor_block: DbAnchorBlockStore,
+    /// Every producer of each root — the reorg-safe replacement for `anchor_block`.
+    anchor_producers: DbAnchorProducersStore,
     scan_block: DbShieldedScanBlockStore,
     burn_store: DbShieldedBurnStore,
 }
@@ -286,8 +444,10 @@ impl ShieldedStateManager {
             nullifier_diffs: DbNullifierDiffStore::new(Arc::clone(&db), cache_policy),
             tree_store: DbShieldedTreeStore::new(Arc::clone(&db), cache_policy),
             supply_store: DbShieldedSupplyStore::new(Arc::clone(&db), cache_policy),
+            dev_accrued_store: DbShieldedDevAccruedStore::new(Arc::clone(&db), cache_policy),
             nullifier_muhash: DbShieldedNullifierMuHashStore::new(Arc::clone(&db), cache_policy),
             anchor_block: DbAnchorBlockStore::new(Arc::clone(&db), cache_policy),
+            anchor_producers: DbAnchorProducersStore::new(Arc::clone(&db), cache_policy),
             scan_block: DbShieldedScanBlockStore::new(Arc::clone(&db), cache_policy),
             burn_store: DbShieldedBurnStore::new(db, cache_policy),
         }
@@ -301,6 +461,28 @@ impl ShieldedStateManager {
     /// Read-only access to the nullifier store (for validation / queries).
     pub fn nullifiers(&self) -> &DbNullifierSetStore {
         &self.nullifiers
+    }
+
+    /// DIAGNOSTIC: does the live global nullifier set still agree with the per-block muhash
+    /// snapshot at `block`?
+    ///
+    /// These are two representations of the same set kept by different paths: `persist` inserts
+    /// into the global store, while the snapshot is folded by `compute`. Only the snapshot is
+    /// intrinsic to a block — the global store is mutated forward and backward by
+    /// `apply_nullifiers_from_store` / `revert_nullifiers_from_store` as the virtual chain moves.
+    /// If a reorg ever removes an entry the up-walk does not restore, the two silently diverge:
+    /// the shielded state root still matches the chain (it reads the snapshot), while
+    /// `partition_applied` — which consults the GLOBAL store — starts accepting spends whose
+    /// nullifiers are already spent. That is exactly the observed failure, so measure it.
+    pub fn global_set_matches_snapshot(&self, block: Hash) -> StoreResult<(bool, usize)> {
+        let mut acc = MuHash::new();
+        let mut count = 0usize;
+        for nf in self.nullifiers.iter_all() {
+            acc.add_element(&nf?);
+            count += 1;
+        }
+        let snapshot = self.load_nullifier_muhash(block)?;
+        Ok((acc.finalize() == snapshot.clone().finalize(), count))
     }
 
     /// The anchor (global tree root) as of a given chain block.
@@ -323,7 +505,21 @@ impl ShieldedStateManager {
     /// max_shielded_anchor_age]` (maturity + fail-closed upper bound, audit
     /// F-04/F-05). `None` means the anchor is not a real tree root of any block.
     pub fn anchor_source_block(&self, anchor: &[u8; 32]) -> StoreResult<Option<Hash>> {
+        // A pinned mapping wins over the locally built index. See [`anchor_overrides`] for why
+        // the local index cannot be trusted to agree with the chain.
+        if let Some(pinned) = anchor_overrides().get(anchor) {
+            return Ok(Some(*pinned));
+        }
         self.anchor_block.get(anchor)
+    }
+
+    /// Every block known to have produced `anchor`.
+    ///
+    /// Unlike [`Self::anchor_source_block`] this is not order-dependent: it keeps all producers
+    /// rather than the last one written, so an orphan that briefly held the chain cannot destroy
+    /// the canonical producer's mapping. See [`DbAnchorProducersStore`].
+    pub fn anchor_producer_blocks(&self, anchor: &[u8; 32]) -> StoreResult<Vec<Hash>> {
+        self.anchor_producers.get_producers(anchor)
     }
 
     /// The `(anchor, source block)` pairs whose source is in `blocks` — the in-window anchors a
@@ -361,6 +557,64 @@ impl ShieldedStateManager {
         self.supply_store.get(block)
     }
 
+    /// Delete a pruned block's per-block shielded snapshots.
+    ///
+    /// # What this may and may not drop
+    ///
+    /// The frontier / supply / MuHash / burn snapshots exist so the transition can be
+    /// recomputed from a block's **selected parent**, and so a reorg can rebuild the
+    /// chain from its fork point. Reorgs are bounded by `finality_depth`, and the
+    /// pruner only ever reaches blocks below `pruning_depth` — which is deeper still
+    /// (108,000 vs 43,200 at 1 BPS) — so a snapshot the pruner can see is one no
+    /// reorg can ever need again.
+    ///
+    /// Deliberately NOT touched:
+    /// - [`DbShieldedScanBlockStore`] — a wallet recovers its notes from the compact
+    ///   archive, and a hole in that stream is the "restored my seed and my balance is
+    ///   partial" failure. It is retained for the life of the chain.
+    /// - the global nullifier set — membership must outlive every block that added to it.
+    /// - the anchor index — bounded separately by anchor age, not by block pruning.
+    ///
+    /// `keep_checkpoint` marks blocks whose frontier survives as a fast-sync anchor for
+    /// `GetShieldedTreeState`; pass `true` for pruning points and for the sparse
+    /// checkpoints, `false` otherwise.
+    pub fn prune_block_snapshots(&self, batch: &mut WriteBatch, block: Hash, keep_checkpoint: bool) -> StoreResult<()> {
+        self.supply_store.delete_batch(batch, block)?;
+        self.nullifier_muhash.delete_batch(batch, block)?;
+        self.burn_store.delete_batch(batch, block)?;
+        self.dev_accrued_store.delete_batch(batch, block)?;
+        // Per-block nullifier diffs only exist to revert a reorg; below the pruning
+        // point no reorg can reach them.
+        self.nullifier_diffs.delete_batch(batch, block)?;
+        if !keep_checkpoint {
+            self.tree_store.delete_batch(batch, block)?;
+        }
+        Ok(())
+    }
+
+    /// Dev fee accrued but unpaid as of a chain block. `0` for every block mined
+    /// before dev-fee accrual activated, and for every payout block (the balance
+    /// left as a note).
+    pub fn dev_accrued_at(&self, block: Hash) -> StoreResult<u64> {
+        self.dev_accrued_store.get(block)
+    }
+
+    /// Record the dev fee a block carries forward. Written in the block-commit batch
+    /// so accrual and the coinbase that consumed it commit together.
+    pub fn set_dev_accrued(&self, batch: &mut WriteBatch, block: Hash, accrued: u64) -> StoreResult<()> {
+        self.dev_accrued_store.set_batch(batch, block, accrued)
+    }
+
+    /// Total value burned out of the pool (bridge peg-out) as of a chain block.
+    ///
+    /// The burn seam is deactivated (`BRIDGE_ENABLED == false`), so this is `0`
+    /// everywhere on the live chain. It is summed from the persisted receipts
+    /// rather than assumed zero, so a supply query stays correct the day the seam
+    /// is enabled.
+    pub fn burn_total_at(&self, block: Hash) -> StoreResult<u128> {
+        Ok(self.burn_store.get(block)?.receipts.iter().map(|&(value, _, _)| value as u128).sum())
+    }
+
     /// Decide, in accepted order, which candidate shielded txs a chain block will
     /// actually APPLY — mirroring exactly the drop rules of the state transition:
     /// a spending tx whose anchor fails the caller's finality predicate (PLAN §2.5)
@@ -373,13 +627,21 @@ impl ShieldedStateManager {
     /// be called against the same persisted nullifier state `compute` will see —
     /// i.e. with the selected-parent chain committed — which is the invariant the
     /// virtual processor already maintains for `compute` itself.
-    pub fn partition_applied<F: FnMut(&ShieldedTx) -> bool>(&self, txs: &[ShieldedTx], mut anchor_final: F) -> Vec<bool> {
+    pub fn partition_applied<F: FnMut(&ShieldedTx) -> bool>(&self, txs: &[ShieldedTx], mut anchor_final: F) -> Vec<PartitionOutcome> {
         let pending = MemNullifierSet::new();
         let finalized = LayeredNullifierSet { store: &self.nullifiers, pending: &pending };
         let mut resolver = NullifierConflictResolver::new(&finalized);
         txs.iter()
             .map(|stx| {
-                (stx.nullifiers.is_empty() || anchor_final(stx)) && resolver.try_accept(stx.nullifiers.iter().copied()).is_ok()
+                // Keep the two drop reasons apart. A composed expression cannot say whether a
+                // spend fell to a non-final anchor or to a nullifier conflict, and those point at
+                // completely different bugs.
+                let anchor_ok = stx.nullifiers.is_empty() || anchor_final(stx);
+                // Preserve the short-circuit: `try_accept` must NOT run when the anchor check
+                // already failed, or a non-final spend would seed the pending conflict set and
+                // wrongly knock out later copies. Diagnostics must not change consensus.
+                let conflict_ok = anchor_ok && resolver.try_accept(stx.nullifiers.iter().copied()).is_ok();
+                PartitionOutcome { anchor_ok, conflict_ok }
             })
             .collect()
     }
@@ -468,6 +730,8 @@ impl ShieldedStateManager {
             // An anchor uniquely identifies (block, its history), so this is an
             // append-only map that needs no reorg reverting.
             self.anchor_block.set_batch(batch, computed.anchor(), block)?;
+            // Record every producer, not just the last: see `DbAnchorProducersStore`.
+            self.anchor_producers.add_producer_batch(batch, computed.anchor(), block)?;
         }
         if computed.supply_totals.cumulative_coinbase > 0 || computed.supply_totals.cumulative_fees > 0 {
             self.supply_store.set_batch(batch, block, computed.supply_totals)?;
@@ -548,7 +812,16 @@ impl ShieldedStateManager {
         let burns = self.burn_store.get(block)?;
         let state_root = PruningPointShieldedMetadata::recompute_state_root(&frontier, &supply, &nullifier_muhash, &burns)
             .map_err(|e| StoreError::DataInconsistency(format!("stored shielded frontier at {block} is corrupt: {e:?}")))?;
-        Ok(Some(PruningPointShieldedMetadata { frontier, supply, nullifier_muhash, burns, state_root, in_window_anchors: Vec::new() }))
+        let dev_accrued = self.dev_accrued_store.get(block)?;
+        Ok(Some(PruningPointShieldedMetadata {
+            frontier,
+            supply,
+            nullifier_muhash,
+            burns,
+            state_root,
+            in_window_anchors: Vec::new(),
+            dev_accrued,
+        }))
     }
 
     /// Snapshot of the current global spent-nullifier set (append-only; reflects the
@@ -657,6 +930,12 @@ impl ShieldedStateManager {
         if md.nullifier_muhash.clone().finalize() != kaspa_muhash::EMPTY_MUHASH {
             self.nullifier_muhash.set_batch(batch, block, md.nullifier_muhash.clone())?;
         }
+        // Dev-fee accrual carried at the pruning point. Zero is the store's default for a
+        // missing key, so a pre-accrual chain (or a peer that predates the field) writes
+        // nothing and behaves exactly as before.
+        if md.dev_accrued > 0 {
+            self.dev_accrued_store.set_batch(batch, block, md.dev_accrued)?;
+        }
         // The whole append-only global membership set (unbounded, PLAN §2.9).
         for nf in nullifiers {
             self.nullifiers.insert_batch(batch, *nf)?;
@@ -724,6 +1003,100 @@ mod tests {
     use kaspa_database::create_temp_db;
     use kaspa_database::prelude::ConnBuilder;
     use kaspa_shielded_core::ExtractedNoteCommitment;
+
+    /// The IBD metadata gained `dev_accrued` after the field order was already on the
+    /// wire, so both directions of a mixed-version network are pinned here rather than
+    /// argued from bincode's documentation: an upgraded node must read a legacy peer's
+    /// shorter blob (falling back, accrual 0), and a legacy node must survive an upgraded
+    /// peer's longer one (bincode allows trailing bytes). Get either wrong and IBD breaks
+    /// during the upgrade window, which is exactly when nobody is watching for it.
+    #[test]
+    fn pruning_point_metadata_wire_is_compatible_across_the_accrual_field() {
+        let md = PruningPointShieldedMetadata {
+            frontier: FrontierState::default(),
+            supply: SupplyTotals { cumulative_coinbase: 700, cumulative_fees: 25 },
+            nullifier_muhash: MuHash::new(),
+            burns: BurnReceipts::default(),
+            state_root: [7u8; 32],
+            in_window_anchors: vec![([3u8; 32], Hash::from_bytes([4u8; 32]))],
+            dev_accrued: 123_456,
+        };
+
+        // Round-trip through the current layout.
+        let bytes = md.to_wire_bytes();
+        let back = PruningPointShieldedMetadata::from_wire_bytes(&bytes).expect("current layout decodes");
+        assert_eq!(back.dev_accrued, 123_456);
+        assert_eq!(back.supply, md.supply);
+        assert_eq!(back.in_window_anchors, md.in_window_anchors);
+
+        // A legacy peer's blob is the same bytes minus the trailing u64. It must decode,
+        // with the accrual defaulted to zero — correct for any chain that has not activated.
+        let legacy_bytes = &bytes[..bytes.len() - std::mem::size_of::<u64>()];
+        let from_legacy = PruningPointShieldedMetadata::from_wire_bytes(legacy_bytes).expect("legacy layout decodes");
+        assert_eq!(from_legacy.dev_accrued, 0, "a peer without the field means no accrual, not a failure");
+        assert_eq!(from_legacy.state_root, md.state_root, "everything before the new field survives");
+
+        // And the other direction: a legacy reader sees our longer blob as its own layout
+        // plus trailing bytes, which bincode ignores.
+        let as_legacy: LegacyPruningPointShieldedMetadata =
+            bincode::deserialize(&bytes).expect("older node tolerates the extra field");
+        assert_eq!(as_legacy.state_root, md.state_root);
+    }
+
+    /// Retention must drop the recomputation snapshots while leaving intact the two
+    /// things a pruned node still has to serve: the compact scan archive (a hole in it
+    /// is the "restored my seed and my balance is partial" bug) and the global nullifier
+    /// set (membership outlives every block that added to it). The frontier survives only
+    /// where the caller marks a checkpoint.
+    #[test]
+    fn pruning_snapshots_keeps_the_scan_archive_and_the_nullifier_set() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = ShieldedStateManager::new(db.clone(), CachePolicy::Empty);
+        let pruned = Hash::from_bytes([1u8; 32]);
+        let checkpoint = Hash::from_bytes([2u8; 32]);
+
+        let mut batch = WriteBatch::default();
+        for b in [pruned, checkpoint] {
+            mgr.tree_store.set_batch(&mut batch, b, FrontierState { size: 5, leaf: Some([9u8; 32]), ommers: vec![] }).unwrap();
+            mgr.supply_store.set_batch(&mut batch, b, SupplyTotals { cumulative_coinbase: 10, cumulative_fees: 1 }).unwrap();
+            mgr.dev_accrued_store.set_batch(&mut batch, b, 77).unwrap();
+            mgr.scan_block
+                .set_batch(
+                    &mut batch,
+                    b,
+                    ShieldedScanBlockData {
+                        blue_score: 1,
+                        daa_score: 1,
+                        timestamp: 0,
+                        coinbase_txid: b,
+                        coinbase_outputs: vec![(vec![9u8; 43], 42)],
+                        accepted: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        mgr.nullifiers.insert_batch(&mut batch, [5u8; 32]).unwrap();
+        db.write(batch).unwrap();
+
+        let mut batch = WriteBatch::default();
+        mgr.prune_block_snapshots(&mut batch, pruned, false).unwrap();
+        mgr.prune_block_snapshots(&mut batch, checkpoint, true).unwrap();
+        db.write(batch).unwrap();
+
+        // Recomputation snapshots are gone for both; zero/default is what a missing key reads as.
+        assert_eq!(mgr.supply_totals_at(pruned).unwrap(), SupplyTotals::default());
+        assert_eq!(mgr.dev_accrued_at(pruned).unwrap(), 0, "accrual snapshot is dropped with the rest");
+        assert_eq!(mgr.frontier_at(pruned).unwrap().size, 0, "a non-checkpoint frontier is dropped");
+
+        // The checkpoint keeps its frontier so fast-sync still has an anchor down here.
+        assert_eq!(mgr.frontier_at(checkpoint).unwrap().size, 5, "a checkpoint frontier survives");
+
+        // Never dropped: the wallet's scan archive and the global nullifier set.
+        for b in [pruned, checkpoint] {
+            assert!(mgr.scan_block(b).unwrap().is_some(), "the compact scan archive must survive pruning");
+        }
+        assert!(mgr.nullifiers.contains(&[5u8; 32]).unwrap(), "a spent nullifier must outlive its block");
+    }
 
     fn cmx(n: u32) -> ExtractedNoteCommitment {
         let mut b = [0u8; 32];
@@ -824,6 +1197,62 @@ mod tests {
             fee: value_balance,
             anchor: empty_anchor(),
         }
+    }
+
+    /// The DAA 371,851 mainnet wedge, reproduced at store level.
+    ///
+    /// Two sibling blocks with the same parent and the same contents mint identical notes and so
+    /// carry an IDENTICAL shielded tree root. `anchor_block` keeps one value per root and is
+    /// written last-write-wins, so whichever sibling a node validated last owns the mapping — and
+    /// if that one later loses the chain race, `is_shielded_anchor_final` fails it on the
+    /// chain-ancestor test and drops every spend against that root. A node that never witnessed
+    /// the losing sibling keeps them. Identical canonical state, opposite verdicts.
+    ///
+    /// The producers index must retain BOTH, so the resolution stops depending on observation
+    /// order and an existential test can find the canonical producer.
+    #[test]
+    fn sibling_blocks_share_a_root_and_both_are_retained_as_producers() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = manager(&db);
+        let parent = h(1);
+        commit_block(&mgr, &db, parent, h(0), Some(coinbase(100, 0)), vec![]);
+
+        // Two siblings over the same parent with identical contents.
+        let (win, lose) = (h(2), h(3));
+        let c_win = commit_block(&mgr, &db, win, parent, Some(coinbase(100, 0)), vec![]);
+        let c_lose = commit_block(&mgr, &db, lose, parent, Some(coinbase(100, 0)), vec![]);
+
+        assert_eq!(c_win.anchor(), c_lose.anchor(), "same parent + same contents ⇒ IDENTICAL tree root");
+
+        // The single-valued index keeps only the last writer — the defect.
+        assert_eq!(
+            mgr.anchor_source_block(&c_win.anchor()).unwrap(),
+            Some(lose),
+            "anchor_block is last-write-wins: the canonical producer's mapping was destroyed"
+        );
+
+        // The producers index keeps both, so the canonical one is still reachable.
+        let producers = mgr.anchor_producer_blocks(&c_win.anchor()).unwrap();
+        assert_eq!(producers.len(), 2, "both producers retained: {producers:?}");
+        assert!(producers.contains(&win) && producers.contains(&lose));
+    }
+
+    /// Re-applying a block after a reorg must not duplicate it: the producers list is a set, and
+    /// unbounded growth on repeated reorgs would be its own problem.
+    #[test]
+    fn recording_a_producer_twice_is_idempotent() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = manager(&db);
+        let parent = h(1);
+        commit_block(&mgr, &db, parent, h(0), Some(coinbase(100, 0)), vec![]);
+        let c = commit_block(&mgr, &db, h(2), parent, Some(coinbase(100, 0)), vec![]);
+
+        // Simulate a reorg re-apply of the very same block.
+        let mut batch = WriteBatch::default();
+        mgr.persist(&mut batch, h(2), &c).unwrap();
+        db.write(batch).unwrap();
+
+        assert_eq!(mgr.anchor_producer_blocks(&c.anchor()).unwrap(), vec![h(2)], "re-apply must not duplicate the producer");
     }
 
     /// A bridge burn must survive the round-trip through the stores: it moves the committed state
@@ -1192,8 +1621,17 @@ mod tests {
             stx(&[], &[203], 0),   // pure-output (no nullifiers): anchor rule exempt — kept
             stx(&[3], &[204], 2),  // independent spend — kept
         ];
-        let keep = mgr.partition_applied(&candidates, |stx| stx.anchor != bad_anchor);
+        let outcomes = mgr.partition_applied(&candidates, |stx| stx.anchor != bad_anchor);
+        let keep: Vec<bool> = outcomes.iter().map(|o| o.kept()).collect();
         assert_eq!(keep, vec![true, false, false, false, true, true]);
+        // The two drop reasons must stay distinguishable. A spend lost to a stale anchor and a
+        // spend lost to a nullifier conflict produce an identical coinbase but mean completely
+        // different things, and collapsing them is what made past divergences undiagnosable.
+        assert!(outcomes[1].anchor_ok && !outcomes[1].conflict_ok, "index 1 lost to a nullifier conflict");
+        assert!(!outcomes[3].anchor_ok, "index 3 lost to a non-final anchor");
+        assert!(outcomes[3].drop_reason().unwrap().contains("anchor"));
+        assert!(outcomes[2].drop_reason().unwrap().contains("nullifier"));
+        assert!(outcomes[0].drop_reason().is_none(), "a kept spend has no drop reason");
 
         // The transition applied to the FULL set accepts exactly the kept indices —
         // the partition is a faithful precomputation of the transition's drops.
@@ -1225,7 +1663,7 @@ mod tests {
 
         // Two conflicting spends of nf(1) arrive in one mergeset: fees 5 and 7.
         let candidates = vec![stx(&[1], &[100], 5), stx(&[1], &[200], 7)];
-        let keep = mgr.partition_applied(&candidates, |_| true);
+        let keep: Vec<bool> = mgr.partition_applied(&candidates, |_| true).iter().map(|o| o.kept()).collect();
         assert_eq!(keep, vec![true, false]);
         let applied: Vec<ShieldedTx> = candidates.iter().zip(&keep).filter(|(_, k)| **k).map(|(s, _)| s.clone()).collect();
         let applied_fees: u64 = applied.iter().map(|s| s.fee).sum();

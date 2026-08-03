@@ -499,6 +499,15 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// The shielded turnstile totals as of `block`, as raw parts
+    /// `(cumulative_coinbase, cumulative_fees, cumulative_burns)` in sompi — the
+    /// public form of the PLAN §2.7 invariant `pool = minted - fees - burns`. Raw
+    /// integers (rather than a `kaspa-shielded-core` type) keep that crate off this
+    /// API boundary. A block with no shielded state reports zeroes.
+    fn get_shielded_supply_totals(&self, _block: Hash) -> ConsensusResult<(u128, u128, u128)> {
+        unimplemented!()
+    }
+
     /// The shielded effects of one **chain block**, exactly as the §2.4 state
     /// transition applied them: the block's own coinbase mint (txid + outputs)
     /// and the accepted shielded transaction payloads in consensus accepted
