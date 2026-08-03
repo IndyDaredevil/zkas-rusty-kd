@@ -930,10 +930,24 @@ pub const MAINNET_PARAMS: Params = Params {
     // bridge's trust root dormant. `always()` matches the neighboring crescendo /
     // merged_mining launch values and must ride the genesis re-cut. CONSENSUS-BREAKING.
     toccata_activation: ForkActivation::always(),
-    // Scheduled separately once a height is agreed; see the field doc.
-    shielded_anchor_multi_activation: ForkActivation::never(),
+    // ZKAS-NU1 ACTIVATION — DAA 757,000.
+    //
+    // Chosen 2026-08-03 08:49 UTC at live DAA 671,210 from a measured 11-hour baseline of
+    // 0.99339 DAA/s (85,829 DAA/day, slightly under the 1 BPS nominal), putting the crossing
+    // at ~2026-08-04 08:48 UTC. DAA is hashrate-driven, so wall-clock moves if hashrate does
+    // (~±1 h per ±5% sustained change). The DAA is the commitment; the time is an estimate.
+    //
+    // Both gates ride the SAME height on purpose — they were validated together in the
+    // mainnet->mainnet rehearsal (2026-08-03), never separately.
+    //
+    // Non-upgraded nodes FAIL CLOSED here: they disqualify every chain block and log
+    // `N disqualified vs 0 valid chain blocks`, character-identical to the known snapshot/IBD
+    // wedge bug. This MUST be announced before the height is reached.
+    shielded_anchor_multi_activation: ForkActivation::new(757_000),
+    // Upgrade 2, deliberately NOT in this fork: F-02 needs the whole wallet fleet
+    // shipped first. Leaving it `never()` is what makes NU1 a node-only upgrade.
     shielded_coinbase_seed_activation: ForkActivation::never(),
-    dev_fee_accrual_activation: ForkActivation::never(),
+    dev_fee_accrual_activation: ForkActivation::new(757_000),
     // ~17 minutes at 1 BPS: short enough that the dev fund is never far behind,
     // long enough to cut per-block dev notes by three orders of magnitude.
     dev_fee_payout_interval: 1_000,
