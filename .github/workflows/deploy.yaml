@@ -18,7 +18,8 @@ jobs:
         # working build. NB: `macos-13` was GitHub's Intel image and has been retired — a job asking
         # for it queues forever instead of failing, which is why zkas-v1.0.1 shipped without an
         # Intel-macOS archive (4 of 5 build jobs succeeded; that one sat queued for 16h).
-        os: [ ubuntu-latest, windows-latest, macos-latest, macos-15-intel ]
+        # KD edit, only build for window
+        os: [ windows-latest ]
     name: Building, ${{ matrix.os }}
     steps:
       - name: Fix CRLF on Windows
