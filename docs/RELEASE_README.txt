@@ -34,6 +34,29 @@ The bundled zkas-miner is CPU-only and intended for bootstrapping or solo
 low-difficulty mining, not competitive hashrate.
 
 -------------------------------------------------------------------------------
+ Solo merged mining (ZKas + Kaspa)
+-------------------------------------------------------------------------------
+The release bridge connects to the ZKas node through kaspad_address. Supplying
+both merged fields enables the Kaspa parent connection; no separate enable flag
+is required:
+
+  kaspad_address: "127.0.0.1:16110"
+  merged_kaspa_address: "127.0.0.1:17110"
+  merged_kaspa_pay_address: "kaspa:YOUR_KASPA_ADDRESS"
+  stratum_port: "0.0.0.0:5555"
+  min_share_diff: 8192
+
+Run:
+
+  stratum-bridge.exe --node-mode external --config config.yaml
+
+Configure the ASIC/miner with `zkas:YOUR_ZKAS_ADDRESS` as its Stratum username.
+ZKas rewards pay that username directly; Kaspa parent rewards pay
+merged_kaspa_pay_address. Startup must log both the ZKas endpoint and
+`Real merged mining ENABLED` with the Kaspa endpoint. If it does not, stop and
+check that the archive contains the AuxPoW-capable bridge.
+
+-------------------------------------------------------------------------------
  Wallets
 -------------------------------------------------------------------------------
   - CLI:    shielded-pay  (in this archive)

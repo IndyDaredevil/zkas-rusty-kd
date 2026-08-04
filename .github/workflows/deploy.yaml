@@ -28,6 +28,18 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v3
 
+      # The node repository's upstream stratum bridge is ZKas-only. The real
+      # AuxPoW/dual-chain bridge lives in zkas-pool and must be the binary we
+      # package. Building the local bridge here previously produced an exe that
+      # silently ignored merged_kaspa_* YAML keys.
+      - name: Checkout AuxPoW bridge sources
+        uses: actions/checkout@v4
+        with:
+          repository: firecash/zkas-pool
+          # Pinned: YAML merged-mining wiring + dual-node runtime proof.
+          ref: d79bf683d1f9ab02a4765be49031397641b4eb41
+          path: zkas-pool
+
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
         with:
@@ -45,6 +57,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
+            zkas-pool/target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
 
@@ -63,15 +76,17 @@ jobs:
           # Build bridge with allow-multiple-definition to resolve mimalloc/libstdc++ symbol collisions.
           # musl-toolchain/build.sh sets RUSTFLAGS directly, so we append this flag here explicitly.
           export RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,--allow-multiple-definition"
-          cargo --verbose build --bin stratum-bridge --release --target x86_64-unknown-linux-musl
+          cargo --verbose build --manifest-path zkas-pool/Cargo.toml --bin stratum-bridge --release --target x86_64-unknown-linux-musl
           mkdir bin || true
           cp target/x86_64-unknown-linux-musl/release/kaspad bin/
           cp target/x86_64-unknown-linux-musl/release/zkas-miner bin/
           cp target/x86_64-unknown-linux-musl/release/zkas-walletd bin/
           cp target/x86_64-unknown-linux-musl/release/zkas-api bin/
           cp target/x86_64-unknown-linux-musl/release/shielded-pay bin/
-          cp target/x86_64-unknown-linux-musl/release/stratum-bridge bin/
+          cp zkas-pool/target/x86_64-unknown-linux-musl/release/stratum-bridge bin/
+          strings bin/stratum-bridge | grep -q 'ZKAS_KASPA_NODE' || { echo 'wrong bridge: merged mining capability missing'; exit 1; }
           cp docs/RELEASE_README.txt bin/README.txt
+          cp docs/SOLO_MERGED_CONFIG.yaml bin/config.example.yaml
           archive="bin/zkas-${{ github.event.release.tag_name }}-linux-amd64.zip"
           zip -r "${archive}" ./bin/*
           echo "archive=${archive}" >> $GITHUB_ENV
@@ -115,15 +130,18 @@ jobs:
           cargo build --bin zkas-walletd --release
           cargo build --bin zkas-api --release
           cargo build --bin shielded-pay --release
-          cargo build --bin stratum-bridge --release
+          cargo build --manifest-path zkas-pool/Cargo.toml --bin stratum-bridge --release
           mkdir bin || true
           cp target/release/kaspad.exe bin/
           cp target/release/zkas-miner.exe bin/
           cp target/release/zkas-walletd.exe bin/
           cp target/release/zkas-api.exe bin/
           cp target/release/shielded-pay.exe bin/
-          cp target/release/stratum-bridge.exe bin/
+          cp zkas-pool/target/release/stratum-bridge.exe bin/
+          powershell -NoProfile -Command '$s=[Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes("bin/stratum-bridge.exe")); if(-not ($s.Contains("ZKAS_KASPA_NODE") -and $s.Contains("merged_kaspa_address") -and $s.Contains("Real merged mining ENABLED"))){throw "wrong bridge: merged mining capability missing"}'
+          powershell -NoProfile -Command '$bad=@("libstdc++-6.dll","libgcc_s_seh-1.dll","libwinpthread-1.dll","vcruntime140.dll","vcruntime140_1.dll","msvcp140.dll"); Get-ChildItem bin/*.exe | ForEach-Object { $s=[Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($_.FullName)); foreach($dll in $bad){if($s.IndexOf($dll,[StringComparison]::OrdinalIgnoreCase)-ge 0){throw "$($_.Name) imports forbidden runtime DLL $dll"}}; Write-Host "portable DLL gate passed: $($_.Name)" }'
           cp docs/RELEASE_README.txt bin/README.txt
+          cp docs/SOLO_MERGED_CONFIG.yaml bin/config.example.yaml
           archive="bin/zkas-${{ github.event.release.tag_name }}-win64.zip"
           powershell "Compress-Archive bin/* \"${archive}\""
           echo "archive=${archive}" >> $GITHUB_ENV
@@ -136,15 +154,17 @@ jobs:
           cargo build --bin zkas-walletd --release
           cargo build --bin zkas-api --release
           cargo build --bin shielded-pay --release
-          cargo build --bin stratum-bridge --release
+          cargo build --manifest-path zkas-pool/Cargo.toml --bin stratum-bridge --release
           mkdir bin || true
           cp target/release/kaspad bin/
           cp target/release/zkas-miner bin/
           cp target/release/zkas-walletd bin/
           cp target/release/zkas-api bin/
           cp target/release/shielded-pay bin/
-          cp target/release/stratum-bridge bin/
+          cp zkas-pool/target/release/stratum-bridge bin/
+          strings bin/stratum-bridge | grep -q 'ZKAS_KASPA_NODE' || { echo 'wrong bridge: merged mining capability missing'; exit 1; }
           cp docs/RELEASE_README.txt bin/README.txt
+          cp docs/SOLO_MERGED_CONFIG.yaml bin/config.example.yaml
           # arch-tagged so the arm64 (macos-latest) and x86_64 (macos-15-intel) archives don't collide.
           archive="bin/zkas-${{ github.event.release.tag_name }}-osx-$(uname -m).zip"
           zip -r "${archive}" ./bin/*
