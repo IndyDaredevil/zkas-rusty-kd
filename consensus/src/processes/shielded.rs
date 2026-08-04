@@ -915,11 +915,25 @@ impl ShieldedStateManager {
             .anchor()
             .to_bytes();
         self.anchor_block.set_batch(batch, anchor, block)?;
+        // Both indexes, always. `anchor_block` answers the pre-fork resolution path and
+        // `anchor_producers` the post-`shielded_anchor_multi_activation` one, which reads
+        // ONLY the producer set and treats a missing key as "anchor is not a known tree
+        // root" (`DbAnchorProducersStore::get_producers` maps `KeyNotFound` to an empty
+        // vec, with no fallback to `anchor_block`). Seeding just `anchor_block` therefore
+        // left a fast-synced node blind after activation: every post-fork spend anchored
+        // below the pruning point resolved to zero producers, was dropped while the
+        // block's producer had kept it, and the resulting fee difference disqualified the
+        // merging chain block — the same wedge this seeding exists to prevent, moved from
+        // the old rule to the new one. `persist` writes both for self-validated blocks;
+        // the import path must match it or the two disagree exactly across the window a
+        // syncee cannot self-populate.
+        self.anchor_producers.add_producer_batch(batch, anchor, block)?;
         // Seed the in-window historical anchors too. Without these the node drops every spend
         // anchored below the pruning point and disqualifies the block that merged it; see
         // [`PruningPointShieldedMetadata::in_window_anchors`].
         for (hist_anchor, source) in md.in_window_anchors.iter() {
             self.anchor_block.set_batch(batch, *hist_anchor, *source)?;
+            self.anchor_producers.add_producer_batch(batch, *hist_anchor, *source)?;
         }
         if md.supply.cumulative_coinbase > 0 || md.supply.cumulative_fees > 0 {
             self.supply_store.set_batch(batch, block, md.supply)?;
@@ -1235,6 +1249,54 @@ mod tests {
         let producers = mgr.anchor_producer_blocks(&c_win.anchor()).unwrap();
         assert_eq!(producers.len(), 2, "both producers retained: {producers:?}");
         assert!(producers.contains(&win) && producers.contains(&lose));
+    }
+
+    /// A fast-synced node must be able to answer the POST-fork resolution path, not just the
+    /// pre-fork one.
+    ///
+    /// `resolve_shielded_anchor` reads `anchor_producers` once
+    /// `shielded_anchor_multi_activation` is live, and `get_producers` maps a missing key to an
+    /// EMPTY vec with no fallback to `anchor_block` — which reads as "anchor is not a known tree
+    /// root". Seeding only `anchor_block` therefore moved the wedge rather than fixing it: after
+    /// activation a syncee dropped every spend anchored below its pruning point while the block's
+    /// producer had kept it, and the fee difference disqualified the merging chain block. The
+    /// window is real — walletd anchors 630 blue units deep and `shielded-pay` 6,000, against a
+    /// 27,000 legal maximum — so it spans blocks a syncee cannot populate from its own validation.
+    #[test]
+    fn seeding_a_pruning_point_populates_both_anchor_indexes() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = manager(&db);
+        let pp = h(9);
+        let (hist_anchor, hist_source) = ([3u8; 32], h(5));
+        let md = PruningPointShieldedMetadata {
+            frontier: FrontierState::default(),
+            supply: SupplyTotals::default(),
+            nullifier_muhash: MuHash::new(),
+            burns: BurnReceipts::default(),
+            state_root: [0u8; 32],
+            in_window_anchors: vec![(hist_anchor, hist_source)],
+            dev_accrued: 0,
+        };
+
+        let mut batch = WriteBatch::default();
+        mgr.seed_pruning_point_shielded(&mut batch, pp, &md, std::iter::empty()).unwrap();
+        db.write(batch).unwrap();
+
+        // Pre-fork path: unchanged.
+        assert_eq!(mgr.anchor_source_block(&hist_anchor).unwrap(), Some(hist_source), "anchor_block seeded");
+
+        // Post-fork path: the producer set must be non-empty, or the anchor reads as unknown and
+        // every spend against it is dropped.
+        let producers = mgr.anchor_producer_blocks(&hist_anchor).unwrap();
+        assert_eq!(producers, vec![hist_source], "in-window anchor must be seeded into anchor_producers too");
+
+        // The pruning point's own root as well.
+        let pp_anchor = GlobalTree::from_state(&md.frontier).unwrap().anchor().to_bytes();
+        assert_eq!(
+            mgr.anchor_producer_blocks(&pp_anchor).unwrap(),
+            vec![pp],
+            "the pruning point's own anchor must resolve under the multi-producer rule"
+        );
     }
 
     /// Re-applying a block after a reorg must not duplicate it: the producers list is a set, and
