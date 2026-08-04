@@ -888,19 +888,35 @@ async fn scan_merged(state: Arc<AppState>) {
 /// `kaspa` is present only when that peer's own address answered a Kaspa p2p
 /// handshake. `checked=false` means the sweep has not reached it yet, which is not
 /// the same as a negative result and must not be rendered as one.
+/// Attribution written by the off-node ZKMM pipeline (see `zkmm_indexer` +
+/// `zkmm_join.sh`): keyed by full peer IP, the Kaspa payout address(es) that peer's
+/// merge-mined blocks committed to, with block counts. Re-read each request (tiny
+/// file); absent/stale is fine — the fields just come back null.
+fn load_attribution() -> serde_json::Value {
+    std::fs::read_to_string("/root/firecash/attribution.json")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(Value::Null)
+}
+
 async fn info_merged(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     let peers = match s.client.get_connected_peer_info().await {
         Ok(r) => r.peer_info,
         Err(e) => return err(e.to_string()),
     };
     let scan = s.merged.read().await;
+    let attr = load_attribution();
+    let attr_nodes = attr.get("nodes").cloned().unwrap_or(Value::Null);
 
     let rows: Vec<Value> = peers
         .iter()
         .map(|p| {
             let id = short_id(&p.id.to_string());
-            let ip = p.address.ip.to_string().parse::<std::net::IpAddr>().ok();
+            let ip_str = p.address.ip.to_string();
+            let ip = ip_str.parse::<std::net::IpAddr>().ok();
             let country = ip.and_then(geo::lookup);
+            // Inferred merge-mining attribution for THIS peer, by full IP.
+            let mm = attr_nodes.get(&ip_str).cloned();
             json!({
                 "id": id,
                 "country": country.map(|c| c.code.clone()),
@@ -917,6 +933,9 @@ async fn info_merged(State(s): State<Arc<AppState>>) -> impl IntoResponse {
                 "reachable": scan.reachable.contains(&id),
                 "kaspa": scan.found.get(&id),
                 "kaspaAddress": scan.found.get(&id).and_then(|v| v.first()).map(|f| f.address.clone()),
+                // Inferred from ZKMM-tag ↔ first-relayer join (see /map-merged-mining
+                // note). `null` until this peer's merge-mined blocks are observed.
+                "mergeMined": mm,
             })
         })
         .collect();
@@ -928,6 +947,8 @@ async fn info_merged(State(s): State<Arc<AppState>>) -> impl IntoResponse {
         "merged": merged_count,
         "checked": scan.checked.len(),
         "ports": merged::KASPA_PORTS,
+        "attribution": attr.get("updatedAt"),
+        "attributionMatched": attr.get("matched"),
         "nodes": rows,
     }))
     .into_response()

@@ -4392,6 +4392,7 @@ dependencies = [
  "kaspa-addresses",
  "kaspa-consensus",
  "kaspa-consensus-core",
+ "kaspa-hashes",
  "kaspa-shielded-core",
  "kaspa-txscript",
 ]
