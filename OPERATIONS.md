@@ -99,7 +99,7 @@ OOMs; release is ~60 MB). `zkas-pool.service` env: `BRIDGE_ALLOW_UNSYNCED=1`
      </dev/null >node.log 2>&1 &
    setsid nohup bin/zkas-walletd --network mainnet --rpc-server 127.0.0.1:16110 \
      --listen 127.0.0.1:8501 --wallet-dir /root/zkas/wallets \
-     --allow-origin https://wallet.zkas.info </dev/null >walletd.log 2>&1 &
+     --allow-origin https://wallet.zkas.info --no-custodial </dev/null >walletd.log 2>&1 &
    setsid nohup bin/zkas-api -s 127.0.0.1:16110 -l 127.0.0.1:8500 \
      </dev/null >api.log 2>&1 &
    ```
@@ -149,6 +149,14 @@ VPS2 log shows `Accepted block … via relay` (following, not IBD of an old chai
 restores the old single-user fallback), and seeds encrypt at rest when
 `--wallet-secret` / `ZKAS_WALLET_SECRET` is set. Always launch it with
 `--allow-origin https://wallet.zkas.info` so the web wallet keeps working.
+On the HOSTED deployment also pass `--no-custodial`: the shipped model is
+watch-only (devices keep their seeds), so `create`/`import`/`send`/`send_many`/
+`reveal`/`consolidate`/`sign` have no business being open to every browser that
+holds a token — with the flag they return 403, which also retires the legacy
+client path that silently pulled a seed down from the server. Expensive proving
+is additionally bounded by `--max-concurrent-proves` (default 2): excess
+`/api/wallet/prepare` calls queue briefly, then get a clean 503 instead of
+piling Halo 2 work onto the box until the HTTP runtime starves.
 
 ## Repos
 

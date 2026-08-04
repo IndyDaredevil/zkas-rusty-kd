@@ -6,17 +6,32 @@
 //! and message sign/verify. Proofs are generated natively here (no in-browser Halo 2
 //! needed) and submitted to a ZKas node over gRPC.
 //!
+//! ## Custody model
+//!
+//! The shipped product model is **non-custodial / watch-only**. The device keeps its
+//! seed and registers only its 96-byte full viewing key (`/api/wallet/watch`); the
+//! daemon scans the chain for it and builds Halo2 spend *proofs* (`/api/wallet/prepare`),
+//! but never holds spend authority — the device signs each payment itself and hands
+//! the signatures back via `/api/wallet/submit`. A daemon compromise then leaks
+//! *visibility* into these wallets, never their coins.
+//!
+//! Custodial seed wallets (`create` / `import` / `send` / `send_many` / `reveal` /
+//! `consolidate` / `sign`) remain supported for self-hosted and payment-gateway use,
+//! where the operator IS the owner. On a hosted multi-tenant deployment they can be
+//! switched off entirely with `--no-custodial`, which makes every seed-requiring
+//! endpoint return 403.
+//!
 //! ## Two deployment modes
 //!
-//! - **Self-hosted (non-custodial):** the user runs this on their own machine; the
-//!   seed never leaves it. Point the web UI's daemon URL at `http://127.0.0.1:8501`.
-//! - **Hosted (convenience hot-wallet):** one instance serves many browsers behind a
-//!   reverse proxy, connected to a public ZKas node so users need no node of
-//!   their own. Each browser owns a random **wallet token** (an `X-Wallet-Token`
-//!   header); the daemon keeps one wallet per token. In this mode the seed is stored
-//!   server-side — weaker than keys-in-browser; the endgame is a client-side WASM
-//!   wallet (WebZjs-style). Do not expose this daemon directly; put a TLS proxy in
-//!   front and keep the bind on loopback.
+//! - **Self-hosted:** the user runs this on their own machine (or on their node via
+//!   `--serve-public`: built-in TLS + a bearer-token pairing QR). Point the web UI's
+//!   daemon URL at `http://127.0.0.1:8501`.
+//! - **Hosted (non-custodial):** one instance serves many browsers behind a reverse
+//!   proxy, connected to a public ZKas node so users need no node of their own. Each
+//!   browser owns a random **wallet token** (an `X-Wallet-Token` header); the daemon
+//!   keeps one wallet per token, each holding only a viewing key. Do not expose this
+//!   daemon directly; put a TLS proxy in front, keep the bind on loopback, and run
+//!   with `--no-custodial` (see OPERATIONS.md).
 //!
 //! ## Sync model
 //!
@@ -184,6 +199,20 @@ pub struct Config {
     /// <token>`. The transport gate for a publicly-bound daemon; the phone gets the token
     /// from the pairing QR. `None` = no bearer gate (loopback-only deployments).
     pub require_bearer: Option<String>,
+    /// Permit custodial (seed-holding) wallets and endpoints: `create`, `import`,
+    /// `send`, `send_many`, `reveal`, `consolidate`, `sign`. `true` preserves the
+    /// historical behaviour; `false` (the CLI's `--no-custodial`) makes each of
+    /// those return 403, so a hosted multi-tenant daemon can serve ONLY the
+    /// watch-only `watch` + `prepare` + `submit` model — it then holds no seeds at
+    /// all, and a daemon compromise cannot move anyone's coins by construction.
+    pub allow_custodial: bool,
+    /// Cap on concurrent payment preparations (the Halo2 proving inside
+    /// `/api/wallet/prepare`). Each proof saturates every core it is given
+    /// (~2.4 core-seconds per input note), so unbounded concurrency is a CPU
+    /// denial-of-service on a hosted daemon. Excess callers queue briefly on the
+    /// semaphore and then get a retry-friendly 503 rather than piling up work.
+    /// The CLI defaults this to [`default_max_concurrent_proves`].
+    pub max_concurrent_proves: usize,
     /// Keep custodial wallets below this many notes by merging their oldest notes in
     /// the background. `None` = off; the CLI defaults it to
     /// [`AUTO_CONSOLIDATE_DEFAULT`] and takes `--no-auto-consolidate` to clear it.
@@ -198,6 +227,29 @@ pub struct Config {
     /// Run continuously the cost is paid a few seconds at a time in the background,
     /// off the interactive path, and the note count never runs away in the first place.
     pub auto_consolidate: Option<usize>,
+}
+
+/// Default for [`Config::max_concurrent_proves`]: two concurrent preparations —
+/// one proof uses every core, so a second slot only absorbs the overlap between a
+/// finishing proof and a waiting caller — but never more slots than cores.
+pub fn default_max_concurrent_proves() -> usize {
+    std::thread::available_parallelism().map(|c| c.get()).unwrap_or(1).min(2).max(1)
+}
+
+/// 403 for seed-requiring endpoints when the daemon runs with custodial wallets
+/// disabled ([`Config::allow_custodial`] = false). The message names the
+/// non-custodial path so an old client tells its user where to go.
+fn require_custodial(state: &AppState) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if state.allow_custodial {
+        Ok(())
+    } else {
+        Err(err(
+            StatusCode::FORBIDDEN,
+            "custodial wallets are disabled on this daemon (--no-custodial): it holds no seeds and cannot \
+             create, import, reveal, spend, consolidate, or sign for any wallet. Register a viewing key with \
+             /api/wallet/watch and spend via /api/wallet/prepare + /api/wallet/submit, signing on your own device.",
+        ))
+    }
 }
 
 /// Map the `--network` string to the consensus [`NetworkType`] the compile-time
@@ -1595,6 +1647,21 @@ struct WalletEntry {
     /// counting it from both places would briefly double the pending amount — so mempool
     /// bundles whose nullifiers appear here are skipped.
     unsettled_nulls: HashSet<kaspa_shielded_core::nullifier::NullifierBytes>,
+    /// The unsettled-margin preview as ONE ENTRY PER BLOCK, newest last, covering
+    /// exactly the window above the settled cutoff. `sync_chunk` used to rebuild
+    /// the whole ~200-block preview from scratch every pass (~1s per wallet): the
+    /// window rolls by one block per second, so ~199/200 of that trial-decryption
+    /// was redoing the previous second's result — the daemon's #1 steady-state
+    /// CPU. The roll is matched against the fresh window by hash and reused
+    /// verbatim; only genuinely new tail blocks are previewed. Any mismatch
+    /// (reorg inside the margin) drops the roll and rebuilds the window once —
+    /// the same self-correction the full recompute gave.
+    preview_roll: VecDeque<PreviewRollEntry>,
+    /// Mempool previews by bundle key (first action's nullifier): the same
+    /// pending bundles sit in the mempool for many 700 ms ticks and were
+    /// re-trial-decrypted on every one. Cleared whenever a block is ingested
+    /// (wallet state may have changed); between blocks it is exact.
+    mempool_cache: HashMap<kaspa_shielded_core::nullifier::NullifierBytes, Preview>,
     /// When the background witness pre-advance last ran for this wallet. The sync loop
     /// spins as fast as every 10 ms while any wallet is behind, so without this throttle
     /// a caught-up note-heavy wallet fires a full `WITNESS_ADVANCE_BUDGET` step ~100×/s
@@ -1628,6 +1695,16 @@ struct WalletEntry {
     /// incident was a wallet silently "losing" 23K ZKAS to exactly this after a
     /// rescan, with nothing anywhere admitting the view was partial.
     blind_below: u64,
+}
+
+/// One block's contribution to the rolling unsettled preview (see
+/// [`WalletEntry::preview_roll`]). Hash-verified against the fresh window before
+/// reuse, so a reorg inside the margin can never resurrect a stale block.
+struct PreviewRollEntry {
+    hash: RpcHash,
+    blue_score: u64,
+    preview: Preview,
+    nulls: Vec<kaspa_shielded_core::nullifier::NullifierBytes>,
 }
 
 /// How many chain-block→leaf boundaries [`WalletEntry`] keeps. Anchor maturity is
@@ -1689,6 +1766,8 @@ impl WalletEntry {
             preview: Preview::default(),
             mempool: Preview::default(),
             unsettled_nulls: HashSet::new(),
+            preview_roll: VecDeque::new(),
+            mempool_cache: HashMap::new(),
             last_witness_advance: None,
             witnesses_warm: false,
             subtree_low_mem_logged: false,
@@ -1707,7 +1786,27 @@ impl WalletEntry {
         // still linger in the mempool, and counting it twice would double the pending sum.
         let fresh: Vec<&ShieldedBundle> =
             bundles.iter().filter(|b| !b.actions.iter().any(|a| self.unsettled_nulls.contains(&a.nullifier))).collect();
-        self.mempool = if fresh.is_empty() { Preview::default() } else { self.db.preview_block(&[], &fresh) };
+        // Trial-decrypt each bundle ONCE per key (first action's nullifier — unique
+        // per bundle). Pending bundles linger for many 700 ms ticks and were
+        // re-decrypted on every single one; between blocks the wallet state the
+        // preview depends on cannot change, so the cached figure is exact. The
+        // cache is cleared on every chain-block ingest (see sync_chunk) and
+        // retained only for bundles still present, so it stays small and current.
+        let mut total = Preview::default();
+        let mut present: HashSet<kaspa_shielded_core::nullifier::NullifierBytes> = HashSet::with_capacity(fresh.len());
+        for b in fresh {
+            let Some(key) = b.actions.first().map(|a| a.nullifier) else { continue };
+            present.insert(key);
+            if let Some(p) = self.mempool_cache.get(&key) {
+                total.add(*p);
+            } else {
+                let p = self.db.preview_block(&[], &[b]);
+                self.mempool_cache.insert(key, p);
+                total.add(p);
+            }
+        }
+        self.mempool_cache.retain(|k, _| present.contains(k));
+        self.mempool = total;
     }
 
     /// Advance this wallet by up to `PAGES_PER_CHUNK` pages of new **chain**
@@ -1795,23 +1894,57 @@ impl WalletEntry {
                         // Everything from here to the tip is inside the reorg margin and must
                         // not be appended to the tree. Preview it instead, so a payment shows
                         // up as pending the moment it is mined rather than ~3 minutes later
-                        // when the margin clears. Recomputed from scratch each pass (not
-                        // accumulated), so it self-corrects if a block drops out.
-                        let mut preview = Preview::default();
-                        let mut nulls = HashSet::new();
-                        for u in &resp.blocks[i..] {
-                            let cb: Vec<(CoinbaseNoteDesc, u64)> = u.coinbase.iter().map(|(d, v, _)| (d.clone(), *v)).collect();
-                            preview.add(self.db.preview_block_compact(&cb, &u.compact));
-                            // Remember what these blocks spend, so the same tx still sitting in
-                            // the mempool is not counted a second time (see `mempool`).
-                            for records in &u.compact {
-                                for a in records {
-                                    nulls.insert(a.nullifier);
-                                }
+                        // when the margin clears.
+                        //
+                        // The window ROLLS by ~one block per second, so keep it as a
+                        // per-block roll and reuse it: entries that hash-match the fresh
+                        // window are kept verbatim (their trial-decryption is NOT redone),
+                        // matured-out entries are dropped, and only genuinely new tail
+                        // blocks are previewed. This used to recompute all ~200 blocks on
+                        // every pass — ~199/200 of the preview CPU was re-running the
+                        // previous second's work, per wallet, forever (the daemon's #1
+                        // steady-state cost). A hash mismatch or length change anywhere
+                        // (a reorg inside the margin) clears the roll and rebuilds the
+                        // window once — the same self-correction the full recompute gave.
+                        let window = &resp.blocks[i..];
+                        let mut roll = std::mem::take(&mut self.preview_roll);
+                        while roll.front().is_some_and(|e| e.blue_score <= settled) {
+                            roll.pop_front();
+                        }
+                        let mut kept: VecDeque<PreviewRollEntry> = VecDeque::with_capacity(window.len());
+                        let mut reusable = true;
+                        for u in window {
+                            if !reusable {
+                                break;
                             }
+                            match roll.pop_front() {
+                                Some(e) if e.hash == u.hash && e.blue_score == u.blue_score => kept.push_back(e),
+                                _ => reusable = false,
+                            }
+                        }
+                        // Leftover roll entries mean the window changed shape (a reorg
+                        // shortened it): rebuild from scratch rather than trust it.
+                        if !reusable || !roll.is_empty() {
+                            kept.clear();
+                        }
+                        for u in &window[kept.len()..] {
+                            let cb: Vec<(CoinbaseNoteDesc, u64)> = u.coinbase.iter().map(|(d, v, _)| (d.clone(), *v)).collect();
+                            let preview = self.db.preview_block_compact(&cb, &u.compact);
+                            // Remember what these blocks spend, so the same tx still sitting
+                            // in the mempool is not counted a second time (see `mempool`).
+                            let nulls: Vec<_> =
+                                u.compact.iter().flat_map(|records| records.iter().map(|a| a.nullifier)).collect();
+                            kept.push_back(PreviewRollEntry { hash: u.hash, blue_score: u.blue_score, preview, nulls });
+                        }
+                        let mut preview = Preview::default();
+                        let mut nulls: HashSet<_> = HashSet::new();
+                        for e in &kept {
+                            preview.add(e.preview);
+                            nulls.extend(e.nulls.iter().copied());
                         }
                         self.preview = preview;
                         self.unsettled_nulls = nulls;
+                        self.preview_roll = kept;
                         at_margin = true;
                         break;
                     }
@@ -1839,6 +1972,12 @@ impl WalletEntry {
                     // No unsettled blocks in this page — nothing is pending from the margin.
                     self.preview = Preview::default();
                     self.unsettled_nulls.clear();
+                    self.preview_roll.clear();
+                }
+                if advanced {
+                    // Chain ingest may have changed this wallet's note/nullifier
+                    // state — cached mempool previews are only valid between blocks.
+                    self.mempool_cache.clear();
                 }
                 (advanced, at_margin)
             });
@@ -1980,6 +2119,17 @@ impl WalletEntry {
                         // leaves×budget), which shortens every later replay.
                         if tokio::task::block_in_place(|| self.db.advance_base_capped(matured, COLD_WARM_STEP)) {
                             continue;
+                        }
+                        // A wallet holding ZERO notes has nothing to witness: phases 2-3
+                        // would sweep the whole tree (~1.5M leaves at 4.4 s/tick, observed
+                        // live after a rescan) for exactly zero benefit. Mark warm once the
+                        // base is rolled; notes arriving later always land ABOVE the matured
+                        // anchor and get witnessed by the steady incremental advance as it
+                        // passes them, and a rescan that finds notes comes back through here
+                        // with note_count > 0 anyway.
+                        if note_count == 0 {
+                            self.witnesses_warm = true;
+                            break;
                         }
                         // Phase 2: sweep the witness set forward to the matured anchor.
                         if tokio::task::block_in_place(|| self.db.advance_witnesses_capped(matured, wstep)) {
@@ -2285,6 +2435,9 @@ struct AppState {
     fvk_index: Mutex<HashMap<[u8; 96], HashSet<String>>>,
     /// Note-count ceiling for background consolidation; see [`Config::auto_consolidate`].
     auto_consolidate: Option<usize>,
+    /// Whether custodial (seed-holding) endpoints are enabled; see
+    /// [`Config::allow_custodial`] and [`require_custodial`].
+    allow_custodial: bool,
 }
 
 /// Build a status snapshot from a locked wallet entry. Shared by the sync loop and the
@@ -3393,6 +3546,7 @@ async fn wallet_create(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<CreateResp>, (StatusCode, Json<serde_json::Value>)> {
+    require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
     if wallet_exists(&state.wallet_dir, &token) {
         return Err(err(StatusCode::CONFLICT, "a wallet already exists for this token; import replaces it"));
@@ -3431,6 +3585,7 @@ async fn wallet_import(
     headers: HeaderMap,
     Json(req): Json<ImportReq>,
 ) -> Result<Json<CreateResp>, (StatusCode, Json<serde_json::Value>)> {
+    require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
     let bytes = unhex(&req.seed_hex).ok_or_else(|| err(StatusCode::BAD_REQUEST, "seed_hex is not valid hex"))?;
     if bytes.len() != 32 {
@@ -3541,6 +3696,7 @@ async fn wallet_reveal(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<RevealResp>, (StatusCode, Json<serde_json::Value>)> {
+    require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let e = w.lock().await;
@@ -4000,6 +4156,7 @@ async fn wallet_send(
     headers: HeaderMap,
     Json(req): Json<SendReq>,
 ) -> Result<Json<SendResp>, (StatusCode, Json<serde_json::Value>)> {
+    require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     ensure_canonical_checkpoint(&state, &w).await?;
@@ -4324,6 +4481,7 @@ async fn wallet_send_many(
     headers: HeaderMap,
     Json(req): Json<SendManyReq>,
 ) -> Result<Json<SendManyResp>, (StatusCode, Json<serde_json::Value>)> {
+    require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     ensure_canonical_checkpoint(&state, &w).await?;
@@ -4554,6 +4712,7 @@ async fn wallet_consolidate(
     headers: HeaderMap,
     body: Option<Json<ConsolidateReq>>,
 ) -> Result<Json<ConsolidateResp>, (StatusCode, Json<serde_json::Value>)> {
+    require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let (base_fee, heal) = match body {
@@ -4750,6 +4909,12 @@ struct PrepareResp {
     /// window; new clients should deserialize and verify this object.
     #[serde(rename = "preparedPayment")]
     prepared_payment: PreparedPaymentEnvelope,
+    /// True when the spend was planned from the daemon's live, synced wallet view
+    /// (the fast path — request token matched this FVK's registered wallet).
+    /// False means it fell back to a watch-only matured chain REPLAY — minutes on
+    /// a long chain — so the client can warn the user about the wait instead of
+    /// looking hung (and fix the token↔FVK mismatch that usually causes it).
+    fast_path: bool,
 }
 
 /// [`kaspa_shielded_core::wallet::build::ActionDisclosure`] over the wire.
@@ -4840,6 +5005,9 @@ async fn wallet_prepare(
     let mut inputs = Vec::new();
     let mut selected = 0u64;
     let mut have_total: Option<u64> = None;
+    // Set when the spend is planned from the live tracked-wallet view rather than
+    // the watch-only chain replay — reported to the caller as `fast_path`.
+    let mut fast_path = false;
     // Notes this payment will spend, so `/submit` can park them once the node accepts.
     // Only the tracked-wallet path below can fill these: the FVK-only slow path has no
     // wallet to record against.
@@ -4886,6 +5054,7 @@ async fn wallet_prepare(
                     let (mut candidates, _stranded) = matured_candidates(&e.db, matured);
                     candidates.sort_by(|a, b| b.value().cmp(&a.value()));
                     have_total = Some(candidates.iter().map(|n| n.value()).sum());
+                    fast_path = true;
                     let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
                     let (take, dyn_fee) = select_spend_count(&values, amount, base_fee, max_per_tx);
                     fee = dyn_fee;
@@ -5088,6 +5257,7 @@ async fn wallet_prepare(
         bundle_hex,
         disclosure,
         prepared_payment,
+        fast_path,
     }))
 }
 
@@ -5183,6 +5353,7 @@ async fn wallet_sign(
     headers: HeaderMap,
     Json(req): Json<SignReq>,
 ) -> Result<Json<SignResp>, (StatusCode, Json<serde_json::Value>)> {
+    require_custodial(&state)?;
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let seed = { w.lock().await.key.seed()? };
@@ -5325,6 +5496,9 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     if cfg.allow_default_token {
         log::warn!("allow_default_token: tokenless requests map to the 'default' wallet; use only on a trusted single-user localhost");
     }
+    if !cfg.allow_custodial {
+        log::info!("custodial endpoints disabled (--no-custodial): create/import/send/send_many/reveal/consolidate/sign return 403");
+    }
 
     // The network genesis hash — the shielded sighash domain consensus verifies
     // against, and the checkpoint guard. Taken from the compile-time network
@@ -5349,9 +5523,9 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         page_cache: Mutex::new(PageCache::new()),
         last_touch: Mutex::new(HashMap::new()),
         load_gate: tokio::sync::Semaphore::new(2),
-        // Two concurrent preparations: proving is CPU-heavy, but a single global permit
-        // meant one tenant's send serialised every other tenant's on a shared daemon.
-        prepare_gate: tokio::sync::Semaphore::new(2),
+        // Concurrent preparations are capped by config (`--max-concurrent-proves`):
+        // proving is CPU-heavy, and unbounded overlap is a CPU DoS on a hosted daemon.
+        prepare_gate: tokio::sync::Semaphore::new(cfg.max_concurrent_proves.max(1)),
         preparing: std::sync::Mutex::new(HashSet::new()),
         warm_gate: tokio::sync::Semaphore::new(WARM_CONCURRENCY),
         node_tip: Mutex::new((0, std::time::Instant::now())),
@@ -5359,6 +5533,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         snapshots: Mutex::new(HashMap::new()),
         fvk_index: Mutex::new(HashMap::new()),
         auto_consolidate: cfg.auto_consolidate,
+        allow_custodial: cfg.allow_custodial,
     });
 
     // Index every existing wallet's viewing key in the background (argon2 per

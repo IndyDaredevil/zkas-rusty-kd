@@ -100,6 +100,20 @@ struct Cli {
     /// and persisted next to the cert).
     #[arg(long)]
     api_token: Option<String>,
+    /// Disable every custodial (seed-holding) endpoint: create, import, send,
+    /// send_many, reveal, consolidate, sign all return 403. The daemon then serves
+    /// ONLY the watch-only model (watch + prepare + submit) and holds no seeds at
+    /// all — the right posture for a hosted multi-tenant deployment (see
+    /// OPERATIONS.md). Off by default so existing self-host/gateway setups are
+    /// unaffected.
+    #[arg(long, default_value_t = false)]
+    no_custodial: bool,
+    /// Cap how many `/api/wallet/prepare` proofs run at once. Each proof saturates
+    /// every core (~2.4 core-seconds per input note), so on a hosted daemon an
+    /// unbounded count is a CPU denial-of-service; excess callers queue briefly,
+    /// then get a retry-friendly 503. Default: min(2, available cores).
+    #[arg(long, value_name = "N")]
+    max_concurrent_proves: Option<usize>,
 }
 
 // Oversubscribe worker threads (2x cores). The background sync loop does CPU-bound
@@ -163,6 +177,11 @@ async fn main() {
 
     // Self-hosting mode: one flag gives TLS + bearer + a pairing QR, no proxy.
     if let Some(addr) = cli.serve_public {
+        // SelfHostConfig is shared with kaspad's embedded mode and stays custodial;
+        // a single-user self-host has no reason to disable its own seed endpoints.
+        if cli.no_custodial {
+            log::warn!("--no-custodial is ignored with --serve-public (self-host mode serves its owner's seed wallet)");
+        }
         let listen: SocketAddr = addr.parse().unwrap_or_else(|e| {
             log::error!("bad --serve-public {addr:?}: {e}");
             std::process::exit(1);
@@ -212,6 +231,9 @@ async fn main() {
         tls: None,
         require_bearer: None,
         auto_consolidate: (!cli.no_auto_consolidate).then_some(cli.auto_consolidate),
+        allow_custodial: !cli.no_custodial,
+        // 0 makes no sense (every prepare would 503); fall back to the default.
+        max_concurrent_proves: cli.max_concurrent_proves.filter(|n| *n > 0).unwrap_or_else(zkas_walletd::default_max_concurrent_proves),
     };
 
     if let Err(e) = serve(cfg, shutdown_rx).await {
