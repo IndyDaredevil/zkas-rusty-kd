@@ -26,6 +26,7 @@ kaspa-alloc = { workspace = true }
 dirs = { workspace = true }
 
 # External dependencies - using workspace versions where available
+async-channel = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
