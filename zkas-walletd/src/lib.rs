@@ -3028,6 +3028,43 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     if e.reorged_strikes >= REORG_STRIKES {
         // Cursor off the selected chain (or pruned away) for enough passes: retire the
         // checkpoint to .bak and let the caller evict + reload it from a fresh anchor.
+        //
+        // But a reload is only LOSSLESS if the node can still serve genesis. The `/rescan`
+        // handler already refuses this exact operation against a node that cannot (it returns
+        // 409 rather than quietly amputating), and that guard exists because a user lost
+        // 18,354 ZKAS to it on 2026-07-28. This path reached the same destructive reload with
+        // no such check: refused when a user asks for it, performed silently when a pruning
+        // jump triggers it. The trigger is routine — the pruning point advances a whole
+        // `finality_depth` at a time (measured live: 567,082 → 610,666), taking every cursor
+        // below it with one step — so this fires on ordinary operation, not on some edge case.
+        //
+        // Park the wallet instead and keep the checkpoint. A stale cursor shows a stale
+        // balance until the operator repoints at an archival node; a pruning-point rebuild
+        // silently hides every note minted below it, and both `/prepare` paths are SPEND
+        // paths, so those notes become "insufficient funds" while the user holds the coins.
+        let serves_genesis = matches!(
+            state.client.get_shielded_tree_state(Some(e.genesis)).await,
+            Ok(ts) if ts.block_hash == e.genesis
+        );
+        if !serves_genesis {
+            // Log once, on the pass that crosses the threshold: this branch is re-entered
+            // every ~1s lap for as long as the wallet stays parked.
+            if e.reorged_strikes == REORG_STRIKES {
+                log::error!(
+                    "wallet '{token}': cursor is unusable ({}) but this node CANNOT SERVE GENESIS, \
+                     so rebuilding would drop every note minted below its pruning point — \
+                     REFUSING to retire the checkpoint. The wallet is parked and its balance is \
+                     stale until you point walletd at an archival node and restart.",
+                    e.error.as_deref().unwrap_or("no error recorded")
+                );
+            }
+            e.error = Some(
+                "cursor unusable and this node cannot serve genesis; checkpoint preserved — \
+                 repoint at an archival node (rebuilding here would lose notes)"
+                    .into(),
+            );
+            return SyncOutcome::Behind;
+        }
         let scan = scan_path(&state.wallet_dir, &token);
         log::warn!(
             "wallet '{token}': cursor off the selected chain for {} consecutive passes ({}) \
@@ -3035,7 +3072,16 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
             e.reorged_strikes,
             e.error.as_deref().unwrap_or("no error recorded")
         );
-        let _ = std::fs::rename(&scan, format!("{scan}.bak"));
+        // Never clobber an existing backup. The rename used to be unconditional, so a second
+        // retirement overwrote the good pre-amputation checkpoint with the already-damaged one
+        // and destroyed the only copy — exactly when a recovering operator is retrying.
+        let bak = format!("{scan}.bak");
+        if std::fs::metadata(&bak).is_ok() {
+            let stamp =
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default();
+            let _ = std::fs::rename(&bak, format!("{bak}.{stamp}"));
+        }
+        let _ = std::fs::rename(&scan, &bak);
         return SyncOutcome::Retired(token);
     }
     if e.reorged_strikes > 0 {
