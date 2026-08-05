@@ -1942,18 +1942,23 @@ impl WalletEntry {
                         // per-block roll and reuse it: entries that hash-match the fresh
                         // window are kept verbatim (their trial-decryption is NOT redone),
                         // matured-out entries are dropped, and only genuinely new tail
-                        // blocks are previewed. This used to recompute all ~200 blocks on
-                        // every pass — ~199/200 of the preview CPU was re-running the
-                        // previous second's work, per wallet, forever (the daemon's #1
-                        // steady-state cost). A hash mismatch or length change anywhere
-                        // (a reorg inside the margin) clears the roll and rebuilds the
-                        // window once — the same self-correction the full recompute gave.
+                        // blocks are previewed. A hash MISMATCH anywhere (a reorg inside
+                        // the margin) drops the roll and rebuilds the page's portion —
+                        // the same self-correction the full recompute gave.
+                        //
+                        // CRITICAL: a caught-up page (16 blocks) covers only the START of
+                        // the ~200-block unsettled window — the roll's unmatched TAIL is
+                        // the rest of that window and must be KEPT, not treated as a
+                        // mismatch. Clearing on leftovers rebuilt the entire window every
+                        // pass — and with preview_block_compact being O(notes x actions),
+                        // one note-heavy wallet (a miner's, registered 4x) pinned every
+                        // sync slot at 400% CPU and froze all progress (2026-08-05).
                         let window = &resp.blocks[i..];
                         let mut roll = std::mem::take(&mut self.preview_roll);
                         while roll.front().is_some_and(|e| e.blue_score <= settled) {
                             roll.pop_front();
                         }
-                        let mut kept: VecDeque<PreviewRollEntry> = VecDeque::with_capacity(window.len());
+                        let mut kept: VecDeque<PreviewRollEntry> = VecDeque::with_capacity(window.len() + roll.len());
                         let mut reusable = true;
                         for u in window {
                             if !reusable {
@@ -1964,9 +1969,9 @@ impl WalletEntry {
                                 _ => reusable = false,
                             }
                         }
-                        // Leftover roll entries mean the window changed shape (a reorg
-                        // shortened it): rebuild from scratch rather than trust it.
-                        if !reusable || !roll.is_empty() {
+                        if !reusable {
+                            // Reorg inside the margin: neither matched entries nor the tail
+                            // are trustworthy — rebuild the page's portion from scratch.
                             kept.clear();
                         }
                         for u in &window[kept.len()..] {
@@ -1977,6 +1982,12 @@ impl WalletEntry {
                             let nulls: Vec<_> =
                                 u.compact.iter().flat_map(|records| records.iter().map(|a| a.nullifier)).collect();
                             kept.push_back(PreviewRollEntry { hash: u.hash, blue_score: u.blue_score, preview, nulls });
+                        }
+                        if reusable {
+                            // The rest of the unsettled window, past the end of this page:
+                            // hash-verified when computed, still unsettled (the maturity
+                            // drop above ran first), still valid.
+                            kept.append(&mut roll);
                         }
                         let mut preview = Preview::default();
                         let mut nulls: HashSet<_> = HashSet::new();
