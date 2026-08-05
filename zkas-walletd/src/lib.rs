@@ -113,6 +113,17 @@ const PAGES_PER_CHUNK: usize = 4;
 /// (c) status reads lock-free snapshots, so a longer burst under the wallet
 /// lock no longer blocks status calls.
 const SHIELDED_PAGE: u64 = 1000;
+/// Blocks requested per page once a wallet is CAUGHT UP and holding a healthy
+/// preview roll: the roll already covers the ~200-block unsettled window (its
+/// entries are hash-verified, so they don't need re-sending), and a caught-up
+/// wallet only needs the ~1 newly settled block + the new tip blocks per second.
+/// Pulling the full 1000-block page anyway was ~60 KB of node egress and decode
+/// per wallet per second, and past 64 active cursors it thrashed the page cache
+/// — the dominant per-wallet cost at hosted scale. 16 covers a 16 s stall; a
+/// page that comes back FULL means more blocks than that arrived, so the next
+/// iteration of the chunk loop drops back to SHIELDED_PAGE and catches up in
+/// one go (see sync_chunk).
+const CAUGHT_UP_PAGE: u64 = 16;
 /// Blue-score margin the sync holds back from the sink before ingesting a chain
 /// block. The wallet's tree is append-only (no rollback), so it must not ingest a
 /// block that a routine near-tip reorg could still replace. Blue score advances
@@ -1556,8 +1567,8 @@ fn decode_compact_actions(bytes: &[u8]) -> Option<Vec<CompactActionRecord>> {
 }
 
 struct PageCache {
-    map: HashMap<RpcHash, (std::time::Instant, Arc<DecodedPage>)>,
-    order: VecDeque<RpcHash>,
+    map: HashMap<(RpcHash, u64), (std::time::Instant, Arc<DecodedPage>)>,
+    order: VecDeque<(RpcHash, u64)>,
 }
 
 const PAGE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1571,21 +1582,25 @@ impl PageCache {
 
 /// Fetch one `GetShieldedBlocks` page through the shared cache, decoding it once.
 /// During a mass rescan every active wallet walks the same stream, so the single
-/// fetch+decode here serves the whole cohort for `PAGE_CACHE_TTL`.
+/// fetch+decode here serves the whole cohort for `PAGE_CACHE_TTL`. The cache key
+/// includes the page limit: a 16-block tip page and a 1000-block catch-up page
+/// from the same cursor are different answers.
 async fn fetch_shielded_page(
     client: &GrpcClient,
     cache: &Mutex<PageCache>,
     low: RpcHash,
+    limit: u64,
 ) -> Result<Arc<DecodedPage>, kaspa_rpc_core::RpcError> {
+    let key = (low, limit);
     {
         let c = cache.lock().await;
-        if let Some((at, resp)) = c.map.get(&low) {
+        if let Some((at, resp)) = c.map.get(&key) {
             if at.elapsed() < PAGE_CACHE_TTL {
                 return Ok(resp.clone());
             }
         }
     }
-    let raw = client.get_shielded_blocks(low, SHIELDED_PAGE).await?;
+    let raw = client.get_shielded_blocks(low, limit).await?;
     // Decode the page ACROSS CORES. The per-block coinbase Sinsemilla commitment is the
     // dominant scan cost (~1 ms/block — it, not decryption, set the measured ~900 blk/s
     // single-thread ceiling), and each block decodes independently. `block_in_place`
@@ -1599,8 +1614,8 @@ async fn fetch_shielded_page(
     });
     let decoded = Arc::new(DecodedPage { reorged: raw.reorged, sink_blue_score: raw.sink_blue_score, blocks });
     let mut c = cache.lock().await;
-    c.map.insert(low, (std::time::Instant::now(), decoded.clone()));
-    c.order.push_back(low);
+    c.map.insert(key, (std::time::Instant::now(), decoded.clone()));
+    c.order.push_back(key);
     if c.order.len() > PAGE_CACHE_CAP {
         if let Some(old) = c.order.pop_front() {
             c.map.remove(&old);
@@ -1833,6 +1848,11 @@ impl WalletEntry {
     /// only once a block is `SYNC_TIP_MARGIN` blue units below the sink (the
     /// append-only tree must not ingest anything a routine reorg could replace).
     async fn sync_chunk(&mut self, client: &GrpcClient, cache: &Mutex<PageCache>, warm_gate: &tokio::sync::Semaphore) {
+        // Set when a small caught-up page comes back FULL: more blocks than it
+        // carried arrived, so the next iteration must take a full page to catch
+        // up in one go (otherwise a stalled wallet would crawl at CAUGHT_UP_PAGE
+        // blocks per pass).
+        let mut need_full_page = false;
         for _ in 0..PAGES_PER_CHUNK {
             // HARD TIMEOUT. There is ONE sync loop for every wallet, and it advances them
             // sequentially — so an await here that never returns does not stall one wallet,
@@ -1842,7 +1862,11 @@ impl WalletEntry {
             // "maturing" and unspendable — indistinguishable from a broken wallet, and only
             // a daemon restart cleared it. A timed-out page is treated exactly like any
             // other transient node failure: keep the checkpoint, record it, move on.
-            let fetched = tokio::time::timeout(SYNC_RPC_TIMEOUT, fetch_shielded_page(client, cache, self.low)).await;
+            // Page size adapts to the wallet's state: caught-up with a healthy
+            // preview roll → only the newest few blocks (the roll already covers
+            // the unsettled window, hash-verified); anything else → a full page.
+            let page_limit = if !need_full_page && !self.preview_roll.is_empty() { CAUGHT_UP_PAGE } else { SHIELDED_PAGE };
+            let fetched = tokio::time::timeout(SYNC_RPC_TIMEOUT, fetch_shielded_page(client, cache, self.low, page_limit)).await;
             let resp = match fetched {
                 Ok(Ok(r)) => r,
                 Err(_elapsed) => {
@@ -1999,7 +2023,14 @@ impl WalletEntry {
                 }
                 (advanced, at_margin)
             });
-            if !advanced || at_margin {
+            // A FULL small page means more blocks arrived than CAUGHT_UP_PAGE
+            // carried: this wallet is not at the tip after all — take a full
+            // page next iteration instead of declaring victory.
+            let small_page_full = page_limit == CAUGHT_UP_PAGE && resp.blocks.len() == CAUGHT_UP_PAGE as usize;
+            if small_page_full {
+                need_full_page = true;
+            }
+            if !advanced || (at_margin && !small_page_full) {
                 self.caught_up = true;
                 break;
             }
