@@ -10,22 +10,22 @@ on:
   pull_request:
     paths:
       - "bridge/**"
-
 concurrency:
   group: bridge-check-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
   bridge:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -33,13 +33,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: bridge-check-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-
+          key: bridge-check-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-v2
       - name: Check bridge crate
         run: cargo check -p kaspa-stratum-bridge --locked
-
       - name: Clippy bridge crate
         run: cargo clippy -p kaspa-stratum-bridge --locked -- -D warnings
-
       - name: Test bridge crate
         run: cargo test -p kaspa-stratum-bridge --locked
