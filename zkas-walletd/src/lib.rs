@@ -1128,6 +1128,20 @@ const SYNC_WALLET_THROTTLE_MS: u64 = 50;
 /// is ~200 blocks of pure-CPU trial decryption with no natural await).
 const SYNC_PAGE_THROTTLE_MS: u64 = 5;
 
+/// Idle wallets are evicted from RAM after this long without a request. The on-disk
+/// checkpoint IS the wallet; memory is only a cache of it, and reloading on the next
+/// touch costs a file read (witness state included since v5). On a hosted daemon with
+/// hundreds of one-visitor browsers, the resident set otherwise grows with every token
+/// ever seen — forever.
+const EVICT_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Hard cap on resident wallets regardless of idleness; the least-recently-touched go
+/// first. A generous browser cohort fits well under this; it exists for the day the
+/// hosted wallet count stops fitting.
+const MAX_RESIDENT_WALLETS: usize = 256;
+/// The eviction sweep itself runs at most this often (cheap map walk; the victim
+/// checkpoint flushes are the real work, and victims are rare).
+const EVICT_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Persist a wallet's scan checkpoint atomically (write-tmp + rename). `genesis`
 /// is the network genesis hash (a chain relaunch invalidates the checkpoint);
 /// `low` is the last ingested chain block, from which sync resumes. The
@@ -1481,9 +1495,13 @@ struct DecodedPage {
 
 /// Shared page decoding gets a bounded pool so it cannot consume every host core
 /// and starve HTTP or kaspad while several wallets ingest concurrently.
+/// Sized to the host: 2 threads minimum, up to 4 on bigger boxes, never more than
+/// half the cores — Halo 2 proving (the prepare gate) and the HTTP runtime must
+/// keep headroom even while a wallet cohort decodes the same catch-up range.
 static PAGE_DECODE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+    let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(2);
     rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
+        .num_threads((cores / 2).clamp(2, 4))
         .thread_name(|i| format!("wallet-page-decode-{i}"))
         .build()
         .expect("build wallet page decode pool")
@@ -3294,7 +3312,63 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     if behind { SyncOutcome::Behind } else { SyncOutcome::Idle }
 }
 
+/// Evict wallets nobody has touched in [`EVICT_IDLE`] (plus LRU overflow past
+/// [`MAX_RESIDENT_WALLETS`]). Memory is a cache of the on-disk checkpoint — a hosted
+/// daemon serving hundreds of browsers must not hold every wallet it has ever loaded.
+/// A dirty victim is flushed to disk first, so the reload on its next request costs a
+/// file read, not a rescan. Safe by construction:
+///  - a wallet in active use is touched on every request, so it can never be a victim;
+///  - a mid-flight `/prepare` + `/submit` pair spans minutes, not the 30-minute idle bar,
+///    and even a cap-evicted submit simply reloads from the checkpoint (the prepared
+///    session lives in `state.prepared`, not in the wallet);
+///  - removal is by Arc identity: a wallet retired/reloaded between our map read and
+///    removal is left alone.
+async fn evict_idle_wallets(state: &Arc<AppState>) {
+    let now = std::time::Instant::now();
+    let touches: HashMap<String, std::time::Instant> = state.last_touch.lock().await.clone();
+    let resident: Vec<(String, Wallet)> = { state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect() };
+    let mut victims: Vec<String> = resident
+        .iter()
+        .filter(|(t, _)| touches.get(t).map(|at| now.duration_since(*at) >= EVICT_IDLE).unwrap_or(false))
+        .map(|(t, _)| t.clone())
+        .collect();
+    if resident.len() > MAX_RESIDENT_WALLETS {
+        let mut by_touch: Vec<(String, std::time::Instant)> =
+            resident.iter().map(|(t, _)| (t.clone(), touches.get(t).copied().unwrap_or(now))).collect();
+        by_touch.sort_by_key(|(_, at)| *at);
+        for (t, _) in by_touch.into_iter().take(resident.len() - MAX_RESIDENT_WALLETS) {
+            if !victims.contains(&t) {
+                victims.push(t);
+            }
+        }
+    }
+    for token in victims {
+        let Some(w) = state.wallets.lock().await.get(&token).cloned() else { continue };
+        {
+            let mut e = w.lock().await;
+            // Flush a dirty victim so eviction is free of rescan cost. A wallet in an
+            // error state is evicted as-is — its checkpoint already lagged and the
+            // reload path re-derives whatever it can.
+            if e.error.is_none() && e.saved_scanned != e.scanned {
+                if save_checkpoint(&state.wallet_dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue, e.blind_below).is_ok()
+                {
+                    e.saved_scanned = e.scanned;
+                    e.force_checkpoint = false;
+                }
+            }
+        }
+        // Remove only if the map still holds THIS instance (a retire/reload racing the
+        // sweep must not be eaten).
+        let mut map = state.wallets.lock().await;
+        if map.get(&token).map(|cur| Arc::ptr_eq(cur, &w)).unwrap_or(false) {
+            map.remove(&token);
+            log::info!("evicted idle wallet '{token}' (checkpoint on disk; it reloads on its next request)");
+        }
+    }
+}
+
 async fn sync_loop(state: Arc<AppState>) {
+    let mut last_evict = std::time::Instant::now();
     loop {
         let wallets: Vec<(String, Wallet)> = { state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect() };
         let mut any_behind = false;
@@ -3367,6 +3441,13 @@ async fn sync_loop(state: Arc<AppState>) {
                 map.remove(&t);
                 snaps.remove(&t);
             }
+        }
+        // Idle-wallet eviction (memory is a cache of the on-disk checkpoints — see
+        // `evict_idle_wallets`). Throttled; a hosted daemon's resident set must track
+        // the wallets people are actually looking at, not every browser that ever visited.
+        if last_evict.elapsed() >= EVICT_SWEEP_INTERVAL {
+            evict_idle_wallets(&state).await;
+            last_evict = std::time::Instant::now();
         }
         // While catching up a big initial scan, loop back immediately (only a
         // tiny yield so status calls can grab the lock); idle slowly once synced.
