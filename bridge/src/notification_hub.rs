@@ -286,8 +286,12 @@ mod tests {
         assert!(matches!(got, Notification::NewBlockTemplate(_)));
     }
 
-    /// Upstream closure publishes Disconnected exactly once and live
-    /// subscribers see channel-closed — the WS4 mode machine's input signal.
+    /// Upstream closure publishes Disconnected — the WS4 mode machine's input
+    /// signal. Note the hub's per-scope senders intentionally outlive the
+    /// relay (late `subscribe()` stays valid), so a subscriber observes
+    /// SILENCE after disconnect, not `Closed` — asserting Closed here would
+    /// deadlock forever, which is exactly what the first version of this test
+    /// did in CI.
     #[tokio::test]
     async fn upstream_closure_publishes_disconnected_health() {
         let (tx, rx) = async_channel::unbounded();
@@ -298,9 +302,13 @@ mod tests {
         let mut sub = hub.subscribe(HubScope::NewBlockTemplate);
         drop(tx); // hard disconnect
 
-        health.changed().await.expect("health transition");
+        timeout(Duration::from_secs(2), health.changed())
+            .await
+            .expect("health transition within 2s")
+            .expect("health channel alive");
         assert_eq!(*health.borrow(), ClientHealth::Disconnected);
-        assert!(matches!(sub.recv().await, Err(broadcast::error::RecvError::Closed)));
+        // Quiescence, not closure: no notification arrived and none will.
+        assert!(matches!(sub.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
     }
 
     /// Subscribing before any notification flows, and late subscription after
