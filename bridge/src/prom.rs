@@ -74,6 +74,11 @@ static MERGED_SUBMIT_MAX_MS_GAUGE: OnceLock<Gauge> = OnceLock::new();
 
 /// Block gauge - unique instances per block mined
 static BLOCK_GAUGE: OnceLock<GaugeVec> = OnceLock::new();
+// c.10: per-event gauges for zKAS/double finds, exact mirror of BLOCK_GAUGE
+// (same BLOCK_LABELS incl. timestamp) so the Recent Blocks table pattern
+// works identically for all three chains/event-types.
+static ZKAS_BLOCK_GAUGE: OnceLock<GaugeVec> = OnceLock::new();
+static DOUBLE_BLOCK_GAUGE: OnceLock<GaugeVec> = OnceLock::new();
 
 /// Disconnect counter - number of disconnects by worker
 static DISCONNECT_COUNTER: OnceLock<CounterVec> = OnceLock::new();
@@ -166,6 +171,17 @@ pub fn init_metrics() {
 
     BLOCK_GAUGE.get_or_init(|| {
         register_gauge_vec!("ks_mined_blocks_gauge", "Gauge containing 1 unique instance per block mined", BLOCK_LABELS).unwrap()
+    });
+    ZKAS_BLOCK_GAUGE.get_or_init(|| {
+        register_gauge_vec!("ks_zkas_mined_blocks_gauge", "Gauge containing 1 unique instance per ZKas block mined", BLOCK_LABELS).unwrap()
+    });
+    DOUBLE_BLOCK_GAUGE.get_or_init(|| {
+        register_gauge_vec!(
+            "ks_double_mined_blocks_gauge",
+            "Gauge containing 1 unique instance per double block (hash = the leg that confirmed second)",
+            BLOCK_LABELS
+        )
+        .unwrap()
     });
 
     // c.8: merged-mining series. Worker-labeled counters mirror K's shape
@@ -770,16 +786,45 @@ pub fn record_block_found(worker: &WorkerContext, nonce: u64, bluescore: u64, ha
         counter.with_label_values(&worker.labels()).inc();
     }
     if let Some(gauge) = BLOCK_GAUGE.get() {
-        let mut labels = worker.labels();
-        let nonce_str = nonce.to_string();
-        let bluescore_str = bluescore.to_string();
-        let timestamp_str =
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs().to_string();
-        labels.push(&nonce_str);
-        labels.push(&bluescore_str);
-        labels.push(&timestamp_str);
-        labels.push(&hash);
-        gauge.with_label_values(&labels).set(1.0);
+        set_block_event_gauge(gauge, worker, nonce, bluescore, hash);
+    }
+}
+
+// c.10: shared by all three per-event gauges (K/Z/D) — one implementation,
+// timestamp always taken at call time (i.e. at blue-confirm for K and Z,
+// matching when their respective counters increment too).
+fn set_block_event_gauge(gauge: &GaugeVec, worker: &WorkerContext, nonce: u64, bluescore: u64, hash: String) {
+    let mut labels = worker.labels();
+    let nonce_str = nonce.to_string();
+    let bluescore_str = bluescore.to_string();
+    let timestamp_str =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs().to_string();
+    labels.push(&nonce_str);
+    labels.push(&bluescore_str);
+    labels.push(&timestamp_str);
+    labels.push(&hash);
+    gauge.with_label_values(&labels).set(1.0);
+}
+
+/// c.10: zKAS-chain twin of `record_block_found` — called from hook E on
+/// blue-confirm. `hash` is the H_fc (the zKAS chain hash; the aux rides
+/// outside the header hash, so H_fc IS the right handle here — same
+/// reasoning as the color-check call).
+pub fn record_zkas_block_found_event(worker: &WorkerContext, nonce: u64, bluescore: u64, hash: String) {
+    if let Some(gauge) = ZKAS_BLOCK_GAUGE.get() {
+        set_block_event_gauge(gauge, worker, nonce, bluescore, hash);
+    }
+}
+
+/// c.10: double-block event. `hash` is whichever leg's confirm task
+/// completed the double (finished second) — a double inherently has TWO
+/// hashes (the KAS block + H_fc), and this single-hash event slot records
+/// only the completing one. The paired hash is recoverable by timestamp
+/// proximity against the K/Z recent-blocks lists (same blue-confirm
+/// window, seconds apart at most).
+pub fn record_double_block_found_event(worker: &WorkerContext, nonce: u64, bluescore: u64, hash: String) {
+    if let Some(gauge) = DOUBLE_BLOCK_GAUGE.get() {
+        set_block_event_gauge(gauge, worker, nonce, bluescore, hash);
     }
 }
 
@@ -1009,6 +1054,8 @@ struct StatsResponse {
     activeWorkers: usize,
     internalCpu: Option<InternalCpuStats>,
     blocks: Vec<BlockInfo>,
+    zkasBlocks: Vec<BlockInfo>, // c.10 — same shape as `blocks`, timestamped
+    doubleBlocks: Vec<BlockInfo>, // c.10
     workers: Vec<WorkerInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bridgeUptime: Option<u64>, // Bridge uptime in seconds
@@ -1124,6 +1171,8 @@ async fn get_stats_json_filtered(instance_id: Option<&str>) -> StatsResponse {
         activeWorkers: 0,
         internalCpu: None,
         blocks: Vec::new(),
+        zkasBlocks: Vec::new(), // c.10
+        doubleBlocks: Vec::new(), // c.10
         workers: Vec::new(),
         bridgeUptime: None,
         totalZkasBlocks: 0, // c.9
@@ -1150,6 +1199,8 @@ async fn get_stats_json_filtered(instance_id: Option<&str>) -> StatsResponse {
     let mut worker_start_times: HashMap<String, f64> = HashMap::new(); // Store start times for hashrate calculation
     let mut worker_difficulties: HashMap<String, f64> = HashMap::new(); // Store current difficulty for each worker
     let mut block_set: HashSet<String> = HashSet::new();
+    let mut zkas_block_set: HashSet<String> = HashSet::new(); // c.10
+    let mut double_block_set: HashSet<String> = HashSet::new(); // c.10
 
     // Parse global network gauges from the unfiltered set.
     // Also pick up internal CPU miner metrics (if present).
@@ -1279,6 +1330,59 @@ async fn get_stats_json_filtered(instance_id: Option<&str>) -> StatsResponse {
                             bluescore,
                         });
                         stats.totalBlocks += 1;
+                    }
+                }
+            }
+        }
+
+        // c.10: zKAS + double per-event gauges — exact mirror of
+        // ks_mined_blocks_gauge above, pushed into their own lists.
+        if name == "ks_zkas_mined_blocks_gauge" {
+            for metric in family.get_metric() {
+                if metric.get_gauge().value() > 0.0 {
+                    let labels = metric.get_label();
+                    let (mut instance, mut worker, mut wallet, mut timestamp, mut hash, mut nonce, mut bluescore) =
+                        (String::new(), String::new(), String::new(), String::new(), String::new(), String::new(), String::new());
+                    for label in labels {
+                        match label.name() {
+                            "instance" => instance = label.value().to_string(),
+                            "worker" => worker = label.value().to_string(),
+                            "wallet" => wallet = label.value().to_string(),
+                            "timestamp" => timestamp = label.value().to_string(),
+                            "hash" => hash = label.value().to_string(),
+                            "nonce" => nonce = label.value().to_string(),
+                            "bluescore" => bluescore = label.value().to_string(),
+                            _ => {}
+                        }
+                    }
+                    if !hash.is_empty() && !zkas_block_set.contains(&hash) {
+                        zkas_block_set.insert(hash.clone());
+                        stats.zkasBlocks.push(BlockInfo { instance, worker, wallet, timestamp, hash, nonce, bluescore });
+                    }
+                }
+            }
+        }
+        if name == "ks_double_mined_blocks_gauge" {
+            for metric in family.get_metric() {
+                if metric.get_gauge().value() > 0.0 {
+                    let labels = metric.get_label();
+                    let (mut instance, mut worker, mut wallet, mut timestamp, mut hash, mut nonce, mut bluescore) =
+                        (String::new(), String::new(), String::new(), String::new(), String::new(), String::new(), String::new());
+                    for label in labels {
+                        match label.name() {
+                            "instance" => instance = label.value().to_string(),
+                            "worker" => worker = label.value().to_string(),
+                            "wallet" => wallet = label.value().to_string(),
+                            "timestamp" => timestamp = label.value().to_string(),
+                            "hash" => hash = label.value().to_string(),
+                            "nonce" => nonce = label.value().to_string(),
+                            "bluescore" => bluescore = label.value().to_string(),
+                            _ => {}
+                        }
+                    }
+                    if !hash.is_empty() && !double_block_set.contains(&hash) {
+                        double_block_set.insert(hash.clone());
+                        stats.doubleBlocks.push(BlockInfo { instance, worker, wallet, timestamp, hash, nonce, bluescore });
                     }
                 }
             }

@@ -133,6 +133,46 @@ function renderMergedPanel(stats) {
   }
   const subEl = document.getElementById('mergedSubmit');
   if (subEl) subEl.textContent = `${fmt1(merged.submitAvgMs)}ms / ${fmt1(merged.submitMaxMs)}ms`;
+
+  renderMergedRecentBlocks(stats);
+}
+
+// c.10: merges stats.blocks (K) / stats.zkasBlocks (Z) / stats.doubleBlocks
+// (D) into one chain-tagged, timestamp-sorted table. Reuses the exact same
+// formatting helpers as the main Recent Blocks table (formatUnixSeconds,
+// shortHash, escapeHtmlAttr, displayWorkerName) for visual consistency.
+function renderMergedRecentBlocks(stats) {
+  const body = document.getElementById('mergedRecentBlocksBody');
+  if (!body) return;
+
+  const chainBadge = { K: 'bg-blue-900/40 text-blue-300', Z: 'bg-purple-900/40 text-purple-300', D: 'bg-yellow-900/40 text-yellow-300' };
+  const tag = (chain, items) => (Array.isArray(items) ? items : []).map((b) => ({ ...b, __chain: chain }));
+
+  const merged = [...tag('K', stats?.blocks), ...tag('Z', stats?.zkasBlocks), ...tag('D', stats?.doubleBlocks)]
+    .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0))
+    .slice(0, 25); // recent-first, cap for a status panel (full history stays in the main Recent Blocks table for K)
+
+  if (!merged.length) {
+    body.innerHTML = `<tr><td colspan="5" class="py-3 text-gray-500 text-center">No merged blocks yet this session</td></tr>`;
+    return;
+  }
+
+  body.innerHTML = '';
+  for (const b of merged) {
+    const hashFull = b.hash || '';
+    const hashShort = typeof shortHash === 'function' ? shortHash(hashFull) : hashFull.slice(0, 16);
+    const workerDisplay = typeof displayWorkerName === 'function' ? displayWorkerName(b.worker) : (b.worker || '-');
+    const tr = document.createElement('tr');
+    tr.className = 'border-b border-card/50';
+    tr.innerHTML = `
+      <td class="py-1.5 pr-3" title="${b.timestamp || ''}">${formatUnixSeconds(b.timestamp)}</td>
+      <td class="py-1.5 pr-3"><span class="text-xs font-medium px-2 py-0.5 rounded ${chainBadge[b.__chain] || ''}">${b.__chain}</span></td>
+      <td class="py-1.5 pr-3" title="${escapeHtmlAttr(workerDisplay)}">${escapeHtmlAttr(workerDisplay)}</td>
+      <td class="py-1.5 pr-3" title="${escapeHtmlAttr(b.bluescore || '')}">${b.bluescore || '-'}</td>
+      <td class="py-1.5 pr-3 font-mono min-w-0 truncate" title="${escapeHtmlAttr(hashFull)}">${hashShort}</td>
+    `;
+    body.appendChild(tr);
+  }
 }
 
 function formatHashrateHs(hs) {

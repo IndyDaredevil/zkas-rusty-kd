@@ -840,6 +840,8 @@ impl ShareHandler {
                                     let instance_z = self.instance_id.clone();
                                     let prom_worker_z = self.worker_prom_context(&ctx, "");
                                     let outcome_z = Arc::clone(&c7_outcome);
+                                    let nonce_z = nonce_val; // c.10 — Copy, cheap capture
+                                    let blue_score_z = blue_score; // c.10
                                     tokio::spawn(async move {
                                         match kaspa_api_z.submit_zkas_block(aux).await {
                                             Ok(resp) if resp.report.is_success() => {
@@ -859,11 +861,17 @@ impl ShareHandler {
                                                             *overall_z.zkas_blocks_found.lock() += 1;
                                                             crate::merged_obs::MERGED_OBS.record_zkas_block();
                                                             crate::prom::record_zkas_block_found(&prom_worker_z); // c.8
+                                                            crate::prom::record_zkas_block_found_event(
+                                                                &prom_worker_z, nonce_z, blue_score_z, zkas_hash.clone(),
+                                                            ); // c.10
                                                             if outcome_z.record_zkas_accept() {
                                                                 *stats_z.double_blocks_found.lock() += 1;
                                                                 *overall_z.double_blocks_found.lock() += 1;
                                                                 crate::merged_obs::MERGED_OBS.record_double_block();
                                                                 crate::prom::record_double_block_found(&prom_worker_z); // c.8
+                                                                crate::prom::record_double_block_found_event(
+                                                                    &prom_worker_z, nonce_z, blue_score_z, zkas_hash.clone(),
+                                                                ); // c.10
                                                                 info!(
                                                                     "[{}] {} {}",
                                                                     instance_z,
@@ -997,6 +1005,9 @@ impl ShareHandler {
                                             *overall.double_blocks_found.lock() += 1;
                                             crate::merged_obs::MERGED_OBS.record_double_block();
                                             crate::prom::record_double_block_found(&prom_worker); // c.8
+                                            crate::prom::record_double_block_found_event(
+                                                &prom_worker, nonce_val, blue_score, block_hash_for_confirm.clone(),
+                                            ); // c.10
                                             info!(
                                                 "[{}] {} {}",
                                                 instance_id,

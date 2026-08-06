@@ -111,36 +111,57 @@
           </div>
         </div>
 
-        <!-- c.9: Merged Mining panel — purely additive, does not touch any
-             existing card/table. Populated by renderMergedPanel() below from
-             the new /api/stats fields (merged, totalZkasBlocks,
-             totalDoubleBlocks). Hidden entirely (data-merged-panel) when the
-             instance never enabled merged mode, so plain RKStratum/old-fork
-             dashboards render unchanged if this file is ever shared there. -->
+        <!-- c.10: Merged Mining panel — now with real per-chain detail and
+             timestamps, sourced from stats.blocks / stats.zkasBlocks /
+             stats.doubleBlocks (all three share BlockInfo's shape, so one
+             render function below handles all three). Hidden entirely when
+             stats.merged is absent, same as c.9. -->
         <div class="bg-surface-1 rounded-lg p-6 border border-card" data-merged-panel style="display:none;">
           <div class="flex items-center justify-between gap-4 mb-4">
             <h3 class="text-lg font-semibold kaspa-primary">Merged Mining</h3>
             <span id="mergedZkStateBadge" class="text-xs font-medium px-2 py-1 rounded-full border border-card">-</span>
           </div>
-          <div class="grid grid-cols-3 gap-3 mb-4">
-            <div class="bg-surface-2 rounded-lg px-3 py-2 border border-card text-center">
-              <div class="text-gray-400 text-xs">KAS</div>
-              <div id="mergedKasBlocks" class="text-lg font-semibold tabular-nums">-</div>
+
+          <div class="grid grid-cols-2 gap-4 mb-4">
+            <div class="bg-surface-2 rounded-lg p-4 border border-card">
+              <div class="text-xs text-gray-400 mb-1">KAS (parent chain)</div>
+              <div id="mergedKasBlocks" class="text-2xl font-semibold tabular-nums">-</div>
+              <div class="text-xs text-gray-500 mt-1">confirmed blue</div>
             </div>
-            <div class="bg-surface-2 rounded-lg px-3 py-2 border border-card text-center">
-              <div class="text-gray-400 text-xs">ZKAS</div>
-              <div id="mergedZkasBlocks" class="text-lg font-semibold tabular-nums">-</div>
-            </div>
-            <div class="bg-surface-2 rounded-lg px-3 py-2 border border-card text-center">
-              <div class="text-gray-400 text-xs">Double</div>
-              <div id="mergedDoubleBlocks" class="text-lg font-semibold tabular-nums">-</div>
+            <div class="bg-surface-2 rounded-lg p-4 border border-card">
+              <div class="text-xs text-gray-400 mb-1">ZKAS (aux chain)</div>
+              <div id="mergedZkasBlocks" class="text-2xl font-semibold tabular-nums">-</div>
+              <div class="text-xs text-gray-500 mt-1">confirmed blue</div>
             </div>
           </div>
-          <div class="space-y-2 text-sm">
+          <div class="bg-surface-2 rounded-lg px-4 py-2 border border-card text-center mb-4">
+            <span class="text-gray-400 text-xs mr-2">Double (both legs, one hash):</span>
+            <span id="mergedDoubleBlocks" class="text-base font-semibold tabular-nums">-</span>
+          </div>
+
+          <div class="space-y-2 text-sm mb-4">
             <div class="flex justify-between"><span class="text-gray-400">Template age</span><span id="mergedZkAge">-</span></div>
             <div class="flex justify-between"><span class="text-gray-400">Jobs/sec</span><span id="mergedJobsPerSec">-</span></div>
             <div class="flex justify-between"><span class="text-gray-400">RPC latency (K / Z)</span><span id="mergedRpc">-</span></div>
             <div class="flex justify-between"><span class="text-gray-400">Submit latency (avg / max)</span><span id="mergedSubmit">-</span></div>
+          </div>
+
+          <div class="border-t border-card pt-4">
+            <h4 class="text-sm font-semibold text-gray-300 mb-2">Recent Merged Blocks</h4>
+            <div class="table-wrap">
+              <table class="min-w-[720px] w-max text-sm">
+                <thead class="text-gray-400">
+                  <tr class="border-b border-card">
+                    <th class="text-left py-2 pr-3">Timestamp</th>
+                    <th class="text-left py-2 pr-3">Chain</th>
+                    <th class="text-left py-2 pr-3">Worker</th>
+                    <th class="text-left py-2 pr-3">Bluescore</th>
+                    <th class="text-left py-2 pr-3">Hash</th>
+                  </tr>
+                </thead>
+                <tbody id="mergedRecentBlocksBody" class="text-gray-200"></tbody>
+              </table>
+            </div>
           </div>
         </div>
 
