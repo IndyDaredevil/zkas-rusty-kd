@@ -433,7 +433,7 @@ mod tests {
             let s1 = Arc::clone(&s);
             let s2 = Arc::clone(&s);
             let t1 = std::thread::spawn(move || s1.record_kas_accept("kh") as u32);
-            let t2 = std::thread::spawn(move || s2.record_zkas_accept() as u32);
+            let t2 = std::thread::spawn(move || s2.record_zkas_accept("zh") as u32);
             let doubles = t1.join().unwrap() + t2.join().unwrap();
             assert_eq!(doubles, 1, "exactly one arm must complete the double");
         }
