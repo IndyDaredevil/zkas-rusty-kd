@@ -169,9 +169,11 @@ impl MergedObs {
 
     // ---- printer-side (single consumer, 10s tick) ----
 
-    /// Drain window counters and render the NODE-line suffix. `elapsed_secs`
-    /// is the wall time since the previous tick.
-    pub fn node_suffix(&self, now_ms: u64, elapsed_secs: f64) -> String {
+    /// c.8: numeric twin of `node_suffix` for Prometheus export — this IS the
+    /// single window-drain point; `node_suffix` formats from its output
+    /// rather than draining independently, so calling either (not both) per
+    /// tick is safe and calling `node_suffix` still drains exactly once.
+    pub fn snapshot(&self, now_ms: u64, elapsed_secs: f64) -> ObsSnapshot {
         let jobs = self.jobs_sent_window.swap(0, Relaxed);
         let dec = self.tpl_decorated_window.swap(0, Relaxed);
         let tot = self.tpl_total_window.swap(0, Relaxed);
@@ -180,39 +182,58 @@ impl MergedObs {
         let sub_n = self.submit_count_window.swap(0, Relaxed);
 
         let jps = if elapsed_secs > 0.0 { jobs as f64 / elapsed_secs } else { 0.0 };
+        let (sub_avg_ms, sub_max_ms) =
+            if sub_n == 0 { (0.0, 0.0) } else { ((sub_sum as f64 / sub_n as f64) / 1000.0, sub_max as f64 / 1000.0) };
 
-        let rpc_k = self.kas_rpc_last_us.load(Relaxed);
-        let rpc_z = self.zkas_rpc_last_us.load(Relaxed);
-        let fmt_rpc = |us: u64| if us == 0 { "-".to_string() } else { format!("{:.1}", us as f64 / 1000.0) };
+        let state = self.zk_state(now_ms, dec, tot);
+        let age_secs = now_ms.saturating_sub(self.last_zkas_tpl_ok_ms.load(Relaxed)) as f64 / 1000.0;
+        let dec_pct = if tot == 0 { 100 } else { (dec * 100) / tot };
 
-        let sub = if sub_n == 0 {
-            "-".to_string()
-        } else {
-            format!("{:.1}/{:.1}ms", (sub_sum as f64 / sub_n as f64) / 1000.0, sub_max as f64 / 1000.0)
-        };
-
-        let zk = self.zk_state_str(now_ms, dec, tot);
-
-        format!("j={:.1}/s | rpc k={} z={} | sub={} | {}", jps, fmt_rpc(rpc_k), fmt_rpc(rpc_z), sub, zk)
-    }
-
-    fn zk_state_str(&self, now_ms: u64, dec_window: u64, tot_window: u64) -> String {
-        match self.zk_state(now_ms, dec_window, tot_window) {
-            ZkState::Off => "zk=OFF".to_string(),
-            state => {
-                let age_ms = now_ms.saturating_sub(self.last_zkas_tpl_ok_ms.load(Relaxed));
-                let pct = if tot_window == 0 { 100 } else { (dec_window * 100) / tot_window };
-                let label = match state {
-                    ZkState::Ok => "ok",
-                    ZkState::Stale => "stale",
-                    ZkState::Plain => "PLAIN",
-                    ZkState::Off => unreachable!(),
-                };
-                format!("zk={} {:.1}s {}%", label, age_ms as f64 / 1000.0, pct)
-            }
+        ObsSnapshot {
+            zk_state: state as u8,
+            zk_age_secs: age_secs,
+            zk_dec_pct: dec_pct,
+            jobs_per_sec: jps,
+            kas_rpc_ms: self.kas_rpc_last_us.load(Relaxed) as f64 / 1000.0, // 0.0 == never observed
+            zkas_rpc_ms: self.zkas_rpc_last_us.load(Relaxed) as f64 / 1000.0, // 0.0 == never observed
+            submit_avg_ms: sub_avg_ms,
+            submit_max_ms: sub_max_ms,
+            submit_n: sub_n,
         }
     }
 
+    /// Drain window counters and render the NODE-line suffix. `elapsed_secs`
+    /// is the wall time since the previous tick. Thin wrapper over
+    /// `snapshot()` + `format_obs_suffix()` — kept for callers/tests that
+    /// want drain-and-render in one call; share_handler's NODE-tick calls
+    /// the two halves separately so the same snapshot can also feed prom.
+    pub fn node_suffix(&self, now_ms: u64, elapsed_secs: f64) -> String {
+        format_obs_suffix(&self.snapshot(now_ms, elapsed_secs))
+    }
+}
+
+/// Pure formatter: renders an `ObsSnapshot` into the NODE-line suffix text.
+/// No atomic access — safe to call as many times as you like on the same
+/// snapshot (unlike `node_suffix`/`snapshot`, which drain on every call).
+pub fn format_obs_suffix(s: &ObsSnapshot) -> String {
+    let fmt_rpc = |ms: f64| if ms == 0.0 { "-".to_string() } else { format!("{:.1}", ms) };
+    let sub = if s.submit_n == 0 { "-".to_string() } else { format!("{:.1}/{:.1}ms", s.submit_avg_ms, s.submit_max_ms) };
+    let zk = match ZkState::from_u8(s.zk_state) {
+        ZkState::Off => "zk=OFF".to_string(),
+        state => {
+            let label = match state {
+                ZkState::Ok => "ok",
+                ZkState::Stale => "stale",
+                ZkState::Plain => "PLAIN",
+                ZkState::Off => unreachable!(),
+            };
+            format!("zk={} {:.1}s {}%", label, s.zk_age_secs, s.zk_dec_pct)
+        }
+    };
+    format!("j={:.1}/s | rpc k={} z={} | sub={} | {}", s.jobs_per_sec, fmt_rpc(s.kas_rpc_ms), fmt_rpc(s.zkas_rpc_ms), sub, zk)
+}
+
+impl MergedObs {
     pub fn zk_state(&self, now_ms: u64, dec_window: u64, tot_window: u64) -> ZkState {
         if !self.merged_enabled.load(Relaxed) {
             return ZkState::Off;
@@ -240,6 +261,38 @@ pub enum ZkState {
     Ok,
     Stale,
     Plain,
+}
+
+impl ZkState {
+    /// Inverse of `as u8` (Off=0 Ok=1 Stale=2 Plain=3, enum declaration
+    /// order). Only ever fed values this module produced via `snapshot()`.
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => ZkState::Off,
+            1 => ZkState::Ok,
+            2 => ZkState::Stale,
+            _ => ZkState::Plain,
+        }
+    }
+}
+
+/// c.8: numeric per-tick observability snapshot for Prometheus export.
+/// `zk_state` uses ZkState's declaration order as its discriminant (0-3).
+/// `kas_rpc_ms`/`zkas_rpc_ms` of exactly 0.0 mean "never observed" (the
+/// recorders floor real latencies at 1µs, so a genuine 0.0 never occurs).
+/// `submit_n == 0` means no shares were submitted this window — avg/max
+/// are meaningless (left 0.0) in that case, check submit_n before using them.
+#[derive(Debug, Clone, Copy)]
+pub struct ObsSnapshot {
+    pub zk_state: u8,
+    pub zk_age_secs: f64,
+    pub zk_dec_pct: u64,
+    pub jobs_per_sec: f64,
+    pub kas_rpc_ms: f64,
+    pub zkas_rpc_ms: f64,
+    pub submit_avg_ms: f64,
+    pub submit_max_ms: f64,
+    pub submit_n: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -438,5 +491,84 @@ mod guard_tests {
         multi_exit(false);
         let after = MERGED_OBS.submit_count_window.load(Relaxed);
         assert_eq!(after - before, 2);
+    }
+}
+
+#[cfg(test)]
+mod c8_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    #[test]
+    fn snapshot_and_node_suffix_drain_exactly_once_not_twice() {
+        // Regression guard for the c.8 double-drain hazard: node_suffix()
+        // must fully consume the window, leaving nothing for a second call.
+        let o = MergedObs::new();
+        o.merged_enabled.store(true, Relaxed);
+        o.record_job_sent();
+        o.record_job_sent();
+        o.record_template(true);
+
+        let first = o.node_suffix(1_000, 1.0);
+        assert!(first.contains("j=2.0/s"), "{first}");
+
+        let second = o.node_suffix(2_000, 1.0);
+        assert!(second.contains("j=0.0/s"), "window not drained: {second}");
+    }
+
+    #[test]
+    fn format_obs_suffix_is_pure_no_drain() {
+        // format_obs_suffix takes a snapshot by value/ref and must not touch
+        // atomics — calling it twice on the same ObsSnapshot is identical.
+        let snap = ObsSnapshot {
+            zk_state: ZkState::Ok as u8,
+            zk_age_secs: 0.3,
+            zk_dec_pct: 100,
+            jobs_per_sec: 3.2,
+            kas_rpc_ms: 1.2,
+            zkas_rpc_ms: 3.4,
+            submit_avg_ms: 0.4,
+            submit_max_ms: 2.1,
+            submit_n: 5,
+        };
+        assert_eq!(format_obs_suffix(&snap), format_obs_suffix(&snap));
+        assert!(format_obs_suffix(&snap).contains("zk=ok 0.3s 100%"));
+    }
+
+    #[test]
+    fn snapshot_matches_node_suffix_rendering() {
+        // The two entry points must describe the same reality: render via
+        // node_suffix, independently render via snapshot+format_obs_suffix
+        // on a twin instance fed identical events, and compare.
+        let a = MergedObs::new();
+        let b = MergedObs::new();
+        for o in [&a, &b] {
+            o.merged_enabled.store(true, Relaxed);
+            o.record_zkas_tpl_ok(900, 500);
+            o.record_template(true);
+            o.record_job_sent();
+            o.record_kas_rpc(800);
+            o.record_submit_us(1_000);
+        }
+        let via_suffix = a.node_suffix(1_000, 1.0);
+        let via_snapshot = format_obs_suffix(&b.snapshot(1_000, 1.0));
+        assert_eq!(via_suffix, via_snapshot);
+    }
+
+    #[test]
+    fn snapshot_zk_state_discriminant_roundtrips_through_from_u8() {
+        for state in [ZkState::Off, ZkState::Ok, ZkState::Stale, ZkState::Plain] {
+            assert_eq!(ZkState::from_u8(state as u8) as u8, state as u8);
+        }
+    }
+
+    #[test]
+    fn snapshot_never_observed_rpc_renders_dash_not_zero() {
+        let o = MergedObs::new();
+        o.merged_enabled.store(true, Relaxed);
+        let snap = o.snapshot(1_000, 1.0);
+        assert_eq!(snap.kas_rpc_ms, 0.0);
+        assert_eq!(snap.zkas_rpc_ms, 0.0);
+        assert!(format_obs_suffix(&snap).contains("rpc k=- z=-"));
     }
 }

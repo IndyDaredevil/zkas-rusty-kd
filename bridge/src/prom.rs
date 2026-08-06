@@ -43,6 +43,17 @@ static BLOCK_COUNTER: OnceLock<CounterVec> = OnceLock::new();
 static BLOCK_ACCEPTED_COUNTER: OnceLock<CounterVec> = OnceLock::new();
 
 static BLOCK_NOT_CONFIRMED_BLUE_COUNTER: OnceLock<CounterVec> = OnceLock::new();
+// c.8: merged-mining series (WS3 increment; mirrors K-side style exactly).
+static ZKAS_BLOCK_COUNTER: OnceLock<CounterVec> = OnceLock::new();
+static DOUBLE_BLOCK_COUNTER: OnceLock<CounterVec> = OnceLock::new();
+static ZKAS_BLOCK_NOT_CONFIRMED_BLUE_COUNTER: OnceLock<CounterVec> = OnceLock::new();
+static MERGED_ZK_STATE_GAUGE: OnceLock<Gauge> = OnceLock::new();
+static MERGED_ZK_TEMPLATE_AGE_GAUGE: OnceLock<Gauge> = OnceLock::new();
+static MERGED_JOBS_PER_SEC_GAUGE: OnceLock<Gauge> = OnceLock::new();
+static MERGED_KAS_RPC_MS_GAUGE: OnceLock<Gauge> = OnceLock::new();
+static MERGED_ZKAS_RPC_MS_GAUGE: OnceLock<Gauge> = OnceLock::new();
+static MERGED_SUBMIT_AVG_MS_GAUGE: OnceLock<Gauge> = OnceLock::new();
+static MERGED_SUBMIT_MAX_MS_GAUGE: OnceLock<Gauge> = OnceLock::new();
 
 /// Block gauge - unique instances per block mined
 static BLOCK_GAUGE: OnceLock<GaugeVec> = OnceLock::new();
@@ -138,6 +149,55 @@ pub fn init_metrics() {
 
     BLOCK_GAUGE.get_or_init(|| {
         register_gauge_vec!("ks_mined_blocks_gauge", "Gauge containing 1 unique instance per block mined", BLOCK_LABELS).unwrap()
+    });
+
+    // c.8: merged-mining series. Worker-labeled counters mirror K's shape
+    // exactly (same WORKER_LABELS) so PromQL joins/rate() comparisons
+    // between K and Z are drop-in. Z counts at blue-confirm (hook E),
+    // matching K's semantics — see merged_obs.rs c.7 decision log.
+    ZKAS_BLOCK_COUNTER.get_or_init(|| {
+        register_counter_vec!("ks_zkas_blocks_mined", "Number of ZKas (merged) blocks confirmed blue, by worker", WORKER_LABELS).unwrap()
+    });
+    DOUBLE_BLOCK_COUNTER.get_or_init(|| {
+        register_counter_vec!(
+            "ks_double_blocks_mined",
+            "Number of shares where BOTH the Kaspa and ZKas legs confirmed blue, by worker",
+            WORKER_LABELS
+        )
+        .unwrap()
+    });
+    ZKAS_BLOCK_NOT_CONFIRMED_BLUE_COUNTER.get_or_init(|| {
+        register_counter_vec!(
+            "ks_zkas_blocks_not_confirmed_blue",
+            "Number of node-accepted ZKas blocks that were not confirmed blue within the confirmation window",
+            WORKER_LABELS
+        )
+        .unwrap()
+    });
+
+    // Bridge-global observability gauges (one process, one merged pipeline —
+    // no worker label needed). zk_state: 0=OFF 1=ok 2=stale 3=PLAIN, matching
+    // merged_obs::ZkState discriminant order.
+    MERGED_ZK_STATE_GAUGE.get_or_init(|| {
+        register_gauge!("ks_merged_zk_state", "ZKas template decoration state: 0=OFF 1=ok 2=stale 3=PLAIN").unwrap()
+    });
+    MERGED_ZK_TEMPLATE_AGE_GAUGE.get_or_init(|| {
+        register_gauge!("ks_merged_zk_template_age_seconds", "Seconds since the last successful ZKas template fetch").unwrap()
+    });
+    MERGED_JOBS_PER_SEC_GAUGE.get_or_init(|| {
+        register_gauge!("ks_merged_jobs_per_sec", "mining.notify dispatch rate (WS2 push-cadence health)").unwrap()
+    });
+    MERGED_KAS_RPC_MS_GAUGE.get_or_init(|| {
+        register_gauge!("ks_merged_kas_rpc_ms", "Last-observed Kaspa getBlockTemplate RPC latency, milliseconds").unwrap()
+    });
+    MERGED_ZKAS_RPC_MS_GAUGE.get_or_init(|| {
+        register_gauge!("ks_merged_zkas_rpc_ms", "Last-observed ZKas template-fetch RPC latency, milliseconds").unwrap()
+    });
+    MERGED_SUBMIT_AVG_MS_GAUGE.get_or_init(|| {
+        register_gauge!("ks_merged_submit_avg_ms", "Average share-submit processing time this window, milliseconds").unwrap()
+    });
+    MERGED_SUBMIT_MAX_MS_GAUGE.get_or_init(|| {
+        register_gauge!("ks_merged_submit_max_ms", "Max share-submit processing time this window, milliseconds").unwrap()
     });
 
     DISCONNECT_COUNTER.get_or_init(|| {
@@ -557,6 +617,61 @@ pub fn record_block_accepted_by_node(worker: &WorkerContext) {
 pub fn record_block_not_confirmed_blue(worker: &WorkerContext) {
     if let Some(counter) = BLOCK_NOT_CONFIRMED_BLUE_COUNTER.get() {
         counter.with_label_values(&worker.labels()).inc();
+    }
+}
+
+// c.8: merged-mining recorders.
+pub fn record_zkas_block_found(worker: &WorkerContext) {
+    if let Some(counter) = ZKAS_BLOCK_COUNTER.get() {
+        counter.with_label_values(&worker.labels()).inc();
+    }
+}
+
+pub fn record_double_block_found(worker: &WorkerContext) {
+    if let Some(counter) = DOUBLE_BLOCK_COUNTER.get() {
+        counter.with_label_values(&worker.labels()).inc();
+    }
+}
+
+pub fn record_zkas_block_not_confirmed_blue(worker: &WorkerContext) {
+    if let Some(counter) = ZKAS_BLOCK_NOT_CONFIRMED_BLUE_COUNTER.get() {
+        counter.with_label_values(&worker.labels()).inc();
+    }
+}
+
+/// One call per NODE-line tick; mirrors merged_obs::MergedObs::node_suffix's
+/// window-drain but writes gauges instead of formatting text. zk_state uses
+/// merged_obs::ZkState's discriminant order (0=OFF 1=ok 2=stale 3=PLAIN).
+#[allow(clippy::too_many_arguments)]
+pub fn record_merged_observability(
+    zk_state: u8,
+    zk_age_secs: f64,
+    jobs_per_sec: f64,
+    kas_rpc_ms: f64,
+    zkas_rpc_ms: f64,
+    submit_avg_ms: f64,
+    submit_max_ms: f64,
+) {
+    if let Some(g) = MERGED_ZK_STATE_GAUGE.get() {
+        g.set(zk_state as f64);
+    }
+    if let Some(g) = MERGED_ZK_TEMPLATE_AGE_GAUGE.get() {
+        g.set(zk_age_secs);
+    }
+    if let Some(g) = MERGED_JOBS_PER_SEC_GAUGE.get() {
+        g.set(jobs_per_sec);
+    }
+    if let Some(g) = MERGED_KAS_RPC_MS_GAUGE.get() {
+        g.set(kas_rpc_ms);
+    }
+    if let Some(g) = MERGED_ZKAS_RPC_MS_GAUGE.get() {
+        g.set(zkas_rpc_ms);
+    }
+    if let Some(g) = MERGED_SUBMIT_AVG_MS_GAUGE.get() {
+        g.set(submit_avg_ms);
+    }
+    if let Some(g) = MERGED_SUBMIT_MAX_MS_GAUGE.get() {
+        g.set(submit_max_ms);
     }
 }
 

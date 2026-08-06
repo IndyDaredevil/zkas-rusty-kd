@@ -858,10 +858,12 @@ impl ShareHandler {
                                                             *stats_z.zkas_blocks_found.lock() += 1;
                                                             *overall_z.zkas_blocks_found.lock() += 1;
                                                             crate::merged_obs::MERGED_OBS.record_zkas_block();
+                                                            crate::prom::record_zkas_block_found(&prom_worker_z); // c.8
                                                             if outcome_z.record_zkas_accept() {
                                                                 *stats_z.double_blocks_found.lock() += 1;
                                                                 *overall_z.double_blocks_found.lock() += 1;
                                                                 crate::merged_obs::MERGED_OBS.record_double_block();
+                                                                crate::prom::record_double_block_found(&prom_worker_z); // c.8
                                                                 info!(
                                                                     "[{}] {} {}",
                                                                     instance_z,
@@ -880,7 +882,7 @@ impl ShareHandler {
                                                         _ => tokio::time::sleep(BLOCK_CONFIRM_RETRY_DELAY).await,
                                                     }
                                                 }
-                                                record_block_not_confirmed_blue(&prom_worker_z);
+                                                crate::prom::record_zkas_block_not_confirmed_blue(&prom_worker_z); // c.8 (was mistagged as K)
                                                 warn!(
                                                     "[{}] {} {}",
                                                     instance_z,
@@ -994,6 +996,7 @@ impl ShareHandler {
                                             *stats.double_blocks_found.lock() += 1;
                                             *overall.double_blocks_found.lock() += 1;
                                             crate::merged_obs::MERGED_OBS.record_double_block();
+                                            crate::prom::record_double_block_found(&prom_worker); // c.8
                                             info!(
                                                 "[{}] {} {}",
                                                 instance_id,
@@ -1615,8 +1618,20 @@ impl ShareHandler {
                 // c.7 observability suffix
                 let obs_elapsed = last_obs_tick.elapsed().as_secs_f64();
                 last_obs_tick = Instant::now();
-                let obs_suffix =
-                    crate::merged_obs::MERGED_OBS.node_suffix(crate::merged_obs::epoch_ms(), obs_elapsed);
+                // c.8: single drain per tick — snapshot() feeds BOTH the
+                // console suffix and Prometheus, so the two can never
+                // disagree and neither starves the other of window data.
+                let obs_snap = crate::merged_obs::MERGED_OBS.snapshot(crate::merged_obs::epoch_ms(), obs_elapsed);
+                crate::prom::record_merged_observability(
+                    obs_snap.zk_state,
+                    obs_snap.zk_age_secs,
+                    obs_snap.jobs_per_sec,
+                    obs_snap.kas_rpc_ms,
+                    obs_snap.zkas_rpc_ms,
+                    obs_snap.submit_avg_ms,
+                    obs_snap.submit_max_ms,
+                );
+                let obs_suffix = crate::merged_obs::format_obs_suffix(&obs_snap);
                 out.push(format!(
                     "[NODE] {}|{} | n={} | v={} | p={} | vd={} | blk={}/{} | d={} | mp={} | tip={} | {}",
                     conn_str, sync_str, net_short, ver, peers, vdaa, blocks, headers, diff, mempool, tip_short, obs_suffix
