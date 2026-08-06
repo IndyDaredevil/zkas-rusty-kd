@@ -82,6 +82,59 @@ function maintainWorkerOrder(existingWorkers, newWorkers) {
   return sorted;
 }
 
+// c.9: Merged Mining panel. Reads the RAW /api/stats response (not the
+// cache-merged `mergedStats`, which only tracks totalBlocks/blocks) — the
+// new fields are per-request truth, no client-side merge logic needed.
+// Defensive throughout: stats.merged is absent on any instance that never
+// enabled merged mode (old fork, plain RKStratum), so the panel just stays
+// hidden — this function must never throw on a plain-mode dashboard.
+function renderMergedPanel(stats) {
+  const panel = document.querySelector('[data-merged-panel]');
+  if (!panel) return;
+
+  const merged = stats && typeof stats === 'object' ? stats.merged : null;
+  if (!merged || typeof merged !== 'object') {
+    panel.style.display = 'none';
+    return;
+  }
+  panel.style.display = '';
+
+  const kEl = document.getElementById('mergedKasBlocks');
+  const zEl = document.getElementById('mergedZkasBlocks');
+  const dEl = document.getElementById('mergedDoubleBlocks');
+  if (kEl) kEl.textContent = stats.totalBlocks ?? '-'; // totalBlocks IS the K-side count already
+  if (zEl) zEl.textContent = stats.totalZkasBlocks ?? '-';
+  if (dEl) dEl.textContent = stats.totalDoubleBlocks ?? '-';
+
+  const stateLabels = { off: 'OFF', ok: 'OK', stale: 'STALE', plain: 'PLAIN' };
+  const stateColors = {
+    off: 'text-gray-400 border-gray-600',
+    ok: 'text-green-400 border-green-700',
+    stale: 'text-yellow-400 border-yellow-700',
+    plain: 'text-red-400 border-red-700',
+  };
+  const state = String(merged.zkState || 'off').toLowerCase();
+  const badge = document.getElementById('mergedZkStateBadge');
+  if (badge) {
+    badge.textContent = stateLabels[state] || state.toUpperCase();
+    badge.className = `text-xs font-medium px-2 py-1 rounded-full border ${stateColors[state] || stateColors.off}`;
+  }
+
+  const fmt1 = (n) => (Number.isFinite(Number(n)) ? Number(n).toFixed(1) : '-');
+  const ageEl = document.getElementById('mergedZkAge');
+  if (ageEl) ageEl.textContent = `${fmt1(merged.zkAgeSeconds)}s`;
+  const jobsEl = document.getElementById('mergedJobsPerSec');
+  if (jobsEl) jobsEl.textContent = `${fmt1(merged.jobsPerSec)}/s`;
+  const rpcEl = document.getElementById('mergedRpc');
+  if (rpcEl) {
+    const k = Number(merged.kasRpcMs) > 0 ? `${fmt1(merged.kasRpcMs)}ms` : '-';
+    const z = Number(merged.zkasRpcMs) > 0 ? `${fmt1(merged.zkasRpcMs)}ms` : '-';
+    rpcEl.textContent = `${k} / ${z}`;
+  }
+  const subEl = document.getElementById('mergedSubmit');
+  if (subEl) subEl.textContent = `${fmt1(merged.submitAvgMs)}ms / ${fmt1(merged.submitMaxMs)}ms`;
+}
+
 function formatHashrateHs(hs) {
   if (!hs || !Number.isFinite(hs)) return '-';
   const units = ['H/s','kH/s','MH/s','GH/s','TH/s','PH/s','EH/s'];
@@ -801,6 +854,7 @@ async function refresh() {
 
     document.getElementById('totalBlocks').textContent = mergedStats.totalBlocks;
     document.getElementById('totalShares').textContent = mergedStats.totalShares;
+    renderMergedPanel(stats); // c.9
     document.getElementById('activeWorkers').textContent = mergedStats.activeWorkers;
     
     // Calculate and display total worker hashrate

@@ -43,6 +43,23 @@ static BLOCK_COUNTER: OnceLock<CounterVec> = OnceLock::new();
 static BLOCK_ACCEPTED_COUNTER: OnceLock<CounterVec> = OnceLock::new();
 
 static BLOCK_NOT_CONFIRMED_BLUE_COUNTER: OnceLock<CounterVec> = OnceLock::new();
+// c.9: cache of the last c.8 observability tick, for the /api/stats JSON
+// endpoint. NOT a source of truth to drain from — read-only snapshot of
+// what record_merged_observability last wrote. None until the RC's first
+// NODE tick (~10s after boot with merged mode enabled).
+static LAST_MERGED_OBS_JSON: OnceLock<parking_lot::Mutex<Option<MergedObsJsonCache>>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug)]
+struct MergedObsJsonCache {
+    zk_state: u8,
+    zk_age_secs: f64,
+    jobs_per_sec: f64,
+    kas_rpc_ms: f64,
+    zkas_rpc_ms: f64,
+    submit_avg_ms: f64,
+    submit_max_ms: f64,
+}
+
 // c.8: merged-mining series (WS3 increment; mirrors K-side style exactly).
 static ZKAS_BLOCK_COUNTER: OnceLock<CounterVec> = OnceLock::new();
 static DOUBLE_BLOCK_COUNTER: OnceLock<CounterVec> = OnceLock::new();
@@ -673,6 +690,15 @@ pub fn record_merged_observability(
     if let Some(g) = MERGED_SUBMIT_MAX_MS_GAUGE.get() {
         g.set(submit_max_ms);
     }
+    *LAST_MERGED_OBS_JSON.get_or_init(|| parking_lot::Mutex::new(None)).lock() = Some(MergedObsJsonCache {
+        zk_state,
+        zk_age_secs,
+        jobs_per_sec,
+        kas_rpc_ms,
+        zkas_rpc_ms,
+        submit_avg_ms,
+        submit_max_ms,
+    });
 }
 
 /// Record a valid share found
@@ -986,6 +1012,24 @@ struct StatsResponse {
     workers: Vec<WorkerInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bridgeUptime: Option<u64>, // Bridge uptime in seconds
+    // c.9: merged-mining aggregates. totals are 0 (not omitted) on
+    // non-merged instances — matches WorkerInfo's zero-not-absent choice.
+    totalZkasBlocks: u64,
+    totalDoubleBlocks: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merged: Option<MergedStatsJson>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MergedStatsJson {
+    // "off" | "ok" | "stale" | "plain" — mirrors merged_obs::ZkState.
+    zkState: String,
+    zkAgeSeconds: f64,
+    jobsPerSec: f64,
+    kasRpcMs: f64,
+    zkasRpcMs: f64,
+    submitAvgMs: f64,
+    submitMaxMs: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1009,6 +1053,10 @@ struct WorkerInfo {
     stale: u64,
     invalid: u64,
     blocks: u64,
+    #[serde(rename = "zkasBlocks")]
+    zkas_blocks: u64, // c.9
+    #[serde(rename = "doubleBlocks")]
+    double_blocks: u64, // c.9
     #[serde(skip_serializing_if = "Option::is_none", rename = "lastSeen")]
     last_seen: Option<u64>, // Unix timestamp in seconds
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1046,6 +1094,8 @@ fn new_worker_info(instance: String, worker: String, wallet: String) -> WorkerIn
         stale: 0,
         invalid: 0,
         blocks: 0,
+        zkas_blocks: 0, // c.9
+        double_blocks: 0, // c.9
         last_seen: None,
         status: None,
         current_difficulty: None,
@@ -1076,6 +1126,23 @@ async fn get_stats_json_filtered(instance_id: Option<&str>) -> StatsResponse {
         blocks: Vec::new(),
         workers: Vec::new(),
         bridgeUptime: None,
+        totalZkasBlocks: 0, // c.9
+        totalDoubleBlocks: 0, // c.9
+        merged: LAST_MERGED_OBS_JSON.get().and_then(|m| *m.lock()).map(|c| MergedStatsJson {
+            zkState: match c.zk_state {
+                0 => "off",
+                1 => "ok",
+                2 => "stale",
+                _ => "plain",
+            }
+            .to_string(),
+            zkAgeSeconds: c.zk_age_secs,
+            jobsPerSec: c.jobs_per_sec,
+            kasRpcMs: c.kas_rpc_ms,
+            zkasRpcMs: c.zkas_rpc_ms,
+            submitAvgMs: c.submit_avg_ms,
+            submitMaxMs: c.submit_max_ms,
+        }), // c.9
     };
 
     let mut worker_stats: HashMap<String, WorkerInfo> = HashMap::new();
@@ -1228,6 +1295,33 @@ async fn get_stats_json_filtered(instance_id: Option<&str>) -> StatsResponse {
                     let entry = worker_stats.entry(key.clone()).or_insert_with(|| new_worker_info(instance, worker_key, wallet));
                     // Aggregate across multiple time series for the same (instance,worker,wallet)
                     entry.blocks = entry.blocks.saturating_add(count);
+                }
+            }
+        }
+
+        // c.9: Parse zKAS + double block counters — exact mirror of
+        // ks_blocks_mined above (same key scheme, same aggregation).
+        if name == "ks_zkas_blocks_mined" {
+            for metric in family.get_metric() {
+                let (instance, worker_key, wallet) = parse_worker_labels(metric.get_label());
+                if !worker_key.is_empty() {
+                    let key = format!("{}:{}:{}", instance, worker_key, wallet);
+                    let count = metric.get_counter().value() as u64;
+                    let entry = worker_stats.entry(key.clone()).or_insert_with(|| new_worker_info(instance, worker_key, wallet));
+                    entry.zkas_blocks = entry.zkas_blocks.saturating_add(count);
+                    stats.totalZkasBlocks = stats.totalZkasBlocks.saturating_add(count);
+                }
+            }
+        }
+        if name == "ks_double_blocks_mined" {
+            for metric in family.get_metric() {
+                let (instance, worker_key, wallet) = parse_worker_labels(metric.get_label());
+                if !worker_key.is_empty() {
+                    let key = format!("{}:{}:{}", instance, worker_key, wallet);
+                    let count = metric.get_counter().value() as u64;
+                    let entry = worker_stats.entry(key.clone()).or_insert_with(|| new_worker_info(instance, worker_key, wallet));
+                    entry.double_blocks = entry.double_blocks.saturating_add(count);
+                    stats.totalDoubleBlocks = stats.totalDoubleBlocks.saturating_add(count);
                 }
             }
         }
