@@ -391,8 +391,6 @@ async fn main() -> Result<(), anyhow::Error> {
         let kaspa_api_clone = Arc::clone(&kaspa_api);
         let instance_shutdown_rx = shutdown_rx.clone();
 
-        let is_first_instance = idx == 0;
-
         let instance_id_str = LogColors::format_instance_id(instance_num);
 
         if let Some(ref prom_port) = instance.prom_port {
@@ -433,7 +431,13 @@ async fn main() -> Result<(), anyhow::Error> {
             listen_and_serve_with_shutdown(
                 bridge_config,
                 Arc::clone(&kaspa_api_clone),
-                if is_first_instance { Some(kaspa_api_clone) } else { None },
+                // Every instance gets the concrete API: each takes an
+                // independent NotificationHub subscription, so all instances
+                // run on real node-push notifications. (Previously gated to
+                // the first instance because the old take()-once receiver
+                // could only serve a single consumer, leaving instances 2..N
+                // on pure block_wait_time polling.)
+                Some(kaspa_api_clone),
                 instance_shutdown_rx,
             )
             .await
