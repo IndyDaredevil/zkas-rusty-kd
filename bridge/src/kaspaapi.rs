@@ -578,6 +578,11 @@ impl KaspaApi {
     }
 
     /// Wait for node to sync
+    /// Retained though currently uncalled: the listener loop's vestigial
+    /// per-iteration sync probe was removed in the NotificationHub refactor,
+    /// but this is the natural health-probe primitive for the WS4 mode
+    /// machine (MERGED/KAS-ONLY/ZKAS-ONLY transitions), which lands next.
+    #[allow(dead_code)]
     async fn wait_for_sync(&self) -> Result<()> {
         loop {
             match self.client.get_sync_status().await {
