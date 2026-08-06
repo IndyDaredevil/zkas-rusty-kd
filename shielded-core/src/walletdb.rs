@@ -170,6 +170,35 @@ impl Preview {
     }
 }
 
+/// Where a scan's CPU actually goes, accumulated across ingest calls.
+///
+/// A wallet scan has exactly two heavy parts and nobody had ever measured their
+/// ratio: **trial decryption** (one Pallas variable-base scalar multiplication per
+/// action per ivk — the cost of privacy, and irreducible per (wallet, action) pair)
+/// and **tree append** (one Sinsemilla combine per leaf, amortized — the cost of
+/// being able to witness later). They call for completely different remedies, so
+/// guessing which dominates is how optimization effort gets spent in the wrong place.
+///
+/// Counters only; reading them is free and they are never persisted.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct ScanCost {
+    /// Nanoseconds inside `scan_compact_prepared` / `scan_bundle_prepared`.
+    pub decrypt_ns: u128,
+    /// Nanoseconds inside `append_leaf` — the Sinsemilla tree work.
+    pub tree_ns: u128,
+    /// Actions offered to trial decryption.
+    pub actions: u64,
+    /// Leaves appended to the commitment tree.
+    pub leaves: u64,
+}
+
+impl ScanCost {
+    /// Both halves together.
+    pub fn total_ns(&self) -> u128 {
+        self.decrypt_ns + self.tree_ns
+    }
+}
+
 /// A wallet's running view of the global note-commitment tree: it walks the
 /// canonical commitment stream, recognises its own notes, and keeps a spendable
 /// witness for each.
@@ -275,6 +304,8 @@ pub struct WalletDb {
     /// step by `append_leaf`; built (and gated) by `build_subtree_cache`. Inactive until
     /// built, and every consumer falls back to the replay when it cannot serve.
     subtree: SubtreeCache,
+    /// Scan cost counters — see [`ScanCost`]. Not persisted; reset on load.
+    scan_cost: ScanCost,
 }
 
 /// How many owned notes keep a live witness. Beyond this, advancing every witness on
@@ -482,6 +513,7 @@ impl WalletDb {
             pending_spends: Vec::new(),
             last_daa: 0,
             subtree: SubtreeCache::default(),
+            scan_cost: ScanCost::default(),
         })
     }
 
@@ -522,6 +554,7 @@ impl WalletDb {
             pending_spends: Vec::new(),
             last_daa: 0,
             subtree: SubtreeCache::default(),
+            scan_cost: ScanCost::default(),
         })
     }
 
@@ -805,7 +838,10 @@ impl WalletDb {
                 continue;
             }
             let spent: u64 = records.iter().filter_map(|a| self.owned_note_value(&a.nullifier)).sum();
+            let t_dec = std::time::Instant::now();
             let received = scan_compact_prepared(&self.prepared_ivk, records);
+            self.scan_cost.decrypt_ns += t_dec.elapsed().as_nanos();
+            self.scan_cost.actions += records.len() as u64;
             for (i, rec) in records.iter().enumerate() {
                 self.notes.retain(|n| n.nullifier != rec.nullifier);
                 self.pending_spends.retain(|p| p.note.nullifier != rec.nullifier);
@@ -1455,6 +1491,10 @@ impl WalletDb {
     }
 
     fn append_leaf(&mut self, cmx: ExtractedNoteCommitment, owned: Option<Note>) {
+        // ~25 ns of clock against ~150 us of Sinsemilla: under 0.02% overhead, and it
+        // is the only place every ingest path (full, compact, precomputed) converges.
+        let t_leaf = std::time::Instant::now();
+        self.scan_cost.leaves += 1;
         let leaf = MerkleHashOrchard::from_cmx(&cmx);
         self.leaves.push(leaf.to_bytes());
         // Keep an already-materialised cache in step rather than invalidating it — a
@@ -1475,6 +1515,7 @@ impl WalletDb {
             self.notes.push(OwnedNote { note, position: self.size, nullifier });
         }
         self.size += 1;
+        self.scan_cost.tree_ns += t_leaf.elapsed().as_nanos();
     }
 
     /// Build a membership witness for the owned note at `position`, as an Orchard
@@ -1614,6 +1655,11 @@ impl WalletDb {
         let ok = self.root_from(&c, self.size).is_some_and(|r| r == self.tree.root());
         self.subtree = if ok { c } else { reject };
         ok
+    }
+
+    /// Where this wallet's scan CPU has gone so far — see [`ScanCost`].
+    pub fn scan_cost(&self) -> ScanCost {
+        self.scan_cost
     }
 
     /// Whether the cache can serve witnesses at `matured` (used by callers to decide

@@ -891,6 +891,14 @@ const SUBTREE_CACHE_MIN_SPAN: u64 = 20_000;
 /// changes only how often the lock is handed back, never how much work is done. 250 ms
 /// is well under the point a user notices a stalled request, and long enough that the
 /// per-slice bookkeeping stays negligible against ~1024 Sinsemilla combines per check.
+/// Leaves of scanning between scan-cost reports.
+///
+/// Keyed on LEAVES, not actions: on this chain almost every leaf is a coinbase note
+/// (~1.98 leaves per block = one reward note plus the dev-fee note), and coinbase
+/// notes are recovered by an address comparison, never trial-decrypted. An
+/// action-keyed trigger would essentially never fire.
+const SCAN_COST_REPORT_LEAVES: u64 = 20_000;
+
 const SUBTREE_BUILD_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Free memory the daemon refuses to build a subtree cache below.
@@ -1745,6 +1753,9 @@ struct WalletEntry {
     /// Last logged completion percentage of a sliced subtree-cache build, so progress is
     /// reported once per 10% instead of on every 250 ms slice.
     subtree_build_pct_logged: u64,
+    /// Leaf count at the last scan-cost report, so it is emitted per unit of WORK
+    /// rather than per tick (a tick can be a whole chunk or almost nothing).
+    scan_cost_reported: u64,
     /// Whether this wallet has already taken its decision on the subtree cache (built
     /// it, or been turned away by the daemon-wide budget). Stops an O(chain) build —
     /// or a budget probe — from being re-attempted on every sync tick.
@@ -1841,6 +1852,7 @@ impl WalletEntry {
             witnesses_warm: false,
             warm_via_subtree_cache: false,
             subtree_build_pct_logged: 0,
+            scan_cost_reported: 0,
             subtree_low_mem_logged: false,
             force_checkpoint: false,
             blind_below: 0,
@@ -3446,6 +3458,32 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     let was_caught_up = e.caught_up;
     e.caught_up = false;
     e.sync_chunk(&state.sync_client, &state.page_cache, &state.warm_gate, state.resources.subtree_free_floor_mb).await;
+    // Report where scan CPU actually goes, once per SCAN_COST_REPORT_ACTIONS of work.
+    //
+    // A scan has two heavy halves — trial decryption (one Pallas scalar mul per action
+    // per ivk) and tree append (one Sinsemilla combine per leaf) — and they need
+    // opposite remedies: decryption is per (wallet, action) and parallelises across
+    // wallets or hardware, while tree work is per leaf and is IDENTICAL for every
+    // wallet, so it wants sharing, not more cores. Until now nothing measured the
+    // ratio, which makes any optimization decision a guess.
+    {
+        let c = e.db.scan_cost();
+        if c.leaves >= e.scan_cost_reported + SCAN_COST_REPORT_LEAVES {
+            e.scan_cost_reported = c.leaves;
+            let total = c.total_ns().max(1);
+            log::info!(
+                "scan cost so far: decrypt {} ms ({}%) over {} actions = {:.1} us/action | tree {} ms ({}%) over {} leaves = {:.1} us/leaf",
+                c.decrypt_ns / 1_000_000,
+                c.decrypt_ns * 100 / total,
+                c.actions,
+                c.decrypt_ns as f64 / 1000.0 / c.actions.max(1) as f64,
+                c.tree_ns / 1_000_000,
+                c.tree_ns * 100 / total,
+                c.leaves,
+                c.tree_ns as f64 / 1000.0 / c.leaves.max(1) as f64,
+            );
+        }
+    }
     // NB: the eager witness pre-advance and base compaction live in `sync_chunk`'s
     // `caught_up` tail, THROTTLED to one bounded step per `WITNESS_ADVANCE_INTERVAL` per
     // wallet (an unthrottled advance on the 10 ms sync spin pinned every core, observed
