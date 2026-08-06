@@ -1742,6 +1742,9 @@ struct WalletEntry {
     /// cache is ever rejected or invalidated, without mistaking a genuinely warm wallet
     /// for one that only looked warm.
     warm_via_subtree_cache: bool,
+    /// Last logged completion percentage of a sliced subtree-cache build, so progress is
+    /// reported once per 10% instead of on every 250 ms slice.
+    subtree_build_pct_logged: u64,
     /// Whether this wallet has already taken its decision on the subtree cache (built
     /// it, or been turned away by the daemon-wide budget). Stops an O(chain) build —
     /// or a budget probe — from being re-attempted on every sync tick.
@@ -1837,6 +1840,7 @@ impl WalletEntry {
             last_witness_advance: None,
             witnesses_warm: false,
             warm_via_subtree_cache: false,
+            subtree_build_pct_logged: 0,
             subtree_low_mem_logged: false,
             force_checkpoint: false,
             blind_below: 0,
@@ -2214,14 +2218,17 @@ impl WalletEntry {
                                 );
                             } else if !built {
                                 // Sliced, not abandoned: the prefix is kept and the next
-                                // pass resumes from it. Reported as progress, because
-                                // "stood down" reads like nothing happened.
-                                log::debug!(
-                                    "subtree cache {}/{} leaves after a {:.0?} slice — resumes next pass",
-                                    self.db.subtree_build_upto(),
-                                    matured,
-                                    t.elapsed()
-                                );
+                                // pass resumes from it. Report at INFO on each 10% of the
+                                // span — a sliced build can take many minutes of wall time,
+                                // and at debug level it is completely invisible while it
+                                // happens, which is how "is it working or wedged?" becomes
+                                // unanswerable without attaching to the process.
+                                let done = self.db.subtree_build_upto().saturating_sub(self.db.base_size());
+                                let pct = if span > 0 { done * 100 / span } else { 100 };
+                                if pct / 10 != self.subtree_build_pct_logged / 10 {
+                                    self.subtree_build_pct_logged = pct;
+                                    log::info!("subtree cache building: {done}/{span} leaves ({pct}%) — resumes next pass");
+                                }
                             } else if self.db.subtree_cache_ready(matured) {
                                 // v8 checkpoints persist this verified index. Flush it
                                 // immediately: waiting for the ordinary 1,000-block
@@ -2266,20 +2273,43 @@ impl WalletEntry {
                 // cache declines and the wallet would silently be left with neither a
                 // cache nor a witness set.
                 let cache_serves = self.db.subtree_cache_ready(matured) && matured > self.db.base_size();
-                if cache_serves && !self.witnesses_warm {
+                // A wallet whose cache is still building must not ALSO run the warm. Both
+                // are one-time heavy work aiming at the same outcome — a fast spend — and
+                // the cache is the one that achieves it, in a fraction of the work. Left
+                // unguarded this tick spends 250 ms building the cache and then 4 s
+                // climbing witnesses the cache is about to make redundant, which is the
+                // treadmill this whole change removes, reintroduced at 94% strength.
+                //
+                // `!subtree_cache_failed()` matters: a rejected cache never becomes ready,
+                // so without it `needs_cache` would stay true forever and suppress the warm
+                // permanently, leaving the wallet with no fast path at all.
+                let cache_pending = needs_cache && !self.db.subtree_cache_failed();
+                if cache_serves {
+                    if !self.witnesses_warm {
+                        self.force_checkpoint = true;
+                        log::info!(
+                            "wallet spend-ready from the subtree cache (notes={note_count}, matured={matured}) — skipping a {}-leaf witness climb it would never read",
+                            matured.saturating_sub(self.db.witnessed_upto())
+                        );
+                    }
                     self.witnesses_warm = true;
                     self.warm_via_subtree_cache = true;
-                    self.force_checkpoint = true;
-                    log::info!(
-                        "wallet spend-ready from the subtree cache (notes={note_count}, matured={matured}) — skipping a {}-leaf witness climb it would never read",
-                        matured.saturating_sub(self.db.witnessed_upto())
-                    );
-                } else if !cache_serves && self.warm_via_subtree_cache {
-                    // The cache stopped covering us (rejected by its root gate, or reset
-                    // by a rebuild). Fall back to actually maintaining witnesses.
+                } else if cache_pending {
+                    // Cache still building: hold the warm off rather than race it. The
+                    // latch is reused only to skip the phases — this is "deferred", not a
+                    // claim the witness set reached the anchor, and nothing reads it as one.
+                    self.witnesses_warm = true;
+                    self.warm_via_subtree_cache = true;
+                } else if self.warm_via_subtree_cache {
+                    // Neither serving nor pending — the cache was rejected by its root gate
+                    // or invalidated by a rebuild, and will not come back. Resume actually
+                    // maintaining witnesses; the climb is slow but it is the only path left.
                     self.warm_via_subtree_cache = false;
                     self.witnesses_warm = false;
-                    log::warn!("subtree cache no longer covers matured={matured}; resuming the witness climb for this wallet");
+                    log::warn!(
+                        "subtree cache unavailable at matured={matured} (failed={}); resuming the witness climb for this wallet",
+                        self.db.subtree_cache_failed()
+                    );
                 }
                 // Take a warm permit, or leave the heavy catch-up to another tick. This is
                 // `try_acquire`, not `acquire`: a wallet that can't warm right now should
@@ -2431,12 +2461,6 @@ impl WalletEntry {
     fn matured_leaves(&self) -> Option<u64> {
         let cutoff_blue = self.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
         self.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, leaves)| leaves)
-    }
-
-    fn advance_spend_witnesses(&mut self) {
-        if let Some(matured) = self.matured_leaves() {
-            self.db.advance_witnesses(matured);
-        }
     }
 
     /// Send-time witness top-up, **bounded for every wallet**.
