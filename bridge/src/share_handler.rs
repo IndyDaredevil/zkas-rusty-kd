@@ -657,6 +657,16 @@ impl ShareHandler {
                 } else {
                     0.0
                 };
+                // c.12: near-miss tracking — session-best only, real diff
+                // ratios make per-share threshold logging pointless (see
+                // merged_obs.rs's near-miss doc comment for the math).
+                if crate::merged_obs::MERGED_OBS.record_near_miss_kas(ratio) {
+                    info!(
+                        "{} {}",
+                        LogColors::block("[NEAR-MISS]"),
+                        format!("New KAS session-best: {:.2e}% of target (worker {})", ratio, ctx.effective_worker_name())
+                    );
+                }
                 debug!(
                     "{} {} {}",
                     LogColors::validation("[VALIDATION]"),
@@ -678,6 +688,7 @@ impl ShareHandler {
             // None and behavior is byte-identical to single-chain RKStratum.
             let zkas_target = kaspa_api.merged_fc_target(&current_job.block);
             let clears_zkas = zkas_target.as_ref().is_some_and(|t| pow_value <= *t);
+<<<<<<< HEAD
             if let Some(zt) = zkas_target.as_ref() {
                 // V2 gate evidence: the dual gate reading BOTH chains off one
                 // job — kaspa target from the parent's own bits, zkas target
@@ -686,6 +697,29 @@ impl ShareHandler {
                     "[MERGED] dual-target: zkas_target={:x} kaspa(network)_target={:x} clears_zkas={} meets_kaspa={}",
                     zt, network_target, clears_zkas, meets_network_target
                 );
+=======
+            // c.12: zKAS-leg near-miss — this target had ZERO near-miss
+            // visibility before c.12 (K's ratio math existed, Z's never
+            // did). Same session-best-only design, same reasoning.
+            if let Some(zt) = zkas_target.as_ref()
+                && !zt.is_zero()
+                && !pow_value.is_zero()
+            {
+                let target_f64 = zt.to_f64().unwrap_or(0.0);
+                let pow_f64 = pow_value.to_f64().unwrap_or(1.0);
+                let zkas_ratio = if pow_f64 > 0.0 { (target_f64 / pow_f64) * 100.0 } else { 0.0 };
+                if crate::merged_obs::MERGED_OBS.record_near_miss_zkas(zkas_ratio) {
+                    info!(
+                        "{} {}",
+                        LogColors::block("[NEAR-MISS]"),
+                        format!(
+                            "New ZKAS session-best: {:.2e}% of target (worker {})",
+                            zkas_ratio,
+                            ctx.effective_worker_name()
+                        )
+                    );
+                }
+>>>>>>> 7af739e (share_handler+merged_obs: near-miss telemetry, both legs (WS3 c.12))
             }
             if meets_network_target || clears_zkas {
                 // c.7 hook D: per-share double correlator, cloned into both
@@ -1641,6 +1675,8 @@ impl ShareHandler {
                     obs_snap.zkas_rpc_ms,
                     obs_snap.submit_avg_ms,
                     obs_snap.submit_max_ms,
+                    obs_snap.kas_near_miss_pct, // c.12
+                    obs_snap.zkas_near_miss_pct, // c.12
                 );
                 let obs_suffix = crate::merged_obs::format_obs_suffix(&obs_snap);
                 out.push(format!(

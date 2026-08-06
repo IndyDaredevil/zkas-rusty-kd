@@ -83,6 +83,17 @@ pub struct MergedObs {
     pub submit_count_window: AtomicU64,
 
     // #5 last-observed RPC latency (µs); 0 == never observed
+    // #6 near-miss tracking (c.12). Session-best (never drained, unlike the
+    // window counters above) — real difficulty ratios mean a fixed percent
+    // threshold would essentially never fire (network/share diff ratios put
+    // "close" shares in the 1e-9 % range), so this tracks the closest any
+    // share has ever come this session instead. f64 stored as raw bits: for
+    // FINITE NON-NEGATIVE floats only, unsigned-integer bit-pattern order
+    // matches numeric order (IEEE 754), so fetch_max on the bits is a valid
+    // lock-free running-max — callers MUST clamp negative/NaN before storing
+    // (both recorders below do this).
+    pub kas_near_miss_pct_bits: AtomicU64,
+    pub zkas_near_miss_pct_bits: AtomicU64,
     pub kas_rpc_last_us: AtomicU64,
     pub zkas_rpc_last_us: AtomicU64,
 }
@@ -124,6 +135,8 @@ impl MergedObs {
             submit_us_sum: AtomicU64::new(0),
             submit_us_max: AtomicU64::new(0),
             submit_count_window: AtomicU64::new(0),
+            kas_near_miss_pct_bits: AtomicU64::new(0),
+            zkas_near_miss_pct_bits: AtomicU64::new(0),
             kas_rpc_last_us: AtomicU64::new(0),
             zkas_rpc_last_us: AtomicU64::new(0),
         }
@@ -151,6 +164,34 @@ impl MergedObs {
 
     pub fn record_kas_rpc(&self, rpc_us: u64) {
         self.kas_rpc_last_us.store(rpc_us.max(1), Relaxed);
+    }
+
+    /// c.12: record a share's closeness to the KAS network target (percent
+    /// of target reached; higher = closer, 100.0 = would-be block). Returns
+    /// true iff this is a NEW session-best — callers use that to decide
+    /// whether to announce it. `pct` must be finite and non-negative
+    /// (NaN/negative are clamped to 0.0, which can never set a record).
+    pub fn record_near_miss_kas(&self, pct: f64) -> bool {
+        Self::record_near_miss(&self.kas_near_miss_pct_bits, pct)
+    }
+
+    pub fn record_near_miss_zkas(&self, pct: f64) -> bool {
+        Self::record_near_miss(&self.zkas_near_miss_pct_bits, pct)
+    }
+
+    fn record_near_miss(cell: &AtomicU64, pct: f64) -> bool {
+        let pct = if pct.is_finite() && pct >= 0.0 { pct } else { 0.0 };
+        let new_bits = pct.to_bits();
+        let mut current = cell.load(Relaxed);
+        loop {
+            if f64::from_bits(current) >= pct {
+                return false; // not a new best
+            }
+            match cell.compare_exchange_weak(current, new_bits, Relaxed, Relaxed) {
+                Ok(_) => return true,
+                Err(actual) => current = actual, // another thread updated first — retry
+            }
+        }
     }
 
     pub fn record_submit_us(&self, us: u64) {
@@ -186,7 +227,17 @@ impl MergedObs {
             if sub_n == 0 { (0.0, 0.0) } else { ((sub_sum as f64 / sub_n as f64) / 1000.0, sub_max as f64 / 1000.0) };
 
         let state = self.zk_state(now_ms, dec, tot);
-        let age_secs = now_ms.saturating_sub(self.last_zkas_tpl_ok_ms.load(Relaxed)) as f64 / 1000.0;
+        // c.11 fix: when last_ok is genuinely 0 (never fetched since boot),
+        // now_ms.saturating_sub(0) == now_ms == the current epoch in ms —
+        // rendering as a multi-billion-second "age" instead of the intended
+        // duration. 0.0 is already this module's sentinel for "never
+        // observed" (see kas_rpc_ms/zkas_rpc_ms above); use it here too so
+        // the console/API never shows a raw Unix timestamp in a duration
+        // field. zk_state is already correctly Plain in this case via the
+        // last_ok==0 special case in zk_state() below — this only fixes the
+        // age NUMBER, not the state classification, which was never wrong.
+        let last_ok = self.last_zkas_tpl_ok_ms.load(Relaxed);
+        let age_secs = if last_ok == 0 { 0.0 } else { now_ms.saturating_sub(last_ok) as f64 / 1000.0 };
         let dec_pct = if tot == 0 { 100 } else { (dec * 100) / tot };
 
         ObsSnapshot {
@@ -199,6 +250,8 @@ impl MergedObs {
             submit_avg_ms: sub_avg_ms,
             submit_max_ms: sub_max_ms,
             submit_n: sub_n,
+            kas_near_miss_pct: f64::from_bits(self.kas_near_miss_pct_bits.load(Relaxed)),
+            zkas_near_miss_pct: f64::from_bits(self.zkas_near_miss_pct_bits.load(Relaxed)),
         }
     }
 
@@ -230,7 +283,20 @@ pub fn format_obs_suffix(s: &ObsSnapshot) -> String {
             format!("zk={} {:.1}s {}%", label, s.zk_age_secs, s.zk_dec_pct)
         }
     };
-    format!("j={:.1}/s | rpc k={} z={} | sub={} | {}", s.jobs_per_sec, fmt_rpc(s.kas_rpc_ms), fmt_rpc(s.zkas_rpc_ms), sub, zk)
+    // c.12: scientific notation is not optional here — real network/share
+    // difficulty ratios put "close" shares in the ~1e-9 % range; {:.1}%
+    // would render 0.0% for the entire session and look broken/silent.
+    let fmt_near = |pct: f64| if pct <= 0.0 { "-".to_string() } else { format!("{:.2e}%", pct) };
+    format!(
+        "j={:.1}/s | rpc k={} z={} | sub={} | near k={} z={} | {}",
+        s.jobs_per_sec,
+        fmt_rpc(s.kas_rpc_ms),
+        fmt_rpc(s.zkas_rpc_ms),
+        sub,
+        fmt_near(s.kas_near_miss_pct),
+        fmt_near(s.zkas_near_miss_pct),
+        zk
+    )
 }
 
 impl MergedObs {
@@ -293,6 +359,11 @@ pub struct ObsSnapshot {
     pub submit_avg_ms: f64,
     pub submit_max_ms: f64,
     pub submit_n: u64,
+    // c.12: session-best (all-time this process), NOT drained per-tick
+    // unlike everything else in this struct — a running record, not a
+    // window sample.
+    pub kas_near_miss_pct: f64,
+    pub zkas_near_miss_pct: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -530,9 +601,12 @@ mod c8_tests {
             submit_avg_ms: 0.4,
             submit_max_ms: 2.1,
             submit_n: 5,
+            kas_near_miss_pct: 1.5e-9,
+            zkas_near_miss_pct: 0.0,
         };
         assert_eq!(format_obs_suffix(&snap), format_obs_suffix(&snap));
         assert!(format_obs_suffix(&snap).contains("zk=ok 0.3s 100%"));
+        assert!(format_obs_suffix(&snap).contains("near k=1.50e-9% z=-"));
     }
 
     #[test]
@@ -570,5 +644,117 @@ mod c8_tests {
         assert_eq!(snap.kas_rpc_ms, 0.0);
         assert_eq!(snap.zkas_rpc_ms, 0.0);
         assert!(format_obs_suffix(&snap).contains("rpc k=- z=-"));
+    }
+}
+
+#[cfg(test)]
+mod c11_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    #[test]
+    fn zk_age_never_fetched_renders_zero_not_raw_epoch() {
+        // Regression test for the bug caught on a real 2-instance RC boot:
+        // when last_zkas_tpl_ok_ms is genuinely 0 (never fetched since
+        // boot), age must render as 0.0s, never as the current Unix epoch
+        // in seconds (a multi-billion-second "age" that leaked into both
+        // the console suffix and /api/stats' merged.zkAgeSeconds).
+        let o = MergedObs::new();
+        o.merged_enabled.store(true, Relaxed);
+        // now_ms deliberately a large real-world-scale epoch, matching
+        // what bit us live (~1.786e12 ms).
+        let now_ms = 1_786_000_230_400u64;
+        let snap = o.snapshot(now_ms, 1.0);
+        assert_eq!(snap.zk_state, ZkState::Plain as u8);
+        assert_eq!(snap.zk_age_secs, 0.0, "never-fetched age must be the 0.0 sentinel, not the raw epoch");
+
+        let suffix = format_obs_suffix(&snap);
+        assert!(suffix.contains("zk=PLAIN 0.0s"), "{suffix}");
+        assert!(!suffix.contains("1786000230"), "raw epoch leaked into rendered suffix: {suffix}");
+    }
+
+    #[test]
+    fn zk_age_after_real_fetch_still_computes_correctly() {
+        // Guard against overcorrecting: once a real fetch has happened,
+        // age must still be the genuine elapsed duration, not clamped to 0.
+        let o = MergedObs::new();
+        o.merged_enabled.store(true, Relaxed);
+        o.record_zkas_tpl_ok(10_000, 500);
+        let snap = o.snapshot(12_500, 1.0);
+        assert_eq!(snap.zk_age_secs, 2.5);
+    }
+}
+
+#[cfg(test)]
+mod c12_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn first_share_always_sets_a_record() {
+        let o = MergedObs::new();
+        assert!(o.record_near_miss_kas(0.001));
+    }
+
+    #[test]
+    fn only_improvements_set_a_new_record() {
+        let o = MergedObs::new();
+        assert!(o.record_near_miss_kas(1.0));
+        assert!(!o.record_near_miss_kas(0.5), "worse share must not overwrite a better record");
+        assert!(!o.record_near_miss_kas(1.0), "an exact tie is not an improvement");
+        assert!(o.record_near_miss_kas(1.0001), "any improvement, however small, is a new record");
+    }
+
+    #[test]
+    fn legs_are_independent() {
+        let o = MergedObs::new();
+        assert!(o.record_near_miss_kas(5.0));
+        assert!(o.record_near_miss_zkas(5.0), "K's record must not block Z's independent record");
+    }
+
+    #[test]
+    fn negative_and_nan_are_clamped_and_never_record() {
+        let o = MergedObs::new();
+        assert!(!o.record_near_miss_kas(-1.0));
+        assert!(!o.record_near_miss_kas(f64::NAN));
+        assert_eq!(o.snapshot(1_000, 1.0).kas_near_miss_pct, 0.0);
+    }
+
+    #[test]
+    fn near_miss_survives_across_snapshot_calls_unlike_window_counters() {
+        // The whole point: session-best must NOT drain like jobs/submit/etc.
+        let o = MergedObs::new();
+        o.record_near_miss_kas(2.5);
+        let _ = o.snapshot(1_000, 1.0);
+        let second = o.snapshot(2_000, 1.0);
+        assert_eq!(second.kas_near_miss_pct, 2.5, "near-miss record must persist across ticks");
+    }
+
+    #[test]
+    fn concurrent_updates_converge_on_the_true_maximum() {
+        // 8 threads racing distinct values; the survivor must be the max,
+        // and exactly the max thread's call must report `true`.
+        let o = Arc::new(MergedObs::new());
+        let values = [0.1, 4.4, 2.2, 9.9, 3.3, 7.7, 1.1, 9.9]; // two ties at the max
+        let handles: Vec<_> = values
+            .iter()
+            .map(|&v| {
+                let o = Arc::clone(&o);
+                std::thread::spawn(move || o.record_near_miss_kas(v))
+            })
+            .collect();
+        let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(o.snapshot(1_000, 1.0).kas_near_miss_pct, 9.9);
+        // At least one of the two 9.9-value threads must have won the race
+        // and reported true; a tie can never both report true (strictly
+        // greater-than check), so at most one of the pair does.
+        assert!(results.iter().filter(|&&r| r).count() >= 1);
+    }
+
+    #[test]
+    fn suffix_renders_dash_when_no_share_evaluated_yet() {
+        let o = MergedObs::new();
+        let s = o.node_suffix(1_000, 1.0);
+        assert!(s.contains("near k=- z=-"), "{s}");
     }
 }

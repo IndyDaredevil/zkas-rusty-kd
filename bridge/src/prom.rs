@@ -58,6 +58,8 @@ struct MergedObsJsonCache {
     zkas_rpc_ms: f64,
     submit_avg_ms: f64,
     submit_max_ms: f64,
+    kas_near_miss_pct: f64, // c.12
+    zkas_near_miss_pct: f64, // c.12
 }
 
 // c.8: merged-mining series (WS3 increment; mirrors K-side style exactly).
@@ -684,6 +686,8 @@ pub fn record_merged_observability(
     zkas_rpc_ms: f64,
     submit_avg_ms: f64,
     submit_max_ms: f64,
+    kas_near_miss_pct: f64, // c.12
+    zkas_near_miss_pct: f64, // c.12
 ) {
     if let Some(g) = MERGED_ZK_STATE_GAUGE.get() {
         g.set(zk_state as f64);
@@ -714,6 +718,8 @@ pub fn record_merged_observability(
         zkas_rpc_ms,
         submit_avg_ms,
         submit_max_ms,
+        kas_near_miss_pct, // c.12
+        zkas_near_miss_pct, // c.12
     });
 }
 
@@ -1069,14 +1075,28 @@ struct StatsResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct MergedStatsJson {
+    // c.12 fix: proper snake_case Rust fields + #[serde(rename)], matching
+    // WorkerInfo's house style (the camelCase-Rust-field version from c.9
+    // compiled fine but triggered non_snake_case warnings every build).
     // "off" | "ok" | "stale" | "plain" — mirrors merged_obs::ZkState.
-    zkState: String,
-    zkAgeSeconds: f64,
-    jobsPerSec: f64,
-    kasRpcMs: f64,
-    zkasRpcMs: f64,
-    submitAvgMs: f64,
-    submitMaxMs: f64,
+    #[serde(rename = "zkState")]
+    zk_state: String,
+    #[serde(rename = "zkAgeSeconds")]
+    zk_age_seconds: f64,
+    #[serde(rename = "jobsPerSec")]
+    jobs_per_sec: f64,
+    #[serde(rename = "kasRpcMs")]
+    kas_rpc_ms: f64,
+    #[serde(rename = "zkasRpcMs")]
+    zkas_rpc_ms: f64,
+    #[serde(rename = "submitAvgMs")]
+    submit_avg_ms: f64,
+    #[serde(rename = "submitMaxMs")]
+    submit_max_ms: f64,
+    #[serde(rename = "kasNearMissPct")]
+    kas_near_miss_pct: f64, // c.12 — session-best % of target reached (KAS leg)
+    #[serde(rename = "zkasNearMissPct")]
+    zkas_near_miss_pct: f64, // c.12 — session-best % of target reached (ZKAS leg)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1178,19 +1198,21 @@ async fn get_stats_json_filtered(instance_id: Option<&str>) -> StatsResponse {
         totalZkasBlocks: 0, // c.9
         totalDoubleBlocks: 0, // c.9
         merged: LAST_MERGED_OBS_JSON.get().and_then(|m| *m.lock()).map(|c| MergedStatsJson {
-            zkState: match c.zk_state {
+            zk_state: match c.zk_state {
                 0 => "off",
                 1 => "ok",
                 2 => "stale",
                 _ => "plain",
             }
             .to_string(),
-            zkAgeSeconds: c.zk_age_secs,
-            jobsPerSec: c.jobs_per_sec,
-            kasRpcMs: c.kas_rpc_ms,
-            zkasRpcMs: c.zkas_rpc_ms,
-            submitAvgMs: c.submit_avg_ms,
-            submitMaxMs: c.submit_max_ms,
+            zk_age_seconds: c.zk_age_secs,
+            jobs_per_sec: c.jobs_per_sec,
+            kas_rpc_ms: c.kas_rpc_ms,
+            zkas_rpc_ms: c.zkas_rpc_ms,
+            submit_avg_ms: c.submit_avg_ms,
+            submit_max_ms: c.submit_max_ms,
+            kas_near_miss_pct: c.kas_near_miss_pct, // c.12
+            zkas_near_miss_pct: c.zkas_near_miss_pct, // c.12
         }), // c.9
     };
 

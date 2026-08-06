@@ -134,6 +134,15 @@ function renderMergedPanel(stats) {
   const subEl = document.getElementById('mergedSubmit');
   if (subEl) subEl.textContent = `${fmt1(merged.submitAvgMs)}ms / ${fmt1(merged.submitMaxMs)}ms`;
 
+  // c.12: real network/share difficulty ratios put "close" shares in the
+  // ~1e-9 % range — scientific notation is required, not stylistic; fixed
+  // decimal would show 0.0% for the entire session.
+  const fmtNear = (pct) => (Number(pct) > 0 ? `${Number(pct).toExponential(2)}%` : '-');
+  const nearKEl = document.getElementById('mergedNearMissKas');
+  if (nearKEl) nearKEl.textContent = fmtNear(merged.kasNearMissPct);
+  const nearZEl = document.getElementById('mergedNearMissZkas');
+  if (nearZEl) nearZEl.textContent = fmtNear(merged.zkasNearMissPct);
+
   renderMergedRecentBlocks(stats);
 }
 
