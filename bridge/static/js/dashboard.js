@@ -155,11 +155,38 @@ function renderMergedRecentBlocks(stats) {
   if (!body) return;
 
   const chainBadge = { K: 'bg-blue-900/40 text-blue-300', Z: 'bg-purple-900/40 text-purple-300', D: 'bg-yellow-900/40 text-yellow-300' };
-  const tag = (chain, items) => (Array.isArray(items) ? items : []).map((b) => ({ ...b, __chain: chain }));
 
-  const merged = [...tag('K', stats?.blocks), ...tag('Z', stats?.zkasBlocks), ...tag('D', stats?.doubleBlocks)]
+  // Solve-based accounting: one SOLVE (one winning nonce) = one row, even
+  // when it lands on both chains. A dual is 1 nonce -> 2 chain blocks with
+  // 2 DIFFERENT hashes (parent hash on KAS; H_fc on ZKAS -- the aux rides
+  // outside the header hash), so a dual row carries both. The doubleBlocks
+  // feed is used as a marker set, never as rows: concatenating K+Z+D would
+  // triple-display every dual (the bug this replaces).
+  const arr = (x) => (Array.isArray(x) ? x : []);
+  const byNonce = (items) => { const m = new Map(); for (const b of items) if (b && b.nonce) m.set(String(b.nonce), b); return m; };
+  const kBy = byNonce(arr(stats?.blocks));
+  const zBy = byNonce(arr(stats?.zkasBlocks));
+  const dSet = new Set(arr(stats?.doubleBlocks).map((b) => String(b?.nonce)));
+  const solveRows = [];
+  const seen = new Set();
+  for (const [nonce, k] of kBy) {
+    seen.add(nonce);
+    const z = zBy.get(nonce);
+    if (z || dSet.has(nonce)) {
+      solveRows.push({ ...k, __chain: 'D', __kasHash: k.hash || '', __zkasHash: (z && z.hash) || '', __zkasBluescore: (z && z.bluescore) || '' });
+    } else {
+      solveRows.push({ ...k, __chain: 'K' });
+    }
+  }
+  for (const [nonce, z] of zBy) {
+    if (seen.has(nonce)) continue;
+    // zkas-only clear (or dual whose K row hasn't landed yet -- it upgrades
+    // to D on the next refresh once both feeds carry the nonce)
+    solveRows.push({ ...z, __chain: dSet.has(nonce) ? 'D' : 'Z', __kasHash: '', __zkasHash: z.hash || '' });
+  }
+  const merged = solveRows
     .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0))
-    .slice(0, 25); // recent-first, cap for a status panel (full history stays in the main Recent Blocks table for K)
+    .slice(0, 25); // recent-first, cap for a status panel
 
   if (!merged.length) {
     body.innerHTML = `<tr><td colspan="5" class="py-3 text-gray-500 text-center">No merged blocks yet this session</td></tr>`;
@@ -168,8 +195,14 @@ function renderMergedRecentBlocks(stats) {
 
   body.innerHTML = '';
   for (const b of merged) {
-    const hashFull = b.hash || '';
-    const hashShort = typeof shortHash === 'function' ? shortHash(hashFull) : hashFull.slice(0, 16);
+    const sh = (h) => (typeof shortHash === 'function' ? shortHash(h) : String(h || '').slice(0, 16));
+    const isDual = b.__chain === 'D';
+    const hashFull = isDual
+      ? `KAS ${b.__kasHash || '-'} | ZKAS ${b.__zkasHash || '-'}`
+      : (b.hash || '');
+    const hashShort = isDual
+      ? `<span class="text-blue-300">K:</span>${sh(b.__kasHash)} <span class="text-purple-300">Z:</span>${sh(b.__zkasHash)}`
+      : sh(hashFull);
     const workerDisplay = typeof displayWorkerName === 'function' ? displayWorkerName(b.worker) : (b.worker || '-');
     const tr = document.createElement('tr');
     tr.className = 'border-b border-card/50';
@@ -635,6 +668,16 @@ function setLastUpdated(updatedMs, isCached) {
 }
 
 function displayTotalBlocksFromStats(stats) {
+  // Solve-based when merged fields exist: solves = KAS + ZKAS - doubles
+  // (a dual is one solve landing on both chains; summing chain-blocks
+  // would double-count it). Falls through to legacy totalBlocks when the
+  // merged counters are absent (plain RKStratum instance).
+  const tz = Number(stats?.totalZkasBlocks);
+  const td = Number(stats?.totalDoubleBlocks);
+  const tk = Number(stats?.totalBlocks ?? stats?.total_blocks ?? stats?.totalblocks);
+  if (Number.isFinite(tk) && Number.isFinite(tz) && Number.isFinite(td) && (tz > 0 || td > 0)) {
+    return tk + tz - td;
+  }
   const n = Number(stats?.totalBlocks ?? stats?.total_blocks ?? stats?.totalblocks);
   const blocksCount = Array.isArray(stats?.blocks) ? stats.blocks.length : 0;
   const candidates = [];
