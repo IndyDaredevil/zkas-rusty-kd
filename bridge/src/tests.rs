@@ -1073,7 +1073,11 @@ fn test_parse_instance_spec_multiple_ports() {
 // These tests run with: cargo test -p kaspa-stratum-bridge --bin stratum-bridge
 // Or with CPU miner: cargo test -p kaspa-stratum-bridge --features rkstratum_cpu_miner --bin stratum-bridge
 
-#[cfg(test)]
+// The integration tests embed an in-process kaspad, which is unavailable on
+// Windows (kaspad's dep chain forces the risc0/cdylib LNK2019 class — see the
+// inprocess_node Windows stub in main.rs). Unit tests and the notification
+// hub / listener suites run on all platforms.
+#[cfg(all(test, not(windows)))]
 mod integration {
     use kaspa_alloc::init_allocator_with_default_settings;
     use kaspa_stratum_bridge::{KaspaApi, StratumServerBridgeConfig as StratumBridgeConfig, listen_and_serve_with_shutdown};
