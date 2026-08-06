@@ -298,6 +298,10 @@ async fn main() -> Result<(), anyhow::Error> {
     //   ZKAS_TREASURY_ADDRESS  — zkas: address paid by all zkas templates
     let merged_cfg = match (std::env::var("ZKAS_MERGED_NODE"), std::env::var("ZKAS_TREASURY_ADDRESS")) {
         (Ok(node), Ok(pay)) if !node.trim().is_empty() && !pay.trim().is_empty() => {
+            // c.7 hook A: drives zk= state on the NODE line (zk=OFF when unset)
+            kaspa_stratum_bridge::merged_obs::MERGED_OBS
+                .merged_enabled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             tracing::info!("MERGED MINING ENABLED: zkas node {}", node.trim());
             tracing::info!("MERGED MINING ENABLED: zkas treasury {}", pay.trim());
             Some(kaspa_stratum_bridge::MergedZkasConfig { node_address: node.trim().to_string(), pay_address: pay.trim().to_string() })

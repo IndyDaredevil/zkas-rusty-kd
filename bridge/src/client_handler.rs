@@ -213,7 +213,9 @@ impl ClientHandler {
             debug!("send_immediate_job: fetching block template for client {} (wallet: {})", client_clone.remote_addr, wallet_addr);
 
             // Get block template
+            let c7_rpc_t0 = std::time::Instant::now(); // c.7
             let template_result = kaspa_api_clone.get_block_template(&wallet_addr, &remote_app, &canxium_addr).await;
+            crate::merged_obs::MERGED_OBS.record_kas_rpc(c7_rpc_t0.elapsed().as_micros() as u64); // c.7
 
             let block = match template_result {
                 Ok(block) => {
@@ -427,6 +429,7 @@ impl ClientHandler {
 
             // IceRiver expects minimal notification format (method + params only, no id or jsonrpc)
             // Send job ID in mining.notify
+            crate::merged_obs::MERGED_OBS.record_job_sent(); // c.7
             let send_result = if is_iceriver {
                 // IceRiver expects minimal notification format (method + params only, no id or jsonrpc)
                 client_clone.send_notification("mining.notify", job_params.clone()).await
@@ -538,7 +541,9 @@ impl ClientHandler {
                     (wallet, app, canx)
                 };
 
-                let template_result = kaspa_api_clone.get_block_template(&wallet_addr, &remote_app, &canxium_addr).await;
+                let c7_rpc_t0 = std::time::Instant::now(); // c.7
+            let template_result = kaspa_api_clone.get_block_template(&wallet_addr, &remote_app, &canxium_addr).await;
+            crate::merged_obs::MERGED_OBS.record_kas_rpc(c7_rpc_t0.elapsed().as_micros() as u64); // c.7
 
                 let block = match template_result {
                     Ok(block) => {
@@ -724,6 +729,7 @@ impl ClientHandler {
 
                 // Send job ID in mining.notify
                 // })
+                crate::merged_obs::MERGED_OBS.record_job_sent(); // c.7
                 let send_result = if is_iceriver_client {
                     // IceRiver expects minimal notification format (method + params only, no id or jsonrpc)
                     client_clone.send_notification("mining.notify", job_params.clone()).await

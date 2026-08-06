@@ -820,9 +820,13 @@ impl KaspaApi {
                     h_fc, fc_block.header.bits
                 );
                 self.pending_fc.lock().insert(h_fc, fc_block);
+                crate::merged_obs::MERGED_OBS.record_template(true); // c.7 hook C
                 kaspa_consensus_core::auxpow::AuxPow::embed_commitment(&self.coinbase_tag, h_fc, &[])
             }
-            None => self.coinbase_tag.clone(),
+            None => {
+                crate::merged_obs::MERGED_OBS.record_template(false); // c.7 hook C
+                self.coinbase_tag.clone()
+            }
         };
 
         // Retry up to 3 times if we get "Odd number of digits" error
@@ -1001,6 +1005,19 @@ impl KaspaApi {
         leg.client.submit_block_call(None, SubmitBlockRequest::new(rpc_block, false)).await.context("Failed to submit ZKas block")
     }
 
+    /// c.7: blue/red for a ZKas chain block (hook E's confirm loop). The
+    /// zkas twin of get_current_block_color; errors when unattached.
+    pub async fn get_zkas_block_color(&self, block_hash: &str) -> Result<bool> {
+        let leg = self.zkas_leg().ok_or_else(|| anyhow::anyhow!("merged mining inactive: no ZKas node attached"))?;
+        let hash = RpcHash::from_str(block_hash).context("Failed to parse ZKas block hash")?;
+        let resp = leg
+            .client
+            .get_current_block_color_call(None, GetCurrentBlockColorRequest { hash })
+            .await
+            .context("Failed to query ZKas block color")?;
+        Ok(resp.blue)
+    }
+
     /// The current ZKas template for commitment purposes, under a strict
     /// non-blocking budget (spec §3: a ZKas hiccup means the next job goes
     /// out PLAIN rather than late). Cache-first with `ZKAS_TEMPLATE_TTL`;
@@ -1027,8 +1044,11 @@ impl KaspaApi {
             return cache.as_ref().map(|(h, b, _)| (*h, b.clone()));
         };
         let _permit = _permit.ok()?;
+        let c7_fetch_t0 = Instant::now(); // c.7 hook B
         match tokio::time::timeout(ZKAS_FETCH_BUDGET, self.get_zkas_block_template()).await {
             Ok(Ok(block)) => {
+                crate::merged_obs::MERGED_OBS
+                    .record_zkas_tpl_ok(crate::merged_obs::epoch_ms(), c7_fetch_t0.elapsed().as_micros() as u64);
                 let h_fc = block.header.hash;
                 *self.zkas_template_cache.lock().await = Some((h_fc, block.clone(), Instant::now()));
                 Some((h_fc, block))
@@ -1253,6 +1273,12 @@ impl KaspaApiTrait for KaspaApi {
         block: Block,
     ) -> Result<kaspa_rpc_core::SubmitBlockResponse, Box<dyn std::error::Error + Send + Sync>> {
         KaspaApi::submit_zkas_block(self, block)
+            .await
+            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
+    async fn get_zkas_block_color(&self, block_hash: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        KaspaApi::get_zkas_block_color(self, block_hash)
             .await
             .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>)
     }

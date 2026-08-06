@@ -6,6 +6,7 @@ pub mod hasher;
 pub mod jsonrpc_event;
 pub mod kaspaapi;
 pub mod log_colors;
+pub mod merged_obs;
 pub mod mining_state;
 pub mod net_utils;
 pub mod merged;
