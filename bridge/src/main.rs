@@ -3,7 +3,6 @@ use futures_util::future::try_join_all;
 use kaspa_alloc::init_allocator_with_default_settings;
 use kaspa_stratum_bridge::log_colors::LogColors;
 use kaspa_stratum_bridge::{KaspaApi, StratumServerBridgeConfig as StratumBridgeConfig, listen_and_serve_with_shutdown, prom};
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -16,12 +15,28 @@ use tracing_subscriber::EnvFilter;
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{CTRL_C_EVENT, SetConsoleCtrlHandler};
 
-use kaspad_lib::args as kaspad_args;
 
 mod app_dirs;
 mod cli;
 mod health_check;
+#[cfg(not(windows))]
 mod inprocess_node;
+/// Windows stub: the embedded in-process node is unavailable because kaspad's
+/// dependency chain forces building kaspa-wrpc-server's cdylib, whose risc0
+/// zkVM symbols (sys_alloc_aligned) only resolve on the RISC-V target —
+/// link.exe fails with LNK2019/LNK1120 (bug ledger #1, workspace edition).
+/// The bridge on Windows runs against an external node, which is the only
+/// production configuration anyway.
+#[cfg(windows)]
+mod inprocess_node {
+    pub(crate) struct InProcessNode;
+    pub(crate) fn start_from_cli_args(_node_args: Vec<String>) -> Result<InProcessNode, anyhow::Error> {
+        Err(anyhow::anyhow!(
+            "the embedded in-process node is not supported on Windows builds; point the bridge at an external kaspad/zkas node"
+        ))
+    }
+    pub(crate) async fn shutdown_inprocess(_node: InProcessNode) {}
+}
 mod tracing_setup;
 
 #[cfg(test)]
@@ -252,11 +267,7 @@ async fn main() -> Result<(), anyhow::Error> {
             assert!(cli.appdir.is_none(), "appdir should not be specified both in bridge args and kaspad args");
         }
 
-        let mut argv: Vec<OsString> = Vec::with_capacity(node_args.len() + 1);
-        argv.push(OsString::from("kaspad"));
-        argv.extend(node_args.iter().map(OsString::from));
-        let args = kaspad_args::Args::parse(argv).map_err(|e| anyhow::anyhow!("{}", e))?;
-        inprocess_node = Some(InProcessNode::start_from_args(args)?);
+        inprocess_node = Some(inprocess_node::start_from_cli_args(node_args)?);
     }
 
     // Install our handler after the embedded node starts (if inprocess) so we run first (Windows calls handlers LIFO).
@@ -391,8 +402,6 @@ async fn main() -> Result<(), anyhow::Error> {
         let kaspa_api_clone = Arc::clone(&kaspa_api);
         let instance_shutdown_rx = shutdown_rx.clone();
 
-        let is_first_instance = idx == 0;
-
         let instance_id_str = LogColors::format_instance_id(instance_num);
 
         if let Some(ref prom_port) = instance.prom_port {
@@ -433,7 +442,13 @@ async fn main() -> Result<(), anyhow::Error> {
             listen_and_serve_with_shutdown(
                 bridge_config,
                 Arc::clone(&kaspa_api_clone),
-                if is_first_instance { Some(kaspa_api_clone) } else { None },
+                // Every instance gets the concrete API: each takes an
+                // independent NotificationHub subscription, so all instances
+                // run on real node-push notifications. (Previously gated to
+                // the first instance because the old take()-once receiver
+                // could only serve a single consumer, leaving instances 2..N
+                // on pure block_wait_time polling.)
+                Some(kaspa_api_clone),
                 instance_shutdown_rx,
             )
             .await

@@ -21,7 +21,6 @@ kaspa-grpc-client = { workspace = true }
 kaspa-notify = { workspace = true }
 kaspa-core = { workspace = true }
 kaspa-utils = { workspace = true }
-kaspad = { workspace = true }
 kaspa-alloc = { workspace = true }
 dirs = { workspace = true }
 
@@ -79,3 +78,11 @@ rkstratum_cpu_miner = []
 
 [lints]
 workspace = true
+
+# kaspad is only needed by the in-process embedded node, which is unavailable
+# on Windows: its dependency chain forces building kaspa-wrpc-server's cdylib,
+# whose risc0-zkvm-platform symbols (sys_alloc_aligned) only resolve on the
+# RISC-V zkVM target -- link.exe fails with LNK2019/LNK1120. (Bug ledger #1,
+# workspace edition; same class as the original zkas-pool cdylib failure.)
+[target.'cfg(not(windows))'.dependencies]
+kaspad = { workspace = true }

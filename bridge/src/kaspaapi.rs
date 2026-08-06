@@ -16,7 +16,9 @@ use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
+
+use crate::notification_hub::{HubScope, NotificationHub, DEFAULT_HUB_CAPACITY};
 use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -132,7 +134,13 @@ pub static NODE_STATUS: Lazy<Mutex<NodeStatusSnapshot>> = Lazy::new(|| Mutex::ne
 /// Both use gRPC under the hood, but through an RPC client wrapper abstraction
 pub struct KaspaApi {
     client: Arc<GrpcClient>,
-    notification_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<Notification>>>>,
+    /// Multi-subscriber fan-out of this client's node notifications. Every
+    /// stratum instance (and any future consumer, e.g. a fate tracker on
+    /// VirtualChainChanged) calls `hub.subscribe(..)` for an independent
+    /// stream — replacing the old take()-once mpsc receiver that limited the
+    /// process to a single notification consumer and forced main.rs to gate
+    /// real notifications to the first instance only.
+    hub: Arc<NotificationHub>,
     connected: Arc<Mutex<bool>>,
     coinbase_tag: Vec<u8>,
 }
@@ -249,22 +257,12 @@ impl KaspaApi {
             }
         }
 
-        // Start receiving notifications
-        let notification_rx = {
-            let receiver = client.notification_channel_receiver();
-            // Convert async_channel::Receiver to tokio::sync::mpsc::UnboundedReceiver
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let receiver_clone = receiver.clone();
-            tokio::spawn(async move {
-                while let Ok(notification) = receiver_clone.recv().await {
-                    let _ = tx.send(notification);
-                }
-            });
-            Arc::new(Mutex::new(Some(rx)))
-        };
+        // Start the notification hub: one relay owns this client's upstream
+        // stream and fans it out to any number of subscribers.
+        let hub = NotificationHub::start(client.notification_channel_receiver(), "kaspa", DEFAULT_HUB_CAPACITY);
 
         let coinbase_tag = build_coinbase_tag_bytes(coinbase_tag_suffix.as_deref());
-        let api = Arc::new(Self { client, notification_rx, connected: Arc::new(Mutex::new(true)), coinbase_tag });
+        let api = Arc::new(Self { client, hub, connected: Arc::new(Mutex::new(true)), coinbase_tag });
 
         // Start network stats thread
         let api_clone = Arc::clone(&api);
@@ -580,6 +578,11 @@ impl KaspaApi {
     }
 
     /// Wait for node to sync
+    /// Retained though currently uncalled: the listener loop's vestigial
+    /// per-iteration sync probe was removed in the NotificationHub refactor,
+    /// but this is the natural health-probe primitive for the WS4 mode
+    /// machine (MERGED/KAS-ONLY/ZKAS-ONLY transitions), which lands next.
+    #[allow(dead_code)]
     async fn wait_for_sync(&self) -> Result<()> {
         loop {
             match self.client.get_sync_status().await {
@@ -772,139 +775,122 @@ impl KaspaApi {
         Ok(resp.blue)
     }
 
-    /// Start listening for block template notifications
-    /// Uses RegisterForNewBlockTemplateNotifications with ticker fallback
-    /// This provides immediate notifications when new blocks are available, with polling as fallback
-    pub async fn start_block_template_listener<F>(self: Arc<Self>, block_wait_time: Duration, mut block_cb: F) -> Result<()>
+    /// Multi-subscriber notification hub for this client. Any consumer may
+    /// subscribe; every subscriber independently sees every notification.
+    pub fn notification_hub(&self) -> &Arc<NotificationHub> {
+        &self.hub
+    }
+
+    /// Start listening for block template notifications (node-push with ticker
+    /// fallback). May be called by EVERY stratum instance: each call takes an
+    /// independent hub subscription, so all instances receive real
+    /// notifications — the old implementation could only serve one caller
+    /// (take()-once receiver) which forced instances 2..N onto pure polling.
+    pub async fn start_block_template_listener<F>(self: Arc<Self>, block_wait_time: Duration, block_cb: F) -> Result<()>
     where
         F: FnMut() + Send + 'static,
     {
-        let mut rx = self.notification_rx.lock().take().ok_or_else(|| anyhow::anyhow!("Notification receiver already taken"))?;
-
-        let api_clone = Arc::clone(&self);
-        tokio::spawn(async move {
-            let mut restart_channel = true;
-            let mut ticker = tokio::time::interval(block_wait_time);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            loop {
-                // Check sync state and reconnect if needed
-                if let Err(e) = api_clone.wait_for_sync().await {
-                    error!("error checking kaspad sync state, attempting reconnect: {}", e);
-                    // Note: gRPC client handles reconnection automatically, but we log it
-                    // In Go, reconnect() is called explicitly, but Rust gRPC handles it
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    restart_channel = true;
-                }
-
-                // Re-register for notifications if needed
-                if restart_channel {
-                    // In Go, RegisterForNewBlockTemplateNotifications is called here when restartChannel is true
-                    // In Rust, we already subscribed in new(), and the notification channel persists
-                    // If the connection is lost, the gRPC client handles reconnection automatically
-                    // The notification subscription should be maintained by the gRPC client
-                    // If notifications stop working, we'll fall back to ticker polling
-                    restart_channel = false;
-                }
-
-                // Wait for either notification or ticker timeout
-                tokio::select! {
-                    // Notification received
-                    notification_result = rx.recv() => {
-                        match notification_result {
-                            Some(Notification::NewBlockTemplate(_)) => {
-                                // Drain any additional notifications
-                                while rx.try_recv().is_ok() {}
-
-                                // Call callback
-                                block_cb();
-
-                                // Reset ticker
-                                ticker = tokio::time::interval(block_wait_time);
-                                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                            }
-                            Some(_) => {
-                                // Other notification types - ignore
-                            }
-                            None => {
-                                // Channel closed - exit loop
-                                warn!("Block template notification channel closed");
-                                break;
-                            }
-                        }
-                    }
-                    // Ticker timeout - manually check for new blocks
-                    _ = ticker.tick() => {
-                        block_cb();
-                    }
-                }
-            }
-        });
-
+        let rx = self.hub.subscribe(HubScope::NewBlockTemplate);
+        tokio::spawn(run_template_listener(rx, block_wait_time, None, block_cb));
         Ok(())
     }
 
     pub async fn start_block_template_listener_with_shutdown<F>(
         self: Arc<Self>,
         block_wait_time: Duration,
-        mut shutdown_rx: watch::Receiver<bool>,
-        mut block_cb: F,
+        shutdown_rx: watch::Receiver<bool>,
+        block_cb: F,
     ) -> Result<()>
     where
         F: FnMut() + Send + 'static,
     {
-        let mut rx = self.notification_rx.lock().take().ok_or_else(|| anyhow::anyhow!("Notification receiver already taken"))?;
+        let rx = self.hub.subscribe(HubScope::NewBlockTemplate);
+        tokio::spawn(run_template_listener(rx, block_wait_time, Some(shutdown_rx), block_cb));
+        Ok(())
+    }
+}
 
-        let api_clone = Arc::clone(&self);
-        tokio::spawn(async move {
-            let mut restart_channel = true;
-            let mut ticker = tokio::time::interval(block_wait_time);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+/// The template-listener loop, shared by every stratum instance and factored
+/// free of `KaspaApi` so multi-instance behavior is directly unit-testable.
+///
+/// Semantics preserved from the original single-consumer listener:
+/// - node-push notifications trigger the callback immediately; the ticker is
+///   reset after each real notification so polling only covers gaps;
+/// - queued notification bursts are drained to a single callback invocation;
+/// - ticker fallback fires the callback on `block_wait_time` cadence.
+///
+/// New with broadcast subscriptions:
+/// - `Lagged(n)`: this subscriber fell behind the ring buffer. Notifications
+///   are edge triggers ("a new template exists"), so the correct recovery is
+///   one resync callback — identical in cost to a ticker tick — never silent
+///   loss.
+/// - `Closed`: the hub (and thus the client) is gone; the loop exits.
+///
+/// Deliberately REMOVED from the original: the per-iteration `wait_for_sync`
+/// preamble and the `restart_channel` flag. Both were vestigial — the code's
+/// own comments note the gRPC client reconnects automatically and the flag's
+/// branch did nothing — and running the sync probe in N instances' loops
+/// would multiply redundant RPC load under fan-out. Connectivity is observed
+/// once, centrally (hub health + the existing stats/status threads).
+pub(crate) async fn run_template_listener<F>(
+    mut rx: broadcast::Receiver<Notification>,
+    block_wait_time: Duration,
+    mut shutdown_rx: Option<watch::Receiver<bool>>,
+    mut block_cb: F,
+) where
+    F: FnMut() + Send + 'static,
+{
+    let mut ticker = tokio::time::interval(block_wait_time);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-            loop {
-                if *shutdown_rx.borrow() {
+    loop {
+        if let Some(s) = shutdown_rx.as_ref() {
+            if *s.borrow() {
+                break;
+            }
+        }
+
+        tokio::select! {
+            _ = async {
+                match shutdown_rx.as_mut() {
+                    Some(s) => { let _ = s.changed().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                if shutdown_rx.as_ref().is_some_and(|s| *s.borrow()) {
                     break;
                 }
-
-                if let Err(e) = api_clone.wait_for_sync().await {
-                    error!("error checking kaspad sync state, attempting reconnect: {}", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    restart_channel = true;
-                }
-
-                if restart_channel {
-                    restart_channel = false;
-                }
-
-                tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            break;
-                        }
-                    }
-                    notification_result = rx.recv() => {
-                        match notification_result {
-                            Some(Notification::NewBlockTemplate(_)) => {
-                                while rx.try_recv().is_ok() {}
-                                block_cb();
-                                ticker = tokio::time::interval(block_wait_time);
-                                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                            }
-                            Some(_) => {}
-                            None => {
-                                warn!("Block template notification channel closed");
-                                break;
-                            }
-                        }
-                    }
-                    _ = ticker.tick() => {
+            }
+            notification_result = rx.recv() => {
+                match notification_result {
+                    Ok(Notification::NewBlockTemplate(_)) => {
+                        // Drain any queued burst into a single callback.
+                        while rx.try_recv().is_ok() {}
                         block_cb();
+                        ticker = tokio::time::interval(block_wait_time);
+                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    }
+                    Ok(_) => {
+                        // Other notification variants routed here would be a hub
+                        // demux bug; the hub only feeds this scope's channel.
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("template listener lagged, missed {n} notifications; forcing resync");
+                        while rx.try_recv().is_ok() {}
+                        block_cb();
+                        ticker = tokio::time::interval(block_wait_time);
+                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        warn!("Block template notification channel closed");
+                        break;
                     }
                 }
             }
-        });
-
-        Ok(())
+            _ = ticker.tick() => {
+                block_cb();
+            }
+        }
     }
 }
 
@@ -944,5 +930,106 @@ impl KaspaApiTrait for KaspaApi {
         KaspaApi::get_current_block_color(self, block_hash)
             .await
             .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>)
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::*;
+    use crate::notification_hub::{HubScope, NotificationHub, DEFAULT_HUB_CAPACITY};
+    use kaspa_rpc_core::NewBlockTemplateNotification;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::timeout;
+
+    fn template_notification() -> Notification {
+        Notification::NewBlockTemplate(NewBlockTemplateNotification {})
+    }
+
+    /// WS2 acceptance: with one hub feeding N listener instances (the
+    /// production shape is 9 per rig), a single node-push notification
+    /// reaches EVERY instance's callback — the property the old
+    /// is_first_instance gate made impossible.
+    #[tokio::test]
+    async fn all_nine_instances_receive_push_notifications() {
+        let (tx, rx) = async_channel::unbounded();
+        let hub = NotificationHub::start(rx, "test", DEFAULT_HUB_CAPACITY);
+
+        let counters: Vec<Arc<AtomicUsize>> = (0..9).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        for c in &counters {
+            let c = Arc::clone(c);
+            // Long block_wait_time so the ticker cannot masquerade as a push.
+            tokio::spawn(run_template_listener(
+                hub.subscribe(HubScope::NewBlockTemplate),
+                Duration::from_secs(3600),
+                None,
+                move || {
+                    c.fetch_add(1, Ordering::SeqCst);
+                },
+            ));
+        }
+        // Interval's first tick fires immediately; absorb it before pushing.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let baseline: Vec<usize> = counters.iter().map(|c| c.load(Ordering::SeqCst)).collect();
+
+        tx.send(template_notification()).await.unwrap();
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let all = counters.iter().zip(&baseline).all(|(c, b)| c.load(Ordering::SeqCst) > *b);
+                if all {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every instance's callback fires from one push notification");
+    }
+
+    /// Ticker fallback: with no notifications flowing, the callback still
+    /// fires on block_wait_time cadence (polling as safety net, not primary).
+    #[tokio::test]
+    async fn ticker_fallback_fires_without_notifications() {
+        let (_tx, rx) = async_channel::unbounded::<Notification>();
+        let hub = NotificationHub::start(rx, "test", DEFAULT_HUB_CAPACITY);
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        tokio::spawn(run_template_listener(
+            hub.subscribe(HubScope::NewBlockTemplate),
+            Duration::from_millis(50),
+            None,
+            move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let n = count.load(Ordering::SeqCst);
+        assert!(n >= 3, "expected several ticker callbacks, got {n}");
+    }
+
+    /// Shutdown signal terminates the listener promptly.
+    #[tokio::test]
+    async fn shutdown_stops_listener() {
+        let (tx, rx) = async_channel::unbounded();
+        let hub = NotificationHub::start(rx, "test", DEFAULT_HUB_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        let handle = tokio::spawn(run_template_listener(
+            hub.subscribe(HubScope::NewBlockTemplate),
+            Duration::from_secs(3600),
+            Some(shutdown_rx),
+            move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(true).unwrap();
+        timeout(Duration::from_secs(2), handle).await.expect("listener exits on shutdown").unwrap();
+        // Later notifications reach no callback.
+        let before = count.load(Ordering::SeqCst);
+        tx.send(template_notification()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(count.load(Ordering::SeqCst), before);
     }
 }

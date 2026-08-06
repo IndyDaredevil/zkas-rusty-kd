@@ -30,3 +30,17 @@ impl InProcessNode {
 pub(crate) async fn shutdown_inprocess(node: InProcessNode) {
     let _ = tokio::task::spawn_blocking(move || node.shutdown()).await;
 }
+
+/// Platform-agnostic entry: build kaspad Args from CLI-style strings and start
+/// the embedded node. Exists so callers (main.rs) never touch kaspad_lib types
+/// directly, which lets the whole module be cfg-gated off Windows (where
+/// kaspad's dependency chain forces a cdylib link of risc0 zkVM symbols that
+/// only resolve on the RISC-V target — the LNK2019 sys_alloc_aligned class).
+pub(crate) fn start_from_cli_args(node_args: Vec<String>) -> Result<InProcessNode, anyhow::Error> {
+    use std::ffi::OsString;
+    let mut argv: Vec<OsString> = Vec::with_capacity(node_args.len() + 1);
+    argv.push(OsString::from("kaspad"));
+    argv.extend(node_args.iter().map(OsString::from));
+    let args = kaspad_args::Args::parse(argv).map_err(|e| anyhow::anyhow!("{}", e))?;
+    InProcessNode::start_from_args(args)
+}
