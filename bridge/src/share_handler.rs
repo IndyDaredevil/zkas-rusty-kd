@@ -688,16 +688,6 @@ impl ShareHandler {
             // None and behavior is byte-identical to single-chain RKStratum.
             let zkas_target = kaspa_api.merged_fc_target(&current_job.block);
             let clears_zkas = zkas_target.as_ref().is_some_and(|t| pow_value <= *t);
-<<<<<<< HEAD
-            if let Some(zt) = zkas_target.as_ref() {
-                // V2 gate evidence: the dual gate reading BOTH chains off one
-                // job — kaspa target from the parent's own bits, zkas target
-                // from the committed H_fc's stashed block.
-                debug!(
-                    "[MERGED] dual-target: zkas_target={:x} kaspa(network)_target={:x} clears_zkas={} meets_kaspa={}",
-                    zt, network_target, clears_zkas, meets_network_target
-                );
-=======
             // c.12: zKAS-leg near-miss — this target had ZERO near-miss
             // visibility before c.12 (K's ratio math existed, Z's never
             // did). Same session-best-only design, same reasoning.
@@ -719,7 +709,6 @@ impl ShareHandler {
                         )
                     );
                 }
->>>>>>> 7af739e (share_handler+merged_obs: near-miss telemetry, both legs (WS3 c.12))
             }
             if meets_network_target || clears_zkas {
                 // c.7 hook D: per-share double correlator, cloned into both
