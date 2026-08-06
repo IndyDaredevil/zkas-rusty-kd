@@ -1759,6 +1759,12 @@ struct WalletEntry {
     /// few passes instead of crawling; after it, only the cheap ~1-leaf/block incremental
     /// advance runs.
     witnesses_warm: bool,
+    /// `witnesses_warm` was latched because the **subtree cache** serves this wallet's
+    /// spends, not because the live-witness set actually reached the anchor. Kept
+    /// separate so the latch can be released — and the ordinary climb resumed — if the
+    /// cache is ever rejected or invalidated, without mistaking a genuinely warm wallet
+    /// for one that only looked warm.
+    warm_via_subtree_cache: bool,
     /// Whether this wallet has already taken its decision on the subtree cache (built
     /// it, or been turned away by the daemon-wide budget). Stops an O(chain) build —
     /// or a budget probe — from being re-attempted on every sync tick.
@@ -1853,6 +1859,7 @@ impl WalletEntry {
             mempool_cache: HashMap::new(),
             last_witness_advance: None,
             witnesses_warm: false,
+            warm_via_subtree_cache: false,
             subtree_low_mem_logged: false,
             force_checkpoint: false,
             blind_below: 0,
@@ -2207,6 +2214,44 @@ impl WalletEntry {
                         }
                     }
                 }
+                // Once the complete-subtree cache covers the matured anchor, EVERY spend
+                // path reaches `witness_paths_at`, which serves from `subtree_paths` in
+                // O(depth) and returns before it ever looks at the live-witness set. The
+                // warm below then builds a structure nothing reads: phase 2 is a
+                // leaf-by-leaf climb costing `leaves × budget`, phase 3 one O(chain)
+                // replay per adopted note.
+                //
+                // This is the same argument the note-heavy branch above already makes —
+                // it was just tied to the wrong condition. Being served by the batch
+                // builder is not a property of holding many notes; it is a property of
+                // the cache being ready, which is equally true of a 4-note wallet.
+                // Live cost of getting that wrong: 48 resident wallets each burning
+                // 4–7 s ticks with ~1 M leaves still to climb, `adopted 0` on every one
+                // of them, walletd pinned at 470% CPU — for witnesses no send consumes.
+                //
+                // Declaring the wallet warm here is not a claim that its witness set
+                // reached the anchor; it is a claim that it does not need to. If the
+                // cache is later rejected or invalidated the latch is released below and
+                // the ordinary climb resumes, so the failure mode is the old behaviour.
+                // `matured > base_size` is `subtree_paths`' own precondition: below it the
+                // cache declines and the wallet would silently be left with neither a
+                // cache nor a witness set.
+                let cache_serves = self.db.subtree_cache_ready(matured) && matured > self.db.base_size();
+                if cache_serves && !self.witnesses_warm {
+                    self.witnesses_warm = true;
+                    self.warm_via_subtree_cache = true;
+                    self.force_checkpoint = true;
+                    log::info!(
+                        "wallet spend-ready from the subtree cache (notes={note_count}, matured={matured}) — skipping a {}-leaf witness climb it would never read",
+                        matured.saturating_sub(self.db.witnessed_upto())
+                    );
+                } else if !cache_serves && self.warm_via_subtree_cache {
+                    // The cache stopped covering us (rejected by its root gate, or reset
+                    // by a rebuild). Fall back to actually maintaining witnesses.
+                    self.warm_via_subtree_cache = false;
+                    self.witnesses_warm = false;
+                    log::warn!("subtree cache no longer covers matured={matured}; resuming the witness climb for this wallet");
+                }
                 // Take a warm permit, or leave the heavy catch-up to another tick. This is
                 // `try_acquire`, not `acquire`: a wallet that can't warm right now should
                 // fall through and keep doing its cheap incremental sync rather than block
@@ -2330,7 +2375,16 @@ impl WalletEntry {
                             // wallet still waiting for a warm permit must NOT do its
                             // catch-up here — that is the warm's job, under the gate that
                             // bounds how many run at once.
-                            if self.witnesses_warm && self.db.advance_witnesses_capped(matured, steady_cap) {
+                            // `warm_via_subtree_cache` wallets are excluded: the sweep
+                            // still costs one `lag_tree` append per leaf even with an
+                            // empty witness set, so leaving them on it would just move
+                            // the same wasted Sinsemilla work from the warm tick to the
+                            // steady tick. Their paths come from the cache, which
+                            // `append_leaf` keeps current for one hash per leaf.
+                            if self.witnesses_warm
+                                && !self.warm_via_subtree_cache
+                                && self.db.advance_witnesses_capped(matured, steady_cap)
+                            {
                                 self.witnesses_warm = false;
                             }
                         });
