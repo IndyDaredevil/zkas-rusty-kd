@@ -3484,8 +3484,21 @@ async fn evict_idle_wallets(state: &Arc<AppState>) {
         .map(|(t, _)| t.clone())
         .collect();
     if resident.len() > state.resources.max_resident_wallets {
-        let mut by_touch: Vec<(String, std::time::Instant)> =
-            resident.iter().map(|(t, _)| (t.clone(), touches.get(t).copied().unwrap_or(now))).collect();
+        // The count cap is a cache-pressure policy, not permission to throw away a
+        // wallet a user is watching while it is catching up. During a redirect/restart
+        // cohort many browsers reconnect together; evicting their recently touched
+        // entries every sweep made large wallets restart forever at 0–70%. Restrict
+        // LRU overflow victims to wallets outside the active-sync window. If every
+        // resident wallet is genuinely active the cap is temporarily soft; the
+        // operator's MemoryHigh/MemoryMax remains the final host safety boundary.
+        let active_window = std::time::Duration::from_secs(state.resources.active_sync_secs);
+        let mut by_touch: Vec<(String, std::time::Instant)> = resident
+            .iter()
+            .filter_map(|(t, _)| {
+                let at = touches.get(t).copied().unwrap_or(now);
+                (now.duration_since(at) >= active_window).then(|| (t.clone(), at))
+            })
+            .collect();
         by_touch.sort_by_key(|(_, at)| *at);
         for (t, _) in by_touch.into_iter().take(resident.len() - state.resources.max_resident_wallets) {
             if !victims.contains(&t) {
