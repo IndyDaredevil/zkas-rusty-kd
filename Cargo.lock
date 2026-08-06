@@ -4392,6 +4392,7 @@ dependencies = [
  "kaspa-addresses",
  "kaspa-consensus",
  "kaspa-consensus-core",
+ "kaspa-hashes",
  "kaspa-shielded-core",
  "kaspa-txscript",
 ]
@@ -4432,6 +4433,7 @@ name = "kaspa-stratum-bridge"
 version = "2.0.1"
 dependencies = [
  "anyhow",
+ "async-channel 2.3.1",
  "async-trait",
  "blake2",
  "chrono",

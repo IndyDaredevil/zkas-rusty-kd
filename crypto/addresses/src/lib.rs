@@ -526,17 +526,23 @@ mod tests {
         // cspell:enable
     }
 
-    /// Pre-rebrand `zkas:` strings (with checksums computed over the old
+    /// Pre-rebrand `firecash:` strings (with checksums computed over the old
     /// HRP) must keep decoding to the same addresses forever — miner payout
     /// configs and saved addresses in the wild use them.
+    ///
+    /// NOTE: these fixture strings intentionally carry the LEGACY HRP. The
+    /// bech32 checksum is computed over the literal HRP in the string, so
+    /// relabeling a fixture to `zkas:` without recomputing its checksum makes
+    /// it invalid — which is exactly what the 8837354 rebrand's blanket
+    /// find/replace did, breaking this test. Do not "modernize" these strings.
     fn legacy_decode_cases() -> Vec<(Address, &'static str)> {
         // cspell:disable
         vec![
             (Address::new(Prefix::Testnet, Version::PubKey, &[0u8; 32]),      "firecashtest:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqp3032w74"),
             (Address::new(Prefix::Testnet, Version::PubKeyECDSA, &[0u8; 33]), "firecashtest:qyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq5gf74dqw"),
             (Address::new(Prefix::Testnet, Version::PubKeyECDSA, b"\xba\x01\xfc\x5f\x4e\x9d\x98\x79\x59\x9c\x69\xa3\xda\xfd\xb8\x35\xa7\x25\x5e\x5f\x2e\x93\x4e\x93\x22\xec\xd3\xaf\x19\x0a\xb0\xf6\x0e"), "firecashtest:qxaqrlzlf6wes72en3568khahq66wf27tuhfxn5nytkd8tcep2c0vrs6txzs7un"),
-            (Address::new(Prefix::Mainnet, Version::PubKey, &[0u8; 32]),      "zkas:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqquzn95rkl"),
-            (Address::new(Prefix::Mainnet, Version::PubKey, b"\x5f\xff\x3c\x4d\xa1\x8f\x45\xad\xcd\xd4\x99\xe4\x46\x11\xe9\xff\xf1\x48\xba\x69\xdb\x3c\x4e\xa2\xdd\xd9\x55\xfc\x46\xa5\x95\x22"), "zkas:qp0l70zd5x85ttwd6jv7g3s3a8llzj96d8dncn4zmhv4tlzx5k2jy2nghue25"),
+            (Address::new(Prefix::Mainnet, Version::PubKey, &[0u8; 32]),      "firecash:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqquzn95rkl"),
+            (Address::new(Prefix::Mainnet, Version::PubKey, b"\x5f\xff\x3c\x4d\xa1\x8f\x45\xad\xcd\xd4\x99\xe4\x46\x11\xe9\xff\xf1\x48\xba\x69\xdb\x3c\x4e\xa2\xdd\xd9\x55\xfc\x46\xa5\x95\x22"), "firecash:qp0l70zd5x85ttwd6jv7g3s3a8llzj96d8dncn4zmhv4tlzx5k2jy2nghue25"),
         ]
         // cspell:enable
     }
