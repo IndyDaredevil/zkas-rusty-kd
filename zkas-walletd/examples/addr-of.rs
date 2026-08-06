@@ -26,7 +26,9 @@ fn main() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
         let seed_hex = v.get("seed_hex").and_then(|s| s.as_str()).unwrap_or("");
         let fvk_hex = v.get("fvk_hex").and_then(|s| s.as_str()).unwrap_or("");
-        let (kind, db) = if let Some(db) = unhex(fvk_hex).and_then(|b| <[u8; 96]>::try_from(b.as_slice()).ok()).and_then(|f| WalletDb::from_fvk(&f)) {
+        let (kind, db) = if let Some(db) =
+            unhex(fvk_hex).and_then(|b| <[u8; 96]>::try_from(b.as_slice()).ok()).and_then(|f| WalletDb::from_fvk(&f))
+        {
             ("fvk", db)
         } else if let Some(db) = unhex(seed_hex).and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()).and_then(WalletDb::from_seed) {
             ("seed", db)

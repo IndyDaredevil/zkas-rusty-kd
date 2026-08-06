@@ -159,7 +159,8 @@ impl Factory {
             submit_block_tasks,
             submit_block_queue,
             KaspadRoutingPolicy::DropIfFull(Arc::new(Box::new(|_: &KaspadRequest| {
-                Ok(Ok(SubmitBlockResponse::reject(SubmitBlockRejectReason::RouteIsFull, "the node's block-processing route is full")).into())
+                Ok(Ok(SubmitBlockResponse::reject(SubmitBlockRejectReason::RouteIsFull, "the node's block-processing route is full"))
+                    .into())
             }))),
         );
 

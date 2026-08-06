@@ -10,7 +10,7 @@ pub mod xoshiro;
 
 use std::cmp::max;
 
-use kaspa_consensus_core::{hashing, header::Header, BlockLevel};
+use kaspa_consensus_core::{BlockLevel, hashing, header::Header};
 use kaspa_hashes::PowHash;
 use kaspa_math::Uint256;
 
@@ -106,12 +106,7 @@ pub fn calc_block_level_check_pow_gated(
 }
 
 /// Aux-aware variant of [`calc_block_level`]; see [`calc_block_level_check_pow_gated`].
-pub fn calc_block_level_gated(
-    header: &Header,
-    max_block_level: BlockLevel,
-    skip_pow: bool,
-    merged_mining_active: bool,
-) -> BlockLevel {
+pub fn calc_block_level_gated(header: &Header, max_block_level: BlockLevel, skip_pow: bool, merged_mining_active: bool) -> BlockLevel {
     calc_block_level_check_pow_gated(header, max_block_level, skip_pow, merged_mining_active).0
 }
 

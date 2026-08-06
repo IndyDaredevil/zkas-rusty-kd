@@ -545,23 +545,30 @@ pub struct GetShieldedBlocksRequest {
     pub start_hash: RpcHash,
     /// Max chain blocks returned (0 = server default).
     pub limit: u64,
+    /// Return only chain metadata (hash/blue/DAA/timestamp). This is used by
+    /// wallet birthday discovery and avoids shipping coinbase/actions that are
+    /// immediately discarded. Older nodes ignore the flag and return full pages.
+    #[serde(default)]
+    pub metadata_only: bool,
 }
 
 impl Serializer for GetShieldedBlocksRequest {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
         store!(RpcHash, &self.start_hash, writer)?;
         store!(u64, &self.limit, writer)?;
+        store!(bool, &self.metadata_only, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for GetShieldedBlocksRequest {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let start_hash = load!(RpcHash, reader)?;
         let limit = load!(u64, reader)?;
-        Ok(Self { start_hash, limit })
+        let metadata_only = if version >= 2 { load!(bool, reader)? } else { false };
+        Ok(Self { start_hash, limit, metadata_only })
     }
 }
 
@@ -572,6 +579,11 @@ impl Deserializer for GetShieldedBlocksRequest {
 pub struct RpcShieldedCoinbaseOutput {
     pub script_public_key: Vec<u8>,
     pub value: u64,
+    /// Optional consensus-computed note commitment. It is carried by gRPC as a
+    /// new protobuf field; legacy binary RPC serialization deliberately omits it
+    /// so old peers remain wire-compatible and wallets retain derivation fallback.
+    #[serde(default)]
+    pub commitment: Option<[u8; 32]>,
 }
 
 impl Serializer for RpcShieldedCoinbaseOutput {
@@ -588,7 +600,7 @@ impl Deserializer for RpcShieldedCoinbaseOutput {
         let _version = load!(u16, reader)?;
         let script_public_key = load!(Vec<u8>, reader)?;
         let value = load!(u64, reader)?;
-        Ok(Self { script_public_key, value })
+        Ok(Self { script_public_key, value, commitment: None })
     }
 }
 

@@ -27,8 +27,8 @@
 
 use kaspa_consensus::model::stores::headers::{DbHeadersStore, HeaderStoreReader};
 use kaspa_database::prelude::{CachePolicy, ConnBuilder};
-use kaspa_hashes::Hash;
 use kaspa_database::registry::DatabaseStorePrefixes;
+use kaspa_hashes::Hash;
 use num_traits::FromPrimitive;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
 use std::collections::BTreeMap;

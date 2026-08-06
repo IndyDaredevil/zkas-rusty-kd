@@ -423,11 +423,8 @@ mod tests {
         bundle.flags |= BUNDLE_FLAG_BURN;
         bundle.burn = Some((20, [0xA1; 32]));
 
-        let expected = if crate::burn::BRIDGE_ENABLED {
-            BundleExtractError::BurnWithoutSpend
-        } else {
-            BundleExtractError::BridgeDisabled
-        };
+        let expected =
+            if crate::burn::BRIDGE_ENABLED { BundleExtractError::BurnWithoutSpend } else { BundleExtractError::BridgeDisabled };
         assert_eq!(ShieldedTx::from_bundle(&bundle).unwrap_err(), expected);
     }
 
@@ -712,8 +709,15 @@ mod tests {
 
     #[test]
     fn extract_rejects_minting_value_balance() {
-        let bundle =
-            ShieldedBundle { actions: vec![], flags: 0, value_balance: -1, anchor: [0; 32], proof: vec![], binding_sig: [0; 64], burn: None };
+        let bundle = ShieldedBundle {
+            actions: vec![],
+            flags: 0,
+            value_balance: -1,
+            anchor: [0; 32],
+            proof: vec![],
+            binding_sig: [0; 64],
+            burn: None,
+        };
         assert!(matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::MintingValueBalance)));
     }
 
@@ -721,8 +725,15 @@ mod tests {
     fn extract_rejects_non_canonical_commitment() {
         let mut bad = action(1, 0);
         bad.cmx = [0xff; 32]; // not a canonical Pallas base-field element
-        let bundle =
-            ShieldedBundle { actions: vec![bad], flags: 0, value_balance: 0, anchor: [0; 32], proof: vec![], binding_sig: [0; 64], burn: None };
+        let bundle = ShieldedBundle {
+            actions: vec![bad],
+            flags: 0,
+            value_balance: 0,
+            anchor: [0; 32],
+            proof: vec![],
+            binding_sig: [0; 64],
+            burn: None,
+        };
         assert!(matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::NonCanonicalCommitment)));
     }
 

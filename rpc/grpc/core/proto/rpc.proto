@@ -263,11 +263,13 @@ message GetShieldedTreeStateResponseMessage {
 message GetShieldedBlocksRequestMessage {
   string startHash = 1;                 // resume cursor (exclusive); must be a chain block
   uint64 limit = 2;                     // max chain blocks returned (0 = server default)
+  bool metadataOnly = 3;                // return headers/timestamps only
 }
 
 message RpcShieldedCoinbaseOutput {
   string scriptPublicKey = 1;           // hex; a 43-byte script is a raw Orchard recipient
   uint64 value = 2;
+  bytes commitment = 3;                 // optional 32-byte consensus-computed note commitment
 }
 
 message RpcShieldedChainBlock {

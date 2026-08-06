@@ -803,7 +803,16 @@ mod tests {
         let mergeset_non_daa = Default::default();
 
         let pre_activation = cbm
-            .expected_coinbase_transaction(99, miner_data.clone(), &ghostdag_data, &mergeset_rewards, &mergeset_non_daa, [0u8; 32], 0, 0)
+            .expected_coinbase_transaction(
+                99,
+                miner_data.clone(),
+                &ghostdag_data,
+                &mergeset_rewards,
+                &mergeset_non_daa,
+                [0u8; 32],
+                0,
+                0,
+            )
             .unwrap();
         let post_activation = cbm
             .expected_coinbase_transaction(100, miner_data, &ghostdag_data, &mergeset_rewards, &mergeset_non_daa, [0u8; 32], 0, 0)
@@ -838,10 +847,8 @@ mod tests {
         let non_daa: BlockHashSet = Default::default();
 
         let miner_data = MinerData::new(ScriptPublicKey::new(0, scriptvec![1, 2, 3]), vec![]);
-        let tx = cbm
-            .expected_coinbase_transaction(0, miner_data, &ghostdag_data, &mergeset_rewards, &non_daa, [0u8; 32], 0, 0)
-            .unwrap()
-            .tx;
+        let tx =
+            cbm.expected_coinbase_transaction(0, miner_data, &ghostdag_data, &mergeset_rewards, &non_daa, [0u8; 32], 0, 0).unwrap().tx;
 
         // Exactly two outputs: the reduced miner reward, then the dev fee (appended last).
         assert_eq!(tx.outputs.len(), 2, "one miner output + one dev output");
@@ -861,7 +868,18 @@ mod tests {
         kaspa_shielded_core::coinbase::coinbase_note(&desc, dev_cut).expect("dev recipient must be a canonical Orchard address");
 
         // With no recipient the manager produces no dev output and pays the full reward to the miner.
-        let no_fee = CoinbaseManager::new(150, 204, 0, 50_000_000_000, ForkedParam::new_const(1), ForkActivation::never(), 50, None, ForkActivation::never(), 1_000);
+        let no_fee = CoinbaseManager::new(
+            150,
+            204,
+            0,
+            50_000_000_000,
+            ForkedParam::new_const(1),
+            ForkActivation::never(),
+            50,
+            None,
+            ForkActivation::never(),
+            1_000,
+        );
         let tx2 = no_fee
             .expected_coinbase_transaction(
                 0,

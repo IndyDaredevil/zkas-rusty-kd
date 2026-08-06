@@ -116,6 +116,17 @@ lower `fee` does not save money — it just gets corrected.
 | `--auto-consolidate MAX_NOTES` | `500` | **On by default.** Keeps custodial wallets under `MAX_NOTES` by merging their oldest notes in the background. Wallets below the ceiling are never touched. See §4. |
 | `--no-auto-consolidate` | `false` | Turn background consolidation off entirely. |
 | `--proof-threads N` | *(every core)* | **Throttle**, not a tuning knob: caps the threads Halo2 proving may use, so the daemon can't starve a co-located node. Lowering it makes payments slower. See §4. |
+| `--runtime-threads N` | `2 × CPU cores` | Tokio workers for HTTP, RPC and coordination. |
+| `--max-concurrent-proves N` | `min(2, cores)` | Global proof admission limit. |
+| `--sync-wallets N` | `cores − 1` (1–8) | Maximum concurrent wallet scans; live free memory can reduce it further. |
+| `--sync-wallet-memory-mb MIB` | `512` | Memory budget charged to each concurrent scan. |
+| `--load-wallets N`, `--warm-wallets N` | hardware-derived, `1` | Concurrent checkpoint loads and cold witness warmups. |
+| `--page-decode-threads N` | `cores − 2` (1–8) | Shared block-page decoder threads. |
+| `--page-cache-entries N`, `--page-cache-ttl SECONDS` | `64`, `10` | Shared decoded page cache size and lifetime. |
+| `--active-sync-window SECONDS` | `90` | Continue background sync this long after a wallet request. |
+| `--idle-evict SECONDS` | `1800` | Remove an idle wallet checkpoint from RAM (not disk). |
+| `--max-resident-wallets N` | derived from `MemAvailable` | Hard cap on loaded wallets. |
+| `--subtree-free-floor-mb MIB` | `1200` | Defer optional subtree-index construction below this free-memory floor. |
 | `--diagnose` | `false` | Offline: print each wallet's note/base/**stranded-note** report, then exit. Run with the daemon stopped. |
 | `--graft TOKEN:/path/older.scan` | — | Offline: repair a stranded wallet from an older snapshot of itself. Daemon stopped. |
 
@@ -376,15 +387,16 @@ unchanged and never pays for this. Concurrency is bounded by cores **and** free 
 (`PROOF_MEM_PER_EXTRA_MB`), so a squeezed box degrades to the sequential path rather
 than running out of memory.
 
-### Threading: what is and isn't configurable
+### Runtime resource controls
 
 | Knob | Where | Default | Configurable at runtime |
 | --- | --- | --- | --- |
 | Halo2 proving threads | rayon global pool | every core | **`--proof-threads N`** (or `RAYON_NUM_THREADS`) |
-| Threads per proof when grouped | `PROOF_THREADS_EACH` | 2 | no — rebuild |
-| Concurrent chunk proofs | `proof_concurrency()` | cores ÷ 2, memory-capped | no — automatic |
-| Tokio worker threads | `main.rs` | 8 | no — rebuild |
-| Wallet sync concurrency | `SYNC_CONCURRENCY` | 3 | no — rebuild |
+| Proof admission | prepare semaphore | min(2, cores) | **`--max-concurrent-proves N`** |
+| Tokio worker threads | runtime | 2 × cores | **`--runtime-threads N`** |
+| Wallet sync concurrency | sync scheduler | cores − 1, memory-capped | **`--sync-wallets N`**, **`--sync-wallet-memory-mb MIB`** |
+| Checkpoint load / cold warm concurrency | semaphores | hardware-derived / 1 | **`--load-wallets N`**, **`--warm-wallets N`** |
+| Shared page decode threads | dedicated rayon pool | cores − 2 | **`--page-decode-threads N`** |
 
 **`--proof-threads` only ever costs you time.** Total CPU work is fixed at ~2.4
 core-seconds per note spent; the flag just decides how many cores divide it:
@@ -401,7 +413,7 @@ On a pool machine also running a node, `--proof-threads $(( $(nproc) - 2 ))` buy
 headroom at a known, bounded latency cost. Do not set it hoping for a speedup — there
 isn't one, and proving is the thing a user is waiting on.
 
-Note the Tokio worker count (8) is separate and does **not** bound proving: proofs run on
+The Tokio worker count is separate and does **not** bound proving: proofs run on
 `spawn_blocking` threads and inside the rayon pool, not on async workers.
 
 ### Sizing
@@ -409,7 +421,7 @@ Note the Tokio worker count (8) is separate and does **not** bound proving: proo
 - **Cache memory:** ~4 B per leaf of span, but building forces that wallet's decoded leaf
   stream to materialise — together ~**11 MB per 200 K-leaf wallet** (32 B/leaf stored +
   32 B/leaf decoded). Gated on live free memory: a build is deferred while
-  `MemAvailable` is under `SUBTREE_CACHE_FREE_FLOOR_MB` (1 200 MB) and retried on a later
+  `MemAvailable` is under `--subtree-free-floor-mb` (default 1 200 MB) and retried on a later
   pass. This replaced a fixed daemon-wide leaf budget that was both an arbitrary number
   and a *lifetime* counter — once spent, every wallet loaded afterwards was permanently
   stuck on the replay path (observed live: 31 wallets skipped, one then taking 16.1 s to

@@ -4129,6 +4129,7 @@ name = "kaspa-p2p-flows"
 version = "2.0.1"
 dependencies = [
  "async-trait",
+ "bincode",
  "chrono",
  "futures",
  "indexmap 2.14.0",
@@ -5082,6 +5083,8 @@ name = "kaspad"
 version = "2.0.1"
 dependencies = [
  "async-channel 2.3.1",
+ "bincode",
+ "blake2b_simd",
  "borsh",
  "cfg-if 1.0.0",
  "clap",

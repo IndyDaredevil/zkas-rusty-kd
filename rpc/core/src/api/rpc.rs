@@ -173,7 +173,7 @@ pub trait RpcApi: Sync + Send + AnySync {
     /// The per-chain-block shielded effects stream for wallet sync: coinbase
     /// mint + accepted (post-retain) bundles, consensus order, oldest first.
     async fn get_shielded_blocks(&self, start_hash: RpcHash, limit: u64) -> RpcResult<GetShieldedBlocksResponse> {
-        self.get_shielded_blocks_call(None, GetShieldedBlocksRequest { start_hash, limit }).await
+        self.get_shielded_blocks_call(None, GetShieldedBlocksRequest { start_hash, limit, metadata_only: false }).await
     }
     async fn get_shielded_blocks_call(
         &self,
@@ -182,6 +182,12 @@ pub trait RpcApi: Sync + Send + AnySync {
     ) -> RpcResult<GetShieldedBlocksResponse> {
         let _ = (connection, request);
         Err(crate::RpcError::General("get_shielded_blocks is not implemented for this RPC client".to_string()))
+    }
+
+    /// Metadata-only variant used for cursor/birthday discovery. A legacy node
+    /// may ignore the flag and return full blocks; callers must tolerate that.
+    async fn get_shielded_block_metadata(&self, start_hash: RpcHash, limit: u64) -> RpcResult<GetShieldedBlocksResponse> {
+        self.get_shielded_blocks_call(None, GetShieldedBlocksRequest { start_hash, limit, metadata_only: true }).await
     }
 
     /// The shielded turnstile totals (minted / fees / burned / pool value) as of a

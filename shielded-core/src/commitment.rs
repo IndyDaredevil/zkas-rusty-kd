@@ -104,10 +104,7 @@ mod tests {
             ExitReceipt { v: 5_000_000, recipient: [0xA1; 32], n: [0x11; 32] },
             ExitReceipt { v: 250_000, recipient: [0xB2; 32], n: [0x22; 32] },
         ]);
-        assert_eq!(
-            hex(&acc.root()),
-            "4a457e6dd8976c5b52b7d7337244ef6478c87e916bdec6465d730ecd5e7fe5d3",
-        );
+        assert_eq!(hex(&acc.root()), "4a457e6dd8976c5b52b7d7337244ef6478c87e916bdec6465d730ecd5e7fe5d3",);
 
         let root = shielded_state_root(&A, &N, 1_000_000_000, 12_345, &acc.root());
         assert_eq!(hex(&root), "4c803ec34ec41afe760122a9e84802fa93d41e38bb84f5d369a9616a8f91dfc7");

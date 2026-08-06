@@ -16,7 +16,6 @@ pub use kaspa_hashes::Hash;
 pub mod acceptance_data;
 pub mod api;
 pub mod auxpow;
-pub mod zkas_state_binding;
 pub mod block;
 pub mod blockhash;
 pub mod blockstatus;
@@ -38,6 +37,7 @@ pub mod subnets;
 pub mod trusted;
 pub mod tx;
 pub mod utxo;
+pub mod zkas_state_binding;
 
 /// Integer type for accumulated PoW of blue blocks. We expect no more than
 /// 2^128 work in a single block (btc has ~2^80), and no more than 2^64

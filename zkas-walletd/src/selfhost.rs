@@ -53,6 +53,8 @@ pub struct SelfHostConfig {
     pub wallet_secret: Option<String>,
     /// Permit the tokenless "default" wallet (single-user self-host convenience).
     pub allow_default_token: bool,
+    /// Runtime resource policy supplied by the standalone CLI or embedding node.
+    pub resources: crate::ResourceLimits,
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -187,6 +189,7 @@ pub async fn run_selfhost(cfg: SelfHostConfig, shutdown: tokio::sync::oneshot::R
         // A self-host is the owner's own daemon: custodial endpoints stay enabled.
         allow_custodial: true,
         max_concurrent_proves: crate::default_max_concurrent_proves(),
+        resources: cfg.resources,
     };
     crate::serve(daemon, shutdown).await
 }

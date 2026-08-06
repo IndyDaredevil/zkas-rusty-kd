@@ -3,10 +3,12 @@
 use super::collector::{CollectorFromConsensus, CollectorFromIndex};
 use crate::converter::feerate_estimate::{FeeEstimateConverter, FeeEstimateVerboseConverter};
 use crate::converter::{consensus::ConsensusConverter, index::IndexConverter, protocol::ProtocolConverter};
+use crate::shielded_rewards::{RECIPIENT_LEN, match_coinbase_outputs};
 use async_trait::async_trait;
 use kaspa_consensus_core::api::counters::ProcessingCounters;
 use kaspa_consensus_core::daa_score_timestamp::DaaScoreTimestamp;
 use kaspa_consensus_core::errors::block::RuleError;
+use kaspa_consensus_core::tx::{ScriptPublicKey as RpcScriptPublicKey, ScriptVec};
 use kaspa_consensus_core::tx::{TransactionQueryResult, TransactionType};
 use kaspa_consensus_core::utxo::utxo_inquirer::UtxoInquirerError;
 use kaspa_consensus_core::{
@@ -66,9 +68,7 @@ use kaspa_rpc_core::{
     model::*,
     notify::connection::ChannelConnection,
 };
-use crate::shielded_rewards::{RECIPIENT_LEN, match_coinbase_outputs};
 use kaspa_system_info::SystemInfo;
-use kaspa_consensus_core::tx::{ScriptPublicKey as RpcScriptPublicKey, ScriptVec};
 use kaspa_txscript::{extract_script_pub_key_address, pay_to_address_script};
 use kaspa_utils::expiring_cache::ExpiringCache;
 use kaspa_utils::{channel::Channel, triggers::SingleTrigger};
@@ -497,11 +497,8 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             //
             // Locate it positionally instead — the red reward, when present, sits directly
             // after the blue rewards — and exclude the dev-fee recipient explicitly.
-            let dev_spk = self
-                .config
-                .params
-                .dev_fee_recipient
-                .map(|recipient| RpcScriptPublicKey::new(0, ScriptVec::from_slice(&recipient)));
+            let dev_spk =
+                self.config.params.dev_fee_recipient.map(|recipient| RpcScriptPublicKey::new(0, ScriptVec::from_slice(&recipient)));
             let red_reward_index = queried_ghostdag.mergeset_blues.len();
             if let Some(own_red_reward_output) = queried_coinbase.outputs.get(red_reward_index) {
                 if dev_spk.as_ref() != Some(&own_red_reward_output.script_public_key) {
@@ -800,17 +797,42 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let mut blocks = Vec::new();
         if !reorged {
             for hash in added.iter().take(limit) {
+                if request.metadata_only {
+                    // Do not touch the shielded scan archive at all for cursor
+                    // discovery. Full archive records can contain large compact
+                    // action payloads; birthday walks need only canonical header
+                    // metadata.
+                    let header = session.async_get_header(*hash).await?;
+                    let blue_score = session.async_get_ghostdag_data(*hash).await?.blue_score;
+                    blocks.push(RpcShieldedChainBlock {
+                        hash: *hash,
+                        blue_score,
+                        daa_score: header.daa_score,
+                        coinbase_txid: RpcHash::default(),
+                        coinbase_outputs: Vec::new(),
+                        accepted_actions: Vec::new(),
+                        accepted_txids: Vec::new(),
+                        timestamp: header.timestamp,
+                    });
+                    continue;
+                }
                 let d = session.async_get_shielded_chain_block_data(*hash).await?;
+                let coinbase_outputs = d
+                    .coinbase_outputs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (script_public_key, value))| RpcShieldedCoinbaseOutput {
+                        script_public_key: script_public_key.clone(),
+                        value: *value,
+                        commitment: d.coinbase_commitments.get(i).copied(),
+                    })
+                    .collect();
                 blocks.push(RpcShieldedChainBlock {
                     hash: d.hash,
                     blue_score: d.blue_score,
                     daa_score: d.daa_score,
                     coinbase_txid: d.coinbase_txid,
-                    coinbase_outputs: d
-                        .coinbase_outputs
-                        .into_iter()
-                        .map(|(script_public_key, value)| RpcShieldedCoinbaseOutput { script_public_key, value })
-                        .collect(),
+                    coinbase_outputs,
                     accepted_actions: d.accepted_actions,
                     accepted_txids: d.accepted_txids,
                     timestamp: d.timestamp,
@@ -843,8 +865,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         };
         let daa_score = session.async_get_header(block_hash).await?.daa_score;
         let blue_score = session.async_get_ghostdag_data(block_hash).await?.blue_score;
-        let (cumulative_coinbase, cumulative_fees, cumulative_burns) =
-            session.async_get_shielded_supply_totals(block_hash).await?;
+        let (cumulative_coinbase, cumulative_fees, cumulative_burns) = session.async_get_shielded_supply_totals(block_hash).await?;
         // The frontier's leaf count is the number of notes ever created, which is
         // read from the same per-block snapshot as the totals — so all the numbers
         // in one response describe exactly one point on the chain.

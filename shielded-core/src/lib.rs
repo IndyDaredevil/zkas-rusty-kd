@@ -30,9 +30,9 @@ pub mod state;
 pub mod tree;
 pub mod turnstile;
 pub mod verify;
-pub mod witness_chain;
 pub mod wallet;
 pub mod walletdb;
+pub mod witness_chain;
 
 // The human-facing wallet facade (keys -> zkas: address -> scan -> pay).
 pub use account::{PaymentError, ShieldedAccount, orchard_recipient_bytes};

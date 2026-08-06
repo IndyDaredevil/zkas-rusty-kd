@@ -569,8 +569,8 @@ async fn immature_shielded_anchor_spend_is_dropped_not_fatal() {
     let vp = ctx.consensus.virtual_processor();
     let before = vp.shielded_supply_totals_at(spend_block_hash).unwrap();
     let after = vp.shielded_supply_totals_at(child_hash).unwrap();
-    let pool_delta = (after.cumulative_coinbase - before.cumulative_coinbase) as i128
-        - (after.cumulative_fees - before.cumulative_fees) as i128;
+    let pool_delta =
+        (after.cumulative_coinbase - before.cumulative_coinbase) as i128 - (after.cumulative_fees - before.cumulative_fees) as i128;
     assert_eq!(pool_delta, note_value as i128, "the pool must grow by exactly the subsidy when a spend is dropped");
 }
 
@@ -1142,7 +1142,6 @@ async fn canonical_r_witness_reconstructs_seq_commit_from_mined_block() {
     assert_eq!(outsider.err(), Some(kaspa_shielded_core::witness_chain::WitnessError::TargetNotInMergeset));
 }
 
-
 /// AGE WINDOW (audit F-04/F-05, task test #1/#2 — predicate level): an anchor is
 /// final iff its source block's blue-score age lies in `[shielded_anchor_depth,
 /// max_shielded_anchor_age]` — both bounds inclusive. Below the depth the anchor is
@@ -1307,8 +1306,8 @@ async fn overaged_shielded_anchor_spend_is_dropped() {
     let vp = ctx.consensus.virtual_processor();
     let before = vp.shielded_supply_totals_at(spend_block_hash).unwrap();
     let after = vp.shielded_supply_totals_at(child_hash).unwrap();
-    let pool_delta = (after.cumulative_coinbase - before.cumulative_coinbase) as i128
-        - (after.cumulative_fees - before.cumulative_fees) as i128;
+    let pool_delta =
+        (after.cumulative_coinbase - before.cumulative_coinbase) as i128 - (after.cumulative_fees - before.cumulative_fees) as i128;
     assert_eq!(pool_delta, note_value as i128, "the pool must grow by exactly the subsidy when a spend is dropped");
 }
 

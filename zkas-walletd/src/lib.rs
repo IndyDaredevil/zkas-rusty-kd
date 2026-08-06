@@ -74,7 +74,6 @@ use kaspa_shielded_core::wallet::build::{
 use kaspa_shielded_core::walletdb::{BlockMeta, HistoryKind, OwnedNote, Preview, WalletDb};
 use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
 use tokio::sync::Mutex;
 use zkas_sdk::{
     ClaimedIntent as SdkClaimedIntent, Network as SdkNetwork, PreparedPayment as SdkPreparedPayment, PreparedPaymentEnvelope,
@@ -238,6 +237,47 @@ pub struct Config {
     /// Run continuously the cost is paid a few seconds at a time in the background,
     /// off the interactive path, and the note count never runs away in the first place.
     pub auto_consolidate: Option<usize>,
+    /// Runtime resource policy. Defaults are hardware-derived and suitable for a
+    /// single-user daemon; hosted operators can override every bound from the CLI.
+    pub resources: ResourceLimits,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResourceLimits {
+    pub sync_wallets: usize,
+    pub sync_wallet_memory_mb: u64,
+    pub load_wallets: usize,
+    pub warm_wallets: usize,
+    pub page_decode_threads: usize,
+    pub page_cache_entries: usize,
+    pub page_cache_ttl_secs: u64,
+    pub active_sync_secs: u64,
+    pub idle_evict_secs: u64,
+    pub max_resident_wallets: usize,
+    pub subtree_free_floor_mb: u64,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(1);
+        // A loaded checkpoint currently occupies roughly 100–190 MiB depending on
+        // chain height and note count. Derive the resident cap from live memory rather
+        // than baking a hosted-machine size into the binary.
+        let max_resident_wallets = mem_available_mb().map(|mb| (mb / 192).clamp(4, 256) as usize).unwrap_or(32);
+        Self {
+            sync_wallets: cores.saturating_sub(1).clamp(1, 8),
+            sync_wallet_memory_mb: 512,
+            load_wallets: cores.saturating_sub(2).clamp(1, 4),
+            warm_wallets: 1,
+            page_decode_threads: cores.saturating_sub(2).clamp(1, 8),
+            page_cache_entries: 64,
+            page_cache_ttl_secs: 10,
+            active_sync_secs: 90,
+            idle_evict_secs: 30 * 60,
+            max_resident_wallets,
+            subtree_free_floor_mb: 1_200,
+        }
+    }
 }
 
 /// Default for [`Config::max_concurrent_proves`]: two concurrent preparations —
@@ -859,7 +899,6 @@ const SUBTREE_CACHE_MIN_SPAN: u64 = 20_000;
 /// 16.1 s to witness 3 notes where a cached wallet took 32 ms). Gating on live free
 /// memory is self-regulating — builds stop as memory tightens and resume when it frees
 /// — and it reconsiders a skipped wallet on a later pass instead of writing it off.
-const SUBTREE_CACHE_FREE_FLOOR_MB: u64 = 1_200;
 
 /// How long a `MemAvailable` reading is reused. The gate is consulted per wallet per
 /// sync pass; re-reading `/proc/meminfo` every time would be pointless syscall traffic,
@@ -1091,7 +1130,6 @@ const WITNESS_ADVANCE_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// A wallet is synced by the background loop only while it has been touched by a
 /// request within this window; after that it is parked until the next request. Keeps a
 /// public daemon's CPU proportional to *active* wallets, not total tokens ever seen.
-const ACTIVE_SYNC_WINDOW: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// How many active wallets the sync loop advances **concurrently**. The per-wallet
 /// scan is CPU-bound (Sinsemilla appends + trial decryption) with no await inside, so
@@ -1102,11 +1140,16 @@ const ACTIVE_SYNC_WINDOW: std::time::Duration = std::time::Duration::from_secs(9
 /// number in parallel uses the idle cores, multiplying throughput ~N×. Bounded (not
 /// unbounded) so it never consumes every core — HTTP handlers, the node, and the
 /// mempool loop must still get scheduled. Kept at cores-2 (min 2) to leave headroom.
-// Shielded scanning performs substantial synchronous curve work while holding a
-// wallet lock. More than one scan at a time can occupy every Tokio worker and make
-// /health and /api/status time out. Keep it serial until the CPU portion is moved
-// behind spawn_blocking; availability is more important than catch-up throughput.
-const SYNC_CONCURRENCY: usize = 3;
+/// Adaptive wallet catch-up fan-out. Each active wallet owns a large commitment
+/// tree, so memory pressure must reduce concurrency before the host starts swapping.
+/// On the 4-core hosted VPS this normally resolves to two jobs, leaving headroom for
+/// the node, HTTP handlers, and the shared page decoder.
+fn sync_concurrency(resources: &ResourceLimits) -> usize {
+    let configured = resources.sync_wallets.max(1);
+    let per_wallet_mb = resources.sync_wallet_memory_mb.max(64);
+    let memory_cap = mem_available_mb().map(|mb| (mb / per_wallet_mb).max(1) as usize).unwrap_or(configured);
+    configured.min(memory_cap)
+}
 
 /// How many wallets may be in their one-time COLD WARM at once.
 ///
@@ -1116,7 +1159,6 @@ const SYNC_CONCURRENCY: usize = 3;
 /// the HTTP handlers, the node RPC and Halo 2 proving combined — so one user's first send
 /// visibly slowed everyone else's sync. Ordinary incremental sync is unaffected by this
 /// cap; only the heavy catch-up queues behind it.
-const WARM_CONCURRENCY: usize = 1;
 
 /// Real sleep between wallets in the sync loop, to guarantee CPU headroom for the HTTP
 /// handlers even while scans run. Caps sync throughput; keeps the daemon responsive.
@@ -1144,11 +1186,9 @@ const SYNC_PAGE_THROTTLE_MS: u64 = 5;
 /// touch costs a file read (witness state included since v5). On a hosted daemon with
 /// hundreds of one-visitor browsers, the resident set otherwise grows with every token
 /// ever seen — forever.
-const EVICT_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 /// Hard cap on resident wallets regardless of idleness; the least-recently-touched go
 /// first. A generous browser cohort fits well under this; it exists for the day the
 /// hosted wallet count stops fitting.
-const MAX_RESIDENT_WALLETS: usize = 256;
 /// The eviction sweep itself runs at most this often (cheap map walk; the victim
 /// checkpoint flushes are the real work, and victims are rare).
 const EVICT_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -1505,19 +1545,9 @@ struct DecodedPage {
 }
 
 /// Shared page decoding gets a bounded pool so it cannot consume every host core
-/// and starve HTTP or kaspad while several wallets ingest concurrently.
-/// Sized to the host: 2 threads minimum, up to 4 on bigger boxes, never more than
-/// half the cores — Halo 2 proving (the prepare gate) and the HTTP runtime must
-/// keep headroom even while a wallet cohort decodes the same catch-up range.
-static PAGE_DECODE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
-    let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(2);
-    rayon::ThreadPoolBuilder::new()
-        .num_threads((cores / 2).clamp(2, 4))
-        .thread_name(|i| format!("wallet-page-decode-{i}"))
-        .build()
-        .expect("build wallet page decode pool")
-});
-
+/// and starve HTTP or kaspad while several wallets ingest concurrently. Two threads
+/// are used on a 4-core box; larger wallet hosts expand to `cores - 2`, capped at
+/// eight. This pool is shared by every wallet and never multiplies per scan.
 fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> DecodedBlock {
     let mut coinbase = Vec::new();
     for (i, out) in b.coinbase_outputs.iter().enumerate() {
@@ -1530,7 +1560,15 @@ fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> DecodedBlock {
             let desc = derive_coinbase_note_desc(recipient, &note_seed);
             // Only keep a note that commits — exactly `WalletDb::ingest_block`'s skip
             // rule, so the shared leaf stream matches the recompute path leaf-for-leaf.
-            if let Ok(cmx) = kaspa_shielded_core::coinbase::coinbase_note_commitment(&desc, out.value) {
+            let cmx = out
+                .commitment
+                .and_then(|bytes| {
+                    Option::<kaspa_shielded_core::ExtractedNoteCommitment>::from(
+                        kaspa_shielded_core::ExtractedNoteCommitment::from_bytes(&bytes),
+                    )
+                })
+                .or_else(|| kaspa_shielded_core::coinbase::coinbase_note_commitment(&desc, out.value).ok());
+            if let Some(cmx) = cmx {
                 coinbase.push((desc, out.value, cmx));
             }
         }
@@ -1569,14 +1607,25 @@ fn decode_compact_actions(bytes: &[u8]) -> Option<Vec<CompactActionRecord>> {
 struct PageCache {
     map: HashMap<(RpcHash, u64), (std::time::Instant, Arc<DecodedPage>)>,
     order: VecDeque<(RpcHash, u64)>,
+    pool: Arc<rayon::ThreadPool>,
+    ttl: std::time::Duration,
+    cap: usize,
 }
 
-const PAGE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
-const PAGE_CACHE_CAP: usize = 64;
-
 impl PageCache {
-    fn new() -> Self {
-        Self { map: HashMap::new(), order: VecDeque::new() }
+    fn new(resources: &ResourceLimits) -> Self {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(resources.page_decode_threads.max(1))
+            .thread_name(|i| format!("wallet-page-decode-{i}"))
+            .build()
+            .expect("build wallet page decode pool");
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            pool: Arc::new(pool),
+            ttl: std::time::Duration::from_secs(resources.page_cache_ttl_secs.max(1)),
+            cap: resources.page_cache_entries.max(1),
+        }
     }
 }
 
@@ -1595,11 +1644,12 @@ async fn fetch_shielded_page(
     {
         let c = cache.lock().await;
         if let Some((at, resp)) = c.map.get(&key) {
-            if at.elapsed() < PAGE_CACHE_TTL {
+            if at.elapsed() < c.ttl {
                 return Ok(resp.clone());
             }
         }
     }
+    let pool = { cache.lock().await.pool.clone() };
     let raw = client.get_shielded_blocks(low, limit).await?;
     // Decode the page ACROSS CORES. The per-block coinbase Sinsemilla commitment is the
     // dominant scan cost (~1 ms/block — it, not decryption, set the measured ~900 blk/s
@@ -1607,7 +1657,7 @@ async fn fetch_shielded_page(
     // moves this task off the async worker pool so the rayon fan-out doesn't stall other
     // tokio tasks; the decode is done once here and shared by every wallet via the cache.
     let blocks = tokio::task::block_in_place(|| {
-        PAGE_DECODE_POOL.install(|| {
+        pool.install(|| {
             use rayon::prelude::*;
             raw.blocks.par_iter().map(decode_block).collect::<Vec<_>>()
         })
@@ -1616,7 +1666,7 @@ async fn fetch_shielded_page(
     let mut c = cache.lock().await;
     c.map.insert(key, (std::time::Instant::now(), decoded.clone()));
     c.order.push_back(key);
-    if c.order.len() > PAGE_CACHE_CAP {
+    if c.order.len() > c.cap {
         if let Some(old) = c.order.pop_front() {
             c.map.remove(&old);
         }
@@ -1847,7 +1897,13 @@ impl WalletEntry {
     /// (own coinbase mint + accepted post-retain bundles, consensus order), and
     /// only once a block is `SYNC_TIP_MARGIN` blue units below the sink (the
     /// append-only tree must not ingest anything a routine reorg could replace).
-    async fn sync_chunk(&mut self, client: &GrpcClient, cache: &Mutex<PageCache>, warm_gate: &tokio::sync::Semaphore) {
+    async fn sync_chunk(
+        &mut self,
+        client: &GrpcClient,
+        cache: &Mutex<PageCache>,
+        warm_gate: &tokio::sync::Semaphore,
+        subtree_free_floor_mb: u64,
+    ) {
         // Set when a small caught-up page comes back FULL: more blocks than it
         // carried arrived, so the next iteration must take a full page to catch
         // up in one go (otherwise a stalled wallet would crawl at CAUGHT_UP_PAGE
@@ -1979,8 +2035,7 @@ impl WalletEntry {
                             let preview = self.db.preview_block_compact(&cb, &u.compact);
                             // Remember what these blocks spend, so the same tx still sitting
                             // in the mempool is not counted a second time (see `mempool`).
-                            let nulls: Vec<_> =
-                                u.compact.iter().flat_map(|records| records.iter().map(|a| a.nullifier)).collect();
+                            let nulls: Vec<_> = u.compact.iter().flat_map(|records| records.iter().map(|a| a.nullifier)).collect();
                             kept.push_back(PreviewRollEntry { hash: u.hash, blue_score: u.blue_score, preview, nulls });
                         }
                         if reusable {
@@ -2111,12 +2166,13 @@ impl WalletEntry {
                     // skipped here is retried on a later pass, so a transient squeeze costs
                     // this wallet one slow send, not its whole session.
                     match mem_available_mb() {
-                        Some(free) if free < SUBTREE_CACHE_FREE_FLOOR_MB => {
+                        Some(free) if free < subtree_free_floor_mb => {
                             // Once per wallet per squeeze, not once per sync pass.
                             if !self.subtree_low_mem_logged {
                                 self.subtree_low_mem_logged = true;
                                 log::warn!(
-                                    "subtree cache deferred ({span} leaves): only {free} MB free, floor is {SUBTREE_CACHE_FREE_FLOOR_MB} MB; this wallet keeps the replay path for now"
+                                    "subtree cache deferred ({span} leaves): only {free} MB free, floor is {} MB; this wallet keeps the replay path for now",
+                                    subtree_free_floor_mb
                                 );
                             }
                         }
@@ -2133,6 +2189,11 @@ impl WalletEntry {
                                     t.elapsed()
                                 );
                             } else if self.db.subtree_cache_ready(matured) {
+                                // v8 checkpoints persist this verified index. Flush it
+                                // immediately: waiting for the ordinary 1,000-block
+                                // cadence leaves a long window in which a restart throws
+                                // away a multi-minute build and repeats it.
+                                self.force_checkpoint = true;
                                 log::info!(
                                     "subtree cache built in {:.1?} ({span} leaves, notes={note_count}) — spends now witness in O(depth), not a full replay",
                                     t.elapsed()
@@ -2368,8 +2429,10 @@ async fn replay_matured(client: &GrpcClient, genesis: RpcHash, mut db: WalletDb)
         _ => {
             let dag = client.get_block_dag_info().await.map_err(|e| format!("get_block_dag_info failed: {e}"))?;
             let start = dag.pruning_point_hash;
-            let ts =
-                client.get_shielded_tree_state(Some(start)).await.map_err(|e| format!("get_shielded_tree_state({start}) failed: {e}"))?;
+            let ts = client
+                .get_shielded_tree_state(Some(start))
+                .await
+                .map_err(|e| format!("get_shielded_tree_state({start}) failed: {e}"))?;
             if ts.block_hash != start {
                 return Err("node does not support explicit tree-state checkpoints (update the node)".into());
             }
@@ -2473,7 +2536,8 @@ struct AppState {
     /// prepare for the SAME wallet is a duplicate — a retry, a double-clicked button —
     /// and is rejected immediately rather than queued: it would select the same notes.
     preparing: std::sync::Mutex<HashSet<String>>,
-    /// Permits for the one-time cold warm; see [`WARM_CONCURRENCY`].
+    /// Permits for the one-time cold warm; configured by
+    /// [`ResourceLimits::warm_wallets`].
     warm_gate: tokio::sync::Semaphore,
     /// Last known virtual DAA score, refreshed by the sync loop and successful status
     /// calls, so status can answer instantly when the node RPC is momentarily contended.
@@ -2498,6 +2562,7 @@ struct AppState {
     /// Whether custodial (seed-holding) endpoints are enabled; see
     /// [`Config::allow_custodial`] and [`require_custodial`].
     allow_custodial: bool,
+    resources: ResourceLimits,
 }
 
 /// Build a status snapshot from a locked wallet entry. Shared by the sync loop and the
@@ -2740,7 +2805,7 @@ impl AppState {
         let mut base_below: Option<RpcHash> = None;
         // Bound the walk (a 2000-block page × this cap covers many millions of blocks).
         for _ in 0..4000 {
-            let page = self.client.get_shielded_blocks(cursor, WALK_PAGE).await.ok()?;
+            let page = self.client.get_shielded_block_metadata(cursor, WALK_PAGE).await.ok()?;
             if page.reorged {
                 return None;
             }
@@ -2879,16 +2944,27 @@ impl AppState {
     /// clone the freshest same-key checkpoint another token already scanned. Runs
     /// the donor verification (argon2 decrypts included) off the async workers.
     async fn adopt_twin(&self, token: &str, fvk: &[u8; 96], birthday: u64) -> Option<(String, u64)> {
-        // DISABLED 2026-07-20: cloning a donor token's checkpoint propagated stale /
-        // phantom-note trees between same-seed devices, which is exactly the
-        // divergent-anchor state `ensure_canonical_checkpoint` now rejects at send
-        // time. A fresh registration must scan the canonical stream itself; re-enable
-        // only behind a proof that the donor checkpoint equals the node frontier at
-        // its cursor. Body kept for that future gated version.
-        let _ = (token, fvk, birthday);
-        return None;
-        #[allow(unreachable_code)]
-        let candidates: Vec<String> = self.fvk_index.lock().await.get(fvk).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+        // The index is built in the background at daemon startup. A second device
+        // commonly registers while that scan is still running; do not silently miss
+        // the reuse path just because the asynchronous warm-up has not finished.
+        // Build a one-shot fallback index off the async runtime and merge it back.
+        let mut candidates: Vec<String> =
+            self.fvk_index.lock().await.get(fvk).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+        if candidates.is_empty() {
+            let (dir, secret) = (self.wallet_dir.clone(), self.wallet_secret.clone());
+            if let Ok(Ok(map)) = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                tokio::task::spawn_blocking(move || build_fvk_index(&dir, secret.as_deref())),
+            )
+            .await
+            {
+                if let Some(found) = map.get(fvk) {
+                    candidates = found.iter().filter(|t| t.as_str() != token).cloned().collect();
+                    let mut index = self.fvk_index.lock().await;
+                    index.entry(*fvk).or_default().extend(found.iter().cloned());
+                }
+            }
+        }
         if candidates.is_empty() {
             return None;
         }
@@ -2961,6 +3037,7 @@ impl AppState {
         // wallet would rebuild from its own leaf stream, so having it turns a ~60s
         // Sinsemilla replay into a frontier copy. Best-effort: if the node can't answer
         // (pruned cursor, RPC hiccup), we simply restore the old way.
+        let mut abandoned_checkpoint = false;
         let tip = match checkpoint_cursor(&self.wallet_dir, token, &genesis) {
             Some(cursor) => match self.client.get_shielded_tree_state(Some(cursor)).await {
                 Ok(ts) => Some(kaspa_shielded_core::tree::FrontierState {
@@ -2972,13 +3049,41 @@ impl AppState {
                 // retried on the next request; treating it as permission to trust the
                 // local file is how stale twin state previously propagated.
                 Err(e) => {
-                    log::warn!("cannot verify checkpoint cursor against selected chain ({e}); keeping checkpoint and retrying");
-                    return None;
+                    let detail = e.to_string();
+                    // A cursor whose header is absent from the selected chain cannot
+                    // become valid by retrying: it is a checkpoint from a discarded
+                    // chain (or an old/pruned store). Keep an immutable forensic copy,
+                    // retire only the active cursor, and rebuild honestly from the
+                    // wallet birthday. Other errors may be transient RPC/node
+                    // failures, so preserve the checkpoint and retry as before.
+                    let permanent = detail.to_ascii_lowercase().contains("cannot find header")
+                        || detail.to_ascii_lowercase().contains("header not found");
+                    if permanent {
+                        let scan = scan_path(&self.wallet_dir, token);
+                        let quarantine = format!("{scan}.stale-{}", now_unix());
+                        if std::fs::copy(&scan, &quarantine).is_ok() {
+                            let _ = std::fs::remove_file(&scan);
+                            log::warn!(
+                                "checkpoint cursor is not on the selected chain ({detail}); quarantined as {quarantine} and rebuilding"
+                            );
+                            abandoned_checkpoint = true;
+                            None
+                        } else {
+                            log::warn!("cannot quarantine stale checkpoint ({detail}); keeping checkpoint and retrying");
+                            return None;
+                        }
+                    } else {
+                        log::warn!(
+                            "cannot verify checkpoint cursor against selected chain ({detail}); keeping checkpoint and retrying"
+                        );
+                        return None;
+                    }
                 }
             },
             None => None,
         };
-        let restored = load_checkpoint(&self.wallet_dir, token, key, &genesis, tip.as_ref());
+        let restored =
+            (!abandoned_checkpoint).then(|| load_checkpoint(&self.wallet_dir, token, key, &genesis, tip.as_ref())).flatten();
         // Preserve a rejected checkpoint for forensic recovery/grafting. Never let
         // the subsequent clean scan overwrite the only copy of older owned notes.
         if restored.is_none() && tip.is_some() && checkpoint_cursor(&self.wallet_dir, token, &genesis).is_some() {
@@ -3050,7 +3155,7 @@ async fn mempool_loop(state: Arc<AppState>) {
                 .lock()
                 .await
                 .iter()
-                .filter(|(_, t)| now.duration_since(**t) < ACTIVE_SYNC_WINDOW)
+                .filter(|(_, t)| now.duration_since(**t) < std::time::Duration::from_secs(state.resources.active_sync_secs))
                 .map(|(k, _)| k.clone())
                 .collect()
         };
@@ -3230,7 +3335,7 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // Advance one chunk from `low` (also the cheap tip catch-up once already synced).
     let was_caught_up = e.caught_up;
     e.caught_up = false;
-    e.sync_chunk(&state.sync_client, &state.page_cache, &state.warm_gate).await;
+    e.sync_chunk(&state.sync_client, &state.page_cache, &state.warm_gate, state.resources.subtree_free_floor_mb).await;
     // NB: the eager witness pre-advance and base compaction live in `sync_chunk`'s
     // `caught_up` tail, THROTTLED to one bounded step per `WITNESS_ADVANCE_INTERVAL` per
     // wallet (an unthrottled advance on the 10 ms sync spin pinned every core, observed
@@ -3290,8 +3395,7 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         // and destroyed the only copy — exactly when a recovering operator is retrying.
         let bak = format!("{scan}.bak");
         if std::fs::metadata(&bak).is_ok() {
-            let stamp =
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default();
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default();
             let _ = std::fs::rename(&bak, format!("{bak}.{stamp}"));
         }
         let _ = std::fs::rename(&scan, &bak);
@@ -3354,8 +3458,8 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     if behind { SyncOutcome::Behind } else { SyncOutcome::Idle }
 }
 
-/// Evict wallets nobody has touched in [`EVICT_IDLE`] (plus LRU overflow past
-/// [`MAX_RESIDENT_WALLETS`]). Memory is a cache of the on-disk checkpoint — a hosted
+/// Evict wallets past [`ResourceLimits::idle_evict_secs`] (plus LRU overflow past
+/// [`ResourceLimits::max_resident_wallets`]). Memory is a cache of the on-disk checkpoint — a hosted
 /// daemon serving hundreds of browsers must not hold every wallet it has ever loaded.
 /// A dirty victim is flushed to disk first, so the reload on its next request costs a
 /// file read, not a rescan. Safe by construction:
@@ -3371,14 +3475,19 @@ async fn evict_idle_wallets(state: &Arc<AppState>) {
     let resident: Vec<(String, Wallet)> = { state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect() };
     let mut victims: Vec<String> = resident
         .iter()
-        .filter(|(t, _)| touches.get(t).map(|at| now.duration_since(*at) >= EVICT_IDLE).unwrap_or(false))
+        .filter(|(t, _)| {
+            touches
+                .get(t)
+                .map(|at| now.duration_since(*at) >= std::time::Duration::from_secs(state.resources.idle_evict_secs))
+                .unwrap_or(false)
+        })
         .map(|(t, _)| t.clone())
         .collect();
-    if resident.len() > MAX_RESIDENT_WALLETS {
+    if resident.len() > state.resources.max_resident_wallets {
         let mut by_touch: Vec<(String, std::time::Instant)> =
             resident.iter().map(|(t, _)| (t.clone(), touches.get(t).copied().unwrap_or(now))).collect();
         by_touch.sort_by_key(|(_, at)| *at);
-        for (t, _) in by_touch.into_iter().take(resident.len() - MAX_RESIDENT_WALLETS) {
+        for (t, _) in by_touch.into_iter().take(resident.len() - state.resources.max_resident_wallets) {
             if !victims.contains(&t) {
                 victims.push(t);
             }
@@ -3392,7 +3501,18 @@ async fn evict_idle_wallets(state: &Arc<AppState>) {
             // error state is evicted as-is — its checkpoint already lagged and the
             // reload path re-derives whatever it can.
             if e.error.is_none() && e.saved_scanned != e.scanned {
-                if save_checkpoint(&state.wallet_dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue, e.blind_below).is_ok()
+                if save_checkpoint(
+                    &state.wallet_dir,
+                    &token,
+                    &e.genesis,
+                    &e.low,
+                    e.scanned as u64,
+                    &e.db,
+                    &e.boundaries,
+                    e.sink_blue,
+                    e.blind_below,
+                )
+                .is_ok()
                 {
                     e.saved_scanned = e.scanned;
                     e.force_checkpoint = false;
@@ -3409,10 +3529,25 @@ async fn evict_idle_wallets(state: &Arc<AppState>) {
     }
 }
 
-async fn sync_loop(state: Arc<AppState>) {
-    let mut last_evict = std::time::Instant::now();
+/// Memory policing must not share the sync loop. A cohort of large checkpoints can
+/// keep that loop inside CPU-heavy scan/witness work for minutes — exactly when the
+/// resident cap is most important. Run the sweep independently so its cadence remains
+/// bounded under scan load.
+async fn eviction_loop(state: Arc<AppState>) {
     loop {
-        let wallets: Vec<(String, Wallet)> = { state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect() };
+        tokio::time::sleep(EVICT_SWEEP_INTERVAL).await;
+        evict_idle_wallets(&state).await;
+    }
+}
+
+async fn sync_loop(state: Arc<AppState>) {
+    loop {
+        // Snapshot token names, not Wallet Arcs. Holding an Arc for every resident
+        // wallet across the whole cohort kept evicted multi-hundred-MiB checkpoints
+        // alive until the slowest scan finished, making the resident cap appear to
+        // run while RSS stayed pinned. Resolve one Arc only when its bounded worker
+        // slot is ready; an entry evicted in the meantime is simply skipped.
+        let wallet_tokens: Vec<String> = { state.wallets.lock().await.keys().cloned().collect() };
         let mut any_behind = false;
         let mut reorged_tokens: Vec<String> = Vec::new();
         // Only sync wallets touched within this window. The rest are parked (kept in
@@ -3426,11 +3561,11 @@ async fn sync_loop(state: Arc<AppState>) {
                 .lock()
                 .await
                 .iter()
-                .filter(|(_, t)| now.duration_since(**t) < ACTIVE_SYNC_WINDOW)
+                .filter(|(_, t)| now.duration_since(**t) < std::time::Duration::from_secs(state.resources.active_sync_secs))
                 .map(|(k, _)| k.clone())
                 .collect()
         };
-        if !wallets.is_empty() {
+        if !wallet_tokens.is_empty() {
             // Timed out for the same reason as the page fetch: this runs once per pass on
             // the shared loop, so a hang here freezes every wallet.
             // A timed-out dag-info must NOT be reported as "the chain is 0 blocks long".
@@ -3454,13 +3589,16 @@ async fn sync_loop(state: Arc<AppState>) {
             // Running up to `SYNC_CONCURRENCY` at once uses the otherwise-idle cores while
             // still leaving headroom for the HTTP handlers, the node RPC, and the mempool
             // loop. Per-wallet correctness is unchanged (each holds only its own lock).
-            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(SYNC_CONCURRENCY));
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(sync_concurrency(&state.resources)));
             let mut set = tokio::task::JoinSet::new();
-            for (token, w) in wallets {
+            for token in wallet_tokens {
                 if !active.contains(&token) {
                     continue; // parked: nobody is looking at this wallet right now
                 }
                 let permit = sem.clone().acquire_owned().await.expect("sync semaphore closed");
+                let Some(w) = state.wallets.lock().await.get(&token).cloned() else {
+                    continue;
+                };
                 let st = state.clone();
                 set.spawn(async move {
                     let _permit = permit; // held for the wallet's whole chunk, bounding concurrency
@@ -3483,13 +3621,6 @@ async fn sync_loop(state: Arc<AppState>) {
                 map.remove(&t);
                 snaps.remove(&t);
             }
-        }
-        // Idle-wallet eviction (memory is a cache of the on-disk checkpoints — see
-        // `evict_idle_wallets`). Throttled; a hosted daemon's resident set must track
-        // the wallets people are actually looking at, not every browser that ever visited.
-        if last_evict.elapsed() >= EVICT_SWEEP_INTERVAL {
-            evict_idle_wallets(&state).await;
-            last_evict = std::time::Instant::now();
         }
         // While catching up a big initial scan, loop back immediately (only a
         // tiny yield so status calls can grab the lock); idle slowly once synced.
@@ -4155,7 +4286,9 @@ async fn wallet_rescan(
             };
             return Err(err(
                 StatusCode::CONFLICT,
-                format!("rescan refused: {detail}. Point the wallet at an archival node and try again, or pass force=true to rescan anyway and accept the loss."),
+                format!(
+                    "rescan refused: {detail}. Point the wallet at an archival node and try again, or pass force=true to rescan anyway and accept the loss."
+                ),
             ));
         }
     }
@@ -5633,6 +5766,8 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     );
     log::info!("network genesis (shielded sighash domain): {genesis}");
 
+    let resources = cfg.resources.clone();
+    log::info!("wallet resource limits: {:?}", resources);
     let state = Arc::new(AppState {
         client,
         sync_client,
@@ -5643,20 +5778,21 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         allow_default_token: cfg.allow_default_token,
         wallet_secret,
         genesis,
-        page_cache: Mutex::new(PageCache::new()),
+        page_cache: Mutex::new(PageCache::new(&resources)),
         last_touch: Mutex::new(HashMap::new()),
-        load_gate: tokio::sync::Semaphore::new(2),
+        load_gate: tokio::sync::Semaphore::new(resources.load_wallets.max(1)),
         // Concurrent preparations are capped by config (`--max-concurrent-proves`):
         // proving is CPU-heavy, and unbounded overlap is a CPU DoS on a hosted daemon.
         prepare_gate: tokio::sync::Semaphore::new(cfg.max_concurrent_proves.max(1)),
         preparing: std::sync::Mutex::new(HashSet::new()),
-        warm_gate: tokio::sync::Semaphore::new(WARM_CONCURRENCY),
+        warm_gate: tokio::sync::Semaphore::new(resources.warm_wallets.max(1)),
         node_tip: Mutex::new((0, std::time::Instant::now())),
         prepared: Mutex::new(HashMap::new()),
         snapshots: Mutex::new(HashMap::new()),
         fvk_index: Mutex::new(HashMap::new()),
         auto_consolidate: cfg.auto_consolidate,
         allow_custodial: cfg.allow_custodial,
+        resources,
     });
 
     // Index every existing wallet's viewing key in the background (argon2 per
@@ -5684,6 +5820,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     }
 
     let sync_task = tokio::spawn(sync_loop(state.clone()));
+    let eviction_task = tokio::spawn(eviction_loop(state.clone()));
     // Unmined payments — the instant-payment path. Separate from sync_loop on purpose
     // (see mempool_loop): it must never queue behind block scanning.
     let mempool_task = tokio::spawn(mempool_loop(state.clone()));
@@ -5797,6 +5934,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     // The loops hold node connections and wallet state; kill them so a re-`serve`
     // starts clean instead of double-scanning the same wallet files.
     sync_task.abort();
+    eviction_task.abort();
     mempool_task.abort();
     tip_task.abort();
     result
@@ -5969,5 +6107,46 @@ mod sdk_api_tests {
             kaspa_consensus_core::config::params::MAINNET_PARAMS.genesis.hash.as_bytes(),
             "SDK genesis drifted from consensus"
         );
+    }
+
+    #[test]
+    fn decode_block_prefers_node_commitment_and_keeps_legacy_fallback() {
+        let db = WalletDb::from_seed([0x31; 32]).expect("valid test seed");
+        let recipient = db.my_address_bytes();
+        let txid = RpcHash::from_bytes([0x42; 32]);
+        let mut seed = Vec::with_capacity(36);
+        seed.extend_from_slice(&txid.as_bytes());
+        seed.extend_from_slice(&0u32.to_le_bytes());
+        let desc = derive_coinbase_note_desc(recipient, &seed);
+        let value = 60_00000000;
+        let expected = kaspa_shielded_core::coinbase::coinbase_note_commitment(&desc, value).unwrap();
+        let base = kaspa_rpc_core::RpcShieldedChainBlock {
+            hash: RpcHash::from_bytes([1; 32]),
+            blue_score: 1,
+            daa_score: 1,
+            coinbase_txid: txid,
+            coinbase_outputs: vec![kaspa_rpc_core::RpcShieldedCoinbaseOutput {
+                script_public_key: recipient.to_vec(),
+                value,
+                commitment: None,
+            }],
+            accepted_actions: Vec::new(),
+            accepted_txids: Vec::new(),
+            timestamp: 0,
+        };
+        let legacy = decode_block(&base);
+        assert_eq!(legacy.coinbase[0].2.to_bytes(), expected.to_bytes());
+
+        let mut other_seed = seed;
+        other_seed[35] = 1;
+        let supplied_cmx =
+            kaspa_shielded_core::coinbase::coinbase_note_commitment(&derive_coinbase_note_desc(recipient, &other_seed), value)
+                .unwrap();
+        let mut with_commitment = base;
+        with_commitment.coinbase_outputs[0].commitment = Some(supplied_cmx.to_bytes());
+        // The supplied bytes are a valid but deliberately different commitment;
+        // decode must use the node value without hashing/deriving it again.
+        let supplied = decode_block(&with_commitment);
+        assert_eq!(supplied.coinbase[0].2.to_bytes(), supplied_cmx.to_bytes());
     }
 }

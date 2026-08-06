@@ -347,11 +347,16 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
 
     // Consensus-divergence diagnostics (`--consensus-diag`). Must be initialised before the
     // consensus threads start, since the setting is read once and then latched.
-    kaspa_consensus::processes::shielded_diag::init(args.consensus_diag.as_ref().map(|d| {
-        if d.is_empty() { app_dir.join(network.to_prefixed()).join("consensus-diag") } else { PathBuf::from(d) }
-    }));
+    kaspa_consensus::processes::shielded_diag::init(
+        args.consensus_diag
+            .as_ref()
+            .map(|d| if d.is_empty() { app_dir.join(network.to_prefixed()).join("consensus-diag") } else { PathBuf::from(d) }),
+    );
     if let Some(d) = args.consensus_diag.as_ref() {
-        info!("Consensus divergence diagnostics ON; reports will be written to {}", if d.is_empty() { "<appdir>/consensus-diag" } else { d });
+        info!(
+            "Consensus divergence diagnostics ON; reports will be written to {}",
+            if d.is_empty() { "<appdir>/consensus-diag" } else { d }
+        );
     }
 
     // Pinned anchor mappings must be loaded before consensus starts: the map is latched on
@@ -596,8 +601,16 @@ Do you confirm? (y/n)";
             match api_addr.parse::<std::net::SocketAddr>() {
                 Err(e) => warn!("--wallet-api {api_addr:?} is not a valid addr:port ({e}); skipping wallet API"),
                 Ok(listen) => {
-                    let net_str =
-                        if args.testnet { "testnet" } else if args.devnet { "devnet" } else if args.simnet { "simnet" } else { "mainnet" }.to_string();
+                    let net_str = if args.testnet {
+                        "testnet"
+                    } else if args.devnet {
+                        "devnet"
+                    } else if args.simnet {
+                        "simnet"
+                    } else {
+                        "mainnet"
+                    }
+                    .to_string();
                     let prefixed = network.to_prefixed();
                     let state_dir = app_dir.join(&prefixed).join("wallet-api");
                     let wallet_dir = app_dir.join(&prefixed).join("wallets").to_string_lossy().into_owned();
@@ -610,7 +623,13 @@ Do you confirm? (y/n)";
                     std::thread::Builder::new()
                         .name("wallet-api".to_string())
                         .spawn(move || {
-                            let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(8).enable_all().build() {
+                            let wallet_runtime_threads =
+                                std::thread::available_parallelism().map(|n| n.get().saturating_mul(2).max(2)).unwrap_or(2);
+                            let rt = match tokio::runtime::Builder::new_multi_thread()
+                                .worker_threads(wallet_runtime_threads)
+                                .enable_all()
+                                .build()
+                            {
                                 Ok(rt) => rt,
                                 Err(e) => {
                                     warn!("wallet API runtime failed to start: {e}");
@@ -630,6 +649,7 @@ Do you confirm? (y/n)";
                                 public_host,
                                 wallet_secret,
                                 allow_default_token: true,
+                                resources: zkas_walletd::ResourceLimits::default(),
                             };
                             if let Err(e) = rt.block_on(zkas_walletd::run_selfhost(cfg, rx)) {
                                 warn!("wallet API exited: {e}");

@@ -46,7 +46,6 @@
 //!   ZKas block, so peg-out latency tracks how often the pool lands Kaspa blocks. Not a soundness
 //!   hole.
 
-
 use kaspa_hashes::Hash;
 use kaspa_seq_commit::hashing::{
     activity_root_hash, miner_payload_leaf, miner_payload_root, payload_and_context_digest, seq_commit, seq_state_root,
@@ -173,8 +172,11 @@ impl SeqCommitWitness {
         inactivity_shortcut: Hash,
         parent_seq_commit: Hash,
     ) -> Result<Self, WitnessError> {
-        let our_leaf =
-            miner_payload_leaf(MinerPayloadLeafInput { block_hash: &block_hash, blue_work_be_bytes: &blue_work_be, payload: &kaspa_payload });
+        let our_leaf = miner_payload_leaf(MinerPayloadLeafInput {
+            block_hash: &block_hash,
+            blue_work_be_bytes: &blue_work_be,
+            payload: &kaspa_payload,
+        });
         let leaf_index = mergeset_leaves.iter().position(|l| *l == our_leaf).ok_or(WitnessError::TargetNotInMergeset)?;
         let mut other_leaves = mergeset_leaves.to_vec();
         other_leaves.remove(leaf_index);

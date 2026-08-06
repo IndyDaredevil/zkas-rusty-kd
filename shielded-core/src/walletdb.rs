@@ -49,7 +49,9 @@ use zcash_note_encryption::try_output_recovery_with_ovk;
 use crate::bundle::ShieldedBundle;
 use crate::coinbase::{CoinbaseNoteDesc, coinbase_note_commitment};
 use crate::tree::{FrontierState, GlobalTree, TREE_DEPTH};
-use crate::wallet::scan::{CompactActionRecord, ReceivedNote, reconstruct_action, scan_bundle_prepared, scan_compact_prepared, trim_memo};
+use crate::wallet::scan::{
+    CompactActionRecord, ReceivedNote, reconstruct_action, scan_bundle_prepared, scan_compact_prepared, trim_memo,
+};
 
 /// A note the wallet owns and can spend. The membership witness is **not** held
 /// live per note (that made scanning O(N²) — every leaf advanced every owned
@@ -660,7 +662,11 @@ impl WalletDb {
     /// caller must supply exactly the notes [`ingest_block`] would keep, in the same
     /// order (skip a note whose `coinbase_note_commitment` errors), so the leaf
     /// stream is byte-identical to the non-shared path.
-    pub fn ingest_block_precomputed(&mut self, coinbase: &[(CoinbaseNoteDesc, u64, ExtractedNoteCommitment)], txs: &[&ShieldedBundle]) {
+    pub fn ingest_block_precomputed(
+        &mut self,
+        coinbase: &[(CoinbaseNoteDesc, u64, ExtractedNoteCommitment)],
+        txs: &[&ShieldedBundle],
+    ) {
         self.ingest_block_precomputed_with_meta(coinbase, txs, None);
     }
 
@@ -871,7 +877,14 @@ impl WalletDb {
     /// spends the recipient/paid-amount/memo are recovered with our OVK when the
     /// send was built with it; otherwise the row falls back to `net outflow − fee`
     /// with no recipient — still a correct amount, just less descriptive.
-    fn record_bundle_history(&mut self, bundle: &ShieldedBundle, spent: u64, received: &[ReceivedNote], txid: [u8; 32], meta: &BlockMeta) {
+    fn record_bundle_history(
+        &mut self,
+        bundle: &ShieldedBundle,
+        spent: u64,
+        received: &[ReceivedNote],
+        txid: [u8; 32],
+        meta: &BlockMeta,
+    ) {
         if !self.history_enabled {
             return;
         }
@@ -889,7 +902,8 @@ impl WalletDb {
             for a in &bundle.actions {
                 let Some(action) = reconstruct_action(a) else { continue };
                 let domain = OrchardDomain::for_action(&action);
-                let Some((note, addr, m)) = try_output_recovery_with_ovk(&domain, &self.ovk, &action, action.cv_net(), &a.out_ciphertext)
+                let Some((note, addr, m)) =
+                    try_output_recovery_with_ovk(&domain, &self.ovk, &action, action.cv_net(), &a.out_ciphertext)
                 else {
                     continue;
                 };
@@ -1067,11 +1081,8 @@ impl WalletDb {
             if records.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
                 continue;
             }
-            let spent: u128 = records
-                .iter()
-                .filter_map(|a| self.notes.iter().find(|n| n.nullifier == a.nullifier))
-                .map(|n| n.value() as u128)
-                .sum();
+            let spent: u128 =
+                records.iter().filter_map(|a| self.notes.iter().find(|n| n.nullifier == a.nullifier)).map(|n| n.value() as u128).sum();
             let received: u128 =
                 scan_compact_prepared(&self.prepared_ivk, records).iter().map(|r| r.note.value().inner() as u128).sum();
             if spent > 0 {
@@ -1401,10 +1412,7 @@ impl WalletDb {
     /// Recovery requires older wallet state whose leaf stream still covers the
     /// note (see the walletd graft tooling), or an archival replay of the chain.
     pub fn stranded_notes(&self) -> Vec<&OwnedNote> {
-        self.notes
-            .iter()
-            .filter(|n| n.position < self.base_size && !self.witnesses.iter().any(|(p, _)| *p == n.position))
-            .collect()
+        self.notes.iter().filter(|n| n.position < self.base_size && !self.witnesses.iter().any(|(p, _)| *p == n.position)).collect()
     }
 
     fn live_witness_path(&self, position: u64, matured_leaves: u64) -> Option<MerklePath> {
@@ -1803,7 +1811,8 @@ impl WalletDb {
                     let mut parents: Vec<u64> = cur.keys().map(|j| j >> 1).collect();
                     parents.sort_unstable();
                     parents.dedup();
-                    let mut up: std::collections::HashMap<u64, MerkleHashOrchard> = std::collections::HashMap::with_capacity(parents.len());
+                    let mut up: std::collections::HashMap<u64, MerkleHashOrchard> =
+                        std::collections::HashMap::with_capacity(parents.len());
                     for pj in parents {
                         let lidx = pj << 1;
                         let Some(left) = cur.get(&lidx) else { continue }; // left child below/straddling base → left context
@@ -2025,6 +2034,16 @@ impl WalletDb {
         }
         out.extend_from_slice(&(psec.len() as u64).to_le_bytes());
         out.extend_from_slice(&psec);
+
+        // v8: persist the root-gated complete-subtree index. Building this index is
+        // deliberately expensive (one Sinsemilla fold over the wallet's retained leaf
+        // stream), but it is pure public chain state and must not be thrown away on every
+        // daemon eviction/restart. The section is optional and best-effort: restore only
+        // activates it after reproducing the independently persisted tip tree root.
+        let mut ssec = Vec::new();
+        write_subtree_section(&mut ssec, &self.subtree);
+        out.extend_from_slice(&(ssec.len() as u64).to_le_bytes());
+        out.extend_from_slice(&ssec);
         out
     }
 
@@ -2149,10 +2168,20 @@ impl WalletDb {
             }
         }
         // v7: pending spends + DAA clock — same length-prefixed best-effort contract.
-        if version >= CHECKPOINT_VERSION {
+        if version >= CHECKPOINT_VERSION_V7 {
             if let Some(plen) = r.u64() {
                 if let Some(pbuf) = r.take(plen as usize) {
                     Self::read_pending_section(&mut db, pbuf);
+                }
+            }
+        }
+        // v8: persisted complete-subtree index. It is an optimisation only and is
+        // accepted solely when it covers this exact tip and reproduces the independent
+        // commitment-tree root; malformed/stale data degrades to an empty cache.
+        if version >= CHECKPOINT_VERSION {
+            if let Some(slen) = r.u64() {
+                if let Some(sbuf) = r.take(slen as usize) {
+                    Self::read_subtree_section(&mut db, sbuf);
                 }
             }
         }
@@ -2160,6 +2189,66 @@ impl WalletDb {
             return None;
         }
         Some(db)
+    }
+
+    fn read_subtree_section(db: &mut Self, buf: &[u8]) {
+        let mut r = Cursor { buf, pos: 0 };
+        let parse = |r: &mut Cursor<'_>| -> Option<SubtreeCache> {
+            let active = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let failed = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let upto = r.u64()?;
+            let n_levels = r.u64()? as usize;
+            if n_levels > TREE_DEPTH as usize + 1 {
+                return None;
+            }
+            let mut levels = Vec::with_capacity(n_levels);
+            let mut first = Vec::with_capacity(n_levels);
+            for _ in 0..n_levels {
+                first.push(r.u64()?);
+                let n = r.u64()? as usize;
+                // A checkpoint cannot legitimately contain more cached roots than
+                // retained leaves (plus one base-frontier root per level).
+                if n > db.leaves.len().saturating_add(TREE_DEPTH as usize + 1) {
+                    return None;
+                }
+                let mut roots = Vec::with_capacity(n);
+                for _ in 0..n {
+                    roots.push(Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(&r.arr::<32>()?))?);
+                }
+                levels.push(roots);
+            }
+            let n_peaks = r.u64()? as usize;
+            if n_peaks > TREE_DEPTH as usize + 1 {
+                return None;
+            }
+            let mut peaks = Vec::with_capacity(n_peaks);
+            for _ in 0..n_peaks {
+                let level = r.u8()?;
+                if level > TREE_DEPTH {
+                    return None;
+                }
+                let index = r.u64()?;
+                let root = Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(&r.arr::<32>()?))?;
+                peaks.push((level, index, root));
+            }
+            r.done().then_some(SubtreeCache { levels, first, peaks, upto, active, failed })
+        };
+        let Some(cache) = parse(&mut r) else { return };
+        // Never restore a partial active cache. A failed/inactive marker is harmless,
+        // but an active cache must describe precisely the tree persisted in this blob.
+        if cache.active && cache.upto == db.size && db.root_from(&cache, db.size).is_some_and(|root| root == db.tree.root()) {
+            db.subtree = cache;
+        } else if cache.failed {
+            db.subtree.failed = true;
+        }
     }
 
     /// Best-effort restore of the v7 pending-spend section — any malformed record
@@ -2237,7 +2326,11 @@ impl WalletDb {
     fn read_witness_section(db: &mut Self, buf: &[u8]) {
         let owned: HashSet<u64> = db.notes.iter().map(|n| n.position).collect();
         let mut r = Cursor { buf, pos: 0 };
-        let parse = |r: &mut Cursor<'_>| -> Option<(u64, CommitmentTree<MerkleHashOrchard, TREE_DEPTH>, Vec<(u64, IncrementalWitness<MerkleHashOrchard, TREE_DEPTH>)>)> {
+        let parse = |r: &mut Cursor<'_>| -> Option<(
+            u64,
+            CommitmentTree<MerkleHashOrchard, TREE_DEPTH>,
+            Vec<(u64, IncrementalWitness<MerkleHashOrchard, TREE_DEPTH>)>,
+        )> {
             let witnessed_upto = r.u64()?;
             let lag_tree = read_tree(r)?;
             let n = r.u64()? as usize;
@@ -2258,6 +2351,26 @@ impl WalletDb {
                 db.witnesses = ws;
             }
         }
+    }
+}
+
+fn write_subtree_section(out: &mut Vec<u8>, subtree: &SubtreeCache) {
+    out.push(u8::from(subtree.active));
+    out.push(u8::from(subtree.failed));
+    out.extend_from_slice(&subtree.upto.to_le_bytes());
+    out.extend_from_slice(&(subtree.levels.len() as u64).to_le_bytes());
+    for (level, roots) in subtree.levels.iter().enumerate() {
+        out.extend_from_slice(&subtree.first.get(level).copied().unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&(roots.len() as u64).to_le_bytes());
+        for root in roots {
+            out.extend_from_slice(&root.to_bytes());
+        }
+    }
+    out.extend_from_slice(&(subtree.peaks.len() as u64).to_le_bytes());
+    for (level, index, root) in &subtree.peaks {
+        out.push(*level);
+        out.extend_from_slice(&index.to_le_bytes());
+        out.extend_from_slice(&root.to_bytes());
     }
 }
 
@@ -2370,7 +2483,10 @@ fn read_witness(r: &mut Cursor<'_>) -> Option<IncrementalWitness<MerkleHashOrcha
 /// clock as another length-prefixed best-effort section — a pure suffix of v6.
 /// Without it a restart forgot which notes were parked awaiting confirmation,
 /// which is half of how a lost transaction became lost money.
-const CHECKPOINT_VERSION: u8 = 7;
+/// v8 persists the root-gated complete-subtree index, avoiding a full Sinsemilla
+/// rebuild after every daemon eviction/restart. It contains public chain state only.
+const CHECKPOINT_VERSION: u8 = 8;
+const CHECKPOINT_VERSION_V7: u8 = 7;
 /// v6 appended the history rows. A pure suffix of v5.
 const CHECKPOINT_VERSION_V6: u8 = 6;
 /// v5 appended the persisted witnesses. A pure suffix of v4.
@@ -2486,10 +2602,8 @@ mod tests {
             recompute.ingest_block(block, &[]);
             // The daemon-side precompute: derive each coinbase leaf commitment once,
             // dropping any that would not commit (exactly ingest_block's skip rule).
-            let pre: Vec<(CoinbaseNoteDesc, u64, ExtractedNoteCommitment)> = block
-                .iter()
-                .filter_map(|(d, v)| coinbase_note_commitment(d, *v).ok().map(|cmx| (d.clone(), *v, cmx)))
-                .collect();
+            let pre: Vec<(CoinbaseNoteDesc, u64, ExtractedNoteCommitment)> =
+                block.iter().filter_map(|(d, v)| coinbase_note_commitment(d, *v).ok().map(|cmx| (d.clone(), *v, cmx))).collect();
             shared.ingest_block_precomputed(&pre, &[]);
         }
 
@@ -2689,6 +2803,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn v8_checkpoint_persists_root_gated_subtree_cache() {
+        let mine = [35u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for b in 0..80u32 {
+            let recipient = if b % 9 == 0 { address_of(mine) } else { address_of([(b % 250 + 1) as u8; 32]) };
+            db.ingest_block(&[coinbase_for(recipient, &b.to_le_bytes(), 1_000 + b as u64)], &[]);
+        }
+        db.build_subtree_cache();
+        assert!(db.subtree_cache_ready(db.size()));
+
+        let blob = db.to_checkpoint();
+        let restored = WalletDb::from_checkpoint(mine, &blob).expect("v8 restores");
+        assert!(restored.subtree_cache_ready(restored.size()), "validated cache survives restart");
+        let positions: Vec<u64> = restored.notes().iter().map(|n| n.position).collect();
+        assert!(restored.witness_paths_at(&positions, restored.size()).iter().all(Option::is_some));
+
+        // Corrupt only the optional cache payload. The whole checkpoint remains
+        // structurally parseable, but the cache root gate must refuse it.
+        let mut ssec = Vec::new();
+        write_subtree_section(&mut ssec, &db.subtree);
+        let mut corrupt = blob;
+        let section_start = corrupt.len() - ssec.len();
+        corrupt[section_start] = 2; // invalid active flag: optional section is declined
+        let restored = WalletDb::from_checkpoint(mine, &corrupt).expect("bad optional cache never loses wallet state");
+        assert!(!restored.subtree_cache_ready(restored.size()), "wrong-root cache rejected");
+        assert_eq!(restored.balance(), db.balance());
     }
 
     /// Rolling the fast-sync base forward (compaction) is representation-only: it must
@@ -3334,7 +3477,9 @@ mod tests {
         assert!(db.history.is_empty() && db.pending_spends.is_empty());
         let hsec_len = 8; // row count
         let psec_len = 8 + 8; // last_daa + record count
-        let suffix_len = tip.len() + (8 + wsec.len()) + (8 + hsec_len) + (8 + psec_len);
+        let mut ssec = Vec::new();
+        write_subtree_section(&mut ssec, &db.subtree);
+        let suffix_len = tip.len() + (8 + wsec.len()) + (8 + hsec_len) + (8 + psec_len) + (8 + ssec.len());
         let mut v3 = v4[..v4.len() - suffix_len].to_vec();
         v3[0] = CHECKPOINT_VERSION_V3;
 
@@ -3361,7 +3506,14 @@ mod tests {
         a.ingest_block(&blk, &[]);
         b.ingest_block(&blk, &[]);
         assert_eq!(a.anchor(), b.anchor(), "post-restore appends agree");
-        assert_eq!(a.anchor(), { db.ingest_block(&blk, &[]); db.anchor() }, "and match the never-restarted wallet");
+        assert_eq!(
+            a.anchor(),
+            {
+                db.ingest_block(&blk, &[]);
+                db.anchor()
+            },
+            "and match the never-restarted wallet"
+        );
     }
 
     /// **Protocol fast-sync equivalence.** A wallet that starts from a node-supplied
@@ -3675,7 +3827,8 @@ mod circuit_tests {
         let sel: Vec<_> = db.notes().iter().map(|o| (o.note.clone(), o.position)).collect();
         let inputs: Vec<_> = sel.into_iter().map(|(note, pos)| (note, db.witness_path(pos).unwrap())).collect();
         let recipient = address_bytes_from_seed([42u8; 32]).unwrap();
-        let payload = build_wallet_payment(miner, inputs, recipient, 5_000, 1_000, &net, ctx, true, [0u8; 512]).expect("multi-note payment builds");
+        let payload = build_wallet_payment(miner, inputs, recipient, 5_000, 1_000, &net, ctx, true, [0u8; 512])
+            .expect("multi-note payment builds");
         let wire = ShieldedBundle::from_bytes(&payload).expect("payload decodes to a bundle");
 
         // Two real spends that actually verify against the shared anchor.

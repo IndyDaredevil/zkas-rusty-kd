@@ -185,10 +185,7 @@ mod tests {
     #[test]
     fn wrong_network_fails() {
         let signed = sign_message(seed(7), b"zkas-mainnet", b"msg", OsRng).unwrap();
-        assert_eq!(
-            verify_message(&signed.address, b"zkas-devnet", b"msg", &signed.fvk, &signed.sig),
-            Err(VerifyError::BadSignature)
-        );
+        assert_eq!(verify_message(&signed.address, b"zkas-devnet", b"msg", &signed.fvk, &signed.sig), Err(VerifyError::BadSignature));
     }
 
     #[test]

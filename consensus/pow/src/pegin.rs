@@ -76,12 +76,7 @@ impl KaspaBurnProof {
         if self.tx_merkle_branch.len() > MAX_BURN_MERKLE_BRANCH {
             return false;
         }
-        verify_tx_merkle_witness(
-            self.tx_leaf(),
-            self.tx_leaf_index,
-            &self.tx_merkle_branch,
-            self.parent_header.hash_merkle_root,
-        )
+        verify_tx_merkle_witness(self.tx_leaf(), self.tx_leaf_index, &self.tx_merkle_branch, self.parent_header.hash_merkle_root)
     }
 
     /// Full check: `burn_tx` is included (structural) **and** the header's kHeavyHash PoW meets
@@ -137,9 +132,8 @@ mod tests {
         let recipient = [0x7c; 32];
         for n in 1..=9usize {
             for burn_idx in 0..n {
-                let txs: Vec<Transaction> = (0..n)
-                    .map(|i| if i == burn_idx { burn_tx(5000, recipient) } else { dummy_tx(i as u8) })
-                    .collect();
+                let txs: Vec<Transaction> =
+                    (0..n).map(|i| if i == burn_idx { burn_tx(5000, recipient) } else { dummy_tx(i as u8) }).collect();
                 let leaves: Vec<KHash> = txs.iter().map(hashing::tx::hash).collect();
                 let root = calc_merkle_root(leaves.iter().copied());
                 let branch = create_tx_merkle_witness(&leaves, burn_idx);
@@ -173,12 +167,8 @@ mod tests {
     #[test]
     fn malformed_burn_yields_no_claim() {
         let header = Header::from_precomputed_hash(KHash::default(), vec![]);
-        let zero = KaspaBurnProof {
-            parent_header: header.clone(),
-            burn_tx: burn_tx(0, [1; 32]),
-            tx_leaf_index: 0,
-            tx_merkle_branch: vec![],
-        };
+        let zero =
+            KaspaBurnProof { parent_header: header.clone(), burn_tx: burn_tx(0, [1; 32]), tx_leaf_index: 0, tx_merkle_branch: vec![] };
         assert_eq!(zero.claim(), None);
 
         let short_payload =

@@ -93,7 +93,7 @@ mod tests {
     use kaspa_consensus_core::merkle::calc_hash_merkle_root;
     use kaspa_consensus_core::subnets::{SUBNETWORK_ID_COINBASE, SUBNETWORK_ID_NATIVE};
     use kaspa_consensus_core::tx::Transaction;
-    use kaspa_consensus_core::{hashing, BlueWorkType};
+    use kaspa_consensus_core::{BlueWorkType, hashing};
     use kaspa_hashes::{Hash, ZERO_HASH};
     use kaspa_merkle::merkle_hash;
 

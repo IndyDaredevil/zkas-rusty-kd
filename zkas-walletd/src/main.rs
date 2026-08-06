@@ -72,6 +72,11 @@ struct Cli {
     /// here; this only decides how many cores divide it.
     #[arg(long, value_name = "N")]
     proof_threads: Option<usize>,
+    /// Tokio worker threads serving HTTP, RPC, and background coordination.
+    /// Default: twice the available CPU count, so CPU-heavy scan tasks cannot
+    /// occupy every runtime worker and starve status/health requests.
+    #[arg(long, value_name = "N")]
+    runtime_threads: Option<usize>,
     /// Offline admin: print each wallet's note/base/STRANDED-note report and exit.
     /// Run with the daemon stopped.
     #[arg(long, default_value_t = false)]
@@ -114,6 +119,39 @@ struct Cli {
     /// then get a retry-friendly 503. Default: min(2, available cores).
     #[arg(long, value_name = "N")]
     max_concurrent_proves: Option<usize>,
+    /// Maximum wallet scans advanced concurrently (default: hardware-derived).
+    #[arg(long, value_name = "N")]
+    sync_wallets: Option<usize>,
+    /// Estimated free memory required per concurrent wallet scan.
+    #[arg(long, value_name = "MIB")]
+    sync_wallet_memory_mb: Option<u64>,
+    /// Maximum checkpoints loaded concurrently.
+    #[arg(long, value_name = "N")]
+    load_wallets: Option<usize>,
+    /// Maximum one-time cold witness warmups running concurrently.
+    #[arg(long, value_name = "N")]
+    warm_wallets: Option<usize>,
+    /// Threads used to decode each shared shielded-block page.
+    #[arg(long, value_name = "N")]
+    page_decode_threads: Option<usize>,
+    /// Maximum decoded shielded-block pages retained in the shared cache.
+    #[arg(long, value_name = "N")]
+    page_cache_entries: Option<usize>,
+    /// Seconds a decoded page remains reusable.
+    #[arg(long, value_name = "SECONDS")]
+    page_cache_ttl: Option<u64>,
+    /// Keep syncing a wallet for this many seconds after its last API request.
+    #[arg(long, value_name = "SECONDS")]
+    active_sync_window: Option<u64>,
+    /// Evict a checkpoint from RAM after this many idle seconds.
+    #[arg(long, value_name = "SECONDS")]
+    idle_evict: Option<u64>,
+    /// Hard cap on wallet checkpoints resident in RAM.
+    #[arg(long, value_name = "N")]
+    max_resident_wallets: Option<usize>,
+    /// Defer optional subtree-index builds below this MemAvailable value.
+    #[arg(long, value_name = "MIB")]
+    subtree_free_floor_mb: Option<u64>,
 }
 
 // Oversubscribe worker threads (2x cores). The background sync loop does CPU-bound
@@ -123,10 +161,30 @@ struct Cli {
 // out at 15s during a 170-wallet rescan). With more workers than cores, a newly
 // runnable HTTP handler is always schedulable within a time slice, so status stays
 // responsive while scans grind in the background.
-#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
-async fn main() {
+fn main() {
     kaspa_core::log::try_init_logger("info");
     let cli = Cli::parse();
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let runtime_threads = cli.runtime_threads.filter(|n| *n > 0).unwrap_or_else(|| cores.saturating_mul(2).max(2));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(runtime_threads)
+        .thread_name("wallet-runtime")
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("cannot build Tokio runtime with {runtime_threads} threads: {e}");
+            std::process::exit(1);
+        });
+    runtime.block_on(run(cli));
+}
+
+async fn run(cli: Cli) {
+    log::info!(
+        "wallet runtime threads: {}",
+        cli.runtime_threads
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| { std::thread::available_parallelism().map(|n| n.get().saturating_mul(2).max(2)).unwrap_or(2) })
+    );
 
     // Size the rayon pool Halo2 proves in, before anything can touch it — `build_global`
     // is one-shot and silently loses to whichever code path initialises rayon first.
@@ -135,6 +193,41 @@ async fn main() {
             Ok(()) => log::info!("proving is capped at {n} thread(s) (--proof-threads); payments trade latency for headroom"),
             Err(e) => log::warn!("could not cap proving threads at {n}: {e}; using every core"),
         }
+    }
+
+    let mut resources = zkas_walletd::ResourceLimits::default();
+    if let Some(v) = cli.sync_wallets.filter(|v| *v > 0) {
+        resources.sync_wallets = v;
+    }
+    if let Some(v) = cli.sync_wallet_memory_mb.filter(|v| *v > 0) {
+        resources.sync_wallet_memory_mb = v;
+    }
+    if let Some(v) = cli.load_wallets.filter(|v| *v > 0) {
+        resources.load_wallets = v;
+    }
+    if let Some(v) = cli.warm_wallets.filter(|v| *v > 0) {
+        resources.warm_wallets = v;
+    }
+    if let Some(v) = cli.page_decode_threads.filter(|v| *v > 0) {
+        resources.page_decode_threads = v;
+    }
+    if let Some(v) = cli.page_cache_entries.filter(|v| *v > 0) {
+        resources.page_cache_entries = v;
+    }
+    if let Some(v) = cli.page_cache_ttl.filter(|v| *v > 0) {
+        resources.page_cache_ttl_secs = v;
+    }
+    if let Some(v) = cli.active_sync_window.filter(|v| *v > 0) {
+        resources.active_sync_secs = v;
+    }
+    if let Some(v) = cli.idle_evict.filter(|v| *v > 0) {
+        resources.idle_evict_secs = v;
+    }
+    if let Some(v) = cli.max_resident_wallets.filter(|v| *v > 0) {
+        resources.max_resident_wallets = v;
+    }
+    if let Some(v) = cli.subtree_free_floor_mb {
+        resources.subtree_free_floor_mb = v;
     }
 
     // Offline admin modes: operate on the wallet files directly and exit.
@@ -199,6 +292,7 @@ async fn main() {
             public_host: cli.public_host,
             wallet_secret,
             allow_default_token: cli.allow_default_token,
+            resources,
         };
         if let Err(e) = zkas_walletd::run_selfhost(sh, shutdown_rx).await {
             log::error!("{e}");
@@ -233,7 +327,11 @@ async fn main() {
         auto_consolidate: (!cli.no_auto_consolidate).then_some(cli.auto_consolidate),
         allow_custodial: !cli.no_custodial,
         // 0 makes no sense (every prepare would 503); fall back to the default.
-        max_concurrent_proves: cli.max_concurrent_proves.filter(|n| *n > 0).unwrap_or_else(zkas_walletd::default_max_concurrent_proves),
+        max_concurrent_proves: cli
+            .max_concurrent_proves
+            .filter(|n| *n > 0)
+            .unwrap_or_else(zkas_walletd::default_max_concurrent_proves),
+        resources,
     };
 
     if let Err(e) = serve(cfg, shutdown_rx).await {

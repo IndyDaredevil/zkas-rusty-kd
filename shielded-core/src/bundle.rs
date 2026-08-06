@@ -538,10 +538,7 @@ mod tests {
         b.value_balance = 30;
 
         assert_eq!(b.declare_burn(0, [1; sizes::FIELD]), Err(BurnDeclareError::ZeroValue));
-        assert_eq!(
-            b.declare_burn(31, [1; sizes::FIELD]),
-            Err(BurnDeclareError::ExceedsValueBalance { burn: 31, value_balance: 30 }),
-        );
+        assert_eq!(b.declare_burn(31, [1; sizes::FIELD]), Err(BurnDeclareError::ExceedsValueBalance { burn: 31, value_balance: 30 }),);
         assert_eq!(b.burn, None, "a rejected declaration must not mutate the bundle");
         assert_eq!(b.flags & BUNDLE_FLAG_BURN, 0);
 

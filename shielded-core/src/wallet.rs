@@ -243,8 +243,8 @@ pub mod scan {
 }
 
 pub use scan::{
-    CompactActionRecord, ReceivedNote, address_bytes_from_seed, ivk_from_seed, scan_bundle, scan_bundle_prepared,
-    scan_compact, scan_compact_prepared, trim_memo,
+    CompactActionRecord, ReceivedNote, address_bytes_from_seed, ivk_from_seed, scan_bundle, scan_bundle_prepared, scan_compact,
+    scan_compact_prepared, trim_memo,
 };
 
 #[cfg(feature = "circuit")]
@@ -569,15 +569,7 @@ pub mod build {
         recoverable: bool,
         memo: [u8; 512],
     ) -> Result<Vec<u8>, BuildError> {
-        build_wallet_payment_multi(
-            owner_seed,
-            inputs,
-            &[(recipient_addr, amount, memo)],
-            fee,
-            network_domain,
-            tx_context,
-            recoverable,
-        )
+        build_wallet_payment_multi(owner_seed, inputs, &[(recipient_addr, amount, memo)], fee, network_domain, tx_context, recoverable)
     }
 
     /// As [`build_wallet_payment`], but paying **several recipients from one
@@ -948,8 +940,18 @@ pub mod build {
             // The HOSTILE prover: the user asked to pay `intended` 6_000, but it builds a
             // bundle paying `attacker` instead. (Everything else is honest, so only the
             // device's checks stand between the user and the theft.)
-            let evil =
-                prepare_payment(&keys.fvk, vec![(note.clone(), merkle_path.clone())], attacker, 6_000, 1_000, &net, ctx, true, [0u8; 512]).unwrap();
+            let evil = prepare_payment(
+                &keys.fvk,
+                vec![(note.clone(), merkle_path.clone())],
+                attacker,
+                6_000,
+                1_000,
+                &net,
+                ctx,
+                true,
+                [0u8; 512],
+            )
+            .unwrap();
 
             // The device checks the bundle against what the USER asked for, and refuses.
             // (Which action index carries the theft depends on the builder's shuffle.)
@@ -960,7 +962,8 @@ pub mod build {
             );
 
             // And the honest payment it DID ask for passes.
-            let good = prepare_payment(&keys.fvk, vec![(note, merkle_path)], intended, 6_000, 1_000, &net, ctx, true, [0u8; 512]).unwrap();
+            let good =
+                prepare_payment(&keys.fvk, vec![(note, merkle_path)], intended, 6_000, 1_000, &net, ctx, true, [0u8; 512]).unwrap();
             check_prepared_payment(&good.effects, &good.disclosure, &keys.fvk, &intended, 6_000, 1_000)
                 .expect("the payment the user asked for must verify");
 
@@ -1017,9 +1020,18 @@ pub mod build {
             let recipient = ShieldedKeys::from_seed([8u8; 32]).unwrap().address();
 
             // SERVER (viewing key only): pay 6_000, fee 1_000 → change 3_000.
-            let prepared =
-                prepare_payment(&keys.fvk, vec![(note, merkle_path)], recipient.to_raw_address_bytes(), 6_000, 1_000, &net, ctx, true, [0u8; 512])
-                    .expect("prepare");
+            let prepared = prepare_payment(
+                &keys.fvk,
+                vec![(note, merkle_path)],
+                recipient.to_raw_address_bytes(),
+                6_000,
+                1_000,
+                &net,
+                ctx,
+                true,
+                [0u8; 512],
+            )
+            .expect("prepare");
             assert_eq!(prepared.value_balance, 1_000);
             assert_eq!(prepared.spend_auth_requests.len(), 1, "exactly one real spend to authorize");
             let sh = prepared.sighash;
