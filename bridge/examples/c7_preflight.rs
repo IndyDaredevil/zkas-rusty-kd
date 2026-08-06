@@ -10,6 +10,13 @@
 //!   BLUE / RED        -> RPC supported: wire hook E exactly as written.
 //!   RPC error mentioning unsupported/unimplemented method
 //!                     -> v1.0.5 predates the op: STOP, use get_block fallback.
+
+// Windows link fix (bug ledger #1, third vector — example binaries):
+// cargo examples do NOT automatically link the parent lib, so this binary's
+// consensus->shielded-core->risc0 dependency chain arrives WITHOUT the lib's
+// cfg(windows) sys_alloc_aligned host stub -> LNK2019/LNK1120. Forcing the
+// lib link brings the stub along. Zero runtime cost.
+use kaspa_stratum_bridge as _;
 //!   connect failure   -> node down or wrong port; nothing proven either way.
 
 use kaspa_grpc_client::GrpcClient;
