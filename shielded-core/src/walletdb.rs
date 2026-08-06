@@ -329,6 +329,13 @@ struct SubtreeCache {
     /// A build was attempted and rejected. Prevents re-paying an O(chain) build every
     /// sync tick for a wallet whose shape the cache cannot serve.
     failed: bool,
+    /// This is an **in-progress** build that stood down part-way, not a usable cache.
+    /// `active` is false, so no consumer can serve from it; the next build resumes from
+    /// `upto` instead of starting over. Deliberately in-memory only — `write_subtree_section`
+    /// does not persist it, and a reloaded checkpoint therefore comes back as a plain
+    /// inactive cache that simply rebuilds from scratch. Losing progress across a restart
+    /// is safe; serving from a half-built index would not be.
+    partial: bool,
 }
 
 impl SubtreeCache {
@@ -1554,17 +1561,47 @@ impl WalletDb {
             return self.subtree.active;
         }
         let reject = SubtreeCache { failed: true, ..Default::default() };
-        let mut c = SubtreeCache::default();
-        if !c.seed_from_frontier(&self.base_frontier, self.base_size) {
-            self.subtree = reject;
-            return false;
-        }
+        // Resume a build that stood down earlier rather than repeat it. The sweep is a
+        // pure left-to-right fold, so a partial cache is a valid prefix and continuing
+        // from `upto` yields exactly the same structure as starting over.
+        //
+        // Without this, yielding costs the WHOLE pass — measured live at 243-296 s per
+        // wallet. That made every stand-down ruinously expensive, which is why the old
+        // code could only afford to yield for proving, and why it could not afford to
+        // yield for a request waiting on the wallet lock at all. Cheap yields are what
+        // make aggressive yielding affordable.
+        //
+        // Only resume when the partial still lines up with the current stream: base
+        // compaction can move `base_size` and re-index `decoded_leaves`, so a prefix
+        // that starts below the current base is discarded rather than reinterpreted.
+        let resume_from = if self.subtree.partial && !self.subtree.active {
+            self.subtree.upto.checked_sub(self.base_size).filter(|&r| r as usize <= self.decoded_leaves().len())
+        } else {
+            None
+        };
+        let mut c = match resume_from {
+            Some(_) => std::mem::take(&mut self.subtree),
+            None => {
+                let mut c = SubtreeCache::default();
+                if !c.seed_from_frontier(&self.base_frontier, self.base_size) {
+                    self.subtree = reject;
+                    return false;
+                }
+                c
+            }
+        };
+        let start = resume_from.unwrap_or(0) as usize;
         {
             let leaves = self.decoded_leaves();
             let base = self.base_size;
-            for (i, leaf) in leaves.iter().enumerate() {
-                if i % YIELD_CHECK_EVERY == 0 && i > 0 && should_yield() {
-                    return false; // stand down; retried later, cache untouched
+            for (i, leaf) in leaves.iter().enumerate().skip(start) {
+                if i % YIELD_CHECK_EVERY == 0 && i > start && should_yield() {
+                    // Stand down, KEEPING the prefix folded so far. Not usable (active
+                    // stays false); resumed by the next call.
+                    c.partial = true;
+                    c.active = false;
+                    self.subtree = c;
+                    return false;
                 }
                 if !c.push_leaf(base + i as u64, *leaf) {
                     self.subtree = reject;
@@ -1572,6 +1609,7 @@ impl WalletDb {
                 }
             }
         }
+        c.partial = false;
         c.active = true;
         let ok = self.root_from(&c, self.size).is_some_and(|r| r == self.tree.root());
         self.subtree = if ok { c } else { reject };
@@ -1582,6 +1620,20 @@ impl WalletDb {
     /// whether a spend needs the slow path at all).
     pub fn subtree_cache_ready(&self, matured: u64) -> bool {
         self.subtree.active && self.subtree.upto >= matured
+    }
+
+    /// The cache was attempted and rejected — it will not be retried, and this wallet
+    /// keeps the replay path. Distinguishes a genuine failure from a build that merely
+    /// stood down part-way, which reports the same `false` from
+    /// [`Self::build_subtree_cache_until`] but has kept its progress.
+    pub fn subtree_cache_failed(&self) -> bool {
+        self.subtree.failed
+    }
+
+    /// Absolute leaf index folded into the cache so far, complete or in progress. Lets a
+    /// caller report real progress for a sliced build instead of guessing.
+    pub fn subtree_build_upto(&self) -> u64 {
+        self.subtree.upto
     }
 
     /// Fold the `2^CACHE_LEVEL`-leaf window starting at `start` (which must be window
@@ -2239,7 +2291,9 @@ impl WalletDb {
                 let root = Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(&r.arr::<32>()?))?;
                 peaks.push((level, index, root));
             }
-            r.done().then_some(SubtreeCache { levels, first, peaks, upto, active, failed })
+            // `partial: false` — the reader below accepts only a complete, root-verified
+            // cache, so a restored one is never an in-progress build.
+            r.done().then_some(SubtreeCache { levels, first, peaks, upto, active, failed, partial: false })
         };
         let Some(cache) = parse(&mut r) else { return };
         // Never restore a partial active cache. A failed/inactive marker is harmless,

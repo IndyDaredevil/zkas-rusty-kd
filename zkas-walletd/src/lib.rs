@@ -885,6 +885,14 @@ const SPEND_CLIMB_INLINE_MAX: u64 = 512;
 /// is already ~5 s per send, which is the point where a send stops feeling instant.
 const SUBTREE_CACHE_MIN_SPAN: u64 = 20_000;
 
+/// Longest a single subtree-cache slice may hold the wallet lock.
+///
+/// This is a LATENCY bound, not a throughput knob: the sweep is resumable, so slicing
+/// changes only how often the lock is handed back, never how much work is done. 250 ms
+/// is well under the point a user notices a stalled request, and long enough that the
+/// per-slice bookkeeping stays negligible against ~1024 Sinsemilla combines per check.
+const SUBTREE_BUILD_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Free memory the daemon refuses to build a subtree cache below.
 ///
 /// The cache itself is small (~4 B/leaf of span) but building it forces that wallet's
@@ -2177,14 +2185,41 @@ impl WalletEntry {
                             // Stand down mid-sweep the moment a payment starts proving —
                             // refusing to *start* during one is not enough when the sweep
                             // itself runs for tens of seconds.
-                            // Mid-sweep abort is proof-only for the same reason: a sweep
-                            // that yields keeps NO partial progress (`build_subtree_cache_until`
-                            // only commits a complete cache), so aborting for background
-                            // backfill would throw the whole pass away and redo it.
-                            let built = tokio::task::block_in_place(|| self.db.build_subtree_cache_until(proving_now));
-                            if !built && !self.db.subtree_cache_ready(matured) {
+                            // Run the sweep in short SLICES, not one long pass.
+                            //
+                            // `sync_one_wallet` holds this wallet's lock for the whole
+                            // chunk, so a 285 s sweep held it for 285 s — and every HTTP
+                            // request for that wallet blocked at `w.lock().await` behind
+                            // it, silently, before it could log or even set `proving_now`.
+                            // A user sent a payment and watched "building your proof" for
+                            // minutes with no proof running at all: the request had not
+                            // reached the prover, it was waiting on the mutex. Yielding to
+                            // `proving_now` cannot help there, because the work that would
+                            // set the flag is exactly the work being blocked.
+                            //
+                            // The fix is to stop holding the lock that long. The build is
+                            // resumable (see `build_subtree_cache_until`), so a slice
+                            // costs nothing but bookkeeping: bound each one by wall time
+                            // and the lock is released ~4x/second regardless of wallet
+                            // size. Total CPU is unchanged; peak latency drops from the
+                            // length of a whole sweep to the length of one slice.
+                            let slice_end = std::time::Instant::now() + SUBTREE_BUILD_SLICE;
+                            let built = tokio::task::block_in_place(|| {
+                                self.db.build_subtree_cache_until(|| proving_now() || std::time::Instant::now() >= slice_end)
+                            });
+                            if !built && self.db.subtree_cache_failed() {
+                                log::warn!(
+                                    "subtree cache rejected by its root gate after {:.1?} ({span} leaves) — spends keep using the replay path",
+                                    t.elapsed()
+                                );
+                            } else if !built {
+                                // Sliced, not abandoned: the prefix is kept and the next
+                                // pass resumes from it. Reported as progress, because
+                                // "stood down" reads like nothing happened.
                                 log::debug!(
-                                    "subtree cache sweep stood down after {:.1?} (a payment or a wallet rebuild needs the core); will retry",
+                                    "subtree cache {}/{} leaves after a {:.0?} slice — resumes next pass",
+                                    self.db.subtree_build_upto(),
+                                    matured,
                                     t.elapsed()
                                 );
                             } else if self.db.subtree_cache_ready(matured) {
@@ -2194,13 +2229,15 @@ impl WalletEntry {
                                 // away a multi-minute build and repeats it.
                                 self.force_checkpoint = true;
                                 log::info!(
-                                    "subtree cache built in {:.1?} ({span} leaves, notes={note_count}) — spends now witness in O(depth), not a full replay",
-                                    t.elapsed()
+                                    "subtree cache complete ({span} leaves, notes={note_count}) — spends now witness in O(depth), not a full replay"
                                 );
                             } else {
-                                log::warn!(
-                                    "subtree cache rejected by its root gate after {:.1?} ({span} leaves) — spends keep using the replay path",
-                                    t.elapsed()
+                                // Built and root-gated, but the anchor moved past it while
+                                // we swept. `append_leaf` keeps it in step from here, so
+                                // this resolves itself on the next pass.
+                                log::debug!(
+                                    "subtree cache built to {} but matured is {matured} — catching up",
+                                    self.db.subtree_build_upto()
                                 );
                             }
                         }
@@ -2402,30 +2439,39 @@ impl WalletEntry {
         }
     }
 
-    /// Send-time witness top-up, **bounded**. For a warm wallet this is the cheap
-    /// "climb the few leaves since the last sync tick". But for a note-heavy wallet
-    /// the eager warm is skipped, so its first spend would climb the whole chain
-    /// here — and each climbed leaf costs one append per live witness (up to 256),
-    /// ~15 ms/leaf. Uncapped that was a 40+ minute compute (the 2026-07-17 outage:
-    /// it ran on the async runtime holding the tokio I/O driver, freezing every
-    /// HTTP request). So a note-heavy wallet only climbs a short gap inline; a
-    /// long climb is skipped entirely — the ≤ max-spends notes a send selects
-    /// rebuild on demand in `witness_path_at`, bounded and witness-count-free.
+    /// Send-time witness top-up, **bounded for every wallet**.
+    ///
+    /// This is a latency optimization, never a correctness requirement: the send path
+    /// calls `witness_paths_at` first (subtree cache, O(depth)) and falls back to a
+    /// per-note rebuild for anything it declines. Climbing only pre-warms
+    /// `live_witness_path`, a third route neither of those needs.
+    ///
+    /// It used to exempt wallets with <= 32 notes from the cap entirely and climb
+    /// *unbounded*, on the theory that a small wallet is always nearly warm. It isn't:
+    /// a wallet whose witnesses were last advanced long ago is arbitrarily far behind
+    /// no matter how few notes it holds. Live, a 2-note wallet spent **397.8 s**
+    /// climbing 891,565 leaves inside a send — and the batch builder then witnessed the
+    /// selected note in **2.9 ms**. The user watched "building your zero-knowledge
+    /// proof" for six minutes before the proof even started. The exemption made the
+    /// smallest wallets pay the largest bill.
+    ///
+    /// So: skip outright when the subtree cache can serve the anchor, and otherwise cap
+    /// the inline climb the same way for everyone. A skipped climb costs nothing but a
+    /// slower first witness build; an uncapped one costs the user the whole payment.
     fn advance_spend_witnesses_bounded(&mut self) {
+        let Some(matured) = self.matured_leaves() else { return };
         let note_count = self.db.notes().len() as u64;
-        if note_count <= EAGER_WARM_MAX_NOTES {
-            self.advance_spend_witnesses();
+        // `subtree_paths`' preconditions: if it can serve, the climb is pure waste.
+        if self.db.subtree_cache_ready(matured) && matured > self.db.base_size() {
             return;
         }
-        if let Some(matured) = self.matured_leaves() {
-            let climb = matured.saturating_sub(self.db.witnessed_upto());
-            if climb <= SPEND_CLIMB_INLINE_MAX {
-                self.db.advance_witnesses(matured);
-            } else {
-                log::info!(
-                    "send: skipping inline witness climb of {climb} leaves on note-heavy wallet (notes={note_count}); selected notes rebuild on demand"
-                );
-            }
+        let climb = matured.saturating_sub(self.db.witnessed_upto());
+        if climb <= SPEND_CLIMB_INLINE_MAX {
+            self.db.advance_witnesses(matured);
+        } else {
+            log::info!(
+                "send: skipping inline witness climb of {climb} leaves (notes={note_count}); selected notes come from the batch builder, or rebuild on demand"
+            );
         }
     }
 }
