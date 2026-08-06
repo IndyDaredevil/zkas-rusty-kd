@@ -200,9 +200,10 @@ function renderMergedRecentBlocks(stats) {
     const hashFull = isDual
       ? `KAS ${b.__kasHash || '-'} | ZKAS ${b.__zkasHash || '-'}`
       : (b.hash || '');
+    const esc = (x) => (typeof escapeHtmlAttr === 'function' ? escapeHtmlAttr(String(x ?? '')) : String(x ?? ''));
     const hashShort = isDual
-      ? `<span class="text-blue-300">K:</span>${sh(b.__kasHash)} <span class="text-purple-300">Z:</span>${sh(b.__zkasHash)}`
-      : sh(hashFull);
+      ? `<span class="text-blue-300">K:</span>${esc(sh(b.__kasHash))} <span class="text-purple-300">Z:</span>${esc(sh(b.__zkasHash))}`
+      : esc(sh(hashFull));
     const workerDisplay = typeof displayWorkerName === 'function' ? displayWorkerName(b.worker) : (b.worker || '-');
     const tr = document.createElement('tr');
     tr.className = 'border-b border-card/50';
