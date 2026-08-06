@@ -273,6 +273,29 @@ impl ConsensusSessionOwned {
         self.clone().spawn_blocking(move |c| c.get_shielded_chain_range(low, limit)).await
     }
 
+    /// Serve a peer's shielded-history backfill request (see `get_shielded_history_below`).
+    pub async fn async_get_shielded_history_indexed_below(
+        &self,
+        anchor: Hash,
+        max_blocks: usize,
+    ) -> ConsensusResult<(Vec<(u64, kaspa_consensus_core::api::ShieldedChainBlockData)>, bool)> {
+        self.clone().spawn_blocking(move |c| c.get_shielded_history_indexed_below(anchor, max_blocks)).await
+    }
+
+    /// The oldest chain block this node can enumerate; the backfill anchor.
+    pub async fn async_get_shielded_history_base(&self) -> Hash {
+        self.clone().spawn_blocking(move |c| c.get_shielded_history_base()).await
+    }
+
+    /// Ingest a backfilled history chunk (index entries + scan records); see
+    /// `backfill_shielded_history`.
+    pub async fn async_backfill_shielded_history(
+        &self,
+        records: Vec<(u64, kaspa_consensus_core::api::ShieldedChainBlockData)>,
+    ) -> ConsensusResult<(u64, u64)> {
+        self.clone().spawn_blocking(move |c| c.backfill_shielded_history(&records)).await
+    }
+
     pub async fn async_get_sink_timestamp(&self) -> u64 {
         self.clone().spawn_blocking(|c| c.get_sink_timestamp()).await
     }

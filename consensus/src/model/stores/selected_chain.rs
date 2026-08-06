@@ -47,6 +47,34 @@ impl DbSelectedChainStore {
         }
     }
 
+    /// Write one `(index, hash)` pair of the selected-chain index, both directions.
+    ///
+    /// Used ONLY by the offline history-restore tool (`zkas-scan-import`), which refills the
+    /// index below a synced node's base so `get_shielded_chain_range` can enumerate history the
+    /// node holds but cannot otherwise reach. Not part of the consensus write path — reorgs go
+    /// through `apply_changes`, which also removes stale entries.
+    pub fn write_entry(&mut self, batch: &mut WriteBatch, index: u64, hash: Hash) -> StoreResult<()> {
+        self.access_hash_by_index.write(BatchDbWriter::new(batch), index.into(), hash)?;
+        self.access_index_by_hash.write(BatchDbWriter::new(batch), hash, index)?;
+        Ok(())
+    }
+
+    /// Move an existing entry from `old_index` to `new_index`.
+    ///
+    /// `init_with_pruning_point` numbers a synced node from its own pruning point as 0, so a
+    /// node restoring genesis-era history must first shift its entries up to make room. Callers
+    /// must iterate highest-index-first so a shift never lands on an entry not yet moved, and
+    /// must update the highest index afterwards via [`Self::set_highest_index`].
+    pub fn rebase_entry(&mut self, batch: &mut WriteBatch, old_index: u64, hash: Hash, new_index: u64) -> StoreResult<()> {
+        self.access_hash_by_index.delete(BatchDbWriter::new(batch), old_index.into())?;
+        self.write_entry(batch, new_index, hash)
+    }
+
+    /// Set the highest chain index. Only for the offline restore tool; see [`Self::rebase_entry`].
+    pub fn set_highest_index(&mut self, batch: &mut WriteBatch, index: u64) -> StoreResult<()> {
+        self.access_highest_index.write(BatchDbWriter::new(batch), &index)
+    }
+
     pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
         Self::new(Arc::clone(&self.db), cache_policy)
     }

@@ -61,6 +61,9 @@ message KaspadMessage {
     RequestPruningPointShieldedStateMessage requestPruningPointShieldedState = 64;
     ShieldedMetadataMessage shieldedMetadata = 65;
     ShieldedNullifierChunkMessage shieldedNullifierChunk = 66;
+    RequestShieldedHistoryMessage requestShieldedHistory = 70;
+    ShieldedHistoryChunkMessage shieldedHistoryChunk = 71;
+    RequestNextShieldedHistoryChunkMessage requestNextShieldedHistoryChunk = 72;
     RequestNextPruningPointShieldedChunkMessage requestNextPruningPointShieldedChunk = 67;
   }
 }

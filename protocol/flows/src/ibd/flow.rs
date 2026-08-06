@@ -41,6 +41,7 @@ use std::{
 use tokio::time::sleep;
 
 use super::{HeadersChunk, IBD_BATCH_SIZE, PruningPointUtxosetChunkStream, progress::ProgressReporter};
+use std::sync::atomic::{AtomicBool, Ordering};
 type BlockBody = Vec<Transaction>;
 
 /// Flow for managing IBD - Initial Block Download
@@ -66,6 +67,10 @@ impl Flow for IbdFlow {
     }
 }
 
+/// Guards the shielded-history backfill to a single attempt per process. See the call site for
+/// why retrying is actively harmful against peers that do not support the request.
+static SHIELDED_HISTORY_BACKFILL_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+
 pub enum IbdType {
     Sync {
         highest_known_syncer_chain_hash: Hash,
@@ -75,7 +80,9 @@ pub enum IbdType {
         is_pp_anticone_synced: bool,
     },
     DownloadHeadersProof,
-    PruningCatchUp { highest_known_syncer_chain_hash: Hash },
+    PruningCatchUp {
+        highest_known_syncer_chain_hash: Hash,
+    },
 }
 
 struct QueueChunkOutput {
@@ -128,7 +135,13 @@ impl IbdFlow {
             )
             .await?;
         match ibd_type {
-            IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_smt_stable, is_shielded_stable, is_pp_anticone_synced } => {
+            IbdType::Sync {
+                highest_known_syncer_chain_hash,
+                is_utxo_stable,
+                is_smt_stable,
+                is_shielded_stable,
+                is_pp_anticone_synced,
+            } => {
                 let pruning_point = session.async_pruning_point().await;
 
                 info!("syncing ahead from current pruning point");
@@ -237,6 +250,39 @@ impl IbdFlow {
             }
         }
 
+        // An archival node must hold ALL note history, not just the range it validated itself.
+        // Every IBD path leaves it holding scan records only from the pruning point forward
+        // (`PruningPointShieldedMetadata` carries the frontier and a nullifier MuHash — aggregates
+        // that cannot yield notes), so a wallet querying it would see a silently partial balance.
+        //
+        // This runs for ALL IBD types deliberately: a fresh node always takes
+        // `DownloadHeadersProof`, which is precisely the case the backfill exists for. Placing it
+        // inside the `Sync` arm — as it first was — meant it never fired for a new node.
+        //
+        // Failure is logged, not fatal: the node is fully valid and correctly validating without
+        // it; it just cannot serve pre-pruning-point wallet history until a later IBD retries.
+        //
+        // ONE attempt per process, not per IBD. Measured 2026-08-06: a peer running a build
+        // without `RequestShieldedHistory` does not ignore it — its router does not recognise the
+        // payload and CLOSES THE CONNECTION. Retrying per-IBD therefore walked the whole peer set
+        // dropping every link in turn (459 attempts / 28 minutes observed). One shot bounds that
+        // to a single dropped connection for the node's lifetime.
+        //
+        // The proper fix is a protocol-version gate so the request is never sent to a peer that
+        // cannot serve it. That needs `PROTOCOL_VERSION` bumped to 11 plus a `v11` flow registry
+        // AND an explicit `10 => v10::register(...)` arm in `handle_handshake` — without that arm
+        // every pre-bump peer is rejected with `VersionMismatch` instead of merely lacking the
+        // feature. Until then, one-shot keeps the cost bounded.
+        if self.ctx.config.is_archival && !SHIELDED_HISTORY_BACKFILL_ATTEMPTED.swap(true, Ordering::SeqCst) {
+            if let Err(e) = self.backfill_shielded_history(&session).await {
+                warn!(
+                    "archival: shielded history backfill did not complete ({e}); wallet history below \
+                     the pruning point is unavailable. Peers running a build without shielded-history \
+                     support close the connection on this request; will not retry this session."
+                );
+            }
+        }
+
         // Sync missing bodies in the past of syncer sink (virtual selected parent)
         self.sync_missing_block_bodies(&session, negotiation_output.syncer_virtual_selected_parent).await?;
 
@@ -314,12 +360,20 @@ impl IbdFlow {
                 let is_shielded_stable = consensus.async_is_pruning_shielded_stable().await;
 
                 return match (syncer_skew, is_utxo_stable && is_smt_stable && is_shielded_stable && is_pp_anticone_synced) {
-                    (SyncerSkew::Aligned, _) => {
-                        Ok(IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_smt_stable, is_shielded_stable, is_pp_anticone_synced })
-                    }
-                    (SyncerSkew::Lagging, true) => {
-                        Ok(IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_smt_stable, is_shielded_stable, is_pp_anticone_synced })
-                    }
+                    (SyncerSkew::Aligned, _) => Ok(IbdType::Sync {
+                        highest_known_syncer_chain_hash,
+                        is_utxo_stable,
+                        is_smt_stable,
+                        is_shielded_stable,
+                        is_pp_anticone_synced,
+                    }),
+                    (SyncerSkew::Lagging, true) => Ok(IbdType::Sync {
+                        highest_known_syncer_chain_hash,
+                        is_utxo_stable,
+                        is_smt_stable,
+                        is_shielded_stable,
+                        is_pp_anticone_synced,
+                    }),
                     (SyncerSkew::Lagging, false) => Err(ProtocolError::Other(
                         "Local node is in a transitional state requiring external data to stabilize, but the syncer lags behind and is unable to provide said data",
                     )),
@@ -327,7 +381,13 @@ impl IbdFlow {
                         if consensus.async_get_block_status(syncer_pruning_point).await.is_some_and(|b| b.has_block_body()) {
                             // While a leading syncer skew often indicates the need for catchup, in this case
                             // the node is just missing a segment in the future of its current pruning point, that is available to the syncer
-                            Ok(IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_smt_stable, is_shielded_stable, is_pp_anticone_synced })
+                            Ok(IbdType::Sync {
+                                highest_known_syncer_chain_hash,
+                                is_utxo_stable,
+                                is_smt_stable,
+                                is_shielded_stable,
+                                is_pp_anticone_synced,
+                            })
                         } else {
                             Ok(IbdType::PruningCatchUp { highest_known_syncer_chain_hash })
                         }
@@ -807,6 +867,71 @@ impl IbdFlow {
     /// into the live global set); if it differs, the import proceeds only when no
     /// validated chain blocks sit above the pruning point, and the seeded state
     /// must match the commitment.
+    /// Backfill the shielded scan archive below this node's base, so an archival node really
+    /// holds ALL history rather than only what it validated itself.
+    ///
+    /// A headers-proof sync writes scan records only from the pruning point forward, and
+    /// `PruningPointShieldedMetadata` carries aggregates (frontier, nullifier MuHash) that cannot
+    /// yield notes. Without this an `--archival` node silently serves partial wallet history —
+    /// a restored seed shows a too-low balance with no error.
+    ///
+    /// Server-driven: this node cannot enumerate the range itself (its index is re-based to 0 at
+    /// its own pruning point, and its header segment stops far above genesis), so it names an
+    /// anchor and the peer walks its own selected chain downward.
+    ///
+    /// Consensus-safe by construction: the scan archive is never read by validation, so even a
+    /// dishonest peer cannot fork this node — the cost of bad data is bounded to wallet serving,
+    /// which is why the range is verified before history is advertised as complete.
+    async fn backfill_shielded_history(&mut self, consensus: &ConsensusProxy) -> Result<(), ProtocolError> {
+        use kaspa_p2p_lib::pb::RequestShieldedHistoryMessage;
+
+        const MAX_BLOCKS_PER_CHUNK: u32 = 4_000;
+        let mut anchor = consensus.async_get_shielded_history_base().await;
+        let (mut total_idx, mut total_rec, mut rounds) = (0u64, 0u64, 0u32);
+        info!("archival: backfilling shielded history below {} from {}", anchor, self.router);
+
+        loop {
+            self.router
+                .enqueue(make_message!(
+                    Payload::RequestShieldedHistory,
+                    RequestShieldedHistoryMessage { anchor_hash: anchor.as_bytes().to_vec(), max_blocks: MAX_BLOCKS_PER_CHUNK }
+                ))
+                .await?;
+
+            let msg = dequeue_with_timeout!(self.incoming_route, Payload::ShieldedHistoryChunk)?;
+            if msg.entries.is_empty() {
+                info!("archival: peer has no further shielded history below {anchor}");
+                break;
+            }
+
+            let mut records = Vec::with_capacity(msg.entries.len());
+            for e in &msg.entries {
+                let data: kaspa_consensus_core::api::ShieldedChainBlockData = bincode::deserialize(&e.data)
+                    .map_err(|err| ProtocolError::OtherOwned(format!("malformed shielded history record: {err}")))?;
+                // The peer's GENESIS-based chain index rides with each record. It cannot be
+                // inferred locally: this node's own index is re-based to 0 at its pruning point,
+                // so the two numbering spaces do not align.
+                records.push((e.chain_index, data));
+            }
+            records.sort_by_key(|(i, _)| *i);
+            let lowest = records.first().map(|(_, r)| r.hash).unwrap_or(anchor);
+
+            let (idx, rec) = consensus.async_backfill_shielded_history(records).await?;
+            total_idx += idx;
+            total_rec += rec;
+            rounds += 1;
+
+            if msg.done {
+                info!("archival: reached genesis after {rounds} rounds");
+                break;
+            }
+            anchor = lowest;
+        }
+
+        info!("archival: shielded history backfill wrote {total_idx} index entries and {total_rec} scan records");
+        Ok(())
+    }
+
     async fn sync_new_shielded_state(&mut self, consensus: &ConsensusProxy, pruning_point: Hash) -> Result<(), ProtocolError> {
         use super::streams::ShieldedStream;
         use kaspa_p2p_lib::pb::RequestPruningPointShieldedStateMessage;
@@ -828,7 +953,10 @@ impl IbdFlow {
                 .await
                 .map_err(|e| ProtocolError::OtherOwned(format!("local shielded state root at pruning point {pruning_point}: {e}")))?;
             if local_root == committed {
-                info!("local shielded state at pruning point {} already matches the PoW-committed root; skipping re-import", pruning_point);
+                info!(
+                    "local shielded state at pruning point {} already matches the PoW-committed root; skipping re-import",
+                    pruning_point
+                );
                 consensus.async_set_pruning_shielded_stable().await;
                 return Ok(());
             }
@@ -840,7 +968,10 @@ impl IbdFlow {
             // committed root (handled above), so reaching here means the local state is corrupt
             // AND has validated descendants — no in-place re-import can repair that, and
             // clearing would trade a detectable wedge for silent state loss.
-            if consensus.async_get_block_status(child).await.is_some_and(|s| s == kaspa_consensus_core::blockstatus::BlockStatus::StatusUTXOValid)
+            if consensus
+                .async_get_block_status(child)
+                .await
+                .is_some_and(|s| s == kaspa_consensus_core::blockstatus::BlockStatus::StatusUTXOValid)
             {
                 return Err(ProtocolError::OtherOwned(format!(
                     "local shielded state at pruning point {pruning_point} does not match the PoW-committed root, but chain \
@@ -900,8 +1031,9 @@ impl IbdFlow {
         let (tx, rx) = tokio::sync::mpsc::channel::<Vec<[u8; 32]>>(2);
 
         let consensus_for_import = consensus.clone();
-        let builder_handle =
-            tokio::task::spawn_blocking(move || consensus_for_import.import_pruning_point_shielded(pruning_point, md, expected_state_root, rx));
+        let builder_handle = tokio::task::spawn_blocking(move || {
+            consensus_for_import.import_pruning_point_shielded(pruning_point, md, expected_state_root, rx)
+        });
 
         while let Some(chunk) = stream.next_chunk().await? {
             tx.send(chunk).await.map_err(|_| ProtocolError::Other("streaming shielded importer stopped unexpectedly"))?;
@@ -926,7 +1058,11 @@ impl IbdFlow {
     /// commitment slot; the caller then falls back to the legacy unverified
     /// import. Any actual misbehaviour (wrong block, merkle-root mismatch, no
     /// coinbase) is a `ProtocolError`.
-    async fn shielded_pp_commitment(&mut self, consensus: &ConsensusProxy, pruning_point: Hash) -> Result<Option<(Hash, [u8; 32])>, ProtocolError> {
+    async fn shielded_pp_commitment(
+        &mut self,
+        consensus: &ConsensusProxy,
+        pruning_point: Hash,
+    ) -> Result<Option<(Hash, [u8; 32])>, ProtocolError> {
         let Some(children) = consensus.async_get_block_children(pruning_point).await else { return Ok(None) };
         let hst = consensus.async_get_headers_selected_tip().await;
         let mut selected_child = None;
@@ -967,10 +1103,15 @@ impl IbdFlow {
         }
         let local_header = consensus.async_get_header(child).await?;
         if block.header.hash_merkle_root != local_header.hash_merkle_root {
-            return Err(ProtocolError::OtherOwned(format!("block {} hash_merkle_root does not match the locally stored header", child)));
+            return Err(ProtocolError::OtherOwned(format!(
+                "block {} hash_merkle_root does not match the locally stored header",
+                child
+            )));
         }
-        let coinbase =
-            block.transactions.first().ok_or_else(|| ProtocolError::OtherOwned(format!("block {} has no coinbase transaction", child)))?;
+        let coinbase = block
+            .transactions
+            .first()
+            .ok_or_else(|| ProtocolError::OtherOwned(format!("block {} has no coinbase transaction", child)))?;
         Ok(kaspa_consensus_core::zkas_state_binding::extract_state_root(&coinbase.payload).map(|root| (child, root)))
     }
 

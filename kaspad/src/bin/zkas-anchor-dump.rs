@@ -25,7 +25,9 @@
 //! Output is one `<anchor-hex>\t<block-hash>` pair per line, sorted by the store's key order.
 
 use kaspa_consensus::model::stores::selected_chain::{DbSelectedChainStore, SelectedChainStoreReader};
-use kaspa_consensus::model::stores::shielded::{AnchorBlockStoreReader, DbAnchorBlockStore, DbShieldedTreeStore, ShieldedTreeStoreReader};
+use kaspa_consensus::model::stores::shielded::{
+    AnchorBlockStoreReader, DbAnchorBlockStore, DbShieldedTreeStore, ShieldedTreeStoreReader,
+};
 use kaspa_database::prelude::{CachePolicy, ConnBuilder};
 use kaspa_hashes::Hash;
 use kaspa_shielded_core::tree::{GlobalTree, NoteCommitmentTree};
@@ -90,7 +92,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(Some(indexed)) if indexed != block && chain.get_by_hash(indexed).is_err() => {
                     // A root a wallet can legitimately anchor to, resolving to a NON-canonical
                     // block: the chain drops such a spend, every fresh sync keeps it. Landmine.
-                    writeln!(out, "{}\t{}\t# canonical producer {} at chain index {}", faster_hex::hex_string(&root), indexed, block, i)?;
+                    writeln!(
+                        out,
+                        "{}\t{}\t# canonical producer {} at chain index {}",
+                        faster_hex::hex_string(&root),
+                        indexed,
+                        block,
+                        i
+                    )?;
                     pins += 1;
                 }
                 _ => {}

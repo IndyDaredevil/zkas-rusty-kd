@@ -357,3 +357,38 @@ message ShieldedNullifierChunkMessage {
 
 message RequestNextPruningPointShieldedChunkMessage {
 }
+
+// ---- Shielded history backfill (ZKas) ----
+//
+// A fresh node syncs from a headers proof and only ever writes scan records for blocks it
+// validates itself, i.e. pruning point forward. The per-note archive below its pruning point is
+// therefore absent, and a wallet querying such a node silently sees a partial balance. This pair
+// backfills that archive AFTER IBD, without re-validating a single historical block.
+//
+// The stream is server-driven: the requester cannot enumerate the range itself (its own
+// selected-chain index is re-based to 0 at its pruning point by `init_with_pruning_point`, so
+// index spaces do not align between nodes, and its header segment stops well above genesis).
+// The server walks ITS selected chain downward from the requested anchor and streams records.
+//
+// Trust: none required. Every record carries the `cmx` leaves; replaying them into an empty tree
+// must reproduce the frontier the requester already holds at its pruning point, which is
+// PoW-anchored via the pruning point's selected child coinbase commitment. A lying peer is
+// detected on the final frontier comparison and its whole contribution discarded.
+message RequestShieldedHistoryMessage {
+  bytes anchorHash = 1;            // walk the server's selected chain DOWNWARD from this block (exclusive)
+  uint32 maxBlocks = 2;            // requester's cap on blocks in this response
+}
+
+message ShieldedHistoryChunkMessage {
+  repeated ShieldedHistoryEntry entries = 1;  // oldest-last (descending chain order)
+  bool done = 2;                              // true when the server reached genesis
+}
+
+message ShieldedHistoryEntry {
+  bytes blockHash = 1;
+  bytes data = 2;                  // bincode(ShieldedScanBlockData)
+  uint64 chainIndex = 3;           // sender's GENESIS-based selected-chain index
+}
+
+message RequestNextShieldedHistoryChunkMessage {
+}

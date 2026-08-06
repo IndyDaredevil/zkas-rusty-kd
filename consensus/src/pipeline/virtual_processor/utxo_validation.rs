@@ -230,10 +230,8 @@ impl VirtualStateProcessor {
                         for a in &bundle.actions {
                             action_bytes.extend_from_slice(&CompactActionRecord::from_wire(a).to_bytes());
                         }
-                        ctx.shielded_scan.push(crate::model::stores::shielded::ShieldedScanTx {
-                            txid: validated_tx.id(),
-                            action_bytes,
-                        });
+                        ctx.shielded_scan
+                            .push(crate::model::stores::shielded::ShieldedScanTx { txid: validated_tx.id(), action_bytes });
                         ctx.shielded_txs.push(stx);
                         shielded_tx_sources.push(merged_block);
                     } else {
@@ -505,12 +503,7 @@ impl VirtualStateProcessor {
                 // batch) lets `GetShieldedBlocks` serve the exact applied truth instead
                 // of re-deriving it — killing the divergent-anchor drift — and keeps
                 // history scannable after the body prunes (PLAN §2.9).
-                let accepted = computed
-                    .outcome
-                    .accepted
-                    .iter()
-                    .map(|&i| ctx.shielded_scan[i].clone())
-                    .collect::<Vec<_>>();
+                let accepted = computed.outcome.accepted.iter().map(|&i| ctx.shielded_scan[i].clone()).collect::<Vec<_>>();
                 // Coinbase notes exist only on a shielded-coinbase network; on a
                 // transparent-coinbase network txs[0]'s outputs are UTXOs, not notes.
                 let coinbase_outputs = if self.shielded_coinbase {
@@ -518,12 +511,15 @@ impl VirtualStateProcessor {
                 } else {
                     Vec::new()
                 };
+                let coinbase_commitments =
+                    coinbase_mint.as_ref().map(|m| m.notes.iter().map(|n| n.commitment.to_bytes()).collect()).unwrap_or_default();
                 computed.scan_block = Some(crate::model::stores::shielded::ShieldedScanBlockData {
                     blue_score: ctx.ghostdag_data.blue_score,
                     daa_score: header.daa_score,
                     timestamp: header.timestamp,
                     coinbase_txid: txs[0].id(),
                     coinbase_outputs,
+                    coinbase_commitments,
                     accepted,
                 });
                 ctx.shielded_computed = Some(computed);

@@ -549,19 +549,20 @@ impl VirtualStateProcessor {
                 daa_score,
                 coinbase_txid: kaspa_hashes::Hash::default(),
                 coinbase_outputs: Vec::new(),
+                coinbase_commitments: Vec::new(),
                 accepted_actions: Vec::new(),
                 accepted_txids: Vec::new(),
                 timestamp,
             });
         };
-        let (accepted_actions, accepted_txids) =
-            scan.accepted.into_iter().map(|t| (t.action_bytes, t.txid)).unzip();
+        let (accepted_actions, accepted_txids) = scan.accepted.into_iter().map(|t| (t.action_bytes, t.txid)).unzip();
         Ok(kaspa_consensus_core::api::ShieldedChainBlockData {
             hash: block,
             blue_score: scan.blue_score,
             daa_score: scan.daa_score,
             coinbase_txid: scan.coinbase_txid,
             coinbase_outputs: scan.coinbase_outputs,
+            coinbase_commitments: scan.coinbase_commitments,
             accepted_actions,
             accepted_txids,
             timestamp: scan.timestamp,
@@ -815,8 +816,8 @@ impl VirtualStateProcessor {
         // never crash the virtual processor here either. With the age window, an in-window
         // source's reachability is never pruned, so `Err` means out-of-window/abandoned —
         // fail closed (F-04); only an explicit `Ok(true)` is canonical.
-        let is_chain_ancestor =
-            source == selected_parent || matches!(self.reachability_service.try_is_chain_ancestor_of(source, selected_parent), Ok(true));
+        let is_chain_ancestor = source == selected_parent
+            || matches!(self.reachability_service.try_is_chain_ancestor_of(source, selected_parent), Ok(true));
         if !is_chain_ancestor {
             return AnchorVerdict {
                 source: Some(source),
@@ -839,6 +840,12 @@ impl VirtualStateProcessor {
             age: Some(age),
             reject_reason: (!verdict).then_some("age outside [shielded_anchor_depth, max_shielded_anchor_age]"),
         }
+    }
+
+    /// Access to the shielded state manager for offline/backfill paths that live outside the
+    /// pipeline module (history backfill ingest). Not a validation entry point.
+    pub(crate) fn shielded_state_manager_ref(&self) -> &crate::processes::shielded::ShieldedStateManager {
+        &self.shielded_state_manager
     }
 
     /// The siblings of an anchor's source block, and whether each is known to carry the same
@@ -2062,8 +2069,7 @@ impl VirtualStateProcessor {
         // coinbase matches what `verify_coinbase_transaction` will expect for this block.
         let shielded_commitment = self.shielded_state_manager.state_root_at(virtual_state.ghostdag_data.selected_parent).unwrap();
         let parent_daa_score = self.headers_store.get_daa_score(virtual_state.ghostdag_data.selected_parent).unwrap();
-        let dev_accrued_parent =
-            self.shielded_state_manager.dev_accrued_at(virtual_state.ghostdag_data.selected_parent).unwrap();
+        let dev_accrued_parent = self.shielded_state_manager.dev_accrued_at(virtual_state.ghostdag_data.selected_parent).unwrap();
         let coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(

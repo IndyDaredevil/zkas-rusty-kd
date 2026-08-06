@@ -17,6 +17,8 @@ pub(crate) mod request_pruning_point_smt_state;
 use request_pruning_point_smt_state::RequestPruningPointSmtStateFlow;
 pub(crate) mod request_pruning_point_shielded_state;
 use request_pruning_point_shielded_state::RequestPruningPointShieldedStateFlow;
+pub(crate) mod request_shielded_history;
+use request_shielded_history::RequestShieldedHistoryFlow;
 
 use crate::{flow_context::FlowContext, flow_trait::Flow, ibd::IbdFlow};
 use kaspa_p2p_lib::{KaspadMessagePayloadType, Router, SharedIncomingRoute, convert::header::HeaderFormat};
@@ -105,6 +107,11 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
                 KaspadMessagePayloadType::RequestPruningPointSmtState,
                 KaspadMessagePayloadType::RequestNextPruningPointSmtChunk,
             ]),
+        )),
+        Box::new(RequestShieldedHistoryFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe(vec![KaspadMessagePayloadType::RequestShieldedHistory]),
         )),
         Box::new(RequestPruningPointShieldedStateFlow::new(
             ctx.clone(),

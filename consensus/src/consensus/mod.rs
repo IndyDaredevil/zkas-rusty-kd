@@ -718,6 +718,118 @@ impl ConsensusApi for Consensus {
         Ok(Some(hashes))
     }
 
+    fn get_shielded_history_base(&self) -> Hash {
+        let _guard = self.pruning_lock.blocking_read();
+        let sc = self.storage.selected_chain_store.read();
+        sc.get_by_index(0).unwrap_or_else(|_| self.config.genesis.hash)
+    }
+
+    fn backfill_shielded_history(
+        &self,
+        records: &[(u64, kaspa_consensus_core::api::ShieldedChainBlockData)],
+    ) -> ConsensusResult<(u64, u64)> {
+        use crate::model::stores::shielded::ShieldedScanBlockData;
+        if records.is_empty() {
+            return Ok((0, 0));
+        }
+        // Hold the pruning lock for the whole write: the index must not move under us between
+        // learning the local base and rebasing it.
+        let _guard = self.pruning_lock.blocking_write();
+        let mut sc = self.storage.selected_chain_store.write();
+
+        // Where does this node's own base sit in the peer's genesis-based numbering? Without an
+        // answer we cannot place history below it, so refuse rather than write a corrupt index.
+        let (local_tip, _) = sc.get_tip().unwrap();
+        let local_base = sc.get_by_index(0).map_err(|_| ConsensusError::General("local selected chain index is empty"))?;
+        let shift = match records.iter().find(|(_, r)| r.hash == local_base).map(|(i, _)| *i) {
+            Some(p) => p,
+            None => return Ok((0, 0)), // this chunk does not reach our base yet; caller re-anchors
+        };
+
+        let mut batch = rocksdb::WriteBatch::default();
+        if shift > 0 {
+            // Rebase highest-first so a shift never lands on an entry not yet moved.
+            for i in (0..=local_tip).rev() {
+                if let Ok(h) = sc.get_by_index(i) {
+                    sc.rebase_entry(&mut batch, i, h, i + shift).unwrap();
+                }
+            }
+            sc.set_highest_index(&mut batch, local_tip + shift).unwrap();
+        }
+
+        let (mut idx_written, mut rec_written) = (0u64, 0u64);
+        for (index, r) in records.iter() {
+            if *index >= shift {
+                continue; // inside our own validated range; ours is authoritative
+            }
+            sc.write_entry(&mut batch, *index, r.hash).unwrap();
+            idx_written += 1;
+            if self.virtual_processor.shielded_state_manager_ref().scan_block(r.hash).unwrap_or(None).is_none() {
+                let accepted = r
+                    .accepted_actions
+                    .iter()
+                    .zip(r.accepted_txids.iter())
+                    .map(|(action_bytes, txid)| crate::model::stores::shielded::ShieldedScanTx {
+                        txid: *txid,
+                        action_bytes: action_bytes.clone(),
+                    })
+                    .collect();
+                let data = ShieldedScanBlockData {
+                    blue_score: r.blue_score,
+                    daa_score: r.daa_score,
+                    timestamp: r.timestamp,
+                    coinbase_txid: r.coinbase_txid,
+                    coinbase_outputs: r.coinbase_outputs.clone(),
+                    coinbase_commitments: r.coinbase_commitments.clone(),
+                    accepted,
+                };
+                self.virtual_processor.shielded_state_manager_ref().persist_backfilled_scan(&mut batch, r.hash, data).unwrap();
+                rec_written += 1;
+            }
+        }
+        self.db.write(batch).unwrap();
+        Ok((idx_written, rec_written))
+    }
+
+    fn get_shielded_history_indexed_below(
+        &self,
+        anchor: Hash,
+        max_blocks: usize,
+    ) -> ConsensusResult<(Vec<(u64, kaspa_consensus_core::api::ShieldedChainBlockData)>, bool)> {
+        // Serve a history-backfill request: walk THIS node's selected chain downward from
+        // `anchor` and return each block's scan record.
+        //
+        // The walk must happen here rather than on the requester, because a syncing node cannot
+        // enumerate this range itself: `init_with_pruning_point` re-bases its selected-chain
+        // index so that its own pruning point is index 0, meaning index spaces do not align
+        // between nodes, and its header segment stops far above genesis.
+        //
+        // Uses only the selected-chain index, which is deliberately retained below the retention
+        // root, so this serves correctly from a pruned node with no reachability or block bodies.
+        let _guard = self.pruning_lock.blocking_read();
+        let sc_read = self.storage.selected_chain_store.read();
+        let Some(anchor_index) = sc_read.get_by_hash(anchor).optional().unwrap() else {
+            // Not on this node's selected chain (or reorged away): the requester must re-anchor.
+            return Ok((Vec::new(), false));
+        };
+        let mut out = Vec::with_capacity(max_blocks.min(anchor_index as usize));
+        let mut index = anchor_index;
+        while out.len() < max_blocks && index > 0 {
+            index -= 1;
+            let Some(hash) = sc_read.get_by_index(index).optional().unwrap() else { break };
+            // A block with no shielded effects has no record; skip it rather than abort — the
+            // requester reconstructs the tree from the `cmx` leaves it does receive.
+            // Reuse the same serving path as `GetShieldedBlocks` so a backfilled record is
+            // byte-identical to one served live. It already yields an empty record for a block
+            // with no shielded effects, and the requester rebuilds the tree from the `cmx`
+            // leaves it receives, so empty records are harmless and keep the walk contiguous.
+            if let Ok(data) = self.virtual_processor.shielded_chain_block_data(hash) {
+                out.push((index, data));
+            }
+        }
+        Ok((out, index == 0))
+    }
+
     fn validate_and_insert_trusted_block(&self, tb: TrustedBlock) -> BlockValidationFutures {
         let (block_task, virtual_state_task) = self.validate_and_insert_block_impl(BlockTask::Trusted { block: tb.block });
         BlockValidationFutures { block_task: Box::pin(block_task), virtual_state_task: Box::pin(virtual_state_task) }
@@ -1622,10 +1734,8 @@ impl ConsensusApi for Consensus {
             })
         };
         let lanes_root = self.storage.smt_stores.get_lanes_root(current_bounds, is_canonical);
-        let mergeset_acceptance_data = self
-            .acceptance_data_store
-            .get(block_hash)
-            .map_err(|e| ConsensusError::GeneralOwned(format!("acceptance_data: {e}")))?;
+        let mergeset_acceptance_data =
+            self.acceptance_data_store.get(block_hash).map_err(|e| ConsensusError::GeneralOwned(format!("acceptance_data: {e}")))?;
         let miner_payload_leaves = self.virtual_processor.mergeset_miner_payload_leaves(&mergeset_acceptance_data);
 
         // In debug builds, verify the proof is consistent with the stored lanes_root

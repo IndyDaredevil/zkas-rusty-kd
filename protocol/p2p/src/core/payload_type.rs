@@ -55,6 +55,9 @@ pub enum KaspadMessagePayloadType {
     RequestPruningPointShieldedState,
     ShieldedMetadata,
     ShieldedNullifierChunk,
+    RequestShieldedHistory,
+    ShieldedHistoryChunk,
+    RequestNextShieldedHistoryChunk,
     RequestNextPruningPointShieldedChunk,
 }
 
@@ -116,11 +119,12 @@ impl From<&KaspadMessagePayload> for KaspadMessagePayloadType {
             KaspadMessagePayload::SmtMetadata(_) => KaspadMessagePayloadType::SmtMetadata,
             KaspadMessagePayload::SmtLaneChunk(_) => KaspadMessagePayloadType::SmtLaneChunk,
             KaspadMessagePayload::RequestNextPruningPointSmtChunk(_) => KaspadMessagePayloadType::RequestNextPruningPointSmtChunk,
-            KaspadMessagePayload::RequestPruningPointShieldedState(_) => {
-                KaspadMessagePayloadType::RequestPruningPointShieldedState
-            }
+            KaspadMessagePayload::RequestPruningPointShieldedState(_) => KaspadMessagePayloadType::RequestPruningPointShieldedState,
             KaspadMessagePayload::ShieldedMetadata(_) => KaspadMessagePayloadType::ShieldedMetadata,
             KaspadMessagePayload::ShieldedNullifierChunk(_) => KaspadMessagePayloadType::ShieldedNullifierChunk,
+            KaspadMessagePayload::RequestShieldedHistory(_) => KaspadMessagePayloadType::RequestShieldedHistory,
+            KaspadMessagePayload::ShieldedHistoryChunk(_) => KaspadMessagePayloadType::ShieldedHistoryChunk,
+            KaspadMessagePayload::RequestNextShieldedHistoryChunk(_) => KaspadMessagePayloadType::RequestNextShieldedHistoryChunk,
             KaspadMessagePayload::RequestNextPruningPointShieldedChunk(_) => {
                 KaspadMessagePayloadType::RequestNextPruningPointShieldedChunk
             }

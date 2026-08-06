@@ -348,9 +348,7 @@ pub struct BurnReceipts {
 impl BurnReceipts {
     /// Rebuild the accumulator this snapshot represents.
     pub fn to_accumulator(&self) -> BurnAccumulator {
-        BurnAccumulator::from_receipts(
-            self.receipts.iter().map(|&(v, recipient, n)| ExitReceipt { v, recipient, n }),
-        )
+        BurnAccumulator::from_receipts(self.receipts.iter().map(|&(v, recipient, n)| ExitReceipt { v, recipient, n }))
     }
 
     /// Snapshot an accumulator for persistence.
@@ -638,6 +636,33 @@ pub struct ShieldedScanBlockData {
     /// Each coinbase output's `(script_public_key script bytes, value)`. The script
     /// carries the recipient's 43-byte Orchard address; the value is public.
     pub coinbase_outputs: Vec<(Vec<u8>, u64)>,
+    /// Consensus-computed note commitments, parallel to `coinbase_outputs`.
+    ///
+    /// **WARNING — `serde(default)` does NOT make this backward compatible.** Records are stored
+    /// with bincode, which is non-self-describing: fields are read POSITIONALLY, so a record
+    /// written before this field existed has no bytes for it and the reader consumes the NEXT
+    /// field's bytes as this vector's length — yielding
+    /// `bincode error: unexpected end of file`, not an empty vec. Proven by
+    /// `serde_default_does_not_make_bincode_records_forward_compatible`.
+    ///
+    /// Consequence: a node upgraded to a binary carrying this field cannot read the scan records
+    /// IT WROTE ITSELF beforehand, so `GetShieldedBlocks` fails and wallet history serving breaks
+    /// on upgrade.
+    ///
+    /// Note the two legacy layouts are AMBIGUOUS at this position — pre-field records have
+    /// `accepted: Vec<ShieldedScanTx>` here and post-field records have
+    /// `commitments: Vec<[u8;32]>`; both start with a bincode length, so a decoder cannot tell
+    /// them apart by inspection. The EOF-tolerance trick used by `UtxoEntry::deserialize`
+    /// (`consensus/core/src/utxo/utxo_entry.rs`) only works for a field appended LAST.
+    ///
+    /// Viable migrations, in preference order:
+    ///   1. Move this field to the END of the struct and give the type a manual `Deserialize`
+    ///      with EOF tolerance (the `UtxoEntry` pattern). Handles pre-field records; requires
+    ///      rewriting records already written WITH the field in its current position.
+    ///   2. Prefix future records with an explicit version byte and decode by version.
+    /// Do NOT assume serde papers over the layout change — it does not.
+    #[serde(default)]
+    pub coinbase_commitments: Vec<[u8; 32]>,
     /// Accepted shielded txs in consensus applied order, each with its actions in
     /// compact form (`CompactActionRecord::to_bytes()`, 148 bytes each, concatenated).
     pub accepted: Vec<ShieldedScanTx>,
@@ -705,6 +730,55 @@ mod tests {
     use kaspa_database::prelude::ConnBuilder;
 
     #[test]
+    /// `#[serde(default)]` does NOT give bincode forward/backward compatibility.
+    ///
+    /// bincode is non-self-describing: fields are read POSITIONALLY with no names, so a record
+    /// written before `coinbase_commitments` existed has no bytes for it and the reader consumes
+    /// the NEXT field's bytes as its length. The doc comment on that field claims serde(default)
+    /// "keeps pre-commitment archives readable" — this test exists because that is false, and the
+    /// same wrong assumption was made once before about `in_window_anchors`.
+    ///
+    /// Consequence if ignored: a node upgraded to a binary carrying this field can no longer read
+    /// the scan records IT ITSELF wrote earlier, so `GetShieldedBlocks` starts failing and wallet
+    /// history serving breaks on upgrade.
+    #[test]
+    fn serde_default_does_not_make_bincode_records_forward_compatible() {
+        // Exactly `ShieldedScanBlockData` as it was BEFORE `coinbase_commitments` was added.
+        #[derive(Serialize)]
+        struct LegacyScanBlockData {
+            blue_score: u64,
+            daa_score: u64,
+            timestamp: u64,
+            coinbase_txid: Hash,
+            coinbase_outputs: Vec<(Vec<u8>, u64)>,
+            accepted: Vec<ShieldedScanTx>,
+        }
+
+        let legacy = LegacyScanBlockData {
+            blue_score: 7,
+            daa_score: 9,
+            timestamp: 11,
+            coinbase_txid: Hash::from_bytes([1u8; 32]),
+            coinbase_outputs: vec![(vec![0xAAu8; 43], 5_700_000_000)],
+            accepted: vec![ShieldedScanTx { txid: Hash::from_bytes([2u8; 32]), action_bytes: vec![0xBB; 148] }],
+        };
+        let bytes = bincode::serialize(&legacy).unwrap();
+
+        // Reading old bytes with the CURRENT struct must not silently succeed with wrong data.
+        let decoded: Result<ShieldedScanBlockData, _> = bincode::deserialize(&bytes);
+        match decoded {
+            Err(_) => { /* expected: positional read runs off the end */ }
+            Ok(v) => panic!(
+                "serde(default) appeared to work for bincode — it does not. Decoded blue_score={}, \
+                 commitments={}, accepted={}. If this ever passes, the field layout changed and the \
+                 archive-compatibility story must be re-derived, not assumed.",
+                v.blue_score,
+                v.coinbase_commitments.len(),
+                v.accepted.len()
+            ),
+        }
+    }
+
     fn scan_block_store_roundtrip() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
         let store = DbShieldedScanBlockStore::new(db.clone(), CachePolicy::Count(16));
@@ -716,6 +790,7 @@ mod tests {
             timestamp: 1234,
             coinbase_txid: Hash::from_bytes([7u8; 32]),
             coinbase_outputs: vec![(vec![9u8; 43], 60_00000000)],
+            coinbase_commitments: vec![[8u8; 32]],
             accepted: vec![ShieldedScanTx { txid: Hash::from_bytes([5u8; 32]), action_bytes: vec![1u8; 148 * 2] }],
         };
         let mut b = WriteBatch::default();
@@ -724,6 +799,7 @@ mod tests {
         let got = store.get(block).unwrap().expect("present");
         assert_eq!(got.blue_score, 42);
         assert_eq!(got.coinbase_outputs, data.coinbase_outputs);
+        assert_eq!(got.coinbase_commitments, data.coinbase_commitments);
         assert_eq!(got.accepted.len(), 1);
         assert_eq!(got.accepted[0].action_bytes.len(), 296);
     }

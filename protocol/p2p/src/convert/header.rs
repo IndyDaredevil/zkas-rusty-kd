@@ -1,5 +1,9 @@
 use crate::pb as protowire;
-use kaspa_consensus_core::{BlueWorkType, auxpow::AuxPow, header::{CompressedParents, Header}};
+use kaspa_consensus_core::{
+    BlueWorkType,
+    auxpow::AuxPow,
+    header::{CompressedParents, Header},
+};
 use kaspa_hashes::Hash;
 
 use super::error::ConversionError;
@@ -133,9 +137,8 @@ impl TryFrom<Versioned<protowire::BlockHeader>> for Header {
             // cumulative counts — a remote zero-work panic in header processing.
             // Re-run the same CompressedParents validation at the edge, before the
             // witness can be stored or relayed.
-            CompressedParents::try_from(aux.parent_header.parents_by_level.raw().to_vec()).map_err(|e| {
-                ConversionError::AuxPowDecodeError(format!("aux parent parents_by_level invalid: {e}"))
-            })?;
+            CompressedParents::try_from(aux.parent_header.parents_by_level.raw().to_vec())
+                .map_err(|e| ConversionError::AuxPowDecodeError(format!("aux parent parents_by_level invalid: {e}")))?;
             Ok(header.with_aux_pow(aux))
         }
     }
@@ -199,7 +202,7 @@ mod tests {
         let h2 = Hash::from_bytes([8u8; 32]);
 
         let cases: Vec<Vec<(u8, Vec<Hash>)>> = vec![
-            vec![(0, vec![h1])],              // first cumulative count is 0
+            vec![(0, vec![h1])],                // first cumulative count is 0
             vec![(5, vec![h1]), (2, vec![h1])], // decreasing cumulative counts
             vec![(3, vec![h1]), (3, vec![h2])], // repeated cumulative count
         ];
@@ -209,7 +212,8 @@ mod tests {
             let bad: CompressedParents = borsh::from_slice(&borsh::to_vec(&raw).unwrap()).unwrap();
             let mut parent = finalized(9);
             parent.parents_by_level = bad;
-            let cb = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, AuxPow::embed_commitment(&[], header.hash, &[]));
+            let cb =
+                Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, AuxPow::embed_commitment(&[], header.hash, &[]));
             let aux = AuxPow { parent_header: parent, parent_coinbase: cb, coinbase_merkle_branch: vec![] };
 
             let mut pb: protowire::BlockHeader = (HeaderFormat::Compressed, &header).into();

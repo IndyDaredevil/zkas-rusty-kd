@@ -10,9 +10,7 @@ use kaspa_p2p_lib::{
     IncomingRoute, Router,
     common::ProtocolError,
     dequeue, make_message,
-    pb::{
-        ShieldedMetadataMessage, ShieldedNullifierChunkMessage, UnexpectedPruningPointMessage, kaspad_message::Payload,
-    },
+    pb::{ShieldedMetadataMessage, ShieldedNullifierChunkMessage, UnexpectedPruningPointMessage, kaspad_message::Payload},
 };
 use std::sync::Arc;
 
@@ -68,9 +66,7 @@ impl RequestPruningPointShieldedStateFlow {
             return Ok(());
         };
 
-        self.router
-            .enqueue(make_message!(Payload::ShieldedMetadata, ShieldedMetadataMessage { data, nullifier_count }))
-            .await?;
+        self.router.enqueue(make_message!(Payload::ShieldedMetadata, ShieldedMetadataMessage { data, nullifier_count })).await?;
 
         if nullifier_count == 0 {
             debug!("Finished sending shielded state for pruning point {}: 0 nullifiers", expected_pp);

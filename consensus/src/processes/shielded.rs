@@ -20,6 +20,7 @@ use kaspa_consensus_core::BlockHashSet;
 use kaspa_consensus_core::tx::Transaction;
 use kaspa_database::prelude::{CachePolicy, DB, StoreError, StoreResult};
 use kaspa_hashes::Hash;
+use kaspa_shielded_core::ExtractedNoteCommitment;
 use kaspa_shielded_core::coinbase::{coinbase_note, derive_coinbase_note_desc};
 use kaspa_shielded_core::nullifier::{MemNullifierSet, NullifierBytes, NullifierConflictResolver, NullifierSet};
 #[cfg(test)]
@@ -27,19 +28,18 @@ use kaspa_shielded_core::state::CoinbaseNote;
 use kaspa_shielded_core::state::{BlockShieldedOutcome, CoinbaseMint, ShieldedStateError, ShieldedTx, apply_chain_block_to};
 use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree, TreeStateError};
 use kaspa_shielded_core::turnstile::SupplyLedger;
+use kaspa_shielded_core::wallet::CompactActionRecord;
 
 use rocksdb::WriteBatch;
 
 use kaspa_muhash::MuHash;
 
 use crate::model::stores::shielded::{
-    AnchorProducersStoreReader, DbAnchorProducersStore,
-    AnchorBlockStoreReader, DbAnchorBlockStore, DbNullifierDiffStore, DbNullifierSetStore, DbShieldedNullifierMuHashStore,
-    BurnReceipts, DbShieldedBurnStore, DbShieldedDevAccruedStore, DbShieldedScanBlockStore, DbShieldedSupplyStore,
-    DbShieldedTreeStore,
-    NullifierDiffStoreReader, NullifierSetStore, NullifierSetStoreReader, ShieldedBurnStoreReader,
-    ShieldedNullifierMuHashStoreReader, ShieldedScanBlockData, ShieldedScanBlockStoreReader, ShieldedSupplyStoreReader,
-    ShieldedTreeStoreReader, SupplyTotals,
+    AnchorBlockStoreReader, AnchorProducersStoreReader, BurnReceipts, DbAnchorBlockStore, DbAnchorProducersStore,
+    DbNullifierDiffStore, DbNullifierSetStore, DbShieldedBurnStore, DbShieldedDevAccruedStore, DbShieldedNullifierMuHashStore,
+    DbShieldedScanBlockStore, DbShieldedSupplyStore, DbShieldedTreeStore, NullifierDiffStoreReader, NullifierSetStore,
+    NullifierSetStoreReader, ShieldedBurnStoreReader, ShieldedNullifierMuHashStoreReader, ShieldedScanBlockData,
+    ShieldedScanBlockStoreReader, ShieldedSupplyStoreReader, ShieldedTreeStoreReader, SupplyTotals,
 };
 
 /// A computed (not-yet-persisted) shielded transition for one chain block.
@@ -456,6 +456,76 @@ impl ShieldedStateManager {
     /// Read-only access to the compact scan archive (for `GetShieldedBlocks`).
     pub fn scan_block(&self, block: Hash) -> StoreResult<Option<ShieldedScanBlockData>> {
         self.scan_block.get(block)
+    }
+
+    /// Persist a scan record obtained from a peer's history backfill.
+    ///
+    /// Distinct from [`Self::persist`], which writes the record a node produced itself while
+    /// validating. Backfilled records describe blocks BELOW this node's pruning point that it
+    /// will never validate, so there is no local computation to compare them against
+    /// block-by-block. Soundness comes from the caller's end-of-stream check: replaying every
+    /// backfilled `cmx` into an empty tree must reproduce the frontier already held at the
+    /// pruning point, which is PoW-anchored. Until that check passes the records are not
+    /// advertised as complete.
+    ///
+    /// Never read by consensus — the archive only ever serves `GetShieldedBlocks` — so even a
+    /// bogus record cannot influence validation.
+    pub fn persist_backfilled_scan(&self, batch: &mut WriteBatch, block: Hash, data: ShieldedScanBlockData) -> StoreResult<()> {
+        self.scan_block.set_batch(batch, block, data)
+    }
+
+    /// Drop a backfilled range after a failed verification.
+    pub fn delete_backfilled_scan(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
+        self.scan_block.delete_batch(batch, block)
+    }
+
+    /// Replay a backfilled history range into an empty tree and return the resulting frontier.
+    ///
+    /// This is what makes history backfill trustless. `GlobalTree::append` is pure append-only,
+    /// so the frontier is a deterministic function of the leaf sequence: replaying every `cmx`
+    /// from genesis up to (and including) `blocks` must reproduce EXACTLY the frontier this node
+    /// already holds at its pruning point — a value it did not learn from the backfilling peer,
+    /// and which is PoW-anchored (the pruning point's selected child commits
+    /// `shielded_state_root(pruning_point)` in its coinbase, bound by `hash_merkle_root`).
+    ///
+    /// A peer that fabricates, omits, reorders or truncates records cannot produce a matching
+    /// frontier, so the check is cryptographic rather than reputational. `blocks` must be in
+    /// ascending chain order (oldest first) — the same order the tree was originally built in.
+    ///
+    /// Leaves come from the coinbase mint first, then the accepted actions in consensus applied
+    /// order, mirroring how `compute` built the tree at validation time.
+    ///
+    /// `coinbase_leaves` is supplied by the caller because the coinbase note seed is FORK
+    /// DEPENDENT (see [`build_coinbase_mint`]): pre-fork it is `txid || index`, post-fork
+    /// `block_hash || txid || index`. A replay that used the wrong rule for a block's height
+    /// would derive different commitments and fail against honest data, so the activation
+    /// decision stays with the caller that owns the params.
+    pub fn replay_history_frontier(
+        blocks: &[kaspa_consensus_core::api::ShieldedChainBlockData],
+        coinbase_leaves: impl Fn(&kaspa_consensus_core::api::ShieldedChainBlockData) -> Vec<[u8; 32]>,
+    ) -> Result<FrontierState, TreeStateError> {
+        let mut tree = GlobalTree::default();
+        for b in blocks {
+            for cmx in coinbase_leaves(b) {
+                let c = ExtractedNoteCommitment::from_bytes(&cmx);
+                if c.is_none().into() {
+                    return Err(TreeStateError::NonCanonicalNode);
+                }
+                tree.append(c.unwrap()).map_err(|_| TreeStateError::Inconsistent)?;
+            }
+            for actions in &b.accepted_actions {
+                for rec in actions.chunks_exact(CompactActionRecord::SERIALIZED_LEN) {
+                    let mut cmx = [0u8; 32];
+                    cmx.copy_from_slice(&rec[32..64]);
+                    let c = ExtractedNoteCommitment::from_bytes(&cmx);
+                    if c.is_none().into() {
+                        return Err(TreeStateError::NonCanonicalNode);
+                    }
+                    tree.append(c.unwrap()).map_err(|_| TreeStateError::Inconsistent)?;
+                }
+            }
+        }
+        Ok(tree.to_state())
     }
 
     /// Read-only access to the nullifier store (for validation / queries).
@@ -878,13 +948,10 @@ impl ShieldedStateManager {
         // 2. The declared state root must be consistent with the transferred parts.
         //    The frontier is peer-controlled: propagate a rebuild failure as an Err
         //    rather than panicking (audit finding F-17).
-        let recomputed =
-            PruningPointShieldedMetadata::recompute_state_root(&md.frontier, &md.supply, &md.nullifier_muhash, &md.burns)
-                .map_err(|e| format!("malformed shielded frontier in pruning-point metadata: {e:?}"))?;
+        let recomputed = PruningPointShieldedMetadata::recompute_state_root(&md.frontier, &md.supply, &md.nullifier_muhash, &md.burns)
+            .map_err(|e| format!("malformed shielded frontier in pruning-point metadata: {e:?}"))?;
         if recomputed != md.state_root {
-            return Err(
-                "declared shielded state root is inconsistent with (frontier, supply, nullifier_muhash, burns)".to_string()
-            );
+            return Err("declared shielded state root is inconsistent with (frontier, supply, nullifier_muhash, burns)".to_string());
         }
         Ok(count)
     }
@@ -1084,6 +1151,7 @@ mod tests {
                         timestamp: 0,
                         coinbase_txid: b,
                         coinbase_outputs: vec![(vec![9u8; 43], 42)],
+                        coinbase_commitments: Vec::new(),
                         accepted: vec![],
                     },
                 )
@@ -1201,11 +1269,7 @@ mod tests {
 
     fn burn_stx(nfs: &[u8], cmxs: &[u32], value_balance: u64, burn_v: u64, tag: u8) -> ShieldedTx {
         ShieldedTx {
-            burn: Some(kaspa_shielded_core::burn::ExitReceipt {
-                v: burn_v,
-                recipient: [tag; 32],
-                n: [tag.wrapping_add(0x90); 32],
-            }),
+            burn: Some(kaspa_shielded_core::burn::ExitReceipt { v: burn_v, recipient: [tag; 32], n: [tag.wrapping_add(0x90); 32] }),
             nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
             commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
             fee: value_balance,
@@ -1676,12 +1740,12 @@ mod tests {
         let mut immature = stx(&[4], &[400], 9);
         immature.anchor = bad_anchor;
         let candidates = vec![
-            stx(&[2], &[200], 5),  // fresh spend — kept
-            stx(&[1], &[201], 5),  // conflicts with the PERSISTED nf(1) — dropped
-            stx(&[2], &[202], 7),  // conflicts with the batch's first tx — dropped
-            immature,              // spend against a non-final anchor — dropped
-            stx(&[], &[203], 0),   // pure-output (no nullifiers): anchor rule exempt — kept
-            stx(&[3], &[204], 2),  // independent spend — kept
+            stx(&[2], &[200], 5), // fresh spend — kept
+            stx(&[1], &[201], 5), // conflicts with the PERSISTED nf(1) — dropped
+            stx(&[2], &[202], 7), // conflicts with the batch's first tx — dropped
+            immature,             // spend against a non-final anchor — dropped
+            stx(&[], &[203], 0),  // pure-output (no nullifiers): anchor rule exempt — kept
+            stx(&[3], &[204], 2), // independent spend — kept
         ];
         let outcomes = mgr.partition_applied(&candidates, |stx| stx.anchor != bad_anchor);
         let keep: Vec<bool> = outcomes.iter().map(|o| o.kept()).collect();
@@ -1750,6 +1814,81 @@ mod tests {
     /// The anchor→block index records a block's tree root so a spend can later be
     /// resolved to its source block (finality/canonicality is then decided by the
     /// virtual processor via reachability + depth, tested at that layer).
+    #[test]
+    /// The backfill verifier must reproduce the exact frontier an honest range builds, and must
+    /// reject any tampering. Without this the whole history-backfill path would be "trust the
+    /// peer", which is precisely what it exists to avoid.
+    #[test]
+    fn history_replay_reproduces_frontier_and_detects_tampering() {
+        use kaspa_consensus_core::api::ShieldedChainBlockData;
+
+        // Build a plausible history: three blocks, each contributing action leaves.
+        let leaf = |n: u8| {
+            let mut c = [0u8; 32];
+            c[0] = n;
+            // Keep it a canonical Pallas base encoding by clearing the high bits.
+            c[31] = 0;
+            c
+        };
+        let block = |leaves: &[u8]| {
+            let mut action_bytes = Vec::new();
+            for &n in leaves {
+                let mut rec = [0u8; CompactActionRecord::SERIALIZED_LEN];
+                rec[32..64].copy_from_slice(&leaf(n));
+                action_bytes.extend_from_slice(&rec);
+            }
+            ShieldedChainBlockData {
+                hash: h(1),
+                blue_score: 0,
+                daa_score: 0,
+                coinbase_txid: h(0),
+                coinbase_outputs: Vec::new(),
+                coinbase_commitments: Vec::new(),
+                accepted_actions: vec![action_bytes],
+                accepted_txids: vec![h(2)],
+                timestamp: 0,
+            }
+        };
+        let no_coinbase = |_: &ShieldedChainBlockData| Vec::new();
+
+        let honest = vec![block(&[1, 2]), block(&[3]), block(&[4, 5])];
+        let expected = ShieldedStateManager::replay_history_frontier(&honest, no_coinbase).unwrap();
+        assert_eq!(expected.size, 5, "five leaves appended across the range");
+
+        // Same leaves, same order => same frontier. (Determinism is what makes the check sound.)
+        let again = ShieldedStateManager::replay_history_frontier(&honest, no_coinbase).unwrap();
+        assert_eq!(again, expected);
+
+        // A peer that OMITS a record cannot match.
+        let omitted = vec![honest[0].clone(), honest[2].clone()];
+        assert_ne!(ShieldedStateManager::replay_history_frontier(&omitted, no_coinbase).unwrap(), expected, "omission must be caught");
+
+        // A peer that REORDERS records cannot match (the tree is order-dependent).
+        let reordered = vec![honest[1].clone(), honest[0].clone(), honest[2].clone()];
+        assert_ne!(
+            ShieldedStateManager::replay_history_frontier(&reordered, no_coinbase).unwrap(),
+            expected,
+            "reordering must be caught"
+        );
+
+        // A peer that FABRICATES a leaf cannot match.
+        let mut tampered = honest.clone();
+        tampered[1] = block(&[99]);
+        assert_ne!(
+            ShieldedStateManager::replay_history_frontier(&tampered, no_coinbase).unwrap(),
+            expected,
+            "fabrication must be caught"
+        );
+
+        // A peer that TRUNCATES the range cannot match.
+        let truncated = vec![honest[0].clone(), honest[1].clone()];
+        assert_ne!(
+            ShieldedStateManager::replay_history_frontier(&truncated, no_coinbase).unwrap(),
+            expected,
+            "truncation must be caught"
+        );
+    }
+
     #[test]
     fn records_anchor_source_block() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));

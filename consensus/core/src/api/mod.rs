@@ -22,8 +22,8 @@ use crate::{
     pruning::{PruningPointProof, PruningPointTrustedData, PruningPointsList, PruningProofMetadata},
     trusted::{ExternalGhostdagData, TrustedBlock},
     tx::{
-        MutableTransaction, ScriptPublicKey, Transaction, TransactionId, TransactionIndexType, TransactionOutpoint, TransactionQueryResult,
-        TransactionType, UtxoEntry,
+        MutableTransaction, ScriptPublicKey, Transaction, TransactionId, TransactionIndexType, TransactionOutpoint,
+        TransactionQueryResult, TransactionType, UtxoEntry,
     },
 };
 use kaspa_hashes::Hash;
@@ -37,7 +37,7 @@ pub mod stats;
 /// The shielded effects of one chain block, as applied by the §2.4 transition —
 /// see [`ConsensusApi::get_shielded_chain_block_data`]. Plain types only, so
 /// `kaspa-shielded-core` stays off this API boundary.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ShieldedChainBlockData {
     /// The chain block.
     pub hash: Hash,
@@ -51,6 +51,11 @@ pub struct ShieldedChainBlockData {
     /// The coinbase outputs in order: `(script_public_key bytes, value)`. A
     /// 43-byte script is a raw Orchard recipient minting a coinbase note.
     pub coinbase_outputs: Vec<(Vec<u8>, u64)>,
+    /// Consensus-computed coinbase note commitments, parallel to
+    /// `coinbase_outputs`. Empty when supplied by an older peer/archive; callers
+    /// must then derive them from the public output description.
+    #[serde(default)]
+    pub coinbase_commitments: Vec<[u8; 32]>,
     /// Accepted shielded actions in consensus applied order, one entry per accepted
     /// tx (parallel to `accepted_txids`): each entry is that tx's actions in **compact**
     /// form — concatenated 148-byte `CompactActionRecord`s (nullifier ‖ cmx ‖ epk ‖
@@ -534,6 +539,49 @@ pub trait ConsensusApi: Send + Sync {
     /// this node pruned its index before the retention change. Callers should treat that as
     /// "re-anchor" and fall back to the reachability path to obtain a precise error.
     fn get_shielded_chain_range(&self, _low: Hash, _limit: usize) -> ConsensusResult<Option<Vec<Hash>>> {
+        unimplemented!()
+    }
+
+    /// Serve a shielded-history backfill request: this node's scan records for the chain blocks
+    /// immediately BELOW `anchor` on its own selected chain, newest first, plus whether the walk
+    /// reached genesis.
+    ///
+    /// Exists because a freshly synced node holds per-note history only from its pruning point
+    /// forward — `PruningPointShieldedMetadata` carries aggregates (frontier, nullifier muhash,
+    /// supply) that cannot yield notes — so wallets querying it see a silently partial balance.
+    /// The requester verifies the result by replaying the `cmx` leaves into an empty tree and
+    /// comparing against the PoW-anchored pruning-point frontier, so no trust in the server is
+    /// required.
+    /// Ingest one chunk of backfilled shielded history: chain-index entries plus scan records
+    /// for blocks BELOW this node's own base.
+    ///
+    /// Restoring the records alone is NOT enough and was measured to fail: wallets reach history
+    /// through `get_shielded_chain_range`, which resolves the start block via
+    /// `selected_chain_store.get_by_hash()`. Without index entries a node holds the data and
+    /// still answers `cannot find header`. The index is the enumerator.
+    ///
+    /// The first call rebases: `init_with_pruning_point` numbers a synced node from ITS pruning
+    /// point as index 0, while the peer's indices are genesis-based, so local entries are shifted
+    /// up to make room below. Returns how many index entries and scan records were written.
+    ///
+    /// The scan archive is never read by consensus, so bad data cannot affect validation; the
+    /// caller still verifies the whole range by replaying its `cmx` leaves against the
+    /// PoW-anchored pruning-point frontier before advertising history as complete.
+    /// The oldest chain block this node can enumerate — the anchor a history backfill walks down
+    /// from. On a headers-proof-synced node this is its pruning point.
+    fn get_shielded_history_base(&self) -> Hash {
+        unimplemented!()
+    }
+
+    fn backfill_shielded_history(&self, _records: &[(u64, ShieldedChainBlockData)]) -> ConsensusResult<(u64, u64)> {
+        unimplemented!()
+    }
+
+    fn get_shielded_history_indexed_below(
+        &self,
+        _anchor: Hash,
+        _max_blocks: usize,
+    ) -> ConsensusResult<(Vec<(u64, ShieldedChainBlockData)>, bool)> {
         unimplemented!()
     }
 
