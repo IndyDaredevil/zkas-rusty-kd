@@ -143,14 +143,51 @@ pub struct KaspaApi {
     hub: Arc<NotificationHub>,
     connected: Arc<Mutex<bool>>,
     coinbase_tag: Vec<u8>,
+    /// KAS-primary inversion (merged-bridge-v2-spec §3): the PRIMARY client
+    /// above is the Kaspa node — the unmodified production RKStratum path —
+    /// and merged mining is the optional enhancement. With these None the
+    /// bridge IS RKStratum (KAS-ONLY base state); when a ZKas node is
+    /// configured, jobs additionally commit to H_fc (MERGED state). ZKas
+    /// state must never gate any Kaspa operation (invariant 6).
+    zkas_client: Option<Arc<GrpcClient>>,
+    zkas_hub: Option<Arc<NotificationHub>>,
+    /// Payout model (a): per-worker kaspa addresses via stratum authorize
+    /// (unchanged RKStratum semantics); ONE global ZKas treasury address for
+    /// all zkas-side templates, configured here.
+    zkas_pay_address: Option<String>,
+}
+
+/// Configuration for the optional merged-mining (ZKas) enhancement.
+#[derive(Debug, Clone)]
+pub struct MergedZkasConfig {
+    /// ZKas node gRPC address (e.g. "127.0.0.1:16810").
+    pub node_address: String,
+    /// ZKas treasury address paid by all zkas-side block templates.
+    pub pay_address: String,
 }
 
 impl KaspaApi {
-    /// Create a new Kaspa API client
+    /// Create a new Kaspa API client (KAS-ONLY base state — no merged mining).
     pub async fn new(
         address: String,
         coinbase_tag_suffix: Option<String>,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> Result<Arc<Self>> {
+        Self::new_with_merged(address, coinbase_tag_suffix, shutdown_rx, None).await
+    }
+
+    /// Create the API client with the optional merged-mining enhancement.
+    ///
+    /// The Kaspa (primary) connection is required and retried until success or
+    /// shutdown — KAS is the ground state. The ZKas connection is BEST-EFFORT:
+    /// bounded retries, then a warning and KAS-ONLY operation, so a missing or
+    /// late ZKas node can never prevent KAS mining (invariant 6; automatic
+    /// later re-attach arrives with the WS4 mode machine).
+    pub async fn new_with_merged(
+        address: String,
+        coinbase_tag_suffix: Option<String>,
         mut shutdown_rx: watch::Receiver<bool>,
+        zkas: Option<MergedZkasConfig>,
     ) -> Result<Arc<Self>> {
         info!("Connecting to Kaspa node at {}", address);
 
@@ -261,8 +298,103 @@ impl KaspaApi {
         // stream and fans it out to any number of subscribers.
         let hub = NotificationHub::start(client.notification_channel_receiver(), "kaspa", DEFAULT_HUB_CAPACITY);
 
+        // Optional ZKas enhancement — best-effort by design. Failure here is a
+        // warning and KAS-ONLY operation, never an error: the Kaspa leg is the
+        // ground state and must be indifferent to ZKas availability.
+        let (zkas_client, zkas_hub, zkas_pay_address) = match zkas {
+            None => (None, None, None),
+            Some(cfg) => {
+                info!("Merged mining configured: connecting to ZKas node at {}", cfg.node_address);
+                let zkas_grpc = if cfg.node_address.starts_with("grpc://") {
+                    cfg.node_address.clone()
+                } else {
+                    format!("grpc://{}", cfg.node_address)
+                };
+                let mut connected_zkas: Option<Arc<GrpcClient>> = None;
+                let mut backoff_ms: u64 = 250;
+                for attempt in 1..=5u64 {
+                    let connect_fut = GrpcClient::connect_with_args(
+                        NotificationMode::Direct,
+                        zkas_grpc.clone(),
+                        None,
+                        true,
+                        None,
+                        false,
+                        Some(500_000),
+                        Default::default(),
+                    );
+                    let res = tokio::select! {
+                        _ = shutdown_rx.wait_for(|v| *v) => return Err(anyhow::anyhow!("shutdown requested")),
+                        res = connect_fut => res,
+                    };
+                    match res {
+                        Ok(c) => {
+                            connected_zkas = Some(Arc::new(c));
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "failed to connect to ZKas node at {} (attempt {}/5): {}; retrying in {:.2}s",
+                                zkas_grpc,
+                                attempt,
+                                e,
+                                Duration::from_millis(backoff_ms).as_secs_f64()
+                            );
+                            tokio::select! {
+                                _ = shutdown_rx.wait_for(|v| *v) => return Err(anyhow::anyhow!("shutdown requested")),
+                                _ = sleep(Duration::from_millis(backoff_ms)) => {}
+                            }
+                            backoff_ms = (backoff_ms.saturating_mul(2)).min(5_000);
+                        }
+                    }
+                }
+                match connected_zkas {
+                    None => {
+                        warn!(
+                            "ZKas node unreachable after 5 attempts — continuing KAS-ONLY. \
+                             Merged mining will require a restart until the WS4 mode machine adds live re-attach."
+                        );
+                        (None, None, None)
+                    }
+                    Some(zc) => {
+                        zc.start(None).await;
+                        // Best-effort subscription with the same bounded policy.
+                        let mut subscribed = false;
+                        let mut backoff_ms: u64 = 250;
+                        for attempt in 1..=5u64 {
+                            match zc.start_notify(ListenerId::default(), NewBlockTemplateScope {}.into()).await {
+                                Ok(_) => {
+                                    subscribed = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!("ZKas template-notification subscribe failed (attempt {}/5): {}", attempt, e);
+                                    sleep(Duration::from_millis(backoff_ms)).await;
+                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(5_000);
+                                }
+                            }
+                        }
+                        if !subscribed {
+                            warn!("ZKas notifications unavailable; zkas-side listeners will run on ticker fallback only");
+                        }
+                        let zhub = NotificationHub::start(zc.notification_channel_receiver(), "zkas", DEFAULT_HUB_CAPACITY);
+                        info!("Merged mining ACTIVE: ZKas node connected, treasury {}", cfg.pay_address);
+                        (Some(zc), Some(zhub), Some(cfg.pay_address))
+                    }
+                }
+            }
+        };
+
         let coinbase_tag = build_coinbase_tag_bytes(coinbase_tag_suffix.as_deref());
-        let api = Arc::new(Self { client, hub, connected: Arc::new(Mutex::new(true)), coinbase_tag });
+        let api = Arc::new(Self {
+            client,
+            hub,
+            connected: Arc::new(Mutex::new(true)),
+            coinbase_tag,
+            zkas_client,
+            zkas_hub,
+            zkas_pay_address,
+        });
 
         // Start network stats thread
         let api_clone = Arc::clone(&api);
@@ -779,6 +911,38 @@ impl KaspaApi {
     /// subscribe; every subscriber independently sees every notification.
     pub fn notification_hub(&self) -> &Arc<NotificationHub> {
         &self.hub
+    }
+
+    /// Whether the merged-mining enhancement is active (ZKas node connected).
+    pub fn has_zkas(&self) -> bool {
+        self.zkas_client.is_some()
+    }
+
+    /// Notification hub for the ZKas node, when merged mining is active.
+    pub fn zkas_hub(&self) -> Option<&Arc<NotificationHub>> {
+        self.zkas_hub.as_ref()
+    }
+
+    /// Fetch a ZKas block template paid to the configured treasury address.
+    /// Errors if merged mining is inactive; callers gate on `has_zkas()`.
+    pub async fn get_zkas_block_template(&self) -> Result<Block> {
+        let zc = self.zkas_client.as_ref().ok_or_else(|| anyhow::anyhow!("merged mining inactive: no ZKas node"))?;
+        let pay = self.zkas_pay_address.as_ref().ok_or_else(|| anyhow::anyhow!("merged mining inactive: no treasury address"))?;
+        let address =
+            Address::try_from(pay.as_str()).map_err(|e| anyhow::anyhow!("Could not decode ZKas treasury address {}: {}", pay, e))?;
+        let response = zc
+            .get_block_template_call(None, GetBlockTemplateRequest::new(address, self.coinbase_tag.clone()))
+            .await
+            .context("Failed to get ZKas block template")?;
+        Block::try_from(response.block).map_err(|e| anyhow::anyhow!("ZKas template conversion failed: {}", e))
+    }
+
+    /// Submit a ZKas block (with its AuxPow riding the RpcRawBlock conversion
+    /// unchanged — invariant 2). Errors if merged mining is inactive.
+    pub async fn submit_zkas_block(&self, block: Block) -> Result<SubmitBlockResponse> {
+        let zc = self.zkas_client.as_ref().ok_or_else(|| anyhow::anyhow!("merged mining inactive: no ZKas node"))?;
+        let rpc_block: RpcRawBlock = (&block).into();
+        zc.submit_block_call(None, SubmitBlockRequest::new(rpc_block, false)).await.context("Failed to submit ZKas block")
     }
 
     /// Start listening for block template notifications (node-push with ticker
