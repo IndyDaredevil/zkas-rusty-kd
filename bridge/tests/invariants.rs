@@ -16,7 +16,9 @@ use kaspa_hashes::Hash;
 use kaspa_stratum_bridge::merged;
 
 /// The embedded payload contains the consensus constant exactly once, at the
-/// commitment site, followed immediately by H_fc.
+/// commitment site, followed immediately by H_fc as ASCII lowercase hex
+/// (64 text bytes, not 32 raw bytes — the wire format the FCMM forensics
+/// showed as human-readable coinbase text: "…/FCMM6bc3694…").
 #[test]
 fn embedded_commitment_magic_matches_consensus_constant() {
     let h_fc = Hash::from_bytes([0xAB; 32]);
@@ -30,10 +32,11 @@ fn embedded_commitment_magic_matches_consensus_constant() {
 
     let at = occurrences[0];
     assert_eq!(&payload[at..at + 4], &MERGE_MINE_MAGIC, "commitment magic != consensus MERGE_MINE_MAGIC");
+    let hex = h_fc.to_string();
     assert_eq!(
-        &payload[at + 4..at + 4 + 32],
-        h_fc.as_bytes().as_slice(),
-        "H_fc must immediately follow the magic"
+        &payload[at + 4..at + 4 + hex.len()],
+        hex.as_bytes(),
+        "H_fc (ASCII lowercase hex) must immediately follow the magic"
     );
 }
 
