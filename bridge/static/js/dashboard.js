@@ -167,13 +167,19 @@ function renderMergedRecentBlocks(stats) {
   const kBy = byNonce(arr(stats?.blocks));
   const zBy = byNonce(arr(stats?.zkasBlocks));
   const dSet = new Set(arr(stats?.doubleBlocks).map((b) => String(b?.nonce)));
+  // item-2: double feed may carry the lossless "kasHash|zkasHash" pair
+  const dPair = new Map(arr(stats?.doubleBlocks).map((b) => {
+    const parts = String(b?.hash || '').split('|');
+    return [String(b?.nonce), parts.length === 2 ? parts : null];
+  }));
   const solveRows = [];
   const seen = new Set();
   for (const [nonce, k] of kBy) {
     seen.add(nonce);
     const z = zBy.get(nonce);
     if (z || dSet.has(nonce)) {
-      solveRows.push({ ...k, __chain: 'D', __kasHash: k.hash || '', __zkasHash: (z && z.hash) || '', __zkasBluescore: (z && z.bluescore) || '' });
+      const pair = dPair.get(nonce);
+      solveRows.push({ ...k, __chain: 'D', __kasHash: (pair && pair[0]) || k.hash || '', __zkasHash: (pair && pair[1]) || (z && z.hash) || '', __zkasBluescore: (z && z.bluescore) || '' });
     } else {
       solveRows.push({ ...k, __chain: 'K' });
     }

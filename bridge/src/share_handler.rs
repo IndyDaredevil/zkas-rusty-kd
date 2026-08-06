@@ -887,14 +887,15 @@ impl ShareHandler {
                                                             crate::prom::record_zkas_block_found_event(
                                                                 &prom_worker_z, nonce_z, blue_score_z, zkas_hash.clone(),
                                                             ); // c.10
-                                                            if outcome_z.record_zkas_accept() {
+                                                            if outcome_z.record_zkas_accept(&zkas_hash) {
                                                                 *stats_z.double_blocks_found.lock() += 1;
                                                                 *overall_z.double_blocks_found.lock() += 1;
                                                                 crate::merged_obs::MERGED_OBS.record_double_block();
                                                                 crate::prom::record_double_block_found(&prom_worker_z); // c.8
+                                                                let (dk, dz) = outcome_z.hashes();
                                                                 crate::prom::record_double_block_found_event(
-                                                                    &prom_worker_z, nonce_z, blue_score_z, zkas_hash.clone(),
-                                                                ); // c.10
+                                                                    &prom_worker_z, nonce_z, blue_score_z, dk, dz,
+                                                                ); // c.10 + item-2: both hashes
                                                                 info!(
                                                                     "[{}] {} {}",
                                                                     instance_z,
@@ -1023,14 +1024,15 @@ impl ShareHandler {
                                         *stats.blocks_found.lock() += 1;
                                         *overall.blocks_found.lock() += 1;
                                         // c.7 hook F: double = both legs blue
-                                        if outcome_k.record_kas_accept() {
+                                        if outcome_k.record_kas_accept(&block_hash_for_confirm) {
                                             *stats.double_blocks_found.lock() += 1;
                                             *overall.double_blocks_found.lock() += 1;
                                             crate::merged_obs::MERGED_OBS.record_double_block();
                                             crate::prom::record_double_block_found(&prom_worker); // c.8
+                                            let (dk, dz) = outcome_k.hashes();
                                             crate::prom::record_double_block_found_event(
-                                                &prom_worker, nonce_val, blue_score, block_hash_for_confirm.clone(),
-                                            ); // c.10
+                                                &prom_worker, nonce_val, blue_score, dk, dz,
+                                            ); // c.10 + item-2: both hashes
                                             info!(
                                                 "[{}] {} {}",
                                                 instance_id,

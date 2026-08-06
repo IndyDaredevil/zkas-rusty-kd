@@ -35,6 +35,12 @@ pub fn epoch_ms() -> u64 {
 pub struct ShareOutcome {
     zkas_accepted: AtomicBool,
     kas_accepted: AtomicBool,
+    // Critique item 2: a double inherently has TWO hashes (parent on KAS,
+    // H_fc on ZKAS). Each arm deposits its hash at accept time so the
+    // second finisher — whichever leg that is — can emit the double event
+    // with BOTH, instead of one hash + timestamp-proximity archaeology.
+    kas_hash: parking_lot::Mutex<String>,
+    zkas_hash: parking_lot::Mutex<String>,
 }
 
 impl ShareOutcome {
@@ -42,16 +48,26 @@ impl ShareOutcome {
         Self::default()
     }
 
-    /// KAS arm: returns true iff the sibling zKAS accept already landed.
-    pub fn record_kas_accept(&self) -> bool {
+    /// KAS arm: deposits the parent hash; returns true iff the sibling zKAS
+    /// accept already landed (this call completes the double).
+    pub fn record_kas_accept(&self, hash: &str) -> bool {
+        *self.kas_hash.lock() = hash.to_string();
         self.kas_accepted.store(true, Relaxed);
         self.zkas_accepted.load(Relaxed)
     }
 
-    /// zKAS arm: returns true iff the sibling KAS accept already landed.
-    pub fn record_zkas_accept(&self) -> bool {
+    /// zKAS arm: deposits H_fc; returns true iff the sibling KAS accept
+    /// already landed (this call completes the double).
+    pub fn record_zkas_accept(&self, hash: &str) -> bool {
+        *self.zkas_hash.lock() = hash.to_string();
         self.zkas_accepted.store(true, Relaxed);
         self.kas_accepted.load(Relaxed)
+    }
+
+    /// Both deposited hashes (kas, zkas). Valid once the double completes;
+    /// an arm that never accepted leaves its slot empty.
+    pub fn hashes(&self) -> (String, String) {
+        (self.kas_hash.lock().clone(), self.zkas_hash.lock().clone())
     }
 }
 
@@ -388,21 +404,22 @@ mod tests {
     #[test]
     fn double_kas_finishes_second() {
         let s = ShareOutcome::new();
-        assert!(!s.record_zkas_accept()); // first finisher: no double yet
-        assert!(s.record_kas_accept()); // second finisher completes double
+        assert!(!s.record_zkas_accept("zh")); // first finisher: no double yet
+        assert!(s.record_kas_accept("kh")); // second finisher completes double
+        assert_eq!(s.hashes(), ("kh".to_string(), "zh".to_string()));
     }
 
     #[test]
     fn double_zkas_finishes_second() {
         let s = ShareOutcome::new();
-        assert!(!s.record_kas_accept());
-        assert!(s.record_zkas_accept());
+        assert!(!s.record_kas_accept("kh"));
+        assert!(s.record_zkas_accept("zh"));
     }
 
     #[test]
     fn zkas_only_share_never_doubles() {
         let s = ShareOutcome::new();
-        assert!(!s.record_zkas_accept());
+        assert!(!s.record_zkas_accept("zh"));
         // KAS arm never spawned (share below network target) — nothing else
         // ever fires; no double possible.
     }
@@ -415,7 +432,7 @@ mod tests {
             let s = Arc::new(ShareOutcome::new());
             let s1 = Arc::clone(&s);
             let s2 = Arc::clone(&s);
-            let t1 = std::thread::spawn(move || s1.record_kas_accept() as u32);
+            let t1 = std::thread::spawn(move || s1.record_kas_accept("kh") as u32);
             let t2 = std::thread::spawn(move || s2.record_zkas_accept() as u32);
             let doubles = t1.join().unwrap() + t2.join().unwrap();
             assert_eq!(doubles, 1, "exactly one arm must complete the double");
