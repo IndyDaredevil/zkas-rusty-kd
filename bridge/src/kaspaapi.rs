@@ -819,7 +819,9 @@ impl KaspaApi {
                     "merged: committing to H_fc {} (zkas bits 0x{:x}) in Kaspa template extra_data",
                     h_fc, fc_block.header.bits
                 );
-                self.pending_fc.lock().insert(h_fc, fc_block);
+                // Stash insert moved to current_zkas_template's fetch-success
+                // branch (once per distinct template, not per request).
+                let _ = &fc_block;
                 crate::merged_obs::MERGED_OBS.record_template(true); // c.7 hook C
                 kaspa_consensus_core::auxpow::AuxPow::embed_commitment(&self.coinbase_tag, h_fc, &[])
             }
@@ -1050,6 +1052,14 @@ impl KaspaApi {
                 crate::merged_obs::MERGED_OBS
                     .record_zkas_tpl_ok(crate::merged_obs::epoch_ms(), c7_fetch_t0.elapsed().as_micros() as u64);
                 let h_fc = block.header.hash;
+                // Stash HERE, exactly once per distinct zkas template — not in
+                // get_block_template (which runs ~21x/sec fleet-wide and was
+                // flooding MergedPending's cap-4096 ring with duplicate keys,
+                // shrinking the eviction window to ~3 minutes; a share solving
+                // an older committed job would find its fc_block evicted and
+                // the zkas leg of a dual silently lost). One insert per H_fc
+                // = 4096 DISTINCT templates (~68 min at 1 BPS).
+                self.pending_fc.lock().insert(h_fc, block.clone());
                 *self.zkas_template_cache.lock().await = Some((h_fc, block.clone(), Instant::now()));
                 Some((h_fc, block))
             }

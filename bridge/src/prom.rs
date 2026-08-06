@@ -822,15 +822,14 @@ pub fn record_zkas_block_found_event(worker: &WorkerContext, nonce: u64, bluesco
     }
 }
 
-/// c.10: double-block event. `hash` is whichever leg's confirm task
-/// completed the double (finished second) — a double inherently has TWO
-/// hashes (the KAS block + H_fc), and this single-hash event slot records
-/// only the completing one. The paired hash is recoverable by timestamp
-/// proximity against the K/Z recent-blocks lists (same blue-confirm
-/// window, seconds apart at most).
-pub fn record_double_block_found_event(worker: &WorkerContext, nonce: u64, bluescore: u64, hash: String) {
+/// c.10/item-2: double-block event with BOTH hashes (parent on KAS, H_fc
+/// on ZKAS). The gauge slot keeps the completing leg's hash for continuity;
+/// the pair is published as "kas|zkas" so /api/stats and the dashboard get
+/// lossless doubles instead of timestamp-proximity archaeology.
+pub fn record_double_block_found_event(worker: &WorkerContext, nonce: u64, bluescore: u64, kas_hash: String, zkas_hash: String) {
     if let Some(gauge) = DOUBLE_BLOCK_GAUGE.get() {
-        set_block_event_gauge(gauge, worker, nonce, bluescore, hash);
+        let joined = format!("{}|{}", kas_hash, zkas_hash);
+        set_block_event_gauge(gauge, worker, nonce, bluescore, joined);
     }
 }
 

@@ -167,13 +167,19 @@ function renderMergedRecentBlocks(stats) {
   const kBy = byNonce(arr(stats?.blocks));
   const zBy = byNonce(arr(stats?.zkasBlocks));
   const dSet = new Set(arr(stats?.doubleBlocks).map((b) => String(b?.nonce)));
+  // item-2: double feed may carry the lossless "kasHash|zkasHash" pair
+  const dPair = new Map(arr(stats?.doubleBlocks).map((b) => {
+    const parts = String(b?.hash || '').split('|');
+    return [String(b?.nonce), parts.length === 2 ? parts : null];
+  }));
   const solveRows = [];
   const seen = new Set();
   for (const [nonce, k] of kBy) {
     seen.add(nonce);
     const z = zBy.get(nonce);
     if (z || dSet.has(nonce)) {
-      solveRows.push({ ...k, __chain: 'D', __kasHash: k.hash || '', __zkasHash: (z && z.hash) || '', __zkasBluescore: (z && z.bluescore) || '' });
+      const pair = dPair.get(nonce);
+      solveRows.push({ ...k, __chain: 'D', __kasHash: (pair && pair[0]) || k.hash || '', __zkasHash: (pair && pair[1]) || (z && z.hash) || '', __zkasBluescore: (z && z.bluescore) || '' });
     } else {
       solveRows.push({ ...k, __chain: 'K' });
     }
@@ -200,9 +206,10 @@ function renderMergedRecentBlocks(stats) {
     const hashFull = isDual
       ? `KAS ${b.__kasHash || '-'} | ZKAS ${b.__zkasHash || '-'}`
       : (b.hash || '');
+    const esc = (x) => (typeof escapeHtmlAttr === 'function' ? escapeHtmlAttr(String(x ?? '')) : String(x ?? ''));
     const hashShort = isDual
-      ? `<span class="text-blue-300">K:</span>${sh(b.__kasHash)} <span class="text-purple-300">Z:</span>${sh(b.__zkasHash)}`
-      : sh(hashFull);
+      ? `<span class="text-blue-300">K:</span>${esc(sh(b.__kasHash))} <span class="text-purple-300">Z:</span>${esc(sh(b.__zkasHash))}`
+      : esc(sh(hashFull));
     const workerDisplay = typeof displayWorkerName === 'function' ? displayWorkerName(b.worker) : (b.worker || '-');
     const tr = document.createElement('tr');
     tr.className = 'border-b border-card/50';
