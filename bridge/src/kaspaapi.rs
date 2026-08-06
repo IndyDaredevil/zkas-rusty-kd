@@ -44,7 +44,23 @@ fn sanitize_coinbase_tag_suffix(suffix: &str) -> Option<String> {
         }
     }
 
-    let out = out.trim_matches('_').to_string();
+    let mut out = out.trim_matches('_').to_string();
+
+    // Anti-ambiguity guard: consensus rejects any parent coinbase where
+    // MERGE_MINE_MAGIC appears more than once (AuxPow::committed_hash), so a
+    // suffix containing the magic would kill 100% of merged submissions with
+    // "block has invalid proof-of-work" while the KAS leg stays healthy — the
+    // FCMM failure signature, reachable from config, CLI, AND the live
+    // settings endpoint (prom.rs coinbase_tag_suffix update). Break the window
+    // (insert '_' after the first byte) rather than reject, so the operator
+    // keeps the rest of their tag. Derived from the consensus constant so a
+    // future magic rename cannot drift past this guard.
+    let magic = std::str::from_utf8(&kaspa_consensus_core::auxpow::MERGE_MINE_MAGIC).expect("MERGE_MINE_MAGIC is ASCII");
+    let broken = format!("{}_{}", &magic[..1], &magic[1..]);
+    while out.contains(magic) {
+        out = out.replace(magic, &broken);
+    }
+
     if out.is_empty() { None } else { Some(out) }
 }
 
@@ -1001,6 +1017,14 @@ impl KaspaApi {
 
     /// Submit a ZKas block (with its AuxPow riding the RpcRawBlock conversion
     /// unchanged — invariant 2). Errors if merged mining is not attached.
+    ///
+    /// SEAM (verified 08-06 vs zkas-v1.0.5): aux rides `RpcRawHeader.aux_pow`
+    /// (borsh-hex, serializer format v2) — `From<&Header> for RpcRawHeader`
+    /// maps it via `aux_pow_to_hex`, protowire clones it both directions, and
+    /// the server reattaches via `attach_aux_pow`. NEVER route merged blocks
+    /// through `RpcHeader`: its `Header` conversions set `aux_pow: None`
+    /// (rpc/core/src/model/header.rs, "does not carry the merged-mining
+    /// witness") and the block would arrive native with insufficient PoW.
     pub async fn submit_zkas_block(&self, block: Block) -> Result<SubmitBlockResponse> {
         let leg = self.zkas_leg().ok_or_else(|| anyhow::anyhow!("merged mining inactive: no ZKas node attached"))?;
         let rpc_block: RpcRawBlock = (&block).into();
@@ -1025,6 +1049,13 @@ impl KaspaApi {
     /// out PLAIN rather than late). Cache-first with `ZKAS_TEMPLATE_TTL`;
     /// on stale, at most one gated RPC bounded by `ZKAS_FETCH_BUDGET`;
     /// any miss ⇒ `None` ⇒ the caller serves an uncommitted Kaspa job.
+    ///
+    /// SAFETY COUPLING: sharing ONE cached zKAS template across all workers is
+    /// consensus-safe only because every worker's zKAS block pays
+    /// `ZKAS_TREASURY_ADDRESS` (identical coinbase ⇒ identical H_fc for all).
+    /// Moving the zKAS leg to per-worker payout requires killing this cache —
+    /// rewriting a cached template's coinbase per worker is the pool guide §3
+    /// failure mode ("coinbase transaction is not built as expected").
     async fn current_zkas_template(&self) -> Option<(kaspa_hashes::Hash, Block)> {
         if !self.has_zkas() {
             return None;
@@ -1392,5 +1423,69 @@ mod listener_tests {
         tx.send(template_notification()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(count.load(Ordering::SeqCst), before);
+    }
+}
+
+#[cfg(test)]
+mod coinbase_tag_tests {
+    //! Anti-ambiguity guard tests (seam review 08-06): `AuxPow::committed_hash`
+    //! rejects a payload where MERGE_MINE_MAGIC appears more than once, so the
+    //! user-configurable tag suffix (config / CLI / live settings endpoint)
+    //! must never be able to smuggle a second magic into the coinbase.
+    use super::{build_coinbase_tag_bytes, STRATUM_COINBASE_TAG_BYTES};
+    use kaspa_consensus_core::auxpow::{AuxPow, MERGE_MINE_MAGIC};
+    use kaspa_hashes::Hash;
+
+    fn magic_windows(bytes: &[u8]) -> usize {
+        bytes.windows(MERGE_MINE_MAGIC.len()).filter(|w| *w == MERGE_MINE_MAGIC).count()
+    }
+
+    /// Adversarial suffixes cannot produce a tag containing the magic: bare,
+    /// embedded, repeated, adjacent-to-whitespace (whitespace maps to '_',
+    /// which must not reassemble a window), and split-by-stripped-chars
+    /// ("ZK!MM": '!' is dropped by the sanitizer, joining ZK+MM — the guard
+    /// must run AFTER charset filtering, which this case proves).
+    #[test]
+    fn suffix_cannot_smuggle_merge_mine_magic() {
+        for suffix in ["ZKMM", "xZKMMy", "ZKMMZKMM", "poolZKMM", "ZKMM ZKMM", "aZKMMbZKMMc", "ZK!MM", "ZKMMM"] {
+            let tag = build_coinbase_tag_bytes(Some(suffix));
+            assert_eq!(
+                magic_windows(&tag),
+                0,
+                "suffix {suffix:?} produced tag containing magic: {:?}",
+                String::from_utf8_lossy(&tag)
+            );
+        }
+    }
+
+    /// The base tag itself, and the suffix-less default path, carry no magic.
+    /// (Join geometry: base ends before '/', hex is lowercase, so neither
+    /// boundary can manufacture a window — asserted here for the base.)
+    #[test]
+    fn base_tag_and_default_path_contain_no_magic() {
+        assert_eq!(magic_windows(STRATUM_COINBASE_TAG_BYTES), 0, "base tag must not contain the magic");
+        assert_eq!(magic_windows(&build_coinbase_tag_bytes(None)), 0);
+    }
+
+    /// Full production extra_data (worst-case adversarial suffix, post-guard)
+    /// through the VALIDATOR'S OWN extraction: exactly one commitment, and
+    /// `committed_hash` — the literal function live zkas-v1.0.5 consensus runs
+    /// (tag-diff vs merged-ws1-port is empty) — round-trips H_fc.
+    #[test]
+    fn production_extra_data_roundtrips_through_consensus_extraction() {
+        use kaspa_consensus_core::{header::Header, subnets::SUBNETWORK_ID_COINBASE, tx::Transaction};
+
+        let tag = build_coinbase_tag_bytes(Some("xZKMMy"));
+        let h_fc = Hash::from_bytes([0xCD; 32]);
+        let payload = AuxPow::embed_commitment(&tag, h_fc, &[]);
+        assert_eq!(magic_windows(&payload), 1, "exactly one magic in the full extra_data");
+
+        let coinbase = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, payload);
+        let aux = AuxPow {
+            parent_header: Header::from_precomputed_hash(Hash::from_bytes([0x11; 32]), vec![]),
+            parent_coinbase: coinbase,
+            coinbase_merkle_branch: vec![],
+        };
+        assert_eq!(aux.committed_hash(), Some(h_fc), "consensus extraction must recover H_fc from production framing");
     }
 }

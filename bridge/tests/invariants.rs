@@ -15,6 +15,20 @@ use kaspa_consensus_core::auxpow::{AuxPow, MERGE_MINE_MAGIC};
 use kaspa_hashes::Hash;
 use kaspa_stratum_bridge::merged;
 
+/// The workspace magic must match the magic the DEPLOYED network verifies.
+/// The other tests in this file prove bridge == workspace-consensus — they
+/// compile from the same file and structurally cannot drift apart, which also
+/// means they cannot catch bridge+consensus drifting from the LIVE network
+/// together (the FCMM failure mode, one level up: a future upstream magic
+/// rename + rebase keeps every constant-based test green while live
+/// zkas-v1.0.5 nodes reject every aux submission). Only this literal pin
+/// covers that direction. If it ever fails, do NOT "fix" the literal until
+/// the live network's nodes actually verify the new value.
+#[test]
+fn merge_mine_magic_matches_live_network() {
+    assert_eq!(MERGE_MINE_MAGIC, *b"ZKMM");
+}
+
 /// The embedded payload contains the consensus constant exactly once, at the
 /// commitment site, followed immediately by H_fc as ASCII lowercase hex
 /// (64 text bytes, not 32 raw bytes — the wire format the FCMM forensics
