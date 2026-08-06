@@ -191,7 +191,7 @@ impl MempoolUtxoSet {
 mod tests {
     use super::*;
     use kaspa_consensus_core::{subnets::SUBNETWORK_ID_NATIVE, tx::TX_VERSION_SHIELDED};
-    use kaspa_shielded_core::bundle::{sizes, ActionWire, ShieldedBundle};
+    use kaspa_shielded_core::bundle::{ActionWire, ShieldedBundle, sizes};
 
     /// A shielded transaction spending the notes identified by `nullifiers`.
     /// Only the payload's nullifiers matter here (mempool conflict keys); the
@@ -211,8 +211,15 @@ mod tests {
                 spend_auth_sig: [0u8; sizes::SIG],
             })
             .collect();
-        let bundle =
-            ShieldedBundle { actions, flags: 0b11, value_balance: 0, anchor: [0u8; sizes::FIELD], proof: vec![], binding_sig: [0u8; sizes::SIG], burn: None };
+        let bundle = ShieldedBundle {
+            actions,
+            flags: 0b11,
+            value_balance: 0,
+            anchor: [0u8; sizes::FIELD],
+            proof: vec![],
+            binding_sig: [0u8; sizes::SIG],
+            burn: None,
+        };
         let tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, bundle.to_bytes());
         MutableTransaction::from_tx(tx)
     }

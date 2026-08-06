@@ -76,8 +76,7 @@ impl PreparedPaymentEnvelope {
     pub const FORMAT: &'static str = "zkas-prepared-payment";
 
     pub fn from_typed(payment: &PreparedPayment, network: &Network) -> Result<Self, WireError> {
-        let recipient =
-            ShieldedAddress::from_raw(network, payment.claimed.recipient).map_err(|_| WireError::BadAddress)?.to_string();
+        let recipient = ShieldedAddress::from_raw(network, payment.claimed.recipient).map_err(|_| WireError::BadAddress)?.to_string();
         let mut wire = Self {
             format: Self::FORMAT.into(),
             version: payment.version,

@@ -26,11 +26,21 @@ fn polymod(values: &[u8]) -> u64 {
     for &d in values {
         let c0 = (c >> 35) as u8;
         c = ((c & 0x07ffffffff) << 5) ^ d as u64;
-        if c0 & 0x01 != 0 { c ^= 0x98f2bc8e61 }
-        if c0 & 0x02 != 0 { c ^= 0x79b76d99e2 }
-        if c0 & 0x04 != 0 { c ^= 0xf33e5fb3c4 }
-        if c0 & 0x08 != 0 { c ^= 0xae2eabe2a8 }
-        if c0 & 0x10 != 0 { c ^= 0x1e4f43e470 }
+        if c0 & 0x01 != 0 {
+            c ^= 0x98f2bc8e61
+        }
+        if c0 & 0x02 != 0 {
+            c ^= 0x79b76d99e2
+        }
+        if c0 & 0x04 != 0 {
+            c ^= 0xf33e5fb3c4
+        }
+        if c0 & 0x08 != 0 {
+            c ^= 0xae2eabe2a8
+        }
+        if c0 & 0x10 != 0 {
+            c ^= 0x1e4f43e470
+        }
     }
     c ^ 1
 }

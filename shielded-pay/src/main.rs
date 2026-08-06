@@ -31,17 +31,17 @@
 
 use clap::{Parser, Subcommand};
 use kaspa_addresses::{Address, Prefix, Version};
-use kaspa_consensus_core::tx::{Transaction, TX_VERSION_SHIELDED};
+use kaspa_consensus_core::tx::{TX_VERSION_SHIELDED, Transaction};
 use kaspa_grpc_client::GrpcClient;
-use kaspa_rpc_core::{api::rpc::RpcApi, notify::mode::NotificationMode, RpcHash, RpcShieldedChainBlock, RpcTransaction};
+use kaspa_rpc_core::{RpcHash, RpcShieldedChainBlock, RpcTransaction, api::rpc::RpcApi, notify::mode::NotificationMode};
 use kaspa_shielded_core::bundle::expected_wire_len;
-use kaspa_shielded_core::tree::FrontierState;
 use kaspa_shielded_core::coinbase::derive_coinbase_note_desc;
-use kaspa_shielded_core::message::{sign_message, verify_message, FVK_LEN, SIG_LEN};
+use kaspa_shielded_core::message::{FVK_LEN, SIG_LEN, sign_message, verify_message};
 use kaspa_shielded_core::orchard_recipient_bytes;
-use kaspa_shielded_core::wallet::build::{build_singleleaf_coinbase_spend, build_wallet_payment};
-use kaspa_shielded_core::wallet::address_bytes_from_seed;
+use kaspa_shielded_core::tree::FrontierState;
 use kaspa_shielded_core::wallet::CompactActionRecord;
+use kaspa_shielded_core::wallet::address_bytes_from_seed;
+use kaspa_shielded_core::wallet::build::{build_singleleaf_coinbase_spend, build_wallet_payment};
 use kaspa_shielded_core::walletdb::WalletDb;
 use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
 
@@ -587,10 +587,7 @@ async fn send(rpc_server: String, owner_seed: [u8; 32], to: String, amount: u64,
                 selected.saturating_sub(fee)
             ));
         }
-        fatal(format!(
-            "insufficient matured funds: have {have} across {} matured note(s), need amount+fee={need}",
-            candidates.len()
-        ));
+        fatal(format!("insufficient matured funds: have {have} across {} matured note(s), need amount+fee={need}", candidates.len()));
     }
     log::info!(
         "spending {} matured note(s) totalling {} (change {}) against anchor {}",
@@ -705,10 +702,8 @@ async fn main() {
             let client = connect(&rpc_server).await;
             // (include_orphan_pool=false, filter_transaction_pool=false) => the
             // transaction pool only (see RpcCoreService::extract_tx_query).
-            let entries = client
-                .get_mempool_entries(false, false)
-                .await
-                .unwrap_or_else(|e| fatal(format!("get_mempool_entries failed: {e}")));
+            let entries =
+                client.get_mempool_entries(false, false).await.unwrap_or_else(|e| fatal(format!("get_mempool_entries failed: {e}")));
             for entry in entries {
                 // `RpcTransaction::id()` recomputes the id from the tx itself.
                 println!("{}", Transaction::try_from(entry.transaction).map(|t| t.id().to_string()).unwrap_or_default());

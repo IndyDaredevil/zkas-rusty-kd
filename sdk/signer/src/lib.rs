@@ -87,14 +87,25 @@ pub enum SignerError {
     WrongNetwork,
     InvalidViewingKey,
     PaymentRejected(PaymentCheckError),
-    InvalidSpendRandomizer { action_index: usize },
-    DuplicateAction { action_index: usize },
-    MissingAction { action_index: usize },
+    InvalidSpendRandomizer {
+        action_index: usize,
+    },
+    DuplicateAction {
+        action_index: usize,
+    },
+    MissingAction {
+        action_index: usize,
+    },
     /// The bundle's public value balance is zero or negative, so it pays no fee
     /// — a shielded payment always pays a positive public fee.
-    NonPositiveFee { value_balance: i64 },
+    NonPositiveFee {
+        value_balance: i64,
+    },
     /// The bundle pays a larger fee than the user approved.
-    FeeAboveApprovedMaximum { fee: u64, max_fee: u64 },
+    FeeAboveApprovedMaximum {
+        fee: u64,
+        max_fee: u64,
+    },
     /// The envelope's claimed intent does not match what the user approved or
     /// what the bundle actually pays.
     ClaimedIntentMismatch(&'static str),
@@ -229,7 +240,15 @@ mod tests {
             version: PreparedPayment::VERSION,
             network_domain: [1; 32],
             tx_context: vec![2, 0],
-            bundle: ShieldedBundle { actions: vec![], flags: 0, value_balance, anchor: [0; 32], proof: vec![], binding_sig: [0; 64], burn: None },
+            bundle: ShieldedBundle {
+                actions: vec![],
+                flags: 0,
+                value_balance,
+                anchor: [0; 32],
+                proof: vec![],
+                binding_sig: [0; 64],
+                burn: None,
+            },
             disclosure: vec![],
             spend_auth: vec![],
             claimed,

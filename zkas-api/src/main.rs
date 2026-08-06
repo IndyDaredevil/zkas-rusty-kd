@@ -192,10 +192,7 @@ fn load_tx_index(path: &str) -> (std::collections::HashMap<String, TxLoc>, VecDe
         let mut f = line.split('\t');
         let (Some(id), Some(bh), Some(bs), Some(bt)) = (f.next(), f.next(), f.next(), f.next()) else { continue };
         let (Ok(blue_score), Ok(block_time)) = (bs.parse::<u64>(), bt.parse::<u64>()) else { continue };
-        if map
-            .insert(id.to_string(), TxLoc { block_hash: bh.to_string(), blue_score, block_time })
-            .is_none()
-        {
+        if map.insert(id.to_string(), TxLoc { block_hash: bh.to_string(), blue_score, block_time }).is_none() {
             order.push_back(id.to_string());
         }
     }
@@ -394,13 +391,19 @@ async fn follow(state: Arc<AppState>) {
     let cutoff_ms = now_secs().saturating_sub(24 * 60 * 60) * 1_000;
     while work_backfill.len() + backfill.len() < WORK_HISTORY_CAP {
         let Some(cursor) = work_cursor else { break };
-        if cursor == RpcHash::default() { break; }
-        let Ok(block) = state.client.get_block(cursor, false).await else { break; };
+        if cursor == RpcHash::default() {
+            break;
+        }
+        let Ok(block) = state.client.get_block(cursor, false).await else {
+            break;
+        };
         work_cursor = block.verbose_data.as_ref().map(|v| v.selected_parent_hash);
         let difficulty = block.verbose_data.as_ref().map(|v| v.difficulty).unwrap_or(0.0);
         let old_enough = block.header.timestamp <= cutoff_ms;
         work_backfill.push(WorkPoint { timestamp: block.header.timestamp, difficulty });
-        if old_enough { break; }
+        if old_enough {
+            break;
+        }
     }
     work_backfill.reverse();
 
@@ -430,7 +433,9 @@ async fn follow(state: Arc<AppState>) {
             {
                 let mut work = state.work_history.write().await;
                 work.push_back(WorkPoint { timestamp: b.header.timestamp, difficulty: summary.difficulty });
-                while work.len() > WORK_HISTORY_CAP { work.pop_front(); }
+                while work.len() > WORK_HISTORY_CAP {
+                    work.pop_front();
+                }
             }
             recent.push_front(summary);
             if recent.len() > RECENT_CAP {
@@ -440,7 +445,9 @@ async fn follow(state: Arc<AppState>) {
         for point in &work_backfill {
             let mut work = state.work_history.write().await;
             work.push_back(point.clone());
-            while work.len() > WORK_HISTORY_CAP { work.pop_front(); }
+            while work.len() > WORK_HISTORY_CAP {
+                work.pop_front();
+            }
         }
     }
     // Index the seeded blocks too, so a just-restarted API can still serve the
@@ -489,7 +496,9 @@ async fn follow(state: Arc<AppState>) {
             {
                 let mut work = state.work_history.write().await;
                 work.push_back(WorkPoint { timestamp: block.header.timestamp, difficulty: summary.difficulty });
-                while work.len() > WORK_HISTORY_CAP { work.pop_front(); }
+                while work.len() > WORK_HISTORY_CAP {
+                    work.pop_front();
+                }
             }
             {
                 let mut recent = state.recent.write().await;
@@ -683,9 +692,7 @@ async fn info_nodes(State(s): State<Arc<AppState>>) -> impl IntoResponse {
                      is_self: bool| {
         let country = ip.and_then(geo::lookup);
         let placed = country.map(|c| {
-            let slot = per_country
-                .entry(c.code.clone())
-                .or_insert_with(|| (c.name.clone(), (c.lat, c.lon), 0));
+            let slot = per_country.entry(c.code.clone()).or_insert_with(|| (c.name.clone(), (c.lat, c.lon), 0));
             slot.2 += 1;
             let seed = u64::from_str_radix(&id, 16).unwrap_or_else(|_| id.len() as u64);
             (c, scatter(c.lat, c.lon, seed, slot.2 - 1))
@@ -725,7 +732,11 @@ async fn info_nodes(State(s): State<Arc<AppState>>) -> impl IntoResponse {
             Some(std::net::IpAddr::V6(_)) => ipv6 += 1,
             None => {}
         }
-        if p.is_outbound { outbound += 1 } else { inbound += 1 }
+        if p.is_outbound {
+            outbound += 1
+        } else {
+            inbound += 1
+        }
         *agents.entry(p.user_agent.clone()).or_default() += 1;
         // The node reports `time_connected` as milliseconds ELAPSED since the
         // connection was established, not as a timestamp.
@@ -764,8 +775,7 @@ async fn info_nodes(State(s): State<Arc<AppState>>) -> impl IntoResponse {
         cb.cmp(&ca).then_with(|| a["code"].as_str().unwrap_or("").cmp(b["code"].as_str().unwrap_or("")))
     });
 
-    let mut user_agents: Vec<Value> =
-        agents.into_iter().map(|(agent, count)| json!({ "agent": agent, "count": count })).collect();
+    let mut user_agents: Vec<Value> = agents.into_iter().map(|(agent, count)| json!({ "agent": agent, "count": count })).collect();
     user_agents.sort_by(|a, b| {
         let (ca, cb) = (a["count"].as_u64().unwrap_or(0), b["count"].as_u64().unwrap_or(0));
         cb.cmp(&ca).then_with(|| a["agent"].as_str().unwrap_or("").cmp(b["agent"].as_str().unwrap_or("")))
@@ -893,10 +903,7 @@ async fn scan_merged(state: Arc<AppState>) {
 /// merge-mined blocks committed to, with block counts. Re-read each request (tiny
 /// file); absent/stale is fine — the fields just come back null.
 fn load_attribution() -> serde_json::Value {
-    std::fs::read_to_string("/root/firecash/attribution.json")
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(Value::Null)
+    std::fs::read_to_string("/root/firecash/attribution.json").ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null)
 }
 
 async fn info_merged(State(s): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1159,10 +1166,8 @@ async fn info_pulse(State(s): State<Arc<AppState>>, Query(query): Query<PulseQue
     }
     // Selected-parent backfill contains only blue-chain blocks, but consecutive
     // DAA scores account for the full DAG (including parallel/red blocks).
-    let dag_blocks_15m = daa_15m.iter().max().zip(daa_15m.iter().min())
-        .map(|(max, min)| max.saturating_sub(*min)).unwrap_or(0);
-    let dag_blocks_1h = daa_1h.iter().max().zip(daa_1h.iter().min())
-        .map(|(max, min)| max.saturating_sub(*min)).unwrap_or(0);
+    let dag_blocks_15m = daa_15m.iter().max().zip(daa_15m.iter().min()).map(|(max, min)| max.saturating_sub(*min)).unwrap_or(0);
+    let dag_blocks_1h = daa_1h.iter().max().zip(daa_1h.iter().min()).map(|(max, min)| max.saturating_sub(*min)).unwrap_or(0);
     // Coinbase is one transaction per DAG block. Add non-coinbase transactions
     // observed in the window without double-counting the selected-chain coinbases.
     let non_coinbase_1h = transactions_1h.saturating_sub(daa_1h.len() as u64);
@@ -1192,9 +1197,13 @@ async fn info_pulse(State(s): State<Arc<AppState>>, Query(query): Query<PulseQue
     let mut work_sum = vec![0.0_f64; work_bins];
     let mut work_count = vec![0_u64; work_bins];
     for point in work.iter() {
-        if point.timestamp > work_now_ms { continue; }
+        if point.timestamp > work_now_ms {
+            continue;
+        }
         let age = work_now_ms - point.timestamp;
-        if age >= work_window_seconds * 1_000 { continue; }
+        if age >= work_window_seconds * 1_000 {
+            continue;
+        }
         let bin = work_bins - 1 - ((age / (work_bin_seconds * 1_000)) as usize).min(work_bins - 1);
         if point.difficulty > 0.0 && point.difficulty.is_finite() {
             work_sum[bin] += point.difficulty;
@@ -1202,12 +1211,22 @@ async fn info_pulse(State(s): State<Arc<AppState>>, Query(query): Query<PulseQue
         }
     }
     for i in 0..work_bins {
-        if work_count[i] > 0 { work_sum[i] /= work_count[i] as f64; }
+        if work_count[i] > 0 {
+            work_sum[i] /= work_count[i] as f64;
+        }
     }
-    let fallback_difficulty = work_sum.iter().rev().copied().find(|d| *d > 0.0)
+    let fallback_difficulty = work_sum
+        .iter()
+        .rev()
+        .copied()
+        .find(|d| *d > 0.0)
         .or_else(|| recent.iter().find(|b| b.difficulty > 0.0).map(|b| b.difficulty))
         .unwrap_or(0.0);
-    for value in &mut work_sum { if *value <= 0.0 { *value = fallback_difficulty; } }
+    for value in &mut work_sum {
+        if *value <= 0.0 {
+            *value = fallback_difficulty;
+        }
+    }
     let work_hashrate: Vec<f64> = work_sum.iter().map(|d| d * 2.0).collect();
 
     Json(json!({
@@ -1330,10 +1349,8 @@ async fn transaction_by_id(State(s): State<Arc<AppState>>, Path(id): Path<String
         if let Ok(txid) = id.parse::<RpcHash>() {
             if let Ok(entry) = s.client.get_mempool_entry(txid, false, false).await {
                 let tx = &entry.transaction;
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
+                let now_ms =
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
                 let outputs = detail_outputs(tx, &id, "");
                 return Json(json!({
                     "subnetwork_id": tx.subnetwork_id.to_string(),

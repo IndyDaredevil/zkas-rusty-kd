@@ -19,8 +19,12 @@ impl CoinbaseManagerMock {
         const SUBSIDY: u64 = 500 * SOMPI_PER_KASPA;
         let output = TransactionOutput::new(SUBSIDY, miner_data.script_public_key.clone());
 
-        let payload =
-            self.serialize_coinbase_payload(&CoinbaseData { blue_score: 1, subsidy: SUBSIDY, shielded_commitment: [0u8; 32], miner_data });
+        let payload = self.serialize_coinbase_payload(&CoinbaseData {
+            blue_score: 1,
+            subsidy: SUBSIDY,
+            shielded_commitment: [0u8; 32],
+            miner_data,
+        });
 
         CoinbaseTransactionTemplate {
             dev_accrued: 0,

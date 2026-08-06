@@ -1180,9 +1180,9 @@ mod tests {
             0,
             vec![],
             vec![
-                TransactionOutput::new(500, blue_spk.clone()),      // blue block reward (miner-independent)
-                TransactionOutput::new(300, miner_a_spk.clone()),   // red reward → template miner
-                TransactionOutput::new(25, dev_spk.clone()),        // dev fee note (must be preserved)
+                TransactionOutput::new(500, blue_spk.clone()),    // blue block reward (miner-independent)
+                TransactionOutput::new(300, miner_a_spk.clone()), // red reward → template miner
+                TransactionOutput::new(25, dev_spk.clone()),      // dev fee note (must be preserved)
             ],
             0,
             SUBNETWORK_ID_COINBASE,
@@ -1232,9 +1232,9 @@ mod tests {
             0,
             vec![],
             vec![
-                TransactionOutput::new(500, blue_spk.clone()),    // blue block reward (miner-independent)
-                TransactionOutput::new(300, dev_spk.clone()),     // red reward → template miner (= dev script)
-                TransactionOutput::new(25, dev_spk.clone()),      // dev fee note (must stay byte-identical)
+                TransactionOutput::new(500, blue_spk.clone()), // blue block reward (miner-independent)
+                TransactionOutput::new(300, dev_spk.clone()),  // red reward → template miner (= dev script)
+                TransactionOutput::new(25, dev_spk.clone()),   // dev fee note (must stay byte-identical)
             ],
             0,
             SUBNETWORK_ID_COINBASE,
@@ -1248,7 +1248,10 @@ mod tests {
         let outs = &modified.block.transactions[0].outputs;
 
         assert_eq!(outs[0].script_public_key, blue_spk, "blue-block reward must be untouched");
-        assert_eq!(outs[1].script_public_key, miner_b.script_public_key, "the RED reward (not the dev fee) must be repointed to the new miner");
+        assert_eq!(
+            outs[1].script_public_key, miner_b.script_public_key,
+            "the RED reward (not the dev fee) must be repointed to the new miner"
+        );
         assert_eq!(outs[1].value, 300, "the red reward's value must be unchanged");
         assert_eq!(outs[2].script_public_key, dev_spk, "dev-fee note must stay on the dev address, not be repointed");
         assert_eq!(outs[2].value, 25, "dev-fee note must be byte-identical (value unchanged)");
@@ -1665,7 +1668,7 @@ mod tests {
     /// proof is needed here (the live-proof path is covered elsewhere).
     fn shielded_mutable_tx(nullifiers: &[[u8; 32]], fee: u64) -> MutableTransaction {
         use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
-        use kaspa_shielded_core::bundle::{sizes, ActionWire, ShieldedBundle};
+        use kaspa_shielded_core::bundle::{ActionWire, ShieldedBundle, sizes};
         let actions = nullifiers
             .iter()
             .map(|&nullifier| ActionWire {

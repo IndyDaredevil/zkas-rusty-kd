@@ -836,7 +836,10 @@ async fn sanity_test() {
                     // count depends on how many blocks the harness has mined, so only
                     // the reorg flag is asserted.
                     let response = rpc_client
-                        .get_shielded_blocks_call(None, GetShieldedBlocksRequest { start_hash: SIMNET_GENESIS.hash, limit: 0 })
+                        .get_shielded_blocks_call(
+                            None,
+                            GetShieldedBlocksRequest { start_hash: SIMNET_GENESIS.hash, limit: 0, metadata_only: false },
+                        )
                         .await
                         .unwrap();
                     assert!(!response.reorged, "genesis cursor must not be reported as reorged");
@@ -889,11 +892,7 @@ async fn sanity_test() {
                         rpc_client
                             .get_shielded_coinbase_rewards_call(
                                 None,
-                                GetShieldedCoinbaseRewardsRequest {
-                                    recipients: vec![],
-                                    start_hash: SIMNET_GENESIS.hash,
-                                    limit: 0
-                                },
+                                GetShieldedCoinbaseRewardsRequest { recipients: vec![], start_hash: SIMNET_GENESIS.hash, limit: 0 },
                             )
                             .await
                             .is_err(),
