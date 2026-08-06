@@ -815,6 +815,10 @@ impl KaspaApi {
         // the job is never late and never blocked on the enhancement.
         let extra_data = match self.current_zkas_template().await {
             Some((h_fc, fc_block)) => {
+                debug!(
+                    "merged: committing to H_fc {} (zkas bits 0x{:x}) in Kaspa template extra_data",
+                    h_fc, fc_block.header.bits
+                );
                 self.pending_fc.lock().insert(h_fc, fc_block);
                 kaspa_consensus_core::auxpow::AuxPow::embed_commitment(&self.coinbase_tag, h_fc, &[])
             }

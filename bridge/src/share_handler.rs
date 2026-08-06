@@ -671,6 +671,15 @@ impl ShareHandler {
             // None and behavior is byte-identical to single-chain RKStratum.
             let zkas_target = kaspa_api.merged_fc_target(&current_job.block);
             let clears_zkas = zkas_target.as_ref().is_some_and(|t| pow_value <= *t);
+            if let Some(zt) = zkas_target.as_ref() {
+                // V2 gate evidence: the dual gate reading BOTH chains off one
+                // job — kaspa target from the parent's own bits, zkas target
+                // from the committed H_fc's stashed block.
+                debug!(
+                    "[MERGED] dual-target: zkas_target={:x} kaspa(network)_target={:x} clears_zkas={} meets_kaspa={}",
+                    zt, network_target, clears_zkas, meets_network_target
+                );
+            }
             if meets_network_target || clears_zkas {
                 let wallet_addr = ctx.wallet_addr.lock().clone();
                 let worker_name = ctx.effective_worker_name();
