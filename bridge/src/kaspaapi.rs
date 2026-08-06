@@ -1227,6 +1227,31 @@ impl KaspaApiTrait for KaspaApi {
             .await
             .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>)
     }
+
+    // Merged mining: delegate to the inherent implementations. Without these
+    // overrides the trait's plain-chain defaults would apply and the real
+    // bridge would silently never settle zkas — the defaults exist for mocks,
+    // not for production.
+    fn merged_fc_target(&self, parent_block: &Block) -> Option<num_bigint::BigUint> {
+        KaspaApi::merged_fc_target(self, parent_block)
+    }
+
+    fn claim_network_solution(&self, job_block: &Block) -> bool {
+        KaspaApi::claim_network_solution(self, job_block)
+    }
+
+    fn pending_zkas_block(&self, h_fc: &kaspa_hashes::Hash) -> Option<Block> {
+        KaspaApi::pending_zkas_block(self, h_fc)
+    }
+
+    async fn submit_zkas_block(
+        &self,
+        block: Block,
+    ) -> Result<kaspa_rpc_core::SubmitBlockResponse, Box<dyn std::error::Error + Send + Sync>> {
+        KaspaApi::submit_zkas_block(self, block)
+            .await
+            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>)
+    }
 }
 
 #[cfg(test)]

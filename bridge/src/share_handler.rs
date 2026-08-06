@@ -665,7 +665,13 @@ impl ShareHandler {
             // Go code compares: powValue.Cmp(&powState.Target) <= 0 where Target is network target from header.bits
             // We calculate network_target directly from current job's header.bits (not from stored state)
             // This ensures we use the correct target for each job, as different jobs may have different header.bits
-            if meets_network_target {
+            // MERGED (KAS-primary): the block gate is EITHER chain's target.
+            // A committed job carries the ZKas (easier) target via the stash;
+            // parent bits remain the KAS gate. Plain jobs: zkas_target is
+            // None and behavior is byte-identical to single-chain RKStratum.
+            let zkas_target = kaspa_api.merged_fc_target(&current_job.block);
+            let clears_zkas = zkas_target.as_ref().is_some_and(|t| pow_value <= *t);
+            if meets_network_target || clears_zkas {
                 let wallet_addr = ctx.wallet_addr.lock().clone();
                 let worker_name = ctx.effective_worker_name();
                 let prefix = self.log_prefix();
@@ -787,6 +793,74 @@ impl ShareHandler {
                     format!("{}:{}", ctx.remote_addr(), ctx.remote_port())
                 );
                 debug!("{} {} {}", LogColors::block("[BLOCK]"), LogColors::label("Block Hash:"), block_hash);
+                // ZKAS settlement (merged jobs) — dispatched FIRST as a spawned
+                // task because the Kaspa arms below break/return. The Kaspa
+                // submission is never gated by the claim outcome (invariants
+                // 4/5/6): a duplicate H_fc claim is still a distinct,
+                // reward-bearing Kaspa candidate.
+                if clears_zkas {
+                    if kaspa_api.claim_network_solution(&block) {
+                        if let Some(h_fc) = crate::merged::committed_h_fc(&block) {
+                            match kaspa_api.pending_zkas_block(&h_fc) {
+                                Some(fc_block) => {
+                                    let aux = crate::merged::assemble_aux_block(&block, &fc_block);
+                                    let prefix_z = self.log_prefix();
+                                    info!(
+                                        "{} {} {}",
+                                        prefix_z,
+                                        LogColors::block("[ZKAS]"),
+                                        LogColors::block(&format!(
+                                            "ZKAS BLOCK FOUND! H_fc: {}, Worker: {}, full_clear: {}",
+                                            h_fc, worker_name, meets_network_target
+                                        ))
+                                    );
+                                    let kaspa_api_z = Arc::clone(&kaspa_api);
+                                    tokio::spawn(async move {
+                                        match kaspa_api_z.submit_zkas_block(aux).await {
+                                            Ok(resp) if resp.report.is_success() => {
+                                                info!(
+                                                    "{} {}",
+                                                    LogColors::block("[ZKAS]"),
+                                                    LogColors::block(&format!("ZKAS BLOCK ACCEPTED BY NODE! H_fc: {}", h_fc))
+                                                );
+                                            }
+                                            Ok(resp) => {
+                                                error!(
+                                                    "{} {} {:?}",
+                                                    LogColors::block("[ZKAS]"),
+                                                    LogColors::error("ZKAS BLOCK REJECTED:"),
+                                                    resp.report
+                                                );
+                                            }
+                                            Err(e) => {
+                                                error!(
+                                                    "{} {} {}",
+                                                    LogColors::block("[ZKAS]"),
+                                                    LogColors::error("ZKAS submit failed:"),
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    });
+                                }
+                                None => {
+                                    warn!(
+                                        "{} merged stash missing for H_fc {} (evicted?); zkas settlement skipped",
+                                        LogColors::block("[ZKAS]"),
+                                        h_fc
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        debug!("[ZKAS] duplicate solution for already-claimed H_fc; kaspa-only settlement");
+                    }
+                }
+
+                // KAS settlement: only when the parent's own (Kaspa) target is
+                // met. A zkas-only clear must never reach the Kaspa node — it
+                // would be rejected as low-pow and miscounted as invalid.
+                if meets_network_target {
                 debug!("{} {}", LogColors::block("[BLOCK]"), "Calling kaspa_api.submit_block()...");
 
                 // Submit block to node
@@ -953,6 +1027,7 @@ impl ShareHandler {
                         }
                     }
                 }
+                } // if meets_network_target (KAS settlement)
             }
 
             // Check pool difficulty
@@ -1667,6 +1742,25 @@ pub trait KaspaApiTrait: Send + Sync {
     ) -> Result<Vec<(String, u64)>, Box<dyn std::error::Error + Send + Sync>>;
 
     async fn get_current_block_color(&self, block_hash: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+
+    // ---- Merged mining (KAS-primary enhancement). Defaults are the plain
+    // single-chain behavior so mocks and non-merged implementations need no
+    // changes: no zkas target, every claim trivially "first", no stash.
+    fn merged_fc_target(&self, _parent_block: &Block) -> Option<num_bigint::BigUint> {
+        None
+    }
+    fn claim_network_solution(&self, _job_block: &Block) -> bool {
+        true
+    }
+    fn pending_zkas_block(&self, _h_fc: &kaspa_hashes::Hash) -> Option<Block> {
+        None
+    }
+    async fn submit_zkas_block(
+        &self,
+        _block: Block,
+    ) -> Result<kaspa_rpc_core::SubmitBlockResponse, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::other("merged mining not supported by this KaspaApi implementation")))
+    }
 }
 
 #[cfg(test)]
