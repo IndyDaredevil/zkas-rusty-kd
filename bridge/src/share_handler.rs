@@ -666,6 +666,27 @@ impl ShareHandler {
                         LogColors::block("[NEAR-MISS]"),
                         format!("New KAS session-best: {:.2e}% of target (worker {})", ratio, ctx.effective_worker_name())
                     );
+                    // c.14: at expected magnitudes (diff-thousands vs
+                    // d~1e16) any ratio above ~1e-6% is already far
+                    // beyond plausible luck -- capture raw hex forensics
+                    // the moment that line is crossed; the observed ~63%
+                    // readings can only be re-diagnosed from the bytes.
+                    if ratio > 1e-6 {
+                        warn!(
+                            "{} {}",
+                            LogColors::block("[NEAR-MISS-FORENSIC]"),
+                            format!(
+                                "IMPLAUSIBLE ratio {:.2e}% -- worker={} job_id={} pow_value=0x{:x} network_target=0x{:x} header.bits=0x{:08x} header.timestamp={}",
+                                ratio,
+                                ctx.effective_worker_name(),
+                                current_job_id,
+                                pow_value,
+                                network_target,
+                                header_clone.bits,
+                                header_clone.timestamp
+                            )
+                        );
+                    }
                 }
                 debug!(
                     "{} {} {}",
@@ -708,6 +729,23 @@ impl ShareHandler {
                             ctx.effective_worker_name()
                         )
                     );
+                    // c.14: same forensic capture as the KAS leg above.
+                    if zkas_ratio > 1e-6 {
+                        warn!(
+                            "{} {}",
+                            LogColors::block("[NEAR-MISS-FORENSIC]"),
+                            format!(
+                                "IMPLAUSIBLE zkas ratio {:.2e}% -- worker={} job_id={} pow_value=0x{:x} zkas_target=0x{:x} header.bits=0x{:08x} header.timestamp={}",
+                                zkas_ratio,
+                                ctx.effective_worker_name(),
+                                current_job_id,
+                                pow_value,
+                                zt,
+                                current_job.block.header.bits,
+                                current_job.block.header.timestamp
+                            )
+                        );
+                    }
                 }
             }
             if meets_network_target || clears_zkas {
