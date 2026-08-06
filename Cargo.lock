@@ -4449,6 +4449,7 @@ dependencies = [
  "kaspa-core",
  "kaspa-grpc-client",
  "kaspa-hashes",
+ "kaspa-merkle",
  "kaspa-notify",
  "kaspa-pow",
  "kaspa-rpc-core",
