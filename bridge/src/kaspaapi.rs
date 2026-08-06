@@ -130,6 +130,13 @@ pub struct NodeStatusSnapshot {
 
 pub static NODE_STATUS: Lazy<Mutex<NodeStatusSnapshot>> = Lazy::new(|| Mutex::new(NodeStatusSnapshot::default()));
 
+/// ZKas templates change at ~1 BPS; within this window the cached template is
+/// authoritative and no zkas RPC occurs on the job path.
+const ZKAS_TEMPLATE_TTL: Duration = Duration::from_millis(500);
+/// Hard bound on an inline zkas template fetch. Exceeding it serves a PLAIN
+/// job — KAS cadence is never delayed by the enhancement (spec §3).
+const ZKAS_FETCH_BUDGET: Duration = Duration::from_millis(250);
+
 /// Kaspa API client wrapper using RPC client
 /// Both use gRPC under the hood, but through an RPC client wrapper abstraction
 pub struct KaspaApi {
@@ -152,6 +159,16 @@ pub struct KaspaApi {
     /// startup ordering. ZKas state must never gate any Kaspa operation
     /// (invariant 6).
     zkas: Arc<parking_lot::RwLock<Option<Arc<ZkasLeg>>>>,
+    /// ZKas blocks awaiting settlement, keyed by H_fc (one-shot claim
+    /// semantics — invariant 5). A solved parent is turned back into an aux
+    /// block via this stash.
+    pending_fc: Arc<Mutex<crate::merged::MergedPending>>,
+    /// TTL cache of the current ZKas template (h_fc, block, fetched_at):
+    /// nine instances × many workers share one KaspaApi, and the zkas fetch
+    /// must never become a per-job RPC storm.
+    zkas_template_cache: Arc<tokio::sync::Mutex<Option<(kaspa_hashes::Hash, Block, Instant)>>>,
+    /// Single-permit gate so at most one zkas template RPC is in flight.
+    zkas_rpc_gate: Arc<tokio::sync::Semaphore>,
 }
 
 /// The attached ZKas enhancement: node client, its notification hub, and the
@@ -305,7 +322,16 @@ impl KaspaApi {
 
         let coinbase_tag = build_coinbase_tag_bytes(coinbase_tag_suffix.as_deref());
         let zkas_slot: Arc<parking_lot::RwLock<Option<Arc<ZkasLeg>>>> = Arc::new(parking_lot::RwLock::new(None));
-        let api = Arc::new(Self { client, hub, connected: Arc::new(Mutex::new(true)), coinbase_tag, zkas: Arc::clone(&zkas_slot) });
+        let api = Arc::new(Self {
+            client,
+            hub,
+            connected: Arc::new(Mutex::new(true)),
+            coinbase_tag,
+            zkas: Arc::clone(&zkas_slot),
+            pending_fc: Arc::new(Mutex::new(crate::merged::MergedPending::new(4096))),
+            zkas_template_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            zkas_rpc_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
 
         // Optional ZKas enhancement: attach in the BACKGROUND, retrying
         // forever with capped backoff. The constructor never waits on ZKas —
@@ -781,6 +807,20 @@ impl KaspaApi {
 
     /// Get block template for a client
     pub async fn get_block_template(&self, wallet_addr: &str, _remote_app: &str, _canxium_addr: &str) -> Result<Block> {
+        // MERGED decoration (KAS-primary): when a fresh ZKas template is
+        // available within budget, the Kaspa template request carries
+        // `coinbase_tag || ZKMM || hex(H_fc)` as extra_data, making every
+        // solved parent simultaneously a worker-paid Kaspa candidate and an
+        // AuxPoW proof for the ZKas block. Any zkas miss ⇒ plain extra_data —
+        // the job is never late and never blocked on the enhancement.
+        let extra_data = match self.current_zkas_template().await {
+            Some((h_fc, fc_block)) => {
+                self.pending_fc.lock().insert(h_fc, fc_block);
+                kaspa_consensus_core::auxpow::AuxPow::embed_commitment(&self.coinbase_tag, h_fc, &[])
+            }
+            None => self.coinbase_tag.clone(),
+        };
+
         // Retry up to 3 times if we get "Odd number of digits" error
         // This error can occur if the block template has malformed hash fields
         let max_retries = 3;
@@ -794,7 +834,7 @@ impl KaspaApi {
             // Request block template using RPC client wrapper
             let response = match self
                 .client
-                .get_block_template_call(None, GetBlockTemplateRequest::new(address, self.coinbase_tag.clone()))
+                .get_block_template_call(None, GetBlockTemplateRequest::new(address, extra_data.clone()))
                 .await
             {
                 Ok(r) => r,
@@ -955,6 +995,86 @@ impl KaspaApi {
         let leg = self.zkas_leg().ok_or_else(|| anyhow::anyhow!("merged mining inactive: no ZKas node attached"))?;
         let rpc_block: RpcRawBlock = (&block).into();
         leg.client.submit_block_call(None, SubmitBlockRequest::new(rpc_block, false)).await.context("Failed to submit ZKas block")
+    }
+
+    /// The current ZKas template for commitment purposes, under a strict
+    /// non-blocking budget (spec §3: a ZKas hiccup means the next job goes
+    /// out PLAIN rather than late). Cache-first with `ZKAS_TEMPLATE_TTL`;
+    /// on stale, at most one gated RPC bounded by `ZKAS_FETCH_BUDGET`;
+    /// any miss ⇒ `None` ⇒ the caller serves an uncommitted Kaspa job.
+    async fn current_zkas_template(&self) -> Option<(kaspa_hashes::Hash, Block)> {
+        if !self.has_zkas() {
+            return None;
+        }
+        {
+            let cache = self.zkas_template_cache.lock().await;
+            if let Some((h_fc, block, at)) = cache.as_ref() {
+                if at.elapsed() < ZKAS_TEMPLATE_TTL {
+                    return Some((*h_fc, block.clone()));
+                }
+            }
+        }
+        // Stale or empty: one fetch at a time, hard-bounded. Losers of the
+        // gate race and timeout losers alike serve plain — never late.
+        let Ok(_permit) = tokio::time::timeout(Duration::from_millis(5), self.zkas_rpc_gate.acquire()).await else {
+            // Another fetch is in flight; reuse whatever the cache holds, even
+            // slightly stale — better a near-fresh commitment than none.
+            let cache = self.zkas_template_cache.lock().await;
+            return cache.as_ref().map(|(h, b, _)| (*h, b.clone()));
+        };
+        let _permit = _permit.ok()?;
+        match tokio::time::timeout(ZKAS_FETCH_BUDGET, self.get_zkas_block_template()).await {
+            Ok(Ok(block)) => {
+                let h_fc = block.header.hash;
+                *self.zkas_template_cache.lock().await = Some((h_fc, block.clone(), Instant::now()));
+                Some((h_fc, block))
+            }
+            Ok(Err(e)) => {
+                debug!("zkas template fetch failed (serving plain): {e}");
+                None
+            }
+            Err(_) => {
+                debug!("zkas template fetch exceeded {:?} budget (serving plain)", ZKAS_FETCH_BUDGET);
+                None
+            }
+        }
+    }
+
+    /// The ZKas (easier) target for a merged parent, looked up via its
+    /// committed H_fc → the stashed ZKas block's own `bits`. `None` ⇒ the job
+    /// carries no commitment (plain) or the stash has moved on ⇒ the caller
+    /// uses the parent's own `bits`. Gates on the JOB's commitment, not on
+    /// current attach state, so in-flight jobs behave correctly across
+    /// attach/detach.
+    pub fn merged_fc_target(&self, parent_block: &Block) -> Option<num_bigint::BigUint> {
+        let h_fc = crate::merged::committed_h_fc(parent_block)?;
+        let fc_block = self.pending_fc.lock().get(&h_fc)?;
+        Some(crate::hasher::calculate_target(fc_block.header.bits as u64))
+    }
+
+    /// The ZKas chain hash for a merged parent (its committed H_fc): the aux
+    /// rides outside the header hash, so the block that lands on the ZKas
+    /// chain keeps exactly this hash — the right handle for color checks and
+    /// block-facing stats. `None` for plain jobs.
+    pub fn merged_chain_hash(&self, parent_block: &Block) -> Option<kaspa_hashes::Hash> {
+        crate::merged::committed_h_fc(parent_block)
+    }
+
+    /// One-shot claim of a merged solution (invariant 5). `true` for plain
+    /// jobs (nothing to claim) and for the FIRST claim of a committed H_fc;
+    /// `false` for duplicates — which are still potentially reward-bearing
+    /// Kaspa blocks and must be submitted to Kaspa regardless (invariant 4).
+    pub fn claim_network_solution(&self, job_block: &Block) -> bool {
+        let Some(h_fc) = crate::merged::committed_h_fc(job_block) else {
+            return true;
+        };
+        self.pending_fc.lock().claim_solution(h_fc)
+    }
+
+    /// The stashed ZKas block for a solved parent's commitment, for aux
+    /// assembly at settlement time.
+    pub fn pending_zkas_block(&self, h_fc: &kaspa_hashes::Hash) -> Option<Block> {
+        self.pending_fc.lock().get(h_fc)
     }
 
     /// Start listening for block template notifications (node-push with ticker
