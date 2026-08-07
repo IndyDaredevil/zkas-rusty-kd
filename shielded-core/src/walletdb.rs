@@ -305,6 +305,25 @@ pub struct WalletDb {
     /// not anything about the stream it holds, and a checkpoint written by a
     /// shared tree must stay loadable as an ordinary (if noteless) wallet.
     leaves_only: bool,
+    /// Do not maintain this wallet's own mirror `tree` — the daemon-wide shared tree
+    /// holds an identical one and will supply its frontier.
+    ///
+    /// The tree is 80% of a scan (measured: 319 s of Sinsemilla against 79 s of trial
+    /// decryption) and it is *public*: every wallet ingesting the same blocks builds
+    /// bit-identical nodes. Having N wallets each build their own is the single
+    /// largest piece of duplicated work in the daemon.
+    ///
+    /// Not persisted — it describes how this copy is being driven right now, not
+    /// anything about the stream.
+    borrow_tree: bool,
+    /// Whether `tree` currently reflects `size`.
+    ///
+    /// False from the moment a leaf is appended without hashing it in. The frontier of
+    /// a commitment tree at N leaves is a pure function of leaves 0..N, so the shared
+    /// tree's frontier at the same `size` IS this wallet's frontier — that is what
+    /// [`Self::adopt_tip_frontier`] installs, and why borrowing is sound rather than a
+    /// guess. Until then nothing may read `anchor()`.
+    tree_valid: bool,
     /// Spends submitted but not yet observed on-chain — see [`PendingSpend`].
     /// Excluded from the balance and from spend selection (like spent notes), but
     /// recoverable if the transaction is lost.
@@ -571,6 +590,8 @@ impl WalletDb {
             history: Vec::new(),
             history_enabled: true,
             leaves_only: false,
+            borrow_tree: false,
+            tree_valid: true,
             pending_spends: Vec::new(),
             last_daa: 0,
             subtree: SubtreeCache::default(),
@@ -613,6 +634,8 @@ impl WalletDb {
             history: Vec::new(),
             history_enabled: true,
             leaves_only: false,
+            borrow_tree: false,
+            tree_valid: true,
             pending_spends: Vec::new(),
             last_daa: 0,
             subtree: SubtreeCache::default(),
@@ -1589,8 +1612,16 @@ impl WalletDb {
         if let Some(d) = self.decoded.get_mut() {
             d.push(leaf);
         }
-        // `append` only errors when the tree is full (2^32 leaves) — unreachable.
-        let _ = self.tree.append(leaf);
+        // The mirror tree is the expensive half of a scan and it is PUBLIC — the shared
+        // tree is building the identical thing. A borrowing wallet skips it and adopts
+        // that frontier instead (see `adopt_tip_frontier`), which is sound because the
+        // frontier at N leaves depends only on leaves 0..N.
+        if self.borrow_tree {
+            self.tree_valid = false;
+        } else {
+            // `append` only errors when the tree is full (2^32 leaves) — unreachable.
+            let _ = self.tree.append(leaf);
+        }
         // Keep the complete-subtree cache in step: one combine per leaf, amortized. If
         // the mountain range ever refuses a leaf the cache is dropped, not patched — a
         // half-updated cache must never be consulted.
@@ -1603,6 +1634,61 @@ impl WalletDb {
         }
         self.size += 1;
         self.scan_cost.tree_ns += t_leaf.elapsed().as_nanos();
+    }
+
+    /// Stop maintaining this wallet's own mirror tree; the shared tree supplies it.
+    ///
+    /// Turning this ON invalidates `tree` as soon as the next leaf arrives, so
+    /// `anchor()` must not be read until [`Self::adopt_tip_frontier`] succeeds.
+    /// Turning it OFF does not repair anything — the wallet keeps hashing from that
+    /// point on, but the leaves it skipped are still missing from `tree`, so it stays
+    /// invalid until a frontier is adopted or the wallet is reloaded.
+    pub fn set_borrow_tree(&mut self, on: bool) {
+        self.borrow_tree = on;
+    }
+
+    /// This wallet's tip frontier, as a portable [`FrontierState`] — how the shared
+    /// tree hands its tree to everyone else.
+    ///
+    /// Returns `None` when `tree` does not describe `size` (a borrowing wallet that has
+    /// not adopted one yet), so a stale frontier can never be handed on as if it were
+    /// current.
+    pub fn tip_frontier_state(&self) -> Option<FrontierState> {
+        if !self.tree_valid {
+            return None;
+        }
+        let f = self.tree.to_frontier();
+        Some(match f.value() {
+            None => FrontierState { size: 0, leaf: None, ommers: Vec::new() },
+            Some(nef) => FrontierState {
+                size: self.size,
+                leaf: Some(nef.leaf().to_bytes()),
+                ommers: nef.ommers().iter().map(|o| o.to_bytes()).collect(),
+            },
+        })
+    }
+
+    /// Whether `tree` reflects `size` — i.e. whether `anchor()` means anything.
+    pub fn tree_is_valid(&self) -> bool {
+        self.tree_valid
+    }
+
+    /// Install a tip frontier taken from the shared tree, making `tree` valid again.
+    ///
+    /// **Refuses unless the frontier describes exactly this wallet's `size`.** A
+    /// commitment tree's frontier at N leaves is determined by leaves 0..N alone, so a
+    /// frontier at the same size is provably this wallet's own — and one at a
+    /// different size provably is not. That single equality check is the whole safety
+    /// argument for borrowing, which is why it is enforced here rather than trusted
+    /// from the caller.
+    pub fn adopt_tip_frontier(&mut self, fs: &crate::tree::FrontierState) -> bool {
+        if fs.size != self.size {
+            return false;
+        }
+        let Ok(t) = GlobalTree::from_state(fs) else { return false };
+        self.tree = CommitmentTree::from_frontier(t.frontier());
+        self.tree_valid = true;
+        true
     }
 
     /// Ingest for the **tree only**, skipping trial decryption.
@@ -2229,7 +2315,16 @@ impl WalletDb {
         // which is minutes of CPU per wallet and is why a daemon restart showed every
         // user `0 balance / 0 notes / syncing 0%` until their wallet finished reloading.
         // Same encoding as the base frontier above.
-        write_frontier(&mut out, &self.tree.to_frontier());
+        // Only write the tip frontier if it actually describes `size`. A borrowing
+        // wallet's mirror tree lags whatever it skipped, and persisting that would be
+        // worse than persisting nothing: the loader would trust it. The empty tag with
+        // a non-zero size is self-evidently "not recorded", and the load path treats it
+        // as such rather than as an empty tree.
+        if self.tree_valid {
+            write_frontier(&mut out, &self.tree.to_frontier());
+        } else {
+            out.push(0);
+        }
 
         // v5: the persisted per-note witnesses, as a length-prefixed, best-effort section
         // (see CHECKPOINT_VERSION). Layout: [witnessed_upto:u64][lag_tree][n:u64]
@@ -2393,7 +2488,16 @@ impl WalletDb {
         // leaf stream (O(N) Sinsemilla), which is what every restore used to cost.
         db.tree = if has_tip_frontier {
             let tip = read_frontier(&mut r, size)?;
-            CommitmentTree::from_frontier(&tip)
+            // An EMPTY tip frontier on a non-empty stream means the writer was borrowing
+            // the shared tree and had nothing valid to record — not that the tree is
+            // empty. Restore what we can and mark it invalid so `anchor()` is not read
+            // until a frontier is adopted.
+            if size > 0 && tip.value().is_none() {
+                db.tree_valid = false;
+                CommitmentTree::from_frontier(&db.base_frontier)
+            } else {
+                CommitmentTree::from_frontier(&tip)
+            }
         } else if let Some(fs) = tip.filter(|fs| fs.size == size) {
             // A v3 blob carries no tip frontier, but the caller got one from the node for
             // exactly this cursor — same tree, so use it and skip the replay.
@@ -3028,6 +3132,64 @@ mod tests {
             ordinary.witness_paths_at(&[3, 17], tip).iter().all(|p| p.is_none()),
             "the compacted wallet cannot — which is precisely why the shared tree must not compact",
         );
+    }
+
+    /// A wallet that skips its own tree ends up with the SAME anchor as one that built
+    /// it, once it adopts the shared tree's frontier.
+    ///
+    /// This is the whole safety argument for borrowing, so it is asserted rather than
+    /// reasoned about: a commitment tree's frontier at N leaves is a pure function of
+    /// leaves 0..N, therefore the shared tree's frontier at the same size IS this
+    /// wallet's frontier. If that were ever false, a borrowing wallet would spend
+    /// against a wrong anchor and the node would reject every payment it made.
+    #[test]
+    fn a_borrowed_tree_produces_the_same_anchor_as_a_built_one() {
+        let mine = [31u8; 32];
+        let other = [32u8; 32];
+
+        let mut built = WalletDb::from_seed(mine).unwrap();
+        let mut borrowed = WalletDb::from_seed(mine).unwrap();
+        let mut shared = WalletDb::from_seed([33u8; 32]).unwrap();
+        shared.set_leaves_only(true);
+        borrowed.set_borrow_tree(true);
+
+        for b in 0..30u32 {
+            let block = vec![
+                coinbase_for(address_of(mine), format!("m-{b}").as_bytes(), 1_000 + b as u64),
+                coinbase_for(address_of(other), format!("o-{b}").as_bytes(), 500),
+            ];
+            built.ingest_block(&block, &[]);
+            borrowed.ingest_block(&block, &[]);
+            shared.ingest_block(&block, &[]);
+        }
+
+        // Skipping the hashing invalidates the mirror tree, and the wallet says so.
+        assert!(!borrowed.tree_is_valid(), "a borrowing wallet knows its tree is stale");
+        assert!(built.tree_is_valid());
+        assert_eq!(built.size(), borrowed.size(), "the same leaves were counted either way");
+        assert_eq!(built.notes().len(), borrowed.notes().len(), "and the same notes were found");
+        assert_eq!(
+            built.notes().iter().map(|n| n.position).collect::<Vec<_>>(),
+            borrowed.notes().iter().map(|n| n.position).collect::<Vec<_>>(),
+            "note POSITIONS are unaffected — they come from counting, not hashing",
+        );
+
+        // Adopt the shared tree's frontier at the same size.
+        let fs = shared.tip_frontier_state().expect("shared tree has a valid tree");
+        assert_eq!(fs.size, borrowed.size());
+        assert!(borrowed.adopt_tip_frontier(&fs), "frontier at the matching size is accepted");
+        assert!(borrowed.tree_is_valid());
+        assert_eq!(built.anchor(), borrowed.anchor(), "identical anchor");
+        assert_eq!(built.anchor(), shared.anchor(), "...and it is the shared tree's anchor");
+
+        // A frontier at ANY other size must be refused: that is the check the entire
+        // safety argument rests on, so it must not be advisory.
+        let mut ahead = shared;
+        ahead.ingest_block(&[coinbase_for(address_of(other), b"extra", 7)], &[]);
+        let stale = ahead.tip_frontier_state().expect("still valid");
+        assert_ne!(stale.size, borrowed.size());
+        assert!(!borrowed.adopt_tip_frontier(&stale), "a frontier at a different size is refused");
+        assert_eq!(built.anchor(), borrowed.anchor(), "and the refusal left the good one in place");
     }
 
     /// A **watch-only** wallet loaded from just the FVK discovers exactly the same

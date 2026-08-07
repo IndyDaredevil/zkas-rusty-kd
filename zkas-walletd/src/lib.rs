@@ -1351,7 +1351,7 @@ fn parse_scan_bytes(
     };
     let db_len = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?) as usize;
     let blob = take(&mut pos, db_len)?;
-    let db = match tip {
+    let mut db = match tip {
         Some(fs) => key.db_from_checkpoint_with_tip(blob, fs)?,
         None => key.db_from_checkpoint(blob)?,
     };
@@ -1360,6 +1360,20 @@ fn parse_scan_bytes(
     // transition was actually dropped, leaving a plausible but divergent tree.
     // Bind every restored checkpoint to the node's frontier at its exact cursor.
     if let Some(fs) = tip {
+        // A checkpoint written while borrowing the shared tree records no tip frontier,
+        // so the restored mirror tree is empty and its anchor would fail the check
+        // below — throwing away a perfectly good checkpoint and forcing a full rescan.
+        //
+        // Adopt the NODE's frontier at this exact cursor instead. That is what the
+        // wallet's tree should be, and `adopt_tip_frontier` accepts it only if it
+        // describes the same leaf count, so the size binding is still enforced. What is
+        // NOT re-derived is the root — for a wallet that never hashed, the root was
+        // never its own claim to make. Its protection is elsewhere and fails closed: a
+        // wallet whose stream diverged produces witnesses that fail `subtree_paths`'
+        // root check, so it declines to spend rather than spending wrongly.
+        if !db.tree_is_valid() {
+            db.adopt_tip_frontier(fs);
+        }
         let expected = GlobalTree::from_state(fs).ok()?.anchor().to_bytes();
         if db.size() != fs.size || db.anchor() != expected {
             log::warn!(
@@ -2289,6 +2303,17 @@ impl WalletEntry {
                 // (its own lock is held by this very sync pass), but say so explicitly
                 // rather than depend on that.
                 let shared_serves = !self.db.is_leaves_only() && shared_tree_covers >= matured && matured > 0;
+                // Stop building this wallet's own mirror tree once the shared tree is at
+                // or ahead of us. That tree is 80% of a scan (319 s of Sinsemilla against
+                // 79 s of trial decryption) and it is PUBLIC — the shared copy is building
+                // bit-identical nodes. The wallet keeps counting leaves, so note positions
+                // are unaffected; only the hashing goes away.
+                //
+                // Requires the shared tree to be AHEAD of us, because that is what makes a
+                // frontier available to adopt afterwards. The chain tree is pinned always-
+                // active and never evicted, so it is ahead of a catching-up wallet in
+                // practice; a wallet that overtakes it simply keeps hashing that pass.
+                self.db.set_borrow_tree(!self.db.is_leaves_only() && shared_tree_covers >= self.db.size());
                 let needs_cache = span >= SUBTREE_CACHE_MIN_SPAN
                     && !self.db.subtree_cache_ready(matured)
                     && !self.db.subtree_cache_failed()
@@ -3698,6 +3723,22 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         shared_tree_covers,
     )
     .await;
+    // A borrowing wallet's mirror tree is stale by construction; make it current again
+    // by taking the shared tree's frontier. `adopt_tip_frontier` REFUSES unless the
+    // frontier describes exactly this wallet's leaf count — the frontier at N leaves is
+    // a pure function of leaves 0..N, so an equal size proves it is this wallet's own
+    // and an unequal one proves it is not. That single check is the whole safety
+    // argument, and it lives in the wallet, not here.
+    //
+    // Re-peeked after the chunk rather than reused from before it: both trees moved.
+    if !e.db.tree_is_valid() {
+        let fs = state.chain_tree.try_lock().ok().and_then(|c| c.db.tip_frontier_state());
+        if let Some(fs) = fs {
+            if e.db.adopt_tip_frontier(&fs) {
+                log::debug!("wallet adopted the shared tree's frontier at {} leaves", fs.size);
+            }
+        }
+    }
     // Report where scan CPU actually goes, once per SCAN_COST_REPORT_ACTIONS of work.
     //
     // A scan has two heavy halves — trial decryption (one Pallas scalar mul per action
@@ -4887,8 +4928,28 @@ fn stranded_hint(stranded_value: u64) -> String {
 /// tree at the wallet cursor. Height/freshness alone cannot establish this: a
 /// legacy checkpoint may be near-tip yet contain bundles consensus dropped.
 async fn ensure_canonical_checkpoint(state: &Arc<AppState>, w: &Wallet) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    // A borrowing wallet's mirror tree is stale until it adopts the shared tree's
+    // frontier, and `anchor()` is meaningless until then. Comparing a stale anchor
+    // against the node would report a divergence that does not exist and retire a
+    // perfectly good checkpoint — turning an optimisation into data loss. So: make it
+    // valid first, and if that is not possible, say "retry" rather than "diverged".
+    {
+        let needs = { !w.lock().await.db.tree_is_valid() };
+        if needs {
+            let fs = state.chain_tree.lock().await.db.tip_frontier_state();
+            if let Some(fs) = fs {
+                w.lock().await.db.adopt_tip_frontier(&fs);
+            }
+        }
+    }
     let (cursor, wallet_size, wallet_anchor) = {
         let e = w.lock().await;
+        if !e.db.tree_is_valid() {
+            return Err(err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "wallet is still catching up with the shared chain state; retry in a moment",
+            ));
+        }
         (e.low, e.db.size(), e.db.anchor())
     };
     let ts = tokio::time::timeout(SYNC_RPC_TIMEOUT, state.client.get_shielded_tree_state(Some(cursor)))
