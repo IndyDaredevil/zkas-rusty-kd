@@ -899,7 +899,19 @@ const SUBTREE_CACHE_MIN_SPAN: u64 = 20_000;
 /// action-keyed trigger would essentially never fire.
 const SCAN_COST_REPORT_LEAVES: u64 = 20_000;
 
-const SUBTREE_BUILD_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long one background subtree-cache slice may hold the wallet lock.
+///
+/// This is a direct trade against how long a build takes in WALL-CLOCK. A slice runs
+/// once per sync pass under a `--warm-wallets` permit, so a 2 M-leaf build (~295 s of
+/// Sinsemilla) needs `295s / slice` passes. At the original 250 ms that was ~1,180
+/// passes shared with every other resident wallet — measured live on 2026-08-07 as
+/// **7 completed builds in 9.5 hours**, i.e. effectively never, which is why users hit
+/// the ~280 s cold-send replay on wallets the UI already called "synced".
+///
+/// 2 s cuts that to ~148 passes. The lock is held for at most one slice, so the worst
+/// case a status poll can queue behind is 2 s — against the 280 s cold send this
+/// prevents.
+const SUBTREE_BUILD_SLICE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Free memory the daemon refuses to build a subtree cache below.
 ///
@@ -2504,11 +2516,49 @@ impl WalletEntry {
         let climb = matured.saturating_sub(self.db.witnessed_upto());
         if climb <= SPEND_CLIMB_INLINE_MAX {
             self.db.advance_witnesses(matured);
-        } else {
-            log::info!(
-                "send: skipping inline witness climb of {climb} leaves (notes={note_count}); selected notes come from the batch builder, or rebuild on demand"
+            return;
+        }
+        // Build the subtree cache HERE rather than let the batch builder do the same
+        // walk and throw it away.
+        //
+        // `witness_paths_at` falls back to one O(chain) pass over base->matured when
+        // the cache cannot serve, and discards it when the send finishes. Building the
+        // cache costs that same single pass and KEEPS it: this send waits no longer
+        // than it already would, and every later send on this wallet witnesses in
+        // O(depth).
+        //
+        // The background builder cannot be relied on to have got here first. It runs in
+        // 250 ms slices, one slice per sync pass, under a gate of `--warm-wallets`
+        // permits shared by every resident wallet — roughly 1,180 slices for a 2 M-leaf
+        // wallet, which is hours of wall-clock. Live on 2026-08-07 a user pressed Send
+        // on a wallet the UI called "synced" (3 notes) and waited ~280 s while
+        // 1,895,608 leaves were replayed and then dropped; 7 background builds had
+        // completed in the preceding 9.5 hours.
+        //
+        // Runs to COMPLETION: no slice deadline and no `proving_now` yield. This IS the
+        // send's critical path, and an abandoned sweep keeps no progress, so yielding
+        // would only make this user wait longer and repeat the work.
+        let span = matured.saturating_sub(self.db.base_size());
+        if span >= SUBTREE_CACHE_MIN_SPAN && !self.db.subtree_cache_failed() {
+            let t = std::time::Instant::now();
+            self.db.build_subtree_cache();
+            if self.db.subtree_cache_ready(matured) {
+                // Persist it at once: this was expensive and a restart must not repeat it.
+                self.force_checkpoint = true;
+                log::info!(
+                    "send: built the subtree cache inline in {:.1?} ({span} leaves, notes={note_count}) — paid the walk the batch builder would have discarded; later sends witness in O(depth)",
+                    t.elapsed()
+                );
+                return;
+            }
+            log::warn!(
+                "send: inline subtree cache build did not cover matured after {:.1?} ({span} leaves); falling back to the batch replay",
+                t.elapsed()
             );
         }
+        log::info!(
+            "send: skipping inline witness climb of {climb} leaves (notes={note_count}); selected notes come from the batch builder, or rebuild on demand"
+        );
     }
 }
 
@@ -3221,6 +3271,37 @@ impl AppState {
                 log::warn!("preserved rejected checkpoint as {quarantine}");
             }
         }
+        // No usable checkpoint — but this wallet may have a TWIN: another token
+        // registered against the same viewing key that has already scanned the chain.
+        //
+        // `adopt_twin` was only ever reached from import / watch-only registration, so a
+        // token registered BEFORE its twin finished scanning, or whose own checkpoint was
+        // later quarantined as stale or divergent, fell through to a full rescan and never
+        // reconsidered it. Measured on the public daemon: **51 of 159** checkpoint-less
+        // wallets had a checkpointed twin sitting on the same disk, each facing a ~330 s
+        // scan (78 % of it Sinsemilla tree work its sibling had already done) to reproduce
+        // state that was already there.
+        //
+        // Nothing is taken on trust: `adopt_twin_checkpoint` matches the donor's FVK and
+        // refuses a donor whose `blind_below` hides notes this birthday wants, and the
+        // adopted file then goes through the SAME `load_checkpoint` verification as any
+        // other — including the cursor-on-selected-chain test above. If any of that
+        // declines, this falls through to the honest scan exactly as before.
+        let restored = match restored {
+            Some(r) => Some(r),
+            None => match key.fvk_bytes() {
+                Some(fvk) => match self.adopt_twin(token, &fvk, birthday).await {
+                    Some((donor, keep_birthday)) => {
+                        log::info!(
+                            "wallet {token}: adopted checkpoint from twin token {donor} (birthday {keep_birthday}) instead of rescanning from {birthday}"
+                        );
+                        load_checkpoint(&self.wallet_dir, token, key, &genesis, tip.as_ref())
+                    }
+                    None => None,
+                },
+                None => None,
+            },
+        };
         let entry = match restored {
             Some((db, low, scanned, boundaries, sink_blue, blind_below)) => {
                 let mut e = WalletEntry::from_parts(key, recoverable_history, db, genesis, low, scanned, boundaries, sink_blue);
@@ -3750,6 +3831,29 @@ async fn sync_loop(state: Arc<AppState>) {
             // Running up to `SYNC_CONCURRENCY` at once uses the otherwise-idle cores while
             // still leaving headroom for the HTTP handlers, the node RPC, and the mempool
             // loop. Per-wallet correctness is unchanged (each holds only its own lock).
+            // Sweep the FURTHEST-BEHIND wallets first, so the shared page cache can
+            // actually hit.
+            //
+            // `fetch_shielded_page` is keyed `(low_hash, limit)` and its whole premise is
+            // that "during a mass rescan every active wallet walks the same stream". That
+            // is only true if their cursors coincide. Iterating a HashMap's arbitrary
+            // order kept the backlog spread across the entire chain, so every wallet
+            // fetched and decoded every page for itself and the cache hit ~0. Measured
+            // 2026-08-07: kaspad burning **562 % CPU** serving 8 independent historical
+            // page streams while merely tip-following at 10 blocks/10 s — the node, not
+            // walletd, had become the bottleneck.
+            //
+            // Ordering by cursor puts the laggards in the same slots at the same time.
+            // They converge toward each other's cursors and, once two wallets land on the
+            // same page, they advance in lockstep from then on (same page ⇒ same next
+            // cursor) and share every subsequent fetch and decode. Purely a scheduling
+            // order: every wallet still scans its own full range, so no wallet can miss a
+            // block because of it.
+            let mut wallet_tokens = wallet_tokens;
+            {
+                let snaps = state.snapshots.lock().await;
+                wallet_tokens.sort_by_key(|t| snaps.get(t).map(|s| s.scanned).unwrap_or(usize::MAX));
+            }
             let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(sync_concurrency(&state.resources)));
             let mut set = tokio::task::JoinSet::new();
             for token in wallet_tokens {
