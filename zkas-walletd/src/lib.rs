@@ -2011,6 +2011,23 @@ impl WalletEntry {
         // cannot be consulted. A wallet covered by it needs no subtree cache of its own.
         shared_tree_covers: u64,
     ) {
+        // Stop building this wallet's own mirror tree while the shared tree is at or
+        // ahead of us. That tree is ~80% of a scan (measured: 319 s of Sinsemilla
+        // against 79 s of trial decryption) and it is PUBLIC — the shared copy builds
+        // bit-identical nodes. The wallet keeps COUNTING leaves, so note positions are
+        // unaffected; only the hashing goes away.
+        //
+        // This must run on EVERY pass, before any ingest. It first lived in the
+        // caught-up tail below, which meant it only ever ran for wallets that had
+        // already finished syncing — so an initial scan, the one case the whole change
+        // exists for, never borrowed anything and hashed the entire chain itself.
+        // Measured after that deploy: tree still 83–99% of scan cost, i.e. no effect.
+        //
+        // Requires the shared tree to be AHEAD of us, since that is what makes a
+        // frontier available to adopt afterwards; a wallet that overtakes it simply
+        // keeps hashing until it is passed again.
+        self.db.set_borrow_tree(!self.db.is_leaves_only() && shared_tree_covers >= self.db.size());
+
         // Set when a small caught-up page comes back FULL: more blocks than it
         // carried arrived, so the next iteration must take a full page to catch
         // up in one go (otherwise a stalled wallet would crawl at CAUGHT_UP_PAGE
@@ -2094,6 +2111,23 @@ impl WalletEntry {
             let (advanced, at_margin) = tokio::task::block_in_place(|| {
                 let mut advanced = false;
                 let mut at_margin = false;
+                // Decide the WHOLE page's trial decryption in one batch before ingesting
+                // any of it. The ingest below walks block by block and transaction by
+                // transaction, which is a handful of actions per call — too small to
+                // spread across cores, and far below the ~100-point batch a GPU needs to
+                // beat the CPU at all. Since the tree work was shared away, decryption is
+                // ~99% of a scan (measured: 113.7 us/action against 0.1 us/leaf), so the
+                // batch size WAS the bottleneck for both.
+                //
+                // Purely a memo: anything it does not cover is decrypted the old way, so
+                // this can cost time but never a note.
+                {
+                    let page_actions: Vec<kaspa_shielded_core::wallet::CompactActionRecord> =
+                        resp.blocks.iter().flat_map(|b| b.compact.iter().flatten().copied()).collect();
+                    if !page_actions.is_empty() {
+                        tokio::task::block_in_place(|| self.db.predecrypt_page(&page_actions));
+                    }
+                }
                 for (i, b) in resp.blocks.iter().enumerate() {
                     if b.blue_score > settled {
                         // Everything from here to the tip is inside the reorg margin and must
@@ -2183,6 +2217,8 @@ impl WalletEntry {
                     }
                     advanced = true;
                 }
+                // The page memo must not survive the page.
+                self.db.end_page();
                 if !at_margin {
                     // No unsettled blocks in this page — nothing is pending from the margin.
                     self.preview = Preview::default();
@@ -2303,17 +2339,6 @@ impl WalletEntry {
                 // (its own lock is held by this very sync pass), but say so explicitly
                 // rather than depend on that.
                 let shared_serves = !self.db.is_leaves_only() && shared_tree_covers >= matured && matured > 0;
-                // Stop building this wallet's own mirror tree once the shared tree is at
-                // or ahead of us. That tree is 80% of a scan (319 s of Sinsemilla against
-                // 79 s of trial decryption) and it is PUBLIC — the shared copy is building
-                // bit-identical nodes. The wallet keeps counting leaves, so note positions
-                // are unaffected; only the hashing goes away.
-                //
-                // Requires the shared tree to be AHEAD of us, because that is what makes a
-                // frontier available to adopt afterwards. The chain tree is pinned always-
-                // active and never evicted, so it is ahead of a catching-up wallet in
-                // practice; a wallet that overtakes it simply keeps hashing that pass.
-                self.db.set_borrow_tree(!self.db.is_leaves_only() && shared_tree_covers >= self.db.size());
                 let needs_cache = span >= SUBTREE_CACHE_MIN_SPAN
                     && !self.db.subtree_cache_ready(matured)
                     && !self.db.subtree_cache_failed()
@@ -2382,7 +2407,16 @@ impl WalletEntry {
                 // `matured > base_size` is `subtree_paths`' own precondition: below it the
                 // cache declines and the wallet would silently be left with neither a
                 // cache nor a witness set.
-                let cache_serves = self.db.subtree_cache_ready(matured) && matured > self.db.base_size();
+                // Served by EITHER this wallet's own cache or the shared tree. Checking
+                // only the former was a bug of exactly the kind this whole file keeps
+                // producing: a borrowing wallet never builds a cache of its own, so the
+                // condition was permanently false and the wallet dropped into the
+                // leaf-by-leaf witness climb — the very work the shared tree exists to
+                // make unnecessary — and sat in "Almost ready" indefinitely.
+                //
+                // The question was never "do I have a cache", it is "can somebody
+                // witness for me".
+                let cache_serves = (self.db.subtree_cache_ready(matured) || shared_serves) && matured > self.db.base_size();
                 // A wallet whose cache is still building must not ALSO run the warm. Both
                 // are one-time heavy work aiming at the same outcome — a fast spend — and
                 // the cache is the one that achieves it, in a fraction of the work. Left
@@ -2767,6 +2801,22 @@ struct AppState {
     /// the ordinary checkpoint path persists it; this handle just saves readers a map
     /// lookup on the spend path.
     chain_tree: Wallet,
+    /// How far the shared tree reaches, PUBLISHED so readers never take its lock.
+    ///
+    /// This started as `chain_tree.try_lock()`, which was wrong in a way that silently
+    /// disabled the whole optimisation: the chain tree is pinned always-active, so its
+    /// own sync pass holds that lock across an entire chunk. `try_lock` therefore failed
+    /// almost every time, every wallet read "the shared tree covers 0 leaves", and every
+    /// wallet went on building its own tree. Measured after deploying: tree still 83–99%
+    /// of scan cost, i.e. no change at all.
+    ///
+    /// An atomic cannot fail to be read, which is the property that was actually needed.
+    chain_tree_size: std::sync::atomic::AtomicU64,
+    /// The shared tree's tip frontier, republished after each of its own passes.
+    ///
+    /// A short-lived lock held only long enough to clone ~32 ommers, never across
+    /// ingest — so a wallet adopting a frontier cannot queue behind a page scan.
+    chain_tree_frontier: Mutex<Option<kaspa_shielded_core::tree::FrontierState>>,
     /// When true, a missing `X-Wallet-Token` maps to the "default" wallet (trusted
     /// single-user localhost). Off by default → a token is required on every request.
     allow_default_token: bool,
@@ -3711,10 +3761,14 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // Advance one chunk from `low` (also the cheap tip catch-up once already synced).
     let was_caught_up = e.caught_up;
     e.caught_up = false;
-    // Non-blocking peek: a wallet must never wait on the shared tree to make progress.
-    // For the shared tree's OWN pass this fails (we are holding its lock) and yields 0,
-    // which is exactly right — it then builds its cache like any other wallet.
-    let shared_tree_covers = state.chain_tree.try_lock().map(|c| c.db.size()).unwrap_or(0);
+    // Published, not peeked. A `try_lock` here read 0 nearly always (the shared tree
+    // holds its own lock across a whole chunk) and so disabled borrowing entirely.
+    // The shared tree itself must not borrow from itself, hence the token check.
+    let shared_tree_covers = if token == CHAIN_TREE_TOKEN {
+        0
+    } else {
+        state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed)
+    };
     e.sync_chunk(
         &state.sync_client,
         &state.page_cache,
@@ -3732,12 +3786,20 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     //
     // Re-peeked after the chunk rather than reused from before it: both trees moved.
     if !e.db.tree_is_valid() {
-        let fs = state.chain_tree.try_lock().ok().and_then(|c| c.db.tip_frontier_state());
+        let fs = state.chain_tree_frontier.lock().await.clone();
         if let Some(fs) = fs {
             if e.db.adopt_tip_frontier(&fs) {
                 log::debug!("wallet adopted the shared tree's frontier at {} leaves", fs.size);
             }
         }
+    }
+
+    // The shared tree republishes its reach after its own pass, so every other wallet
+    // sees it without ever touching its lock.
+    if token == CHAIN_TREE_TOKEN {
+        state.chain_tree_size.store(e.db.size(), std::sync::atomic::Ordering::Relaxed);
+        let fs = e.db.tip_frontier_state();
+        *state.chain_tree_frontier.lock().await = fs;
     }
     // Report where scan CPU actually goes, once per SCAN_COST_REPORT_ACTIONS of work.
     //
@@ -6378,6 +6440,8 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         client,
         sync_client,
         chain_tree: chain_tree.clone(),
+        chain_tree_size: std::sync::atomic::AtomicU64::new(0),
+        chain_tree_frontier: Mutex::new(None),
         wallet_dir,
         prefix: prefix_from(&cfg.network),
         network: cfg.network,
@@ -6407,6 +6471,33 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     // `state.chain_tree`, so both views are one object. It is never returned by
     // `get_wallet` (no request can name its token) and never evicted.
     state.wallets.lock().await.insert(CHAIN_TREE_TOKEN.to_string(), chain_tree);
+    // Publish its reach immediately. A checkpoint-resumed tree already covers most of
+    // the chain, and without this every wallet would build its own tree for one whole
+    // pass before the first republish — the slow path, for no reason.
+    {
+        let c = state.chain_tree.lock().await;
+        state.chain_tree_size.store(c.db.size(), std::sync::atomic::Ordering::Relaxed);
+        let fs = c.db.tip_frontier_state();
+        drop(c);
+        *state.chain_tree_frontier.lock().await = fs;
+    }
+
+    // GPU acceleration for trial decryption, on by default when a device is present.
+    // `install_gpu_agree` is a no-op on hosts without one, and every scan then takes the
+    // CPU path — same results, only slower. A device that ever misbehaves poisons itself
+    // and the daemon carries on, so this can make the wallet faster but never wrong.
+    match std::env::var("ZKAS_GPU").as_deref() {
+        Ok("off") | Ok("0") => log::info!("GPU disabled by ZKAS_GPU=off; trial decryption stays on the CPU"),
+        _ => {
+            if let Some(gpu) = zkas_gpu::Gpu::load() {
+                let devices = gpu.devices();
+                kaspa_shielded_core::wallet::install_gpu_agree(Box::new(move |ivk, epks| gpu.batch_agree_points(ivk, epks)));
+                log::info!("GPU trial decryption enabled ({devices} device(s))");
+            } else {
+                log::info!("no GPU found; trial decryption stays on the CPU");
+            }
+        }
+    }
 
     // Index every existing wallet's viewing key in the background (argon2 per
     // encrypted seed file — a blocking thread, not the startup path), then MERGE

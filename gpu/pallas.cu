@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cuda_runtime.h>
+#include <mutex>
 
 #define LIMBS 8
 
@@ -363,33 +364,62 @@ extern "C" int zkas_gpu_device_count() {
     return n;
 }
 
+// Persistent device buffers and one stream, guarded by a mutex.
+//
+// The first version allocated and freed device memory on EVERY call. That is fine when
+// a call carries 100,000 points, and catastrophic when it carries five: `cudaMalloc`
+// alone can cost ~100 us, so the fixed overhead dwarfed the arithmetic. Measured on the
+// live daemon, trial decryption went from 105.6 us/action to ~700 us/action — a 7x
+// REGRESSION — because the wallet ingests one transaction at a time, which is a handful
+// of actions per call.
+//
+// Buffers are therefore allocated once, grown when a bigger batch arrives, and never
+// freed. The mutex costs nothing that matters: there is one device, so concurrent
+// callers would serialise on it regardless.
+static std::mutex g_lock;
+static uint32_t *g_in = nullptr;
+static uint32_t *g_out = nullptr;
+static size_t g_in_cap = 0;   // in bytes
+static size_t g_out_cap = 0;  // in bytes
+
+static bool ensure_capacity(size_t in_bytes, size_t out_bytes) {
+    if (in_bytes > g_in_cap) {
+        if (g_in) cudaFree(g_in);
+        g_in = nullptr;
+        if (cudaMalloc(&g_in, in_bytes) != cudaSuccess) { g_in_cap = 0; return false; }
+        g_in_cap = in_bytes;
+    }
+    if (out_bytes > g_out_cap) {
+        if (g_out) cudaFree(g_out);
+        g_out = nullptr;
+        if (cudaMalloc(&g_out, out_bytes) != cudaSuccess) { g_out_cap = 0; return false; }
+        g_out_cap = out_bytes;
+    }
+    return true;
+}
+
 /// 0 on success, non-zero on any CUDA failure — in which case the caller MUST fall
 /// back to the CPU rather than treat the output buffer as meaningful.
 extern "C" int zkas_gpu_batch_ka(const uint32_t *scalar, int scalar_bits, const uint32_t *in_xy, uint32_t *out_xyz,
                                  int n) {
     if (n <= 0 || scalar_bits <= 0 || scalar_bits > 256) return 1;
-    if (cudaMemcpyToSymbol(SCALAR, scalar, LIMBS * 4) != cudaSuccess) return 2;
-    if (cudaMemcpyToSymbol(SCALAR_BITS, &scalar_bits, sizeof(int)) != cudaSuccess) return 3;
+    std::lock_guard<std::mutex> guard(g_lock);
 
     size_t in_bytes = (size_t)n * 2 * LIMBS * 4;
     size_t out_bytes = (size_t)n * 3 * LIMBS * 4;
-    uint32_t *d_in = nullptr, *d_out = nullptr;
-    int rc = 0;
-    if (cudaMalloc(&d_in, in_bytes) != cudaSuccess) { rc = 4; goto done; }
-    if (cudaMalloc(&d_out, out_bytes) != cudaSuccess) { rc = 5; goto done; }
-    if (cudaMemcpy(d_in, in_xy, in_bytes, cudaMemcpyHostToDevice) != cudaSuccess) { rc = 6; goto done; }
-    {
-        int block = 128;
-        int grid = (n + block - 1) / block;
-        ka_kernel<<<grid, block>>>(d_in, d_out, n);
-    }
-    if (cudaDeviceSynchronize() != cudaSuccess) { rc = 7; goto done; }
-    if (cudaGetLastError() != cudaSuccess) { rc = 8; goto done; }
-    if (cudaMemcpy(out_xyz, d_out, out_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) { rc = 9; goto done; }
-done:
-    if (d_in) cudaFree(d_in);
-    if (d_out) cudaFree(d_out);
-    return rc;
+    if (!ensure_capacity(in_bytes, out_bytes)) return 4;
+
+    if (cudaMemcpyToSymbol(SCALAR, scalar, LIMBS * 4) != cudaSuccess) return 2;
+    if (cudaMemcpyToSymbol(SCALAR_BITS, &scalar_bits, sizeof(int)) != cudaSuccess) return 3;
+    if (cudaMemcpy(g_in, in_xy, in_bytes, cudaMemcpyHostToDevice) != cudaSuccess) return 6;
+
+    int block = 128;
+    int grid = (n + block - 1) / block;
+    ka_kernel<<<grid, block>>>(g_in, g_out, n);
+    if (cudaDeviceSynchronize() != cudaSuccess) return 7;
+    if (cudaGetLastError() != cudaSuccess) return 8;
+    if (cudaMemcpy(out_xyz, g_out, out_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return 9;
+    return 0;
 }
 
 #ifndef ZKAS_GPU_LIB

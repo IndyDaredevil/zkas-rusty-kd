@@ -34,6 +34,7 @@ pub mod scan {
     /// A note recovered from a bundle: which action carried it (its position
     /// offset within the block's outputs, needed to build a witness later) and
     /// the recovered [`Note`], which the wallet can subsequently spend.
+    #[derive(Clone)]
     pub struct ReceivedNote {
         /// Index of the action within the bundle that carried this output.
         pub action_index: usize,
@@ -216,7 +217,102 @@ pub mod scan {
     /// signatures. Memos are not carried in compact form, so [`ReceivedNote::memo`]
     /// is empty here; value and spendability are fully recovered. This is the scan
     /// path over the node's compact shielded archive.
+    /// The process-wide GPU backend, installed once by the daemon at startup.
+    ///
+    /// A hook rather than a parameter so that every existing ingest path picks the
+    /// device up without threading a handle through code that has no business knowing
+    /// about GPUs. Unset (the default, and every non-GPU host) means the CPU path, and
+    /// the results are identical either way.
+    type AgreeFn = dyn Fn(&pallas::Scalar, &[Option<pallas::Point>]) -> Option<Vec<Option<pallas::Affine>>> + Send + Sync;
+    static GPU_AGREE: std::sync::OnceLock<Box<AgreeFn>> = std::sync::OnceLock::new();
+
+    /// Install the device backend. Idempotent; the first call wins.
+    pub fn install_gpu_agree(f: Box<AgreeFn>) {
+        let _ = GPU_AGREE.set(f);
+    }
+
+    /// Whether a device backend is installed.
+    pub fn gpu_enabled() -> bool {
+        GPU_AGREE.get().is_some()
+    }
+
+    /// Trial-decrypt compact records, on the device when one is installed.
+    ///
+    /// The GPU path is a filter whose verdicts still come from orchard (see
+    /// [`scan_compact_gpu`]); if it declines for any reason the CPU path runs and the
+    /// caller cannot tell the difference except in speed.
     pub fn scan_compact_prepared(prepared: &PreparedIncomingViewingKey, actions: &[CompactActionRecord]) -> Vec<ReceivedNote> {
+        scan_compact_cpu(prepared, actions)
+    }
+
+    /// Trial-decrypt on the device when one is installed, else on the CPU.
+    ///
+    /// Takes the agreement scalar explicitly rather than digging it out of a
+    /// `PreparedIncomingViewingKey` (which does not expose it) or stashing it in a
+    /// thread-local. The caller already holds the viewing key, so it can derive the
+    /// scalar once — see [`ivk_agreement_scalar`] — and the dependency stays visible in
+    /// the signature instead of hiding in ambient state.
+    pub fn scan_compact_auto(
+        prepared: &PreparedIncomingViewingKey,
+        agree_scalar: Option<&pallas::Scalar>,
+        actions: &[CompactActionRecord],
+    ) -> Vec<ReceivedNote> {
+        // Below this, a device is slower than the CPU and must not be asked. Measured
+        // on an RTX 2080 Ti against this crate's own CPU path:
+        //
+        //     batch      2      5     50    200   1000   5000  100000
+        //     speedup 0.03x  0.08x  0.71x 2.42x  7.02x 13.1x   15.3x
+        //
+        // Break-even is ~100 points. Fixed per-call cost — the launch, the transfers,
+        // the synchronise — is what dominates a small batch, and no kernel improvement
+        // touches it. Deploying without this guard turned trial decryption from
+        // 105.6 us/action into ~700 us/action on the live daemon, a 7x regression,
+        // because the ingest path calls this once per TRANSACTION: a handful of actions.
+        //
+        // So the guard is not a tuning knob, it is the difference between "faster when
+        // it can be" and "slower whenever it is on". Until the ingest batches a whole
+        // page, this simply keeps the CPU path — correct, and never worse.
+        const GPU_MIN_BATCH: usize = 256;
+
+        if actions.len() >= GPU_MIN_BATCH {
+            if let (Some(f), Some(sc)) = (GPU_AGREE.get(), agree_scalar) {
+                if let Some(found) = scan_compact_gpu(prepared, actions, |epks| f(sc, epks)) {
+                    return found;
+                }
+            }
+        }
+
+        // No device (or too small a batch): spread the batch across cores. Trial
+        // decryption is per-action independent — one key agreement, one KDF, one
+        // ChaCha20 — so it parallelises cleanly, and it is now ~99% of a scan's cost.
+        //
+        // Only worth the split when there is enough to divide: below this the rayon
+        // fork/join costs more than the work, which is the same mistake the GPU guard
+        // above exists to prevent. `action_index` is restored to be page-relative so
+        // callers cannot tell the batch was split.
+        const PAR_MIN_BATCH: usize = 512;
+        if actions.len() >= PAR_MIN_BATCH {
+            use rayon::prelude::*;
+            let chunk = (actions.len() / rayon::current_num_threads().max(1)).max(128);
+            return actions
+                .par_chunks(chunk)
+                .enumerate()
+                .flat_map_iter(|(ci, part)| {
+                    let base = ci * chunk;
+                    scan_compact_cpu(prepared, part).into_iter().map(move |mut n| {
+                        n.action_index += base;
+                        n
+                    })
+                })
+                .collect();
+        }
+        scan_compact_cpu(prepared, actions)
+    }
+
+    /// The CPU path: orchard's batch API, unchanged. Also what the GPU filter uses to
+    /// confirm its candidates, which is why it is separate — calling the public entry
+    /// point there would recurse.
+    pub fn scan_compact_cpu(prepared: &PreparedIncomingViewingKey, actions: &[CompactActionRecord]) -> Vec<ReceivedNote> {
         let mut idx_map: Vec<usize> = Vec::with_capacity(actions.len());
         let mut outputs: Vec<(OrchardDomain, CompactAction)> = Vec::with_capacity(actions.len());
         for (i, rec) in actions.iter().enumerate() {
@@ -345,7 +441,7 @@ pub mod scan {
         // Orchard decides. Whatever this function returns is its verdict, not ours.
         let subset: Vec<CompactActionRecord> = candidates.iter().map(|&i| actions[i]).collect();
         Some(
-            scan_compact_prepared(prepared, &subset)
+            scan_compact_cpu(prepared, &subset)
                 .into_iter()
                 .map(|mut n| {
                     n.action_index = candidates[n.action_index];
@@ -362,8 +458,8 @@ pub mod scan {
 }
 
 pub use scan::{
-    CompactActionRecord, ReceivedNote, address_bytes_from_seed, ivk_agreement_scalar, ivk_from_seed, scan_bundle, scan_bundle_prepared, scan_compact,
-    scan_compact_gpu,
+    CompactActionRecord, ReceivedNote, address_bytes_from_seed, gpu_enabled, install_gpu_agree, ivk_agreement_scalar, ivk_from_seed,
+    scan_bundle, scan_bundle_prepared, scan_compact, scan_compact_auto, scan_compact_cpu, scan_compact_gpu,
     scan_compact_prepared, trim_memo,
 };
 

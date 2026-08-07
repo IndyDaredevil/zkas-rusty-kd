@@ -41,6 +41,9 @@ pasta_curves = "=0.5.1"
 # Shielded-transaction sighash.
 blake2b_simd = { workspace = true }
 chacha20 = "0.9"
+# Trial decryption is ~99% of a scan and is per-action independent, so a page batch
+# is split across cores. Needed by the library now, not only the benches.
+rayon.workspace = true
 # Bridge burn-accumulator hashing. SHA-256 rather than the chain's usual blake2b
 # because the verifier is the Kaspa-side risc0 peg-out guest, whose shared ABI
 # hashes with SHA-256; the two implementations must agree byte-for-byte.

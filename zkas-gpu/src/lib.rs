@@ -223,6 +223,18 @@ impl Gpu {
     }
 }
 
+impl Gpu {
+    /// The shape `shielded-core`'s hook expects: scalar and points in, affine shared
+    /// secrets out, `None` meaning "use the CPU".
+    pub fn batch_agree_points(
+        &self,
+        ivk: &pallas::Scalar,
+        epks: &[Option<pallas::Point>],
+    ) -> Option<Vec<Option<pallas::Affine>>> {
+        self.batch_agree(ivk, epks)
+    }
+}
+
 /// The CPU answer, for the differential check and for hosts with no GPU.
 pub fn cpu_batch_agree(ivk: &pallas::Scalar, epks: &[Option<pallas::Point>]) -> Vec<Option<pallas::Affine>> {
     epks.iter().map(|e| e.map(|p| (p * ivk).to_affine())).collect()

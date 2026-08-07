@@ -27,6 +27,7 @@ kaspa-rpc-core.workspace = true
 # The shielded engine: WalletDb (scan/witness/balance), the real Halo 2 payment
 # builder (circuit feature), coinbase-note reconstruction, and message sign/verify.
 kaspa-shielded-core = { workspace = true, features = ["circuit"] }
+zkas-gpu = { path = "../zkas-gpu" }
 # Canonical shielded-tx shape + its sighash context.
 kaspa-shielded-wallet.workspace = true
 zkas-wallet-engine.workspace = true

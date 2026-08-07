@@ -50,7 +50,7 @@ use crate::bundle::ShieldedBundle;
 use crate::coinbase::{CoinbaseNoteDesc, coinbase_note_commitment};
 use crate::tree::{FrontierState, GlobalTree, TREE_DEPTH};
 use crate::wallet::scan::{
-    CompactActionRecord, ReceivedNote, reconstruct_action, scan_bundle_prepared, scan_compact_prepared, trim_memo,
+    CompactActionRecord, ReceivedNote, reconstruct_action, scan_bundle_prepared, scan_compact_auto, scan_compact_prepared, trim_memo,
 };
 
 /// A note the wallet owns and can spend. The membership witness is **not** held
@@ -300,6 +300,22 @@ pub struct WalletDb {
     /// holder must explicitly accept that before anything is written. Turning it
     /// off purges what was recorded ([`Self::set_history_enabled`]).
     history_enabled: bool,
+    /// Decryption results for the page currently being ingested, keyed by the action's
+    /// nullifier (unique per action).
+    ///
+    /// Trial decryption is now ~99% of a scan's cost, and it was being done one
+    /// TRANSACTION at a time — a handful of actions per call. That is too small to
+    /// parallelise usefully and far below the ~100-point batch a GPU needs to beat the
+    /// CPU at all, so both levers were blocked by the batch size rather than by
+    /// anything hard. Deciding a whole page at once unblocks both.
+    ///
+    /// Only what the page contains, cleared per page. A miss simply falls through to
+    /// the old per-transaction path, so this is a memo and can never change a result.
+    predecrypted: Option<std::collections::HashMap<[u8; 32], Option<ReceivedNote>>>,
+    /// This wallet's key-agreement scalar, derived once so the GPU path does not have
+    /// to re-derive it per page. `None` only if the key could not yield one, in which
+    /// case scanning stays on the CPU.
+    agree_scalar: Option<pasta_curves::pallas::Scalar>,
     /// Skip trial decryption in the ingest path — see [`Self::set_leaves_only`].
     /// Deliberately NOT persisted: it describes what this in-memory copy is for,
     /// not anything about the stream it holds, and a checkpoint written by a
@@ -567,6 +583,7 @@ impl WalletDb {
         let fvk = FullViewingKey::from(&sk);
         let ivk = fvk.to_ivk(Scope::External);
         let prepared_ivk = ivk.prepare();
+        let agree_scalar = crate::wallet::ivk_agreement_scalar(&ivk);
         let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
         let ovk = fvk.to_ovk(Scope::External);
         Some(Self {
@@ -589,6 +606,8 @@ impl WalletDb {
             ovk,
             history: Vec::new(),
             history_enabled: true,
+            agree_scalar,
+            predecrypted: None,
             leaves_only: false,
             borrow_tree: false,
             tree_valid: true,
@@ -611,6 +630,7 @@ impl WalletDb {
         let fvk = FullViewingKey::from_bytes(fvk_bytes)?;
         let ivk = fvk.to_ivk(Scope::External);
         let prepared_ivk = ivk.prepare();
+        let agree_scalar = crate::wallet::ivk_agreement_scalar(&ivk);
         let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
         let ovk = fvk.to_ovk(Scope::External);
         Some(Self {
@@ -633,6 +653,8 @@ impl WalletDb {
             ovk,
             history: Vec::new(),
             history_enabled: true,
+            agree_scalar,
+            predecrypted: None,
             leaves_only: false,
             borrow_tree: false,
             tree_valid: true,
@@ -934,9 +956,30 @@ impl WalletDb {
             // skipping decryption cannot change which bundles append leaves — only
             // whether we notice that one of those leaves is ours. See `set_leaves_only`.
             let t_dec = std::time::Instant::now();
-            let received = if self.leaves_only { Vec::new() } else { scan_compact_prepared(&self.prepared_ivk, records) };
-            self.scan_cost.decrypt_ns += t_dec.elapsed().as_nanos();
-            self.scan_cost.actions += records.len() as u64;
+            let from_memo = self.predecrypted.is_some();
+            let received = if self.leaves_only {
+                Vec::new()
+            } else if let Some(hits) = self.predecrypted.as_ref().filter(|m| records.iter().all(|r| m.contains_key(&r.nullifier))) {
+                // Whole transaction already decided by the page pass.
+                records
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| {
+                        hits.get(&r.nullifier).and_then(|o| o.clone()).map(|mut n| {
+                            n.action_index = i;
+                            n
+                        })
+                    })
+                    .collect()
+            } else {
+                scan_compact_auto(&self.prepared_ivk, self.agree_scalar.as_ref(), records)
+            };
+            // A memo hit did its decryption in `predecrypt_page`, which already charged
+            // for it; charging again here would double-count the same actions.
+            if !from_memo {
+                self.scan_cost.decrypt_ns += t_dec.elapsed().as_nanos();
+                self.scan_cost.actions += records.len() as u64;
+            }
             for (i, rec) in records.iter().enumerate() {
                 self.notes.retain(|n| n.nullifier != rec.nullifier);
                 self.pending_spends.retain(|p| p.note.nullifier != rec.nullifier);
@@ -1689,6 +1732,41 @@ impl WalletDb {
         self.tree = CommitmentTree::from_frontier(t.frontier());
         self.tree_valid = true;
         true
+    }
+
+    /// Trial-decrypt an entire page up front, so the expensive per-action work happens
+    /// once over a large batch instead of once per transaction.
+    ///
+    /// Call immediately before ingesting the page's blocks; the results are consumed by
+    /// [`Self::ingest_block_compact_precomputed_with_meta`] and dropped by
+    /// [`Self::end_page`]. Purely an optimisation: anything not found is decrypted the
+    /// old way, so a bug here can cost time but not notes.
+    pub fn predecrypt_page(&mut self, all: &[CompactActionRecord]) {
+        if self.leaves_only || all.is_empty() {
+            return;
+        }
+        // Count this against the scan's decrypt budget. Moving the work here without
+        // moving the timer made both counters read ~0.1 us/action while the daemon was
+        // doing exactly as much work as before — telemetry that flatters the change it
+        // is supposed to measure is worse than none, and I nearly reported it as a win.
+        let t_dec = std::time::Instant::now();
+        let found = scan_compact_auto(&self.prepared_ivk, self.agree_scalar.as_ref(), all);
+        self.scan_cost.decrypt_ns += t_dec.elapsed().as_nanos();
+        self.scan_cost.actions += all.len() as u64;
+        let mut map: std::collections::HashMap<[u8; 32], Option<ReceivedNote>> =
+            all.iter().map(|r| (r.nullifier, None)).collect();
+        for n in found {
+            if let Some(rec) = all.get(n.action_index) {
+                map.insert(rec.nullifier, Some(n));
+            }
+        }
+        self.predecrypted = Some(map);
+    }
+
+    /// Drop the page memo. Always call after the page's blocks are ingested — a stale
+    /// memo would answer for a later page it never saw.
+    pub fn end_page(&mut self) {
+        self.predecrypted = None;
     }
 
     /// Ingest for the **tree only**, skipping trial decryption.
