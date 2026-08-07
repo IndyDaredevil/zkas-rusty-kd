@@ -794,51 +794,72 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         };
         let sink = session.async_get_sink().await;
         let sink_blue_score = session.async_get_ghostdag_data(sink).await?.blue_score;
-        let mut blocks = Vec::new();
-        if !reorged {
-            for hash in added.iter().take(limit) {
-                if request.metadata_only {
-                    // Do not touch the shielded scan archive at all for cursor
-                    // discovery. Full archive records can contain large compact
-                    // action payloads; birthday walks need only canonical header
-                    // metadata.
-                    let header = session.async_get_header(*hash).await?;
-                    let blue_score = session.async_get_ghostdag_data(*hash).await?.blue_score;
-                    blocks.push(RpcShieldedChainBlock {
-                        hash: *hash,
-                        blue_score,
-                        daa_score: header.daa_score,
-                        coinbase_txid: RpcHash::default(),
-                        coinbase_outputs: Vec::new(),
-                        accepted_actions: Vec::new(),
-                        accepted_txids: Vec::new(),
-                        timestamp: header.timestamp,
-                    });
-                    continue;
-                }
-                let d = session.async_get_shielded_chain_block_data(*hash).await?;
-                let coinbase_outputs = d
-                    .coinbase_outputs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (script_public_key, value))| RpcShieldedCoinbaseOutput {
-                        script_public_key: script_public_key.clone(),
-                        value: *value,
-                        commitment: d.coinbase_commitments.get(i).copied(),
-                    })
-                    .collect();
-                blocks.push(RpcShieldedChainBlock {
-                    hash: d.hash,
-                    blue_score: d.blue_score,
-                    daa_score: d.daa_score,
-                    coinbase_txid: d.coinbase_txid,
-                    coinbase_outputs,
-                    accepted_actions: d.accepted_actions,
-                    accepted_txids: d.accepted_txids,
-                    timestamp: d.timestamp,
-                });
-            }
-        }
+        // ONE `spawn_blocking` for the whole page, not one per block.
+        //
+        // Every `session.async_*` call is `spawn_blocking(...).await` — it queues onto
+        // the blocking pool, wakes a thread, and awaits a oneshot back. Paying that per
+        // block, sequentially, made a 1,000-block page cost ~1.75 SECONDS, of which the
+        // wallet then spent ~55 ms ingesting and ~10 ms decrypting. Measured from the
+        // wallet side, the fetch was 96-99% of sync time; the reads themselves are not
+        // what is slow, the thousand round trips to the pool are.
+        //
+        // The work inside is identical and in the same order — this changes only how
+        // many times the runtime is asked to schedule it.
+        let metadata_only = request.metadata_only;
+        let hashes: Vec<RpcHash> = added.iter().take(limit).copied().collect();
+        let blocks = if reorged {
+            Vec::new()
+        } else {
+            session
+                .clone()
+                .spawn_blocking(move |c| -> kaspa_consensus_core::errors::consensus::ConsensusResult<Vec<RpcShieldedChainBlock>> {
+                    let mut out = Vec::with_capacity(hashes.len());
+                    for hash in hashes {
+                        if metadata_only {
+                            // Do not touch the shielded scan archive at all for cursor
+                            // discovery. Full archive records can contain large compact
+                            // action payloads; birthday walks need only canonical header
+                            // metadata.
+                            let header = c.get_header(hash)?;
+                            let blue_score = c.get_ghostdag_data(hash)?.blue_score;
+                            out.push(RpcShieldedChainBlock {
+                                hash,
+                                blue_score,
+                                daa_score: header.daa_score,
+                                coinbase_txid: RpcHash::default(),
+                                coinbase_outputs: Vec::new(),
+                                accepted_actions: Vec::new(),
+                                accepted_txids: Vec::new(),
+                                timestamp: header.timestamp,
+                            });
+                            continue;
+                        }
+                        let d = c.get_shielded_chain_block_data(hash)?;
+                        let coinbase_outputs = d
+                            .coinbase_outputs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (script_public_key, value))| RpcShieldedCoinbaseOutput {
+                                script_public_key: script_public_key.clone(),
+                                value: *value,
+                                commitment: d.coinbase_commitments.get(i).copied(),
+                            })
+                            .collect();
+                        out.push(RpcShieldedChainBlock {
+                            hash: d.hash,
+                            blue_score: d.blue_score,
+                            daa_score: d.daa_score,
+                            coinbase_txid: d.coinbase_txid,
+                            coinbase_outputs,
+                            accepted_actions: d.accepted_actions,
+                            accepted_txids: d.accepted_txids,
+                            timestamp: d.timestamp,
+                        });
+                    }
+                    Ok(out)
+                })
+                .await?
+        };
         Ok(GetShieldedBlocksResponse { blocks, reorged, sink_blue_score })
     }
 
