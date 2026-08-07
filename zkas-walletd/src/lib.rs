@@ -343,6 +343,64 @@ fn now_unix() -> u64 {
 
 /// A wallet token identifies one browser's wallet. Sanitise it hard: it becomes a
 /// filename, so allow only url-safe token chars and a sane length.
+/// Build the shared chain tree, resuming its persisted checkpoint when there is one.
+///
+/// Deliberately falls back to a genesis start rather than failing: this entry is an
+/// optimization, and a daemon that cannot load it must still serve wallets from their
+/// own trees exactly as before.
+fn chain_tree_from_genesis(genesis: RpcHash) -> WalletEntry {
+    let mut db = WalletDb::from_seed(CHAIN_TREE_SEED).expect("fixed chain-tree seed is a valid spending key");
+    db.set_leaves_only(true);
+    WalletEntry::from_parts(WalletKey::Seed(CHAIN_TREE_SEED), false, db, genesis, genesis, 0, VecDeque::new(), 0)
+}
+
+fn build_chain_tree(dir: &str, genesis: RpcHash) -> Wallet {
+    let key = WalletKey::Seed(CHAIN_TREE_SEED);
+    let entry = match load_checkpoint(dir, CHAIN_TREE_TOKEN, key, &genesis, None) {
+        Some((mut db, low, scanned, boundaries, sink_blue, _blind_below)) => {
+            // The flag is not persisted (it describes what this copy is FOR, not the
+            // stream it holds), so re-arm it on every load or the tree would start
+            // trial-decrypting against a key that matches nothing.
+            db.set_leaves_only(true);
+            log::info!(
+                "shared chain tree resumed from checkpoint: {} leaves, scanned {scanned} blocks",
+                db.size()
+            );
+            WalletEntry::from_parts(key, false, db, genesis, low, scanned, boundaries, sink_blue)
+        }
+        None => {
+            log::info!("shared chain tree starting from genesis — one keyless pass builds the stream every wallet shares");
+            chain_tree_from_genesis(genesis)
+        }
+    };
+    Arc::new(Mutex::new(entry))
+}
+
+/// Token of the daemon-wide **shared chain tree** — one keyless copy of the public
+/// commitment stream that every wallet witnesses against.
+///
+/// ~80% of a wallet scan is building a structure that depends on no viewing key
+/// (measured: 151 µs/leaf of tree against 103 µs/action of trial decryption), plus a
+/// second full Sinsemilla fold to build the subtree cache. Each of those is a pure
+/// function of the chain, so N resident wallets were computing N byte-identical copies
+/// of it — and storing N copies too (the live pool wallet's checkpoint is 133 MB, of
+/// which ~65 MB is leaf stream; its first load took 128 s).
+///
+/// The chain tree is that work, done once. It is an ordinary [`WalletEntry`] holding a
+/// key that matches nothing (`set_leaves_only`), driven by the ordinary sync loop — so
+/// its leaf stream cannot drift from a real wallet's, because it is produced by the
+/// same code path over the same pages. See `WalletDb::set_leaves_only`.
+///
+/// The `.` is deliberate: [`sanitize_token`] accepts only alphanumerics, `-` and `_`,
+/// so **no HTTP request can ever name this token**. That is a property of the parser,
+/// not a blocklist someone can forget to update.
+const CHAIN_TREE_TOKEN: &str = "__chain.tree__";
+
+/// Seed for the chain tree's throwaway key. Its only requirement is that it is not a
+/// key anybody uses: the entry never decrypts (`leaves_only`), never holds a note, and
+/// never spends. Fixed so a restart reloads the same checkpoint.
+const CHAIN_TREE_SEED: [u8; 32] = *b"zkas-shared-chain-tree-v1-notele";
+
 fn sanitize_token(raw: &str) -> Option<String> {
     let t = raw.trim();
     if t.is_empty() || t.len() > 128 {
@@ -2663,6 +2721,11 @@ struct AppState {
     prefix: Prefix,
     network: String,
     wallets: Mutex<HashMap<String, Wallet>>,
+    /// The shared public commitment stream — see [`CHAIN_TREE_TOKEN`]. The SAME `Arc`
+    /// is also in `wallets` under that token, so the ordinary sync loop advances it and
+    /// the ordinary checkpoint path persists it; this handle just saves readers a map
+    /// lookup on the spend path.
+    chain_tree: Wallet,
     /// When true, a missing `X-Wallet-Token` maps to the "default" wallet (trusted
     /// single-user localhost). Off by default → a token is required on every request.
     allow_default_token: bool,
@@ -2887,6 +2950,71 @@ impl Drop for PreparingGuard {
 }
 
 impl AppState {
+    /// Merkle paths for `positions` at `matured`, served from the **shared chain tree**
+    /// instead of the calling wallet's own copy of the stream.
+    ///
+    /// Returns `None` — meaning "use your own tree" — unless the shared tree can answer
+    /// for *every* requested position. A partial answer would send the caller down its
+    /// own O(chain) path anyway, and paying both is worse than paying one.
+    ///
+    /// **Never blocks.** `try_lock`: the chain tree is being advanced by the sync loop
+    /// most of the time, and a send must not queue behind a page ingest. A miss here
+    /// costs the old behaviour, not a stall. This is also what keeps the lock order
+    /// safe — a wallet may reach for the chain tree, the chain tree never reaches for a
+    /// wallet, and neither ever waits.
+    ///
+    /// Correctness does not rest on the two streams agreeing: every path
+    /// `witness_paths_at` returns is verified to root at `matured` before it is handed
+    /// out (`subtree_paths`), so a chain tree that had somehow diverged would return
+    /// `None` and decline, never a wrong witness.
+    fn chain_tree_paths(&self, positions: &[u64], matured: u64) -> Option<Vec<Option<kaspa_shielded_core::MerklePath>>> {
+        let e = self.chain_tree.try_lock().ok()?;
+        if !e.db.is_leaves_only() || e.db.size() < matured {
+            return None;
+        }
+        let paths = e.db.witness_paths_at(positions, matured);
+        paths.iter().all(|p| p.is_some()).then_some(paths)
+    }
+
+    /// Batch Merkle paths for a spend: from the shared chain tree when it can serve
+    /// them, otherwise from the wallet's own stream.
+    ///
+    /// **The differential.** When the shared tree answers AND the wallet's own subtree
+    /// cache is ready, both answers cost O(depth), so we take both and compare. That
+    /// makes every send on an already-warm wallet a live cross-check of the shared
+    /// stream against an independently built one, on production data, through real
+    /// reorgs — the evidence needed before wallets are allowed to stop keeping their own
+    /// tree at all.
+    ///
+    /// It is deliberately gated on `subtree_cache_ready`: the wallet's fallback answer
+    /// is an O(chain) replay, and paying that to check the thing that exists to avoid it
+    /// would defeat the entire change. Cheap to verify, or not verified.
+    ///
+    /// On disagreement we log loudly and return the wallet's OWN paths. A wallet's own
+    /// tree is the incumbent; the shared one has to earn the trust.
+    fn batch_witness_paths(&self, db: &WalletDb, positions: &[u64], matured: u64) -> Vec<Option<kaspa_shielded_core::MerklePath>> {
+        let Some(shared) = self.chain_tree_paths(positions, matured) else {
+            return db.witness_paths_at(positions, matured);
+        };
+        if db.subtree_cache_ready(matured) {
+            let own = db.witness_paths_at(positions, matured);
+            for (i, (a, b)) in shared.iter().zip(own.iter()).enumerate() {
+                let (Some(a), Some(b)) = (a, b) else { continue };
+                if a.position() != b.position() || a.auth_path() != b.auth_path() {
+                    log::error!(
+                        "SHARED TREE DISAGREES with the wallet's own tree at position {} (matured={matured}, note {i} of {}) — \
+                         using the wallet's own path and continuing; the shared stream has diverged and must not be trusted",
+                        positions.get(i).copied().unwrap_or_default(),
+                        positions.len()
+                    );
+                    return own;
+                }
+            }
+            log::debug!("shared tree agreed with the wallet's own tree on {} path(s) at matured={matured}", shared.len());
+        }
+        shared
+    }
+
     /// The wallet's receive address, taken from its view (works for seed and
     /// watch-only wallets alike — both know the address).
     fn address_of(&self, db: &WalletDb) -> String {
@@ -3731,7 +3859,14 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
 async fn evict_idle_wallets(state: &Arc<AppState>) {
     let now = std::time::Instant::now();
     let touches: HashMap<String, std::time::Instant> = state.last_touch.lock().await.clone();
-    let resident: Vec<(String, Wallet)> = { state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect() };
+    // The chain tree is never a victim. It has no `last_touch` (nothing can address it),
+    // so both the idle rule and the LRU-overflow rule would evict it immediately — and
+    // evicting it throws away the one structure every other wallet is about to use,
+    // guaranteeing it is rebuilt from scratch. Filtering it out here is why it needs no
+    // special case in either rule below.
+    let resident: Vec<(String, Wallet)> = {
+        state.wallets.lock().await.iter().filter(|(k, _)| k.as_str() != CHAIN_TREE_TOKEN).map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
     let mut victims: Vec<String> = resident
         .iter()
         .filter(|(t, _)| {
@@ -3828,14 +3963,20 @@ async fn sync_loop(state: Arc<AppState>) {
         // full-scan all of them at once and pin every core.
         let active: HashSet<String> = {
             let now = std::time::Instant::now();
-            state
+            let mut a: HashSet<String> = state
                 .last_touch
                 .lock()
                 .await
                 .iter()
                 .filter(|(_, t)| now.duration_since(**t) < std::time::Duration::from_secs(state.resources.active_sync_secs))
                 .map(|(k, _)| k.clone())
-                .collect()
+                .collect();
+            // The chain tree is never "touched" by a request — nothing can address its
+            // token — so the activity filter would park it forever. It is always active:
+            // it is the one entry whose work every other wallet depends on, and it can
+            // serve nobody it has not already reached.
+            a.insert(CHAIN_TREE_TOKEN.to_string());
+            a
         };
         if !wallet_tokens.is_empty() {
             // Timed out for the same reason as the page fetch: this runs once per pass on
@@ -3910,11 +4051,24 @@ async fn sync_loop(state: Arc<AppState>) {
             }
         }
         if !reorged_tokens.is_empty() {
+            // The chain tree cannot be handled by "remove it and let the next request
+            // reload it" — nothing can request it. Dropping it would leave `wallets`
+            // without it forever, so it would stop advancing, go stale, and silently
+            // decline every wallet from then until a restart. Reset it in place instead
+            // (same `Arc`, so `state.chain_tree` follows) and let it rescan; its
+            // checkpoint has already been retired to .bak by the retire path.
+            if reorged_tokens.iter().any(|t| t == CHAIN_TREE_TOKEN) {
+                log::warn!("shared chain tree hit a reorg it could not follow — resetting it to genesis and rebuilding");
+                *state.chain_tree.lock().await = chain_tree_from_genesis(state.genesis);
+            }
             let mut map = state.wallets.lock().await;
             let mut snaps = state.snapshots.lock().await;
             for t in reorged_tokens {
-                map.remove(&t);
                 snaps.remove(&t);
+                if t == CHAIN_TREE_TOKEN {
+                    continue; // reset above; keep it resident so the sync loop keeps driving it
+                }
+                map.remove(&t);
             }
         }
         // While catching up a big initial scan, loop back immediately (only a
@@ -4834,7 +4988,7 @@ async fn wallet_send(
                     // declines falls back to the exact per-note rebuild — never wrong.
                     let total: usize = plan.iter().map(|(n, _, _)| *n).sum();
                     let all_positions: Vec<u64> = candidates[..total].iter().map(|n| n.position).collect();
-                    let batch_paths = tokio::task::block_in_place(|| e.db.witness_paths_at(&all_positions, matured));
+                    let batch_paths = tokio::task::block_in_place(|| state.batch_witness_paths(&e.db, &all_positions, matured));
                     let mut chunks = Vec::with_capacity(plan.len());
                     let mut idx = 0usize;
                     for (n_notes, pay, cfee) in plan {
@@ -5173,7 +5327,7 @@ async fn wallet_send_many(
 
         // One witness pass for every note across every batch.
         let all_positions: Vec<u64> = candidates[..taken].iter().map(|n| n.position).collect();
-        let paths = tokio::task::block_in_place(|| e.db.witness_paths_at(&all_positions, matured));
+        let paths = tokio::task::block_in_place(|| state.batch_witness_paths(&e.db, &all_positions, matured));
         for (gi, (start, n_notes, fee)) in plan.into_iter().enumerate() {
             let mut inputs = Vec::with_capacity(n_notes);
             let mut positions = Vec::with_capacity(n_notes);
@@ -5357,7 +5511,7 @@ async fn consolidate_once(
         // what makes healing a fragmented treasury feasible — a full 38-note consolidation
         // costs one pass, not 38 × ~26 s. Declined notes fall back to the exact rebuild.
         let cons_positions: Vec<u64> = candidates.iter().map(|n| n.position).collect();
-        let cons_paths = tokio::task::block_in_place(|| e.db.witness_paths_at(&cons_positions, matured));
+        let cons_paths = tokio::task::block_in_place(|| state.batch_witness_paths(&e.db, &cons_positions, matured));
         for (i, n) in candidates.iter().enumerate() {
             let path = match cons_paths[i].clone() {
                 Some(p) => p,
@@ -5644,7 +5798,7 @@ async fn wallet_prepare(
                     let selected_notes: Vec<_> = candidates.iter().take(take).cloned().collect();
                     let positions: Vec<u64> = selected_notes.iter().map(|n| n.position).collect();
                     let t_b = std::time::Instant::now();
-                    let paths = tokio::task::block_in_place(|| e.db.witness_paths_at(&positions, matured));
+                    let paths = tokio::task::block_in_place(|| state.batch_witness_paths(&e.db, &positions, matured));
                     let batched = paths.iter().filter(|p| p.is_some()).count();
                     log::info!(
                         "prepare: batch-witnessed {}/{} notes in {:.1?} (rest rebuild individually)",
@@ -6089,9 +6243,11 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
 
     let resources = cfg.resources.clone();
     log::info!("wallet resource limits: {:?}", resources);
+    let chain_tree = build_chain_tree(&wallet_dir, genesis);
     let state = Arc::new(AppState {
         client,
         sync_client,
+        chain_tree: chain_tree.clone(),
         wallet_dir,
         prefix: prefix_from(&cfg.network),
         network: cfg.network,
@@ -6115,6 +6271,12 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         allow_custodial: cfg.allow_custodial,
         resources,
     });
+
+    // Register the chain tree as an ordinary resident wallet so the ordinary sync loop
+    // advances it and the ordinary checkpoint path persists it. Same `Arc` as
+    // `state.chain_tree`, so both views are one object. It is never returned by
+    // `get_wallet` (no request can name its token) and never evicted.
+    state.wallets.lock().await.insert(CHAIN_TREE_TOKEN.to_string(), chain_tree);
 
     // Index every existing wallet's viewing key in the background (argon2 per
     // encrypted seed file — a blocking thread, not the startup path), then MERGE

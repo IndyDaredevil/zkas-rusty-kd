@@ -2918,6 +2918,65 @@ mod tests {
         }
     }
 
+    /// The shared tree keeps serving correct paths after the *wallet* has compacted its
+    /// own base away.
+    ///
+    /// This is the case the daemon actually runs: the shared tree holds the whole stream
+    /// from position 0 and never compacts, while each wallet rolls its base up to its own
+    /// notes to bound memory. Their `base_size` values therefore diverge immediately, and
+    /// a note's position is absolute in the global stream — so the shared tree resolving
+    /// `position` against ITS base is only correct because both bases are offsets into
+    /// one stream. If that were ever wrong, this test fails and the daemon would be
+    /// handing out witnesses rooted at the wrong subtree.
+    #[test]
+    fn shared_tree_serves_paths_after_the_wallet_compacts_its_base() {
+        let mine = [11u8; 32];
+        let other = [12u8; 32];
+        let nobody = [13u8; 32];
+
+        let mut wallet = WalletDb::from_seed(mine).unwrap();
+        let mut shared = WalletDb::from_seed(nobody).unwrap();
+        shared.set_leaves_only(true);
+
+        // A long prefix of other people's leaves, then ours, then more of theirs — so the
+        // wallet's notes sit well above position 0 and its base can roll a long way.
+        for b in 0..60u32 {
+            let block = vec![coinbase_for(address_of(other), format!("pre-{b}").as_bytes(), 500)];
+            wallet.ingest_block(&block, &[]);
+            shared.ingest_block(&block, &[]);
+        }
+        for b in 0..4u32 {
+            let block = vec![coinbase_for(address_of(mine), format!("ours-{b}").as_bytes(), 9_000 + b as u64)];
+            wallet.ingest_block(&block, &[]);
+            shared.ingest_block(&block, &[]);
+        }
+        for b in 0..60u32 {
+            let block = vec![coinbase_for(address_of(other), format!("post-{b}").as_bytes(), 500)];
+            wallet.ingest_block(&block, &[]);
+            shared.ingest_block(&block, &[]);
+        }
+
+        // The wallet compacts; the shared tree does not.
+        let first_note = wallet.notes().iter().map(|n| n.position).min().unwrap();
+        while wallet.advance_base_capped(first_note, u64::MAX) {}
+        assert!(wallet.base_size() > 0, "wallet actually compacted");
+        assert_eq!(shared.base_size(), 0, "shared tree holds the stream from position 0");
+        assert_ne!(wallet.base_size(), shared.base_size(), "the bases diverge — the case under test");
+
+        let matured = wallet.size();
+        assert_eq!(matured, shared.size(), "same stream length");
+
+        let positions: Vec<u64> = wallet.notes().iter().map(|n| n.position).collect();
+        let from_shared = shared.witness_paths_at(&positions, matured);
+        let from_wallet = wallet.witness_paths_at(&positions, matured);
+        assert!(from_shared.iter().all(|p| p.is_some()), "shared tree served every path despite never compacting");
+        for (i, (a, b)) in from_shared.iter().zip(from_wallet.iter()).enumerate() {
+            let (a, b) = (a.as_ref().unwrap(), b.as_ref().expect("wallet still witnesses its own note"));
+            assert_eq!(a.position(), b.position(), "position differs at note {i}");
+            assert_eq!(a.auth_path(), b.auth_path(), "auth path differs at note {i} across divergent bases");
+        }
+    }
+
     /// A **watch-only** wallet loaded from just the FVK discovers exactly the same
     /// owned notes, positions, balance and tip anchor as the seed wallet — proving the
     /// non-custodial server can sync with no spend authority.
