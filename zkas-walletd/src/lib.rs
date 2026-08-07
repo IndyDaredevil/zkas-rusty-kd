@@ -2993,26 +2993,34 @@ impl AppState {
     /// On disagreement we log loudly and return the wallet's OWN paths. A wallet's own
     /// tree is the incumbent; the shared one has to earn the trust.
     fn batch_witness_paths(&self, db: &WalletDb, positions: &[u64], matured: u64) -> Vec<Option<kaspa_shielded_core::MerklePath>> {
-        let Some(shared) = self.chain_tree_paths(positions, matured) else {
-            return db.witness_paths_at(positions, matured);
-        };
-        if db.subtree_cache_ready(matured) {
-            let own = db.witness_paths_at(positions, matured);
+        // The wallet's OWN paths are what go into a payment. Authoritative, full stop.
+        //
+        // Sends succeeded at 12:21 and 12:24 on 2026-08-07 and failed from 13:30 onward
+        // with `InvalidExternalSignature`; the shared chain tree went live at 12:30. I
+        // have no mechanism linking a Merkle witness to a spend-authorization signature
+        // failure — the witness would fail the PROOF at the node, not the signature —
+        // and the timing may be coincidence. But that is not a thing to be right about
+        // at a user's expense. The shared tree is an optimization; correctness is not.
+        // It stops feeding spends until it is exonerated.
+        //
+        // It still answers alongside and any disagreement is logged, so the production
+        // cross-check keeps running on real data through real reorgs. That evidence is
+        // how it earns its way back onto this path.
+        let own = db.witness_paths_at(positions, matured);
+        if let Some(shared) = self.chain_tree_paths(positions, matured) {
             for (i, (a, b)) in shared.iter().zip(own.iter()).enumerate() {
                 let (Some(a), Some(b)) = (a, b) else { continue };
                 if a.position() != b.position() || a.auth_path() != b.auth_path() {
                     log::error!(
-                        "SHARED TREE DISAGREES with the wallet's own tree at position {} (matured={matured}, note {i} of {}) — \
-                         using the wallet's own path and continuing; the shared stream has diverged and must not be trusted",
+                        "SHARED TREE DISAGREES with the wallet\'s own tree at position {} (matured={matured}, note {i} of {}) \
+                         — the wallet\'s own path was used, as always",
                         positions.get(i).copied().unwrap_or_default(),
                         positions.len()
                     );
-                    return own;
                 }
             }
-            log::debug!("shared tree agreed with the wallet's own tree on {} path(s) at matured={matured}", shared.len());
         }
-        shared
+        own
     }
 
     /// The wallet's receive address, taken from its view (works for seed and
