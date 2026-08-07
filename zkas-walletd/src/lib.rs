@@ -1762,6 +1762,16 @@ struct WalletEntry {
     /// cache is ever rejected or invalidated, without mistaking a genuinely warm wallet
     /// for one that only looked warm.
     warm_via_subtree_cache: bool,
+    /// The `--warm-wallets` slot this wallet is holding **for the duration of its
+    /// subtree-cache build**, not just for one slice.
+    ///
+    /// Acquiring per pass and dropping at the end of it turned the build into
+    /// round-robin starvation: with ~46 resident wallets sharing 4 permits, a 247 s
+    /// build advanced one 2 s slice per turn and needed hours. Live, 17 builds started
+    /// and **zero finished** in 11 minutes, so users kept paying that same 247 s inline
+    /// on their first send. Holding the permit makes it a queue instead — a wallet that
+    /// starts a build finishes it, then hands the slot on.
+    build_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     /// Last logged completion percentage of a sliced subtree-cache build, so progress is
     /// reported once per 10% instead of on every 250 ms slice.
     subtree_build_pct_logged: u64,
@@ -1863,6 +1873,7 @@ impl WalletEntry {
             last_witness_advance: None,
             witnesses_warm: false,
             warm_via_subtree_cache: false,
+            build_permit: None,
             subtree_build_pct_logged: 0,
             scan_cost_reported: 0,
             subtree_low_mem_logged: false,
@@ -1913,7 +1924,7 @@ impl WalletEntry {
         &mut self,
         client: &GrpcClient,
         cache: &Mutex<PageCache>,
-        warm_gate: &tokio::sync::Semaphore,
+        warm_gate: &std::sync::Arc<tokio::sync::Semaphore>,
         subtree_free_floor_mb: u64,
     ) {
         // Set when a small caught-up page comes back FULL: more blocks than it
@@ -2140,6 +2151,12 @@ impl WalletEntry {
         // valid above the base — see `advance_base_capped`), so the two no longer fight.
         // Any note not yet reached still rebuilds on demand in `witness_path_at`, so
         // correctness never depends on this pre-advance.
+        // A wallet that has fallen behind the tip again will not reach the build block
+        // below, so it would sit on its slot without using it. Hand it back now; it
+        // re-queues when it catches up.
+        if !self.caught_up && self.build_permit.is_some() {
+            self.build_permit = None;
+        }
         if self.caught_up {
             if let Some(matured) = self.matured_leaves() {
                 // How many witnesses this wallet maintains. Every step below costs
@@ -2187,12 +2204,23 @@ impl WalletEntry {
                 // The build is bounded instead by the warm gate (`--warm-wallets`),
                 // acquired below and held across it, so a burst of cold wallets can no
                 // longer put one O(chain) sweep per sync slot on the box at once.
-                let needs_cache = span >= SUBTREE_CACHE_MIN_SPAN && !self.db.subtree_cache_ready(matured);
-                // One permit covers BOTH kinds of heavy one-time wallet work. A wallet
-                // that took it to build its cache usually then needs no warm at all.
-                let heavy_permit =
-                    if needs_cache || !self.witnesses_warm { warm_gate.try_acquire().ok() } else { None };
-                if needs_cache && heavy_permit.is_some() && !proving_now() {
+                // `subtree_cache_failed` is checked too: a wallet the cache cannot serve
+                // must not sit on a build slot re-attempting a build that will be
+                // rejected again.
+                let needs_cache = span >= SUBTREE_CACHE_MIN_SPAN
+                    && !self.db.subtree_cache_ready(matured)
+                    && !self.db.subtree_cache_failed();
+                // Take a build slot and KEEP it across passes until the build finishes —
+                // see `build_permit`. Releasing the moment a wallet no longer needs one
+                // hands the slot straight to whoever is queued.
+                if needs_cache {
+                    if self.build_permit.is_none() {
+                        self.build_permit = warm_gate.clone().try_acquire_owned().ok();
+                    }
+                } else if self.build_permit.is_some() {
+                    self.build_permit = None;
+                }
+                if needs_cache && self.build_permit.is_some() && !proving_now() {
                     // Only refuse when the kernel says memory is genuinely tight. A wallet
                     // skipped here is retried on a later pass, so a transient squeeze costs
                     // this wallet one slow send, not its whole session.
@@ -2339,7 +2367,10 @@ impl WalletEntry {
                 // `try_acquire`, not `acquire`: a wallet that can't warm right now should
                 // fall through and keep doing its cheap incremental sync rather than block
                 // a sync slot waiting. Ordinary sync never touches this gate.
-                let warm_permit = if self.witnesses_warm { None } else { heavy_permit };
+                // The warm climb takes its own short-lived permit. It is throttled work,
+                // not a build that must run to completion, so it must not sit on a slot a
+                // queued cache build could use.
+                let warm_permit = if self.witnesses_warm { None } else { warm_gate.try_acquire().ok() };
                 if !self.witnesses_warm && warm_permit.is_some() {
                     // Roll the base up to our notes first (cheap: cost is leaves, not
                     // leaves×budget), then warm the witnesses to the matured anchor.
@@ -2716,7 +2747,7 @@ struct AppState {
     preparing: std::sync::Mutex<HashSet<String>>,
     /// Permits for the one-time cold warm; configured by
     /// [`ResourceLimits::warm_wallets`].
-    warm_gate: tokio::sync::Semaphore,
+    warm_gate: std::sync::Arc<tokio::sync::Semaphore>,
     /// Last known virtual DAA score, refreshed by the sync loop and successful status
     /// calls, so status can answer instantly when the node RPC is momentarily contended.
     node_tip: Mutex<(u64, std::time::Instant)>,
@@ -6050,7 +6081,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         // proving is CPU-heavy, and unbounded overlap is a CPU DoS on a hosted daemon.
         prepare_gate: tokio::sync::Semaphore::new(cfg.max_concurrent_proves.max(1)),
         preparing: std::sync::Mutex::new(HashSet::new()),
-        warm_gate: tokio::sync::Semaphore::new(resources.warm_wallets.max(1)),
+        warm_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(resources.warm_wallets.max(1))),
         node_tip: Mutex::new((0, std::time::Instant::now())),
         prepared: Mutex::new(HashMap::new()),
         snapshots: Mutex::new(HashMap::new()),
