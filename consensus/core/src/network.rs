@@ -164,7 +164,7 @@ impl TryFrom<&NetworkTypeT> for Prefix {
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum NetworkIdError {
-    #[error("Invalid network name prefix: {0}. The expected prefix is 'zkas' (or the legacy 'zkas').")]
+    #[error("Invalid network name prefix: {0}. Expected 'zkas' (also accepted: 'kaspa' for merged-mining upstream nodes, or the legacy 'firecash').")]
     InvalidPrefix(String),
 
     #[error(transparent)]
@@ -283,7 +283,16 @@ impl NetworkId {
     }
 
     pub fn from_prefixed(prefixed: &str) -> Result<Self, NetworkIdError> {
-        if let Some(stripped) = prefixed.strip_prefix("zkas-").or_else(|| prefixed.strip_prefix("firecash-")) {
+        // `kaspa-` accepted read-side for merged mining: bridges/tools talk to
+        // genuine upstream Kaspa nodes whose self-reported network name is
+        // e.g. "kaspa-mainnet" (twin of 7372571, which added the kaspa
+        // ADDRESS prefix but not the network-name prefix). Write-side
+        // identity (to_prefixed, p2p handshake, datadir) remains zkas-.
+        if let Some(stripped) = prefixed
+            .strip_prefix("zkas-")
+            .or_else(|| prefixed.strip_prefix("firecash-"))
+            .or_else(|| prefixed.strip_prefix("kaspa-"))
+        {
             Self::from_str(stripped)
         } else {
             Err(NetworkIdError::InvalidPrefix(prefixed.to_string()))

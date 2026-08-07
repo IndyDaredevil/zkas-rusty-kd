@@ -17,3 +17,8 @@ release
 package-sizes.js
 rustbridge_*.log
 auxtest.log
+
+# work-transfer residue (agent bundle pipeline) and local notes
+*.bundle
+notes-before.json
+notes-after.json

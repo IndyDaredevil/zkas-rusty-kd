@@ -82,6 +82,148 @@ function maintainWorkerOrder(existingWorkers, newWorkers) {
   return sorted;
 }
 
+// c.9: Merged Mining panel. Reads the RAW /api/stats response (not the
+// cache-merged `mergedStats`, which only tracks totalBlocks/blocks) — the
+// new fields are per-request truth, no client-side merge logic needed.
+// Defensive throughout: stats.merged is absent on any instance that never
+// enabled merged mode (old fork, plain RKStratum), so the panel just stays
+// hidden — this function must never throw on a plain-mode dashboard.
+function renderMergedPanel(stats) {
+  const panel = document.querySelector('[data-merged-panel]');
+  if (!panel) return;
+
+  const merged = stats && typeof stats === 'object' ? stats.merged : null;
+  if (!merged || typeof merged !== 'object') {
+    panel.style.display = 'none';
+    return;
+  }
+  panel.style.display = '';
+
+  const kEl = document.getElementById('mergedKasBlocks');
+  const zEl = document.getElementById('mergedZkasBlocks');
+  const dEl = document.getElementById('mergedDoubleBlocks');
+  if (kEl) kEl.textContent = stats.totalBlocks ?? '-'; // totalBlocks IS the K-side count already
+  if (zEl) zEl.textContent = stats.totalZkasBlocks ?? '-';
+  if (dEl) dEl.textContent = stats.totalDoubleBlocks ?? '-';
+
+  const stateLabels = { off: 'OFF', ok: 'OK', stale: 'STALE', plain: 'PLAIN' };
+  const stateColors = {
+    off: 'text-gray-400 border-gray-600',
+    ok: 'text-green-400 border-green-700',
+    stale: 'text-yellow-400 border-yellow-700',
+    plain: 'text-red-400 border-red-700',
+  };
+  const state = String(merged.zkState || 'off').toLowerCase();
+  const badge = document.getElementById('mergedZkStateBadge');
+  if (badge) {
+    badge.textContent = stateLabels[state] || state.toUpperCase();
+    badge.className = `text-xs font-medium px-2 py-1 rounded-full border ${stateColors[state] || stateColors.off}`;
+  }
+
+  const fmt1 = (n) => (Number.isFinite(Number(n)) ? Number(n).toFixed(1) : '-');
+  const ageEl = document.getElementById('mergedZkAge');
+  if (ageEl) ageEl.textContent = `${fmt1(merged.zkAgeSeconds)}s`;
+  const jobsEl = document.getElementById('mergedJobsPerSec');
+  if (jobsEl) jobsEl.textContent = `${fmt1(merged.jobsPerSec)}/s`;
+  const rpcEl = document.getElementById('mergedRpc');
+  if (rpcEl) {
+    const k = Number(merged.kasRpcMs) > 0 ? `${fmt1(merged.kasRpcMs)}ms` : '-';
+    const z = Number(merged.zkasRpcMs) > 0 ? `${fmt1(merged.zkasRpcMs)}ms` : '-';
+    rpcEl.textContent = `${k} / ${z}`;
+  }
+  const subEl = document.getElementById('mergedSubmit');
+  if (subEl) subEl.textContent = `${fmt1(merged.submitAvgMs)}ms / ${fmt1(merged.submitMaxMs)}ms`;
+
+  // c.12: real network/share difficulty ratios put "close" shares in the
+  // ~1e-9 % range — scientific notation is required, not stylistic; fixed
+  // decimal would show 0.0% for the entire session.
+  const fmtNear = (pct) => (Number(pct) > 0 ? `${Number(pct).toExponential(2)}%` : '-');
+  const nearKEl = document.getElementById('mergedNearMissKas');
+  if (nearKEl) nearKEl.textContent = fmtNear(merged.kasNearMissPct);
+  const nearZEl = document.getElementById('mergedNearMissZkas');
+  if (nearZEl) nearZEl.textContent = fmtNear(merged.zkasNearMissPct);
+
+  renderMergedRecentBlocks(stats);
+}
+
+// c.10: merges stats.blocks (K) / stats.zkasBlocks (Z) / stats.doubleBlocks
+// (D) into one chain-tagged, timestamp-sorted table. Reuses the exact same
+// formatting helpers as the main Recent Blocks table (formatUnixSeconds,
+// shortHash, escapeHtmlAttr, displayWorkerName) for visual consistency.
+function renderMergedRecentBlocks(stats) {
+  const body = document.getElementById('mergedRecentBlocksBody');
+  if (!body) return;
+
+  const chainBadge = { K: 'bg-blue-900/40 text-blue-300', Z: 'bg-purple-900/40 text-purple-300', D: 'bg-yellow-900/40 text-yellow-300' };
+
+  // Solve-based accounting: one SOLVE (one winning nonce) = one row, even
+  // when it lands on both chains. A dual is 1 nonce -> 2 chain blocks with
+  // 2 DIFFERENT hashes (parent hash on KAS; H_fc on ZKAS -- the aux rides
+  // outside the header hash), so a dual row carries both. The doubleBlocks
+  // feed is used as a marker set, never as rows: concatenating K+Z+D would
+  // triple-display every dual (the bug this replaces).
+  const arr = (x) => (Array.isArray(x) ? x : []);
+  const byNonce = (items) => { const m = new Map(); for (const b of items) if (b && b.nonce) m.set(String(b.nonce), b); return m; };
+  const kBy = byNonce(arr(stats?.blocks));
+  const zBy = byNonce(arr(stats?.zkasBlocks));
+  const dSet = new Set(arr(stats?.doubleBlocks).map((b) => String(b?.nonce)));
+  // item-2: double feed may carry the lossless "kasHash|zkasHash" pair
+  const dPair = new Map(arr(stats?.doubleBlocks).map((b) => {
+    const parts = String(b?.hash || '').split('|');
+    return [String(b?.nonce), parts.length === 2 ? parts : null];
+  }));
+  const solveRows = [];
+  const seen = new Set();
+  for (const [nonce, k] of kBy) {
+    seen.add(nonce);
+    const z = zBy.get(nonce);
+    if (z || dSet.has(nonce)) {
+      const pair = dPair.get(nonce);
+      solveRows.push({ ...k, __chain: 'D', __kasHash: (pair && pair[0]) || k.hash || '', __zkasHash: (pair && pair[1]) || (z && z.hash) || '', __zkasBluescore: (z && z.bluescore) || '' });
+    } else {
+      solveRows.push({ ...k, __chain: 'K' });
+    }
+  }
+  for (const [nonce, z] of zBy) {
+    if (seen.has(nonce)) continue;
+    // zkas-only clear (or dual whose K row hasn't landed yet -- it upgrades
+    // to D on the next refresh once both feeds carry the nonce)
+    solveRows.push({ ...z, __chain: dSet.has(nonce) ? 'D' : 'Z', __kasHash: '', __zkasHash: z.hash || '' });
+  }
+  const merged = solveRows
+    .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0))
+    .slice(0, 25); // recent-first, cap for a status panel
+
+  if (!merged.length) {
+    body.innerHTML = `<tr><td colspan="5" class="py-3 text-gray-500 text-center">No merged blocks yet this session</td></tr>`;
+    return;
+  }
+
+  body.innerHTML = '';
+  for (const b of merged) {
+    const sh = (h) => (typeof shortHash === 'function' ? shortHash(h) : String(h || '').slice(0, 16));
+    const isDual = b.__chain === 'D';
+    const hashFull = isDual
+      ? `KAS ${b.__kasHash || '-'} | ZKAS ${b.__zkasHash || '-'}`
+      : (b.hash || '');
+    const esc = (x) => (typeof escapeHtmlAttr === 'function' ? escapeHtmlAttr(String(x ?? '')) : String(x ?? ''));
+    const hashShort = isDual
+      ? `<span class="text-blue-300">K:</span>${esc(sh(b.__kasHash))} <span class="text-purple-300">Z:</span>${esc(sh(b.__zkasHash))}`
+      : esc(sh(hashFull));
+    const workerDisplay = typeof displayWorkerName === 'function' ? displayWorkerName(b.worker) : (b.worker || '-');
+    const tr = document.createElement('tr');
+    tr.className = 'border-b border-card/50';
+    tr.innerHTML = `
+      <td class="py-1.5 pr-3" title="${b.timestamp || ''}">${formatUnixSeconds(b.timestamp)}</td>
+      <td class="py-1.5 pr-3"><span class="text-xs font-medium px-2 py-0.5 rounded ${chainBadge[b.__chain] || ''}">${b.__chain}</span></td>
+      <td class="py-1.5 pr-3" title="${escapeHtmlAttr(workerDisplay)}">${escapeHtmlAttr(workerDisplay)}</td>
+      <td class="py-1.5 pr-3" title="${escapeHtmlAttr(b.bluescore || '')}">${b.bluescore || '-'}</td>
+      <td class="py-1.5 pr-3 font-mono min-w-0 truncate" title="${escapeHtmlAttr(hashFull)}">${hashShort}</td>
+    `;
+    body.appendChild(tr);
+  }
+}
+
 function formatHashrateHs(hs) {
   if (!hs || !Number.isFinite(hs)) return '-';
   const units = ['H/s','kH/s','MH/s','GH/s','TH/s','PH/s','EH/s'];
@@ -533,6 +675,16 @@ function setLastUpdated(updatedMs, isCached) {
 }
 
 function displayTotalBlocksFromStats(stats) {
+  // Solve-based when merged fields exist: solves = KAS + ZKAS - doubles
+  // (a dual is one solve landing on both chains; summing chain-blocks
+  // would double-count it). Falls through to legacy totalBlocks when the
+  // merged counters are absent (plain RKStratum instance).
+  const tz = Number(stats?.totalZkasBlocks);
+  const td = Number(stats?.totalDoubleBlocks);
+  const tk = Number(stats?.totalBlocks ?? stats?.total_blocks ?? stats?.totalblocks);
+  if (Number.isFinite(tk) && Number.isFinite(tz) && Number.isFinite(td) && (tz > 0 || td > 0)) {
+    return tk + tz - td;
+  }
   const n = Number(stats?.totalBlocks ?? stats?.total_blocks ?? stats?.totalblocks);
   const blocksCount = Array.isArray(stats?.blocks) ? stats.blocks.length : 0;
   const candidates = [];
@@ -801,6 +953,7 @@ async function refresh() {
 
     document.getElementById('totalBlocks').textContent = mergedStats.totalBlocks;
     document.getElementById('totalShares').textContent = mergedStats.totalShares;
+    renderMergedPanel(stats); // c.9
     document.getElementById('activeWorkers').textContent = mergedStats.activeWorkers;
     
     // Calculate and display total worker hashrate

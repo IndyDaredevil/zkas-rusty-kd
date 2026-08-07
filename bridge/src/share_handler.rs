@@ -129,6 +129,10 @@ pub fn set_rkstratum_cpu_miner_metrics(metrics: Arc<InternalMinerMetrics>) {
 #[derive(Clone)]
 pub struct WorkStats {
     pub blocks_found: Arc<Mutex<i64>>,
+    // c.7: merged legs. blocks_found = K (blue-confirmed). zkas = Z
+    // (blue-confirmed, symmetric). double = D (both legs blue).
+    pub zkas_blocks_found: Arc<Mutex<i64>>,
+    pub double_blocks_found: Arc<Mutex<i64>>,
     pub shares_found: Arc<Mutex<i64>>,
     pub shares_diff: Arc<Mutex<f64>>,
     pub stale_shares: Arc<Mutex<i64>>,
@@ -146,6 +150,8 @@ impl WorkStats {
     pub fn new(worker_name: String) -> Self {
         Self {
             blocks_found: Arc::new(Mutex::new(0)),
+            zkas_blocks_found: Arc::new(Mutex::new(0)),
+            double_blocks_found: Arc::new(Mutex::new(0)),
             shares_found: Arc::new(Mutex::new(0)),
             shares_diff: Arc::new(Mutex::new(0.0)),
             stale_shares: Arc::new(Mutex::new(0)),
@@ -316,6 +322,7 @@ impl ShareHandler {
         event: JsonRpcEvent,
         kaspa_api: Arc<dyn KaspaApiTrait + Send + Sync>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _c7_submit_timer = crate::merged_obs::SubmitTimer::start(); // records on every exit path
         let prefix = self.log_prefix();
         debug!("{} [SUBMIT] ===== SHARE SUBMISSION FROM {} =====", prefix, ctx.remote_addr);
         debug!("{} [SUBMIT] Event ID: {:?}", prefix, event.id);
@@ -650,6 +657,37 @@ impl ShareHandler {
                 } else {
                     0.0
                 };
+                // c.12: near-miss tracking — session-best only, real diff
+                // ratios make per-share threshold logging pointless (see
+                // merged_obs.rs's near-miss doc comment for the math).
+                if crate::merged_obs::MERGED_OBS.record_near_miss_kas(ratio) {
+                    info!(
+                        "{} {}",
+                        LogColors::block("[NEAR-MISS]"),
+                        format!("New KAS session-best: {:.2e}% of target (worker {})", ratio, ctx.effective_worker_name())
+                    );
+                    // c.14: at expected magnitudes (diff-thousands vs
+                    // d~1e16) any ratio above ~1e-6% is already far
+                    // beyond plausible luck -- capture raw hex forensics
+                    // the moment that line is crossed; the observed ~63%
+                    // readings can only be re-diagnosed from the bytes.
+                    if ratio > 1e-6 {
+                        warn!(
+                            "{} {}",
+                            LogColors::block("[NEAR-MISS-FORENSIC]"),
+                            format!(
+                                "IMPLAUSIBLE ratio {:.2e}% -- worker={} job_id={} pow_value=0x{:x} network_target=0x{:x} header.bits=0x{:08x} header.timestamp={}",
+                                ratio,
+                                ctx.effective_worker_name(),
+                                current_job_id,
+                                pow_value,
+                                network_target,
+                                header_clone.bits,
+                                header_clone.timestamp
+                            )
+                        );
+                    }
+                }
                 debug!(
                     "{} {} {}",
                     LogColors::validation("[VALIDATION]"),
@@ -665,7 +703,55 @@ impl ShareHandler {
             // Go code compares: powValue.Cmp(&powState.Target) <= 0 where Target is network target from header.bits
             // We calculate network_target directly from current job's header.bits (not from stored state)
             // This ensures we use the correct target for each job, as different jobs may have different header.bits
-            if meets_network_target {
+            // MERGED (KAS-primary): the block gate is EITHER chain's target.
+            // A committed job carries the ZKas (easier) target via the stash;
+            // parent bits remain the KAS gate. Plain jobs: zkas_target is
+            // None and behavior is byte-identical to single-chain RKStratum.
+            let zkas_target = kaspa_api.merged_fc_target(&current_job.block);
+            let clears_zkas = zkas_target.as_ref().is_some_and(|t| pow_value <= *t);
+            // c.12: zKAS-leg near-miss — this target had ZERO near-miss
+            // visibility before c.12 (K's ratio math existed, Z's never
+            // did). Same session-best-only design, same reasoning.
+            if let Some(zt) = zkas_target.as_ref()
+                && !zt.is_zero()
+                && !pow_value.is_zero()
+            {
+                let target_f64 = zt.to_f64().unwrap_or(0.0);
+                let pow_f64 = pow_value.to_f64().unwrap_or(1.0);
+                let zkas_ratio = if pow_f64 > 0.0 { (target_f64 / pow_f64) * 100.0 } else { 0.0 };
+                if crate::merged_obs::MERGED_OBS.record_near_miss_zkas(zkas_ratio) {
+                    info!(
+                        "{} {}",
+                        LogColors::block("[NEAR-MISS]"),
+                        format!(
+                            "New ZKAS session-best: {:.2e}% of target (worker {})",
+                            zkas_ratio,
+                            ctx.effective_worker_name()
+                        )
+                    );
+                    // c.14: same forensic capture as the KAS leg above.
+                    if zkas_ratio > 1e-6 {
+                        warn!(
+                            "{} {}",
+                            LogColors::block("[NEAR-MISS-FORENSIC]"),
+                            format!(
+                                "IMPLAUSIBLE zkas ratio {:.2e}% -- worker={} job_id={} pow_value=0x{:x} zkas_target=0x{:x} header.bits=0x{:08x} header.timestamp={}",
+                                zkas_ratio,
+                                ctx.effective_worker_name(),
+                                current_job_id,
+                                pow_value,
+                                zt,
+                                current_job.block.header.bits,
+                                current_job.block.header.timestamp
+                            )
+                        );
+                    }
+                }
+            }
+            if meets_network_target || clears_zkas {
+                // c.7 hook D: per-share double correlator, cloned into both
+                // settlement arms; increments D exactly once (both legs blue).
+                let c7_outcome = Arc::new(crate::merged_obs::ShareOutcome::new());
                 let wallet_addr = ctx.wallet_addr.lock().clone();
                 let worker_name = ctx.effective_worker_name();
                 let prefix = self.log_prefix();
@@ -787,6 +873,133 @@ impl ShareHandler {
                     format!("{}:{}", ctx.remote_addr(), ctx.remote_port())
                 );
                 debug!("{} {} {}", LogColors::block("[BLOCK]"), LogColors::label("Block Hash:"), block_hash);
+                // ZKAS settlement (merged jobs) — dispatched FIRST as a spawned
+                // task because the Kaspa arms below break/return. The Kaspa
+                // submission is never gated by the claim outcome (invariants
+                // 4/5/6): a duplicate H_fc claim is still a distinct,
+                // reward-bearing Kaspa candidate.
+                if clears_zkas {
+                    if kaspa_api.claim_network_solution(&block) {
+                        if let Some(h_fc) = crate::merged::committed_h_fc(&block) {
+                            match kaspa_api.pending_zkas_block(&h_fc) {
+                                Some(fc_block) => {
+                                    let aux = crate::merged::assemble_aux_block(&block, &fc_block);
+                                    let prefix_z = self.log_prefix();
+                                    info!(
+                                        "{} {} {}",
+                                        prefix_z,
+                                        LogColors::block("[ZKAS]"),
+                                        LogColors::block(&format!(
+                                            "ZKAS BLOCK FOUND! H_fc: {}, Worker: {}, full_clear: {}",
+                                            h_fc, worker_name, meets_network_target
+                                        ))
+                                    );
+                                    let kaspa_api_z = Arc::clone(&kaspa_api);
+                                    // c.7 hook E: handles for the blue-confirm task
+                                    let stats_z = self.get_create_stats(&ctx);
+                                    let overall_z = self.overall.clone();
+                                    let instance_z = self.instance_id.clone();
+                                    let prom_worker_z = self.worker_prom_context(&ctx, "");
+                                    let outcome_z = Arc::clone(&c7_outcome);
+                                    let nonce_z = nonce_val; // c.10 — Copy, cheap capture
+                                    let blue_score_z = blue_score; // c.10
+                                    tokio::spawn(async move {
+                                        match kaspa_api_z.submit_zkas_block(aux).await {
+                                            Ok(resp) if resp.report.is_success() => {
+                                                info!(
+                                                    "{} {}",
+                                                    LogColors::block("[ZKAS]"),
+                                                    LogColors::block(&format!("ZKAS BLOCK ACCEPTED BY NODE! H_fc: {}", h_fc))
+                                                );
+                                                // c.7 hook E: Z counts only on blue-confirm
+                                                // (K symmetry). The aux rides outside the header
+                                                // hash, so H_fc IS the chain hash to color-check.
+                                                let zkas_hash = h_fc.to_string();
+                                                for _ in 0..BLOCK_CONFIRM_MAX_ATTEMPTS {
+                                                    match kaspa_api_z.get_zkas_block_color(&zkas_hash).await {
+                                                        Ok(true) => {
+                                                            *stats_z.zkas_blocks_found.lock() += 1;
+                                                            *overall_z.zkas_blocks_found.lock() += 1;
+                                                            crate::merged_obs::MERGED_OBS.record_zkas_block();
+                                                            crate::prom::record_zkas_block_found(&prom_worker_z); // c.8
+                                                            crate::prom::record_zkas_block_found_event(
+                                                                &prom_worker_z, nonce_z, blue_score_z, zkas_hash.clone(),
+                                                            ); // c.10
+                                                            if outcome_z.record_zkas_accept(&zkas_hash) {
+                                                                *stats_z.double_blocks_found.lock() += 1;
+                                                                *overall_z.double_blocks_found.lock() += 1;
+                                                                crate::merged_obs::MERGED_OBS.record_double_block();
+                                                                crate::prom::record_double_block_found(&prom_worker_z); // c.8
+                                                                let (dk, dz) = outcome_z.hashes();
+                                                                crate::prom::record_double_block_found_event(
+                                                                    &prom_worker_z, nonce_z, blue_score_z, dk, dz,
+                                                                ); // c.10 + item-2: both hashes
+                                                                info!(
+                                                                    "[{}] {} {}",
+                                                                    instance_z,
+                                                                    LogColors::block("[ZKAS]"),
+                                                                    LogColors::block(&format!("DOUBLE! Both legs blue. H_fc: {}", zkas_hash))
+                                                                );
+                                                            }
+                                                            info!(
+                                                                "[{}] {} {}",
+                                                                instance_z,
+                                                                LogColors::block("[ZKAS]"),
+                                                                LogColors::block(&format!("ZKas block confirmed BLUE! H_fc: {}", zkas_hash))
+                                                            );
+                                                            return;
+                                                        }
+                                                        _ => tokio::time::sleep(BLOCK_CONFIRM_RETRY_DELAY).await,
+                                                    }
+                                                }
+                                                crate::prom::record_zkas_block_not_confirmed_blue(&prom_worker_z); // c.8 (was mistagged as K)
+                                                warn!(
+                                                    "[{}] {} {}",
+                                                    instance_z,
+                                                    LogColors::block("[ZKAS]"),
+                                                    LogColors::label(&format!(
+                                                        "ZKas block not confirmed blue after {} attempts (not counted): {}",
+                                                        BLOCK_CONFIRM_MAX_ATTEMPTS, zkas_hash
+                                                    ))
+                                                );
+                                            }
+                                            Ok(resp) => {
+                                                error!(
+                                                    "{} {} {:?}",
+                                                    LogColors::block("[ZKAS]"),
+                                                    LogColors::error("ZKAS BLOCK REJECTED:"),
+                                                    resp.report
+                                                );
+                                            }
+                                            Err(e) => {
+                                                error!(
+                                                    "{} {} {}",
+                                                    LogColors::block("[ZKAS]"),
+                                                    LogColors::error("ZKAS submit failed:"),
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    });
+                                }
+                                None => {
+                                    warn!(
+                                        "{} merged stash missing for H_fc {} (evicted?); zkas settlement skipped",
+                                        LogColors::block("[ZKAS]"),
+                                        h_fc
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        debug!("[ZKAS] duplicate solution for already-claimed H_fc; kaspa-only settlement");
+                    }
+                }
+
+                // KAS settlement: only when the parent's own (Kaspa) target is
+                // met. A zkas-only clear must never reach the Kaspa node — it
+                // would be rejected as low-pow and miscounted as invalid.
+                if meets_network_target {
                 debug!("{} {}", LogColors::block("[BLOCK]"), "Calling kaspa_api.submit_block()...");
 
                 // Submit block to node
@@ -840,6 +1053,7 @@ impl ShareHandler {
 
                         let kaspa_api = Arc::clone(&kaspa_api);
                         let block_hash_for_confirm = block_hash.clone();
+                        let outcome_k = Arc::clone(&c7_outcome); // c.7 hook F
 
                         tokio::spawn(async move {
                             for _ in 0..BLOCK_CONFIRM_MAX_ATTEMPTS {
@@ -847,6 +1061,23 @@ impl ShareHandler {
                                     Ok(true) => {
                                         *stats.blocks_found.lock() += 1;
                                         *overall.blocks_found.lock() += 1;
+                                        // c.7 hook F: double = both legs blue
+                                        if outcome_k.record_kas_accept(&block_hash_for_confirm) {
+                                            *stats.double_blocks_found.lock() += 1;
+                                            *overall.double_blocks_found.lock() += 1;
+                                            crate::merged_obs::MERGED_OBS.record_double_block();
+                                            crate::prom::record_double_block_found(&prom_worker); // c.8
+                                            let (dk, dz) = outcome_k.hashes();
+                                            crate::prom::record_double_block_found_event(
+                                                &prom_worker, nonce_val, blue_score, dk, dz,
+                                            ); // c.10 + item-2: both hashes
+                                            info!(
+                                                "[{}] {} {}",
+                                                instance_id,
+                                                LogColors::block("[BLOCK]"),
+                                                LogColors::block(&format!("DOUBLE! Both legs blue. Parent: {}", block_hash_for_confirm))
+                                            );
+                                        }
                                         record_block_found(&prom_worker, nonce_val, blue_score, block_hash_for_confirm.clone());
                                         info!(
                                             "[{}] {} {}",
@@ -953,6 +1184,7 @@ impl ShareHandler {
                         }
                     }
                 }
+                } // if meets_network_target (KAS settlement)
             }
 
             // Check pool difficulty
@@ -1250,8 +1482,8 @@ impl ShareHandler {
             const SPM_W: usize = 11;
             const TRND_W: usize = 4;
             const ACC_W: usize = 12;
-            const BLK_W: usize = 6;
-            const TBLK_W: usize = 6;
+            const BLK_W: usize = 8; // c.7: K/Z/D
+            const TBLK_W: usize = 8; // c.7: K/Z/D
             const TIME_W: usize = 11;
 
             fn border() -> String {
@@ -1278,6 +1510,7 @@ impl ShareHandler {
             }
 
             let mut interval = tokio::time::interval(STATS_PRINT_INTERVAL);
+            let mut last_obs_tick = Instant::now(); // c.7 window clock
             // Internal miner hashrate is based on hashes/sec (not Stratum shares), so we keep a
             // last-sample snapshot to compute a stable, accurate rate (matching the dashboard).
             #[cfg(feature = "rkstratum_cpu_miner")]
@@ -1323,7 +1556,11 @@ impl ShareHandler {
                 let mut total_stales: i64 = 0;
                 let mut total_invalids: i64 = 0;
                 let mut total_blocks: i64 = 0;
+                let mut total_zkas_blocks: i64 = 0;
+                let mut total_double_blocks: i64 = 0;
                 let mut total_blocks_all_time: i64 = 0;
+                let mut total_zkas_all_time: i64 = 0;
+                let mut total_double_all_time: i64 = 0;
 
                 let now = Instant::now();
                 let start = entries.iter().map(|(_, _, start, _, _)| *start).max_by_key(|t| t.elapsed()).unwrap_or_else(Instant::now);
@@ -1341,6 +1578,8 @@ impl ShareHandler {
                     // overall.blocks_found includes blocks from all workers (even pruned ones)
                     // Accumulate for the "Total" column (all-time blocks)
                     total_blocks_all_time += *overall.blocks_found.lock();
+                    total_zkas_all_time += *overall.zkas_blocks_found.lock();
+                    total_double_all_time += *overall.double_blocks_found.lock();
 
                     let stats_map = stats.lock();
                     for v in stats_map.values() {
@@ -1357,10 +1596,14 @@ impl ShareHandler {
                         let stales = *v.stale_shares.lock();
                         let invalids = *v.invalid_shares.lock();
                         let blocks = *v.blocks_found.lock();
+                        let zk_blocks = *v.zkas_blocks_found.lock();
+                        let dbl_blocks = *v.double_blocks_found.lock();
                         let min_diff = *v.min_diff.lock();
 
                         // Sum blocks from individual workers for "Blocks" column (online workers only)
                         total_blocks += blocks;
+                        total_zkas_blocks += zk_blocks;
+                        total_double_blocks += dbl_blocks;
 
                         let spm = if elapsed > 0.0 { (shares as f64) / (elapsed / 60.0) } else { 0.0 };
                         total_worker_spm += spm;
@@ -1387,8 +1630,8 @@ impl ShareHandler {
                             spm_tgt,
                             trend,
                             format!("{}/{}/{}", shares, stales, invalids),
-                            blocks,
-                            blocks, // Total blocks (same as Blocks for active workers)
+                            crate::merged_obs::format_kzd(blocks, zk_blocks, dbl_blocks),
+                            crate::merged_obs::format_kzd(blocks, zk_blocks, dbl_blocks), // Total (= Blocks for active workers)
                             format_uptime(v.start_time.elapsed())
                         );
                         let sort_key = format!("{}:{}", inst_short, worker);
@@ -1446,9 +1689,28 @@ impl ShareHandler {
                     }
                 };
 
+                // c.7 observability suffix
+                let obs_elapsed = last_obs_tick.elapsed().as_secs_f64();
+                last_obs_tick = Instant::now();
+                // c.8: single drain per tick — snapshot() feeds BOTH the
+                // console suffix and Prometheus, so the two can never
+                // disagree and neither starves the other of window data.
+                let obs_snap = crate::merged_obs::MERGED_OBS.snapshot(crate::merged_obs::epoch_ms(), obs_elapsed);
+                crate::prom::record_merged_observability(
+                    obs_snap.zk_state,
+                    obs_snap.zk_age_secs,
+                    obs_snap.jobs_per_sec,
+                    obs_snap.kas_rpc_ms,
+                    obs_snap.zkas_rpc_ms,
+                    obs_snap.submit_avg_ms,
+                    obs_snap.submit_max_ms,
+                    obs_snap.kas_near_miss_pct, // c.12
+                    obs_snap.zkas_near_miss_pct, // c.12
+                );
+                let obs_suffix = crate::merged_obs::format_obs_suffix(&obs_snap);
                 out.push(format!(
-                    "[NODE] {}|{} | n={} | v={} | p={} | vd={} | blk={}/{} | d={} | mp={} | tip={}",
-                    conn_str, sync_str, net_short, ver, peers, vdaa, blocks, headers, diff, mempool, tip_short
+                    "[NODE] {}|{} | n={} | v={} | p={} | vd={} | blk={}/{} | d={} | mp={} | tip={} | {}",
+                    conn_str, sync_str, net_short, ver, peers, vdaa, blocks, headers, diff, mempool, tip_short, obs_suffix
                 ));
 
                 out.push(top.clone());
@@ -1538,8 +1800,8 @@ impl ShareHandler {
                     total_spm_tgt,
                     "-",
                     format!("{}/{}/{}", total_shares, total_stales, total_invalids),
-                    total_blocks,        // Blocks from online workers only
-                    total_blocks_all_time, // Total blocks from all workers (including offline)
+                    crate::merged_obs::format_kzd(total_blocks, total_zkas_blocks, total_double_blocks), // online workers
+                    crate::merged_obs::format_kzd(total_blocks_all_time, total_zkas_all_time, total_double_all_time), // all workers
                     format_uptime(now.duration_since(start))
                 ));
 
@@ -1667,6 +1929,31 @@ pub trait KaspaApiTrait: Send + Sync {
     ) -> Result<Vec<(String, u64)>, Box<dyn std::error::Error + Send + Sync>>;
 
     async fn get_current_block_color(&self, block_hash: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+
+    // ---- Merged mining (KAS-primary enhancement). Defaults are the plain
+    // single-chain behavior so mocks and non-merged implementations need no
+    // changes: no zkas target, every claim trivially "first", no stash.
+    fn merged_fc_target(&self, _parent_block: &Block) -> Option<num_bigint::BigUint> {
+        None
+    }
+    fn claim_network_solution(&self, _job_block: &Block) -> bool {
+        true
+    }
+    fn pending_zkas_block(&self, _h_fc: &kaspa_hashes::Hash) -> Option<Block> {
+        None
+    }
+    async fn submit_zkas_block(
+        &self,
+        _block: Block,
+    ) -> Result<kaspa_rpc_core::SubmitBlockResponse, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::other("merged mining not supported by this KaspaApi implementation")))
+    }
+    /// c.7: zkas-side color query for Z=blue-confirmed. Default errors —
+    /// mocks never reach hook E's loop (it runs only after a successful
+    /// zkas submit, which the default submit_zkas_block above precludes).
+    async fn get_zkas_block_color(&self, _block_hash: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::other("merged mining not supported by this KaspaApi implementation")))
+    }
 }
 
 #[cfg(test)]

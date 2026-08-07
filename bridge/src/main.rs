@@ -290,11 +290,38 @@ async fn main() -> Result<(), anyhow::Error> {
         health_check::spawn_health_check_server(health_port);
     }
 
-    // Create shared kaspa API client (all instances use the same node)
-    let kaspa_api =
-        KaspaApi::new(config.global.kaspad_address.clone(), config.global.coinbase_tag_suffix.clone(), shutdown_rx.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create Kaspa API client: {}", e))?;
+    // Create shared kaspa API client (all instances use the same node).
+    // MERGED MINING (optional enhancement, spec WS5): enabled when BOTH env
+    // vars are set. The zkas leg attaches in the background — the bridge
+    // boots and mines KAS regardless of zkas node availability.
+    //   ZKAS_MERGED_NODE       — zkas node gRPC address (e.g. 127.0.0.1:16810)
+    //   ZKAS_TREASURY_ADDRESS  — zkas: address paid by all zkas templates
+    let merged_cfg = match (std::env::var("ZKAS_MERGED_NODE"), std::env::var("ZKAS_TREASURY_ADDRESS")) {
+        (Ok(node), Ok(pay)) if !node.trim().is_empty() && !pay.trim().is_empty() => {
+            // c.7 hook A: drives zk= state on the NODE line (zk=OFF when unset)
+            kaspa_stratum_bridge::merged_obs::MERGED_OBS
+                .merged_enabled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("MERGED MINING ENABLED: zkas node {}", node.trim());
+            tracing::info!("MERGED MINING ENABLED: zkas treasury {}", pay.trim());
+            Some(kaspa_stratum_bridge::MergedZkasConfig { node_address: node.trim().to_string(), pay_address: pay.trim().to_string() })
+        }
+        (Ok(_), Err(_)) | (Err(_), Ok(_)) => {
+            tracing::warn!(
+                "Merged mining NOT enabled: both ZKAS_MERGED_NODE and ZKAS_TREASURY_ADDRESS must be set (found only one)"
+            );
+            None
+        }
+        _ => None,
+    };
+    let kaspa_api = KaspaApi::new_with_merged(
+        config.global.kaspad_address.clone(),
+        config.global.coinbase_tag_suffix.clone(),
+        shutdown_rx.clone(),
+        merged_cfg,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to create Kaspa API client: {}", e))?;
 
     if !config.global.web_dashboard_port.is_empty() {
         let web_dashboard_port = config.global.web_dashboard_port.clone();
