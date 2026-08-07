@@ -292,6 +292,11 @@ pub struct WalletDb {
     /// holder must explicitly accept that before anything is written. Turning it
     /// off purges what was recorded ([`Self::set_history_enabled`]).
     history_enabled: bool,
+    /// Skip trial decryption in the ingest path — see [`Self::set_leaves_only`].
+    /// Deliberately NOT persisted: it describes what this in-memory copy is for,
+    /// not anything about the stream it holds, and a checkpoint written by a
+    /// shared tree must stay loadable as an ordinary (if noteless) wallet.
+    leaves_only: bool,
     /// Spends submitted but not yet observed on-chain — see [`PendingSpend`].
     /// Excluded from the balance and from spend selection (like spent notes), but
     /// recoverable if the transaction is lost.
@@ -557,6 +562,7 @@ impl WalletDb {
             ovk,
             history: Vec::new(),
             history_enabled: true,
+            leaves_only: false,
             pending_spends: Vec::new(),
             last_daa: 0,
             subtree: SubtreeCache::default(),
@@ -598,6 +604,7 @@ impl WalletDb {
             ovk,
             history: Vec::new(),
             history_enabled: true,
+            leaves_only: false,
             pending_spends: Vec::new(),
             last_daa: 0,
             subtree: SubtreeCache::default(),
@@ -729,7 +736,9 @@ impl WalletDb {
             // (consensus would already have rejected the block, so this is just
             // defensive — an un-appendable leaf can carry no note for us either).
             let Ok(cmx) = coinbase_note_commitment(desc, *value) else { continue };
-            let owned = self.recover_coinbase_note(desc, *value);
+            // Key-independent: the commit-or-skip decision above is what shapes the
+            // stream, and it has already been made. See `set_leaves_only`.
+            let owned = if self.leaves_only { None } else { self.recover_coinbase_note(desc, *value) };
             if owned.is_some() {
                 if let Some(m) = meta {
                     self.record_coinbase_history(*value, m);
@@ -841,7 +850,9 @@ impl WalletDb {
         }
         for (desc, value) in coinbase {
             let Ok(cmx) = coinbase_note_commitment(desc, *value) else { continue };
-            let owned = self.recover_coinbase_note(desc, *value);
+            // Key-independent: the commit-or-skip decision above is what shapes the
+            // stream, and it has already been made. See `set_leaves_only`.
+            let owned = if self.leaves_only { None } else { self.recover_coinbase_note(desc, *value) };
             if owned.is_some() {
                 if let Some(m) = meta {
                     self.record_coinbase_history(*value, m);
@@ -866,7 +877,10 @@ impl WalletDb {
             self.last_daa = self.last_daa.max(m.daa_score);
         }
         for (desc, value, cmx) in coinbase {
-            let owned = self.recover_coinbase_note(desc, *value);
+            // `leaves_only`: recognising the note is the only key-dependent step here.
+            // The commit-or-skip rule that decides whether this leaf exists at all was
+            // applied by the caller when it built `coinbase`, so the stream is unchanged.
+            let owned = if self.leaves_only { None } else { self.recover_coinbase_note(desc, *value) };
             if owned.is_some() {
                 if let Some(m) = meta {
                     self.record_coinbase_history(*value, m);
@@ -885,8 +899,11 @@ impl WalletDb {
                 continue;
             }
             let spent: u64 = records.iter().filter_map(|a| self.owned_note_value(&a.nullifier)).sum();
+            // The nullifier drop rule above is key-independent and has already run, so
+            // skipping decryption cannot change which bundles append leaves — only
+            // whether we notice that one of those leaves is ours. See `set_leaves_only`.
             let t_dec = std::time::Instant::now();
-            let received = scan_compact_prepared(&self.prepared_ivk, records);
+            let received = if self.leaves_only { Vec::new() } else { scan_compact_prepared(&self.prepared_ivk, records) };
             self.scan_cost.decrypt_ns += t_dec.elapsed().as_nanos();
             self.scan_cost.actions += records.len() as u64;
             for (i, rec) in records.iter().enumerate() {
@@ -1563,6 +1580,35 @@ impl WalletDb {
         }
         self.size += 1;
         self.scan_cost.tree_ns += t_leaf.elapsed().as_nanos();
+    }
+
+    /// Ingest for the **tree only**, skipping trial decryption.
+    ///
+    /// A Merkle path is a statement about the chain, not about a viewing key: every
+    /// wallet ingesting the same blocks builds a byte-identical leaf stream. That
+    /// shared half is also where a scan's CPU actually goes — measured live at
+    /// **169 µs/leaf of tree against 107 µs/action of decryption**, ~80/20. A daemon
+    /// syncing many wallets pays the shared half once *per wallet* today; it only
+    /// ever needs to pay it once in total, if one keyless copy of the stream is kept
+    /// for everyone to witness against.
+    ///
+    /// This flag makes that copy cheap. Only the two calls that try to *recognise* a
+    /// note are suppressed. Everything that determines the leaf STREAM is
+    /// key-independent and still runs — the nullifier drop rule, the coinbase
+    /// commit-or-skip rule, the append order — so the stream stays identical to a
+    /// real wallet's leaf for leaf. That is why this is a flag on the ordinary
+    /// ingest rather than a separate "append these commitments" entry point: the
+    /// caller cannot get the sequence wrong, because it is the same code.
+    ///
+    /// Such a wallet can never own a note, so `notes` stays empty and no balance,
+    /// history or spend path is meaningful on it.
+    pub fn set_leaves_only(&mut self, on: bool) {
+        self.leaves_only = on;
+    }
+
+    /// Whether this is a keyless shared tree — see [`Self::set_leaves_only`].
+    pub fn is_leaves_only(&self) -> bool {
+        self.leaves_only
     }
 
     /// Build a membership witness for the owned note at `position`, as an Orchard
@@ -2811,6 +2857,59 @@ mod tests {
         assert_eq!(recompute.anchor(), shared.anchor(), "identical tip anchor");
     }
 
+    /// A **keyless, leaves-only** wallet builds a leaf stream identical to a real
+    /// wallet's, and can therefore witness that wallet's notes for it.
+    ///
+    /// This is the premise of the daemon-wide shared tree: ~80% of a scan is
+    /// building a structure that does not depend on any viewing key, so it should be
+    /// built once for all wallets rather than once per wallet. The test pins both
+    /// halves of that claim — the stream is the same (identical anchor, leaf for
+    /// leaf), and a path taken from the shared copy is accepted for a note the
+    /// shared copy has no idea it is looking at.
+    #[test]
+    fn leaves_only_tree_is_identical_and_can_witness_another_wallets_note() {
+        let mine = [7u8; 32];
+        let other = [8u8; 32];
+        let nobody = [9u8; 32]; // the shared tree's key: matches nothing on this chain
+
+        let blocks: Vec<Vec<(CoinbaseNoteDesc, u64)>> = (0..40u32)
+            .map(|b| {
+                vec![
+                    coinbase_for(address_of(mine), format!("txid-{b}||0").as_bytes(), 1_000 + b as u64),
+                    coinbase_for(address_of(other), format!("txid-{b}||1").as_bytes(), 7_000),
+                ]
+            })
+            .collect();
+
+        let mut wallet = WalletDb::from_seed(mine).unwrap();
+        let mut shared = WalletDb::from_seed(nobody).unwrap();
+        shared.set_leaves_only(true);
+        assert!(shared.is_leaves_only());
+        for block in &blocks {
+            wallet.ingest_block(block, &[]);
+            shared.ingest_block(block, &[]);
+        }
+
+        // The stream is the same object, built two ways.
+        assert_eq!(wallet.size(), shared.size(), "same leaf count");
+        assert_eq!(wallet.anchor(), shared.anchor(), "identical tip anchor");
+        // ...but the shared copy recognises nothing, which is what makes it cheap.
+        assert!(shared.notes().is_empty(), "a leaves-only tree can never own a note");
+        assert!(!wallet.notes().is_empty(), "the real wallet did find its notes");
+
+        // Now the point: witness the WALLET's note from the SHARED tree.
+        let matured = wallet.size();
+        let positions: Vec<u64> = wallet.notes().iter().map(|n| n.position).collect();
+        let from_shared = shared.witness_paths_at(&positions, matured);
+        let from_wallet = wallet.witness_paths_at(&positions, matured);
+        assert!(from_shared.iter().all(|p| p.is_some()), "shared tree served every path");
+        for (i, (a, b)) in from_shared.iter().zip(from_wallet.iter()).enumerate() {
+            let (a, b) = (a.as_ref().unwrap(), b.as_ref().unwrap());
+            assert_eq!(a.auth_path(), b.auth_path(), "auth path differs at note {i}");
+            assert_eq!(a.position(), b.position(), "position differs at note {i}");
+        }
+    }
+
     /// A **watch-only** wallet loaded from just the FVK discovers exactly the same
     /// owned notes, positions, balance and tip anchor as the seed wallet — proving the
     /// non-custodial server can sync with no spend authority.
@@ -3182,15 +3281,6 @@ mod tests {
         }
     }
 
-    /// A note the sweep already passed can be adopted into the warm set, and the witness
-    /// it gets is identical to the one a full replay produces.
-    ///
-    /// This is the miner/pool endgame. Witnesses are only opened as the forward sweep
-    /// reaches each leaf, so a note sitting BELOW `witnessed_upto` can never acquire one
-    /// — it re-pays the whole O(matured − base) replay on every single spend, forever.
-    /// With the notes clustered just above the compaction base and the matured tip
-    /// ~126 K leaves ahead, that was the 22 s-per-note cost on the live wallet.
-    #[test]
     /// The live incident (note@564934): a note parked in `pending_spends` is not
     /// in `notes`, so the old compaction cap ignored it, rolled the base past it,
     /// and `reclaim_expired` later re-inserted it BELOW the base — permanently
@@ -3296,6 +3386,14 @@ mod tests {
         assert!(db.graft_history(&stranger).is_err());
     }
 
+    /// A note the sweep already passed can be adopted into the warm set, and the witness
+    /// it gets is identical to the one a full replay produces.
+    ///
+    /// This is the miner/pool endgame. Witnesses are only opened as the forward sweep
+    /// reaches each leaf, so a note sitting BELOW `witnessed_upto` can never acquire one
+    /// — it re-pays the whole O(matured − base) replay on every single spend, forever.
+    /// With the notes clustered just above the compaction base and the matured tip
+    /// ~126 K leaves ahead, that was the 22 s-per-note cost on the live wallet.
     #[test]
     fn a_note_below_the_sweep_can_be_adopted_and_matches_a_full_replay() {
         let mine = [63u8; 32];
