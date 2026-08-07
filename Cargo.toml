@@ -31,6 +31,7 @@ members = [
     "shielded-pay",
     "zkas-api",
     "zkas-walletd",
+    "zkas-gpu",
     "zkas-relayer",
     "miner",
     "consensus/wasm",
@@ -105,6 +106,7 @@ include = [
 ]
 
 [workspace.dependencies]
+libloading = "0.8"
 kaspa-testing-integration = { version = "2.0.1", path = "testing/integration" }
 kaspa-addresses = { version = "2.0.1", path = "crypto/addresses" }
 kaspa-addressmanager = { version = "2.0.1", path = "components/addressmanager" }

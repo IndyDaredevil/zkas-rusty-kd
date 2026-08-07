@@ -1,0 +1,15 @@
+[package]
+name = "zkas-gpu"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Optional CUDA acceleration for Orchard trial decryption; falls back to the CPU"
+
+[dependencies]
+pasta_curves = "0.5"
+group = "0.13"
+libloading = "0.8"
+log.workspace = true
+
+[dev-dependencies]
+rand = "0.8"

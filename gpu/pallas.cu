@@ -343,6 +343,56 @@ __global__ void ka_kernel(const uint32_t *__restrict__ in_xy, uint32_t *__restri
         }                                                                                          \
     } while (0)
 
+// ---------------------------------------------------------------------------
+// C ABI, for the daemon.
+//
+// Loaded with dlopen at runtime rather than linked at build time, deliberately: the
+// node and wallet must build and run on hosts with no GPU and no CUDA toolkit, so a
+// build-time dependency would be unacceptable. A host without the library simply
+// keeps the CPU path.
+//
+// Returns Jacobian (X, Y, Z) canonical little-endian. Converting to affine needs one
+// modular inverse, which the caller does for the WHOLE batch at once with Montgomery's
+// trick (~0.21 us/action, measured) using pasta_curves — far cheaper than ~255
+// squarings per point here, and it keeps that step on an implementation that is
+// already trusted.
+// ---------------------------------------------------------------------------
+extern "C" int zkas_gpu_device_count() {
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess) return 0;
+    return n;
+}
+
+/// 0 on success, non-zero on any CUDA failure — in which case the caller MUST fall
+/// back to the CPU rather than treat the output buffer as meaningful.
+extern "C" int zkas_gpu_batch_ka(const uint32_t *scalar, int scalar_bits, const uint32_t *in_xy, uint32_t *out_xyz,
+                                 int n) {
+    if (n <= 0 || scalar_bits <= 0 || scalar_bits > 256) return 1;
+    if (cudaMemcpyToSymbol(SCALAR, scalar, LIMBS * 4) != cudaSuccess) return 2;
+    if (cudaMemcpyToSymbol(SCALAR_BITS, &scalar_bits, sizeof(int)) != cudaSuccess) return 3;
+
+    size_t in_bytes = (size_t)n * 2 * LIMBS * 4;
+    size_t out_bytes = (size_t)n * 3 * LIMBS * 4;
+    uint32_t *d_in = nullptr, *d_out = nullptr;
+    int rc = 0;
+    if (cudaMalloc(&d_in, in_bytes) != cudaSuccess) { rc = 4; goto done; }
+    if (cudaMalloc(&d_out, out_bytes) != cudaSuccess) { rc = 5; goto done; }
+    if (cudaMemcpy(d_in, in_xy, in_bytes, cudaMemcpyHostToDevice) != cudaSuccess) { rc = 6; goto done; }
+    {
+        int block = 128;
+        int grid = (n + block - 1) / block;
+        ka_kernel<<<grid, block>>>(d_in, d_out, n);
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) { rc = 7; goto done; }
+    if (cudaGetLastError() != cudaSuccess) { rc = 8; goto done; }
+    if (cudaMemcpy(out_xyz, d_out, out_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) { rc = 9; goto done; }
+done:
+    if (d_in) cudaFree(d_in);
+    if (d_out) cudaFree(d_out);
+    return rc;
+}
+
+#ifndef ZKAS_GPU_LIB
 // Input file (written by the Rust generator):
 //   [32B scalar canonical LE][n × 64B affine point: x LE, y LE]
 // Output file:
@@ -416,3 +466,4 @@ int main(int argc, char **argv) {
     printf("throughput       : %.0f mults/sec\n", n / (total_ms / 1000.0));
     return 0;
 }
+#endif // ZKAS_GPU_LIB
