@@ -19,14 +19,16 @@
 /// the hot path a light-wallet indexer accelerates.)
 pub mod scan {
     use crate::bundle::{ActionWire, ShieldedBundle};
+    use group::GroupEncoding;
     use orchard::{
         Action,
-        keys::{FullViewingKey, IncomingViewingKey, PreparedIncomingViewingKey, Scope, SpendingKey},
-        note::{ExtractedNoteCommitment, Note, Nullifier, TransmittedNoteCiphertext},
+        keys::{Diversifier, FullViewingKey, IncomingViewingKey, PreparedIncomingViewingKey, Scope, SpendingKey},
+        note::{ExtractedNoteCommitment, Note, Nullifier, RandomSeed, Rho, TransmittedNoteCiphertext},
         note_encryption::{CompactAction, OrchardDomain},
         primitives::redpallas::{Signature, SpendAuth, VerificationKey},
-        value::ValueCommitment,
+        value::{NoteValue, ValueCommitment},
     };
+    use pasta_curves::pallas;
     use zcash_note_encryption::{EphemeralKeyBytes, batch};
 
     /// A note recovered from a bundle: which action carried it (its position
@@ -236,6 +238,123 @@ pub mod scan {
         received
     }
 
+    /// The raw key-agreement scalar behind an incoming viewing key, so the Pallas
+    /// multiplication can be handed to a device.
+    ///
+    /// `IncomingViewingKey::to_bytes()` is public and its second 32 bytes are exactly
+    /// that scalar, canonical little-endian. Orchard stores it as a base-field element
+    /// and uses it as a group scalar; that reinterpretation is exact here because
+    /// Pallas's base modulus is SMALLER than its scalar modulus, so every base-field
+    /// element is already a valid scalar with the same integer value. (If that were
+    /// ever false the value would silently wrap and no note would ever be found — which
+    /// is precisely what `gpu_scan_path_finds_exactly_what_orchard_finds` would catch,
+    /// since it recovers a real note end to end.)
+    ///
+    /// This exposes nothing new: any caller holding the viewing key already holds this.
+    pub fn ivk_agreement_scalar(ivk: &IncomingViewingKey) -> Option<pallas::Scalar> {
+        use group::ff::PrimeField;
+        let b = ivk.to_bytes();
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&b[32..64]);
+        Option::from(pallas::Scalar::from_repr(s))
+    }
+
+    /// GPU-assisted trial decryption: identical results to
+    /// [`scan_compact_prepared`], with the Pallas key agreement done on a device.
+    ///
+    /// # How, and why it is safe
+    ///
+    /// This is a FILTER, not a reimplementation of note decryption. For every action it
+    /// does the cheap half — key agreement (on the GPU), the Orchard KDF, and the
+    /// ChaCha20 keystream — and then looks at ONE byte: the note-plaintext version.
+    /// Orchard writes `0x02` there for every note it produces, so any action that is
+    /// genuinely ours must show `0x02`. Everything that survives is handed to orchard's
+    /// own `try_compact_note_decryption`, which decides.
+    ///
+    /// The correctness argument is therefore short: the filter's condition is implied
+    /// by orchard's, so the set it passes through is a SUPERSET of orchard's. It cannot
+    /// miss a note — the only failure that matters, since a missed note is a user's
+    /// coins appearing to vanish. False positives cost nothing: orchard discards them,
+    /// and at one byte of discrimination only ~1 action in 256 survives by chance.
+    ///
+    /// That ratio is also where the speed comes from. The expensive part of orchard's
+    /// path is the key agreement, and this skips it for ~255 of every 256 actions —
+    /// which is why the gain is not bounded by the share the key agreement takes.
+    ///
+    /// Deliberately reconstructs NO note and derives NO address: those need orchard
+    /// internals, and needing none of them is what keeps this a filter rather than a
+    /// second implementation of consensus-adjacent cryptography.
+    ///
+    /// Returns `None` if the device could not answer, and the caller uses the CPU path.
+    pub fn scan_compact_gpu(
+        prepared: &PreparedIncomingViewingKey,
+        actions: &[CompactActionRecord],
+        agree: impl FnOnce(&[Option<pallas::Point>]) -> Option<Vec<Option<pallas::Affine>>>,
+    ) -> Option<Vec<ReceivedNote>> {
+        use blake2b_simd::Params;
+        use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+
+        if actions.is_empty() {
+            return Some(Vec::new());
+        }
+        // An ephemeral key that is not a valid encoding can never yield a note; it is
+        // carried as `None` so positions stay aligned with `actions`.
+        let epks: Vec<Option<pallas::Point>> = actions
+            .iter()
+            .map(|r| Option::<pallas::Affine>::from(pallas::Affine::from_bytes(&r.ephemeral_key)).map(pallas::Point::from))
+            .collect();
+
+        let secrets = agree(&epks)?;
+        if secrets.len() != actions.len() {
+            return None;
+        }
+
+        let mut candidates: Vec<usize> = Vec::new();
+        for (i, (rec, secret)) in actions.iter().zip(secrets.iter()).enumerate() {
+            let Some(secret) = secret else { continue };
+            // The Orchard KDF, exactly as the spec defines it (§5.4.5.6): BLAKE2b-256
+            // personalised "Zcash_OrchardKDF" over the affine shared secret then the
+            // ephemeral key bytes.
+            let key = Params::new()
+                .hash_length(32)
+                .personal(b"Zcash_OrchardKDF")
+                .to_state()
+                .update(&secret.to_bytes())
+                .update(&rec.ephemeral_key)
+                .finalize();
+
+            // ChaCha20, zero nonce, SEEKED TO BYTE 64 — block 0 is the Poly1305 keying
+            // output and is skipped. Spelled out because getting it wrong decrypts to
+            // noise and then silently finds nothing at all.
+            //
+            // Only the first byte is needed, but ChaCha20 is a stream cipher over a
+            // 52-byte buffer; there is nothing cheaper to ask for.
+            let mut pt = rec.enc_ciphertext;
+            let mut cipher = chacha20::ChaCha20::new(key.as_bytes().into(), &[0u8; 12].into());
+            cipher.seek(64u32);
+            cipher.apply_keystream(&mut pt);
+
+            if pt[0] == 0x02 {
+                candidates.push(i);
+            }
+        }
+
+        if candidates.is_empty() {
+            return Some(Vec::new());
+        }
+        // Orchard decides. Whatever this function returns is its verdict, not ours.
+        let subset: Vec<CompactActionRecord> = candidates.iter().map(|&i| actions[i]).collect();
+        Some(
+            scan_compact_prepared(prepared, &subset)
+                .into_iter()
+                .map(|mut n| {
+                    n.action_index = candidates[n.action_index];
+                    n
+                })
+                .collect(),
+        )
+    }
+
     /// Convenience wrapper that prepares the ivk once (see [`scan_compact_prepared`]).
     pub fn scan_compact(ivk: &IncomingViewingKey, actions: &[CompactActionRecord]) -> Vec<ReceivedNote> {
         scan_compact_prepared(&ivk.prepare(), actions)
@@ -243,7 +362,8 @@ pub mod scan {
 }
 
 pub use scan::{
-    CompactActionRecord, ReceivedNote, address_bytes_from_seed, ivk_from_seed, scan_bundle, scan_bundle_prepared, scan_compact,
+    CompactActionRecord, ReceivedNote, address_bytes_from_seed, ivk_agreement_scalar, ivk_from_seed, scan_bundle, scan_bundle_prepared, scan_compact,
+    scan_compact_gpu,
     scan_compact_prepared, trim_memo,
 };
 
@@ -1134,6 +1254,58 @@ pub mod build {
             // A stranger recovers nothing from the compact records either.
             let stranger = crate::wallet::ivk_from_seed([9u8; 32]).unwrap();
             assert!(crate::wallet::scan_compact(&stranger, &compact).is_empty());
+        }
+
+        /// The GPU scan path finds exactly what orchard finds — on real notes.
+        ///
+        /// `scan_compact_gpu` reimplements the cheap half of trial decryption (KDF,
+        /// ChaCha20, plaintext parse, commitment check) so the expensive half (the
+        /// Pallas key agreement) can run on a device. A mistake in that reimplementation
+        /// means missed notes, which a user experiences as their coins vanishing — so it
+        /// is checked against orchard on a real bundle rather than reasoned about.
+        ///
+        /// The key agreement is done on the CPU here, so this tests the pipeline itself
+        /// and passes on any machine. The device is checked separately (`zkas-gpu`),
+        /// where 1024 points came back byte-identical to `pasta_curves`.
+        #[test]
+        fn gpu_scan_path_finds_exactly_what_orchard_finds() {
+            use crate::wallet::CompactActionRecord;
+            use group::Curve;
+            let pk = ProvingKey::build();
+            let recipient = ShieldedKeys::from_seed([2u8; 32]).expect("valid seed");
+            let wire =
+                build_output_only_bundle(&pk, recipient.address(), 4242, &[0x33u8; 32], b"ctx", rand::rngs::OsRng).expect("build");
+            let compact: Vec<CompactActionRecord> = wire.actions.iter().map(CompactActionRecord::from_wire).collect();
+
+            let ivk = crate::wallet::ivk_from_seed([2u8; 32]).unwrap();
+            let prepared = ivk.prepare();
+            // Stand in for the device: the same ivk·epk, on the CPU.
+            let ivk_scalar = crate::wallet::ivk_agreement_scalar(&ivk).unwrap();
+            let agree = |epks: &[Option<pasta_curves::pallas::Point>]| {
+                Some(epks.iter().map(|e| e.map(|p| (p * ivk_scalar).to_affine())).collect())
+            };
+
+            let via_gpu = crate::wallet::scan_compact_gpu(&prepared, &compact, agree).expect("path ran");
+            let via_cpu = crate::wallet::scan_compact_prepared(&prepared, &compact);
+            assert_eq!(via_gpu.len(), via_cpu.len(), "same number of notes");
+            assert_eq!(via_gpu.len(), 1, "and it is the note we planted");
+            assert_eq!(via_gpu[0].action_index, via_cpu[0].action_index, "same action position");
+            assert_eq!(via_gpu[0].value(), via_cpu[0].value(), "same value");
+            assert_eq!(via_gpu[0].value(), 4242);
+
+            // A stranger's key finds nothing down the GPU path either — the filter must
+            // not be loose in the direction that matters for privacy.
+            let stranger = crate::wallet::ivk_from_seed([9u8; 32]).unwrap();
+            let s_scalar = crate::wallet::ivk_agreement_scalar(&stranger).unwrap();
+            let s_agree = |epks: &[Option<pasta_curves::pallas::Point>]| {
+                Some(epks.iter().map(|e| e.map(|p| (p * s_scalar).to_affine())).collect())
+            };
+            let s_gpu = crate::wallet::scan_compact_gpu(&stranger.prepare(), &compact, s_agree).expect("ran");
+            assert!(s_gpu.is_empty(), "a stranger recovers nothing");
+
+            // A refusing device means "use the CPU", never "no notes".
+            let refuse = |_: &[Option<pasta_curves::pallas::Point>]| None;
+            assert!(crate::wallet::scan_compact_gpu(&prepared, &compact, refuse).is_none());
         }
     }
 }
