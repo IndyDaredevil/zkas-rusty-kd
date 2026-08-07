@@ -313,6 +313,53 @@ pub struct WalletDb {
 /// minutes; the excess notes fall back to the on-demand rebuild.
 const MAX_LIVE_WITNESSES: usize = 256;
 
+/// A subtree-cache build detached from the wallet that owns it.
+///
+/// The cache is a pure function of `(base_frontier, base_size, leaf stream)` and the fold
+/// mutates none of them, so it does not need the wallet lock — and holding that lock for
+/// the ~247 s a full build takes is what made background builds unaffordable. Slicing the
+/// build to keep the lock available instead capped it at one 2 s slice per sync lap: on the
+/// live daemon that was a ~10 % duty cycle, and **no build completed at all** while users
+/// went on paying the full 247 s inline on their first send.
+///
+/// Snapshot the inputs under the lock (a memcpy of the decoded leaves, ~61 MB at 1.9 M
+/// leaves), release it, fold on a blocking thread, then install with
+/// [`WalletDb::install_subtree_cache`], which re-checks that the snapshot still matches.
+pub struct SubtreeBuildJob {
+    base_frontier: Frontier<MerkleHashOrchard, TREE_DEPTH>,
+    base_size: u64,
+    leaves: Vec<MerkleHashOrchard>,
+}
+
+/// A folded cache awaiting installation — see [`SubtreeBuildJob::run`].
+pub struct BuiltSubtreeCache {
+    cache: SubtreeCache,
+    base_size: u64,
+}
+
+impl SubtreeBuildJob {
+    /// How many leaves this build has to fold (for progress reporting).
+    pub fn leaves(&self) -> usize {
+        self.leaves.len()
+    }
+
+    /// Fold the snapshot. Pure CPU over owned data — belongs on a blocking thread.
+    /// `None` if the frontier cannot seed the cache or a subtree root cannot be
+    /// recorded, in which case the caller keeps the replay path.
+    pub fn run(self) -> Option<BuiltSubtreeCache> {
+        let mut c = SubtreeCache::default();
+        if !c.seed_from_frontier(&self.base_frontier, self.base_size) {
+            return None;
+        }
+        for (i, leaf) in self.leaves.iter().enumerate() {
+            if !c.push_leaf(self.base_size + i as u64, *leaf) {
+                return None;
+            }
+        }
+        Some(BuiltSubtreeCache { cache: c, base_size: self.base_size })
+    }
+}
+
 /// Level at or above which [`SubtreeCache`] retains complete subtree roots. Below it a
 /// note's siblings are folded from its own `2^CACHE_LEVEL`-leaf window at spend time.
 ///
@@ -1655,6 +1702,52 @@ impl WalletDb {
         let ok = self.root_from(&c, self.size).is_some_and(|r| r == self.tree.root());
         self.subtree = if ok { c } else { reject };
         ok
+    }
+
+    /// Snapshot everything a subtree-cache build needs, so it can run **off the wallet
+    /// lock** — see [`SubtreeBuildJob`].
+    pub fn subtree_build_job(&self) -> SubtreeBuildJob {
+        SubtreeBuildJob {
+            base_frontier: self.base_frontier.clone(),
+            base_size: self.base_size,
+            leaves: self.decoded_leaves().to_vec(),
+        }
+    }
+
+    /// Install a cache folded off-lock by [`SubtreeBuildJob::run`].
+    ///
+    /// Accepted only if it still describes THIS stream: base compaction re-indexes the
+    /// leaves, so a cache folded over an older base cannot be reinterpreted against the
+    /// current one and is refused rather than adjusted. Leaves appended while the build
+    /// ran are folded in here — the tail only, which is cheap — and the result must pass
+    /// exactly the same root gate as an in-line build before anything can serve from it.
+    /// Returns false on any mismatch, leaving the wallet on the replay path.
+    pub fn install_subtree_cache(&mut self, built: BuiltSubtreeCache) -> bool {
+        if self.subtree.failed || built.base_size != self.base_size {
+            return false;
+        }
+        let mut c = built.cache;
+        {
+            let base = self.base_size;
+            let Some(start) = c.upto.checked_sub(base) else { return false };
+            let leaves = self.decoded_leaves();
+            if start as usize > leaves.len() {
+                return false;
+            }
+            for (i, leaf) in leaves.iter().enumerate().skip(start as usize) {
+                if !c.push_leaf(base + i as u64, *leaf) {
+                    return false;
+                }
+            }
+        }
+        c.active = true;
+        c.partial = false;
+        if self.root_from(&c, self.size).is_some_and(|r| r == self.tree.root()) {
+            self.subtree = c;
+            true
+        } else {
+            false
+        }
     }
 
     /// Where this wallet's scan CPU has gone so far — see [`ScanCost`].

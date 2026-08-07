@@ -1772,6 +1772,13 @@ struct WalletEntry {
     /// on their first send. Holding the permit makes it a queue instead — a wallet that
     /// starts a build finishes it, then hands the slot on.
     build_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// Set by `sync_chunk` when this wallet wants a subtree cache and holds a slot for
+    /// one; cleared by `sync_one_wallet` when it takes the snapshot. The build runs off
+    /// the wallet lock, so the decision and the work are deliberately separated.
+    wants_cache_build: bool,
+    /// A detached subtree-cache build is already folding for this wallet. Without it,
+    /// every sync pass during the ~247 s fold would queue another identical build.
+    build_in_flight: bool,
     /// Last logged completion percentage of a sliced subtree-cache build, so progress is
     /// reported once per 10% instead of on every 250 ms slice.
     subtree_build_pct_logged: u64,
@@ -1874,6 +1881,8 @@ impl WalletEntry {
             witnesses_warm: false,
             warm_via_subtree_cache: false,
             build_permit: None,
+            wants_cache_build: false,
+            build_in_flight: false,
             subtree_build_pct_logged: 0,
             scan_cost_reported: 0,
             subtree_low_mem_logged: false,
@@ -2213,94 +2222,44 @@ impl WalletEntry {
                 // Take a build slot and KEEP it across passes until the build finishes —
                 // see `build_permit`. Releasing the moment a wallet no longer needs one
                 // hands the slot straight to whoever is queued.
-                if needs_cache {
+                // The build itself no longer runs under this lock — see `SubtreeBuildJob`.
+                // Record the intent and let `sync_one_wallet` snapshot and fold it after
+                // the guard is released.
+                //
+                // Slicing it to keep the lock available was the previous answer, and it
+                // did not work: one 2 s slice per sync lap is a ~10 % duty cycle, so on
+                // the live daemon builds crawled and NONE completed, while users kept
+                // paying the whole 247 s inline on their first send. Off the lock there is
+                // no reason to slice at all.
+                if needs_cache && !self.build_in_flight {
                     if self.build_permit.is_none() {
                         self.build_permit = warm_gate.clone().try_acquire_owned().ok();
                     }
-                } else if self.build_permit.is_some() {
-                    self.build_permit = None;
-                }
-                if needs_cache && self.build_permit.is_some() && !proving_now() {
-                    // Only refuse when the kernel says memory is genuinely tight. A wallet
-                    // skipped here is retried on a later pass, so a transient squeeze costs
-                    // this wallet one slow send, not its whole session.
-                    match mem_available_mb() {
-                        Some(free) if free < subtree_free_floor_mb => {
-                            // Once per wallet per squeeze, not once per sync pass.
-                            if !self.subtree_low_mem_logged {
-                                self.subtree_low_mem_logged = true;
-                                log::warn!(
-                                    "subtree cache deferred ({span} leaves): only {free} MB free, floor is {} MB; this wallet keeps the replay path for now",
-                                    subtree_free_floor_mb
-                                );
-                            }
-                        }
-                        _ => {
-                            self.subtree_low_mem_logged = false;
-                            let t = std::time::Instant::now();
-                            // Stand down mid-sweep the moment a payment starts proving —
-                            // refusing to *start* during one is not enough when the sweep
-                            // itself runs for tens of seconds.
-                            // Run the sweep in short SLICES, not one long pass.
-                            //
-                            // `sync_one_wallet` holds this wallet's lock for the whole
-                            // chunk, so a 285 s sweep held it for 285 s — and every HTTP
-                            // request for that wallet blocked at `w.lock().await` behind
-                            // it, silently, before it could log or even set `proving_now`.
-                            // A user sent a payment and watched "building your proof" for
-                            // minutes with no proof running at all: the request had not
-                            // reached the prover, it was waiting on the mutex. Yielding to
-                            // `proving_now` cannot help there, because the work that would
-                            // set the flag is exactly the work being blocked.
-                            //
-                            // The fix is to stop holding the lock that long. The build is
-                            // resumable (see `build_subtree_cache_until`), so a slice
-                            // costs nothing but bookkeeping: bound each one by wall time
-                            // and the lock is released ~4x/second regardless of wallet
-                            // size. Total CPU is unchanged; peak latency drops from the
-                            // length of a whole sweep to the length of one slice.
-                            let slice_end = std::time::Instant::now() + SUBTREE_BUILD_SLICE;
-                            let built = tokio::task::block_in_place(|| {
-                                self.db.build_subtree_cache_until(|| proving_now() || std::time::Instant::now() >= slice_end)
-                            });
-                            if !built && self.db.subtree_cache_failed() {
-                                log::warn!(
-                                    "subtree cache rejected by its root gate after {:.1?} ({span} leaves) — spends keep using the replay path",
-                                    t.elapsed()
-                                );
-                            } else if !built {
-                                // Sliced, not abandoned: the prefix is kept and the next
-                                // pass resumes from it. Report at INFO on each 10% of the
-                                // span — a sliced build can take many minutes of wall time,
-                                // and at debug level it is completely invisible while it
-                                // happens, which is how "is it working or wedged?" becomes
-                                // unanswerable without attaching to the process.
-                                let done = self.db.subtree_build_upto().saturating_sub(self.db.base_size());
-                                let pct = if span > 0 { done * 100 / span } else { 100 };
-                                if pct / 10 != self.subtree_build_pct_logged / 10 {
-                                    self.subtree_build_pct_logged = pct;
-                                    log::info!("subtree cache building: {done}/{span} leaves ({pct}%) — resumes next pass");
+                    // A payment in flight still wins: the box has finite cores and the
+                    // user is watching that one.
+                    if self.build_permit.is_some() && !proving_now() {
+                        // Only refuse when the kernel says memory is genuinely tight. A
+                        // wallet skipped here is retried on a later pass, so a transient
+                        // squeeze costs this wallet one slow send, not its whole session.
+                        match mem_available_mb() {
+                            Some(free) if free < subtree_free_floor_mb => {
+                                // Once per wallet per squeeze, not once per sync pass.
+                                if !self.subtree_low_mem_logged {
+                                    self.subtree_low_mem_logged = true;
+                                    log::warn!(
+                                        "subtree cache deferred ({span} leaves): only {free} MB free, floor is {} MB; this wallet keeps the replay path for now",
+                                        subtree_free_floor_mb
+                                    );
                                 }
-                            } else if self.db.subtree_cache_ready(matured) {
-                                // v8 checkpoints persist this verified index. Flush it
-                                // immediately: waiting for the ordinary 1,000-block
-                                // cadence leaves a long window in which a restart throws
-                                // away a multi-minute build and repeats it.
-                                self.force_checkpoint = true;
-                                log::info!(
-                                    "subtree cache complete ({span} leaves, notes={note_count}) — spends now witness in O(depth), not a full replay"
-                                );
-                            } else {
-                                // Built and root-gated, but the anchor moved past it while
-                                // we swept. `append_leaf` keeps it in step from here, so
-                                // this resolves itself on the next pass.
-                                log::debug!(
-                                    "subtree cache built to {} but matured is {matured} — catching up",
-                                    self.db.subtree_build_upto()
-                                );
+                            }
+                            _ => {
+                                self.subtree_low_mem_logged = false;
+                                self.wants_cache_build = true;
                             }
                         }
                     }
+                } else if self.build_permit.is_some() {
+                    self.build_permit = None;
                 }
                 // Once the complete-subtree cache covers the matured anchor, EVERY spend
                 // path reaches `witness_paths_at`, which serves from `subtree_paths` in
@@ -3708,10 +3667,50 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
             e.force_checkpoint = false;
         }
     }
+    // Snapshot the subtree-cache build inputs while we still hold the lock; the fold
+    // itself runs without it (see `SubtreeBuildJob`).
+    let build_job = if e.wants_cache_build && !e.build_in_flight {
+        e.wants_cache_build = false;
+        e.build_in_flight = true;
+        Some(e.db.subtree_build_job())
+    } else {
+        None
+    };
     // Refresh the out-of-band status snapshot while we still hold the lock.
     let snap = snap_from_entry(state.address_of(&e.db), &e, chain_len);
     drop(e);
     state.snapshots.lock().await.insert(token.clone(), snap);
+    if let Some(job) = build_job {
+        // DETACHED on purpose. `sync_loop` joins every wallet task before starting the
+        // next lap, so awaiting a ~247 s fold here would stall every other wallet for
+        // that long — the opposite of the point.
+        let w2 = w.clone();
+        let who = token.clone();
+        tokio::spawn(async move {
+            let leaves = job.leaves();
+            log::info!("subtree cache build started for {who} ({leaves} leaves, off the wallet lock)");
+            let t = std::time::Instant::now();
+            let built = tokio::task::spawn_blocking(move || job.run()).await.ok().flatten();
+            let mut e = w2.lock().await;
+            e.build_in_flight = false;
+            // Hand the slot back either way, so a queued wallet starts immediately.
+            e.build_permit = None;
+            let installed = built.is_some_and(|b| e.db.install_subtree_cache(b));
+            if installed {
+                // Persist at once: this was expensive and a restart must not repeat it.
+                e.force_checkpoint = true;
+                log::info!(
+                    "subtree cache complete for {who} in {:.1?} ({leaves} leaves, built OFF the wallet lock) — spends now witness in O(depth)",
+                    t.elapsed()
+                );
+            } else {
+                log::warn!(
+                    "subtree cache build for {who} did not install after {:.1?} ({leaves} leaves) — the stream moved under it; keeping the replay path and retrying",
+                    t.elapsed()
+                );
+            }
+        });
+    }
     // A real sleep (not just yield_now) after each wallet, so HTTP handlers get a cycle
     // even while scans run. With bounded concurrency each in-flight scan still yields here.
     tokio::time::sleep(std::time::Duration::from_millis(SYNC_WALLET_THROTTLE_MS)).await;
