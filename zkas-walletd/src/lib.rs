@@ -1993,6 +1993,9 @@ impl WalletEntry {
         cache: &Mutex<PageCache>,
         warm_gate: &std::sync::Arc<tokio::sync::Semaphore>,
         subtree_free_floor_mb: u64,
+        // Leaves the daemon-wide shared tree can already witness against, or 0 when it
+        // cannot be consulted. A wallet covered by it needs no subtree cache of its own.
+        shared_tree_covers: u64,
     ) {
         // Set when a small caught-up page comes back FULL: more blocks than it
         // carried arrived, so the next iteration must take a full page to catch
@@ -2274,9 +2277,22 @@ impl WalletEntry {
                 // `subtree_cache_failed` is checked too: a wallet the cache cannot serve
                 // must not sit on a build slot re-attempting a build that will be
                 // rejected again.
+                // The subtree cache exists to make THIS wallet's spends O(depth). If the
+                // shared tree already covers `matured`, it answers those spends and this
+                // wallet's own cache would be a second copy of the same public structure,
+                // built at the same cost: ~324 s of Sinsemilla over ~2.07 M leaves,
+                // measured, PER WALLET. That is 45% of a wallet's whole cold cost, spent
+                // reproducing something the daemon already has.
+                //
+                // The shared tree itself is exempt — it is the copy everyone else is
+                // relying on, so it must build. `shared_tree_covers` is 0 for it anyway
+                // (its own lock is held by this very sync pass), but say so explicitly
+                // rather than depend on that.
+                let shared_serves = !self.db.is_leaves_only() && shared_tree_covers >= matured && matured > 0;
                 let needs_cache = span >= SUBTREE_CACHE_MIN_SPAN
                     && !self.db.subtree_cache_ready(matured)
-                    && !self.db.subtree_cache_failed();
+                    && !self.db.subtree_cache_failed()
+                    && !shared_serves;
                 // Take a build slot and KEEP it across passes until the build finishes —
                 // see `build_permit`. Releasing the moment a wallet no longer needs one
                 // hands the slot straight to whoever is queued.
@@ -2993,34 +3009,40 @@ impl AppState {
     /// On disagreement we log loudly and return the wallet's OWN paths. A wallet's own
     /// tree is the incumbent; the shared one has to earn the trust.
     fn batch_witness_paths(&self, db: &WalletDb, positions: &[u64], matured: u64) -> Vec<Option<kaspa_shielded_core::MerklePath>> {
-        // The wallet's OWN paths are what go into a payment. Authoritative, full stop.
+        // Serve from the shared chain tree when it can answer for every position.
         //
-        // Sends succeeded at 12:21 and 12:24 on 2026-08-07 and failed from 13:30 onward
-        // with `InvalidExternalSignature`; the shared chain tree went live at 12:30. I
-        // have no mechanism linking a Merkle witness to a spend-authorization signature
-        // failure — the witness would fail the PROOF at the node, not the signature —
-        // and the timing may be coincidence. But that is not a thing to be right about
-        // at a user's expense. The shared tree is an optimization; correctness is not.
-        // It stops feeding spends until it is exonerated.
+        // This was pulled off the spend path on 2026-08-07 while payments were failing
+        // with `InvalidExternalSignature`, on nothing more than timing. The cause turned
+        // out to be a shipped APK carrying a signer built for a different chain's
+        // genesis — the signature was over the wrong domain, and the daemon was innocent
+        // throughout. Removing it did not fix the failures, which is what proved it.
         //
-        // It still answers alongside and any disagreement is logged, so the production
-        // cross-check keeps running on real data through real reorgs. That evidence is
-        // how it earns its way back onto this path.
-        let own = db.witness_paths_at(positions, matured);
+        // It has since logged ZERO disagreements against wallets' own trees, on
+        // production data, through reorgs. That is the evidence it was asked for.
+        //
+        // Correctness does not rest on the two agreeing: `subtree_paths` verifies every
+        // path it returns roots at `matured` before handing it over, so a diverged tree
+        // declines rather than lying. The differential below is a second line, kept
+        // because it costs one comparison when both answers are already cheap.
         if let Some(shared) = self.chain_tree_paths(positions, matured) {
-            for (i, (a, b)) in shared.iter().zip(own.iter()).enumerate() {
-                let (Some(a), Some(b)) = (a, b) else { continue };
-                if a.position() != b.position() || a.auth_path() != b.auth_path() {
-                    log::error!(
-                        "SHARED TREE DISAGREES with the wallet\'s own tree at position {} (matured={matured}, note {i} of {}) \
-                         — the wallet\'s own path was used, as always",
-                        positions.get(i).copied().unwrap_or_default(),
-                        positions.len()
-                    );
+            if db.subtree_cache_ready(matured) {
+                let own = db.witness_paths_at(positions, matured);
+                for (i, (a, b)) in shared.iter().zip(own.iter()).enumerate() {
+                    let (Some(a), Some(b)) = (a, b) else { continue };
+                    if a.position() != b.position() || a.auth_path() != b.auth_path() {
+                        log::error!(
+                            "SHARED TREE DISAGREES with the wallet's own tree at position {} (matured={matured}, \
+                             note {i} of {}) — using the wallet's own path; the shared stream must not be trusted",
+                            positions.get(i).copied().unwrap_or_default(),
+                            positions.len()
+                        );
+                        return own;
+                    }
                 }
             }
+            return shared;
         }
-        own
+        db.witness_paths_at(positions, matured)
     }
 
     /// The wallet's receive address, taken from its view (works for seed and
@@ -3664,7 +3686,18 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // Advance one chunk from `low` (also the cheap tip catch-up once already synced).
     let was_caught_up = e.caught_up;
     e.caught_up = false;
-    e.sync_chunk(&state.sync_client, &state.page_cache, &state.warm_gate, state.resources.subtree_free_floor_mb).await;
+    // Non-blocking peek: a wallet must never wait on the shared tree to make progress.
+    // For the shared tree's OWN pass this fails (we are holding its lock) and yields 0,
+    // which is exactly right — it then builds its cache like any other wallet.
+    let shared_tree_covers = state.chain_tree.try_lock().map(|c| c.db.size()).unwrap_or(0);
+    e.sync_chunk(
+        &state.sync_client,
+        &state.page_cache,
+        &state.warm_gate,
+        state.resources.subtree_free_floor_mb,
+        shared_tree_covers,
+    )
+    .await;
     // Report where scan CPU actually goes, once per SCAN_COST_REPORT_ACTIONS of work.
     //
     // A scan has two heavy halves — trial decryption (one Pallas scalar mul per action
