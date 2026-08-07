@@ -265,8 +265,42 @@ async fn run(cli: Cli) {
         .or_else(|| std::env::var("ZKAS_WALLET_SECRET").ok())
         .or_else(|| std::env::var("FIRECASH_WALLET_SECRET").ok());
 
-    // The sender is held (never fired) so the daemon runs until the process dies.
-    let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // Fire `shutdown` on SIGINT/SIGTERM so the daemon can flush every resident wallet's
+    // checkpoint before exiting.
+    //
+    // This used to be `_shutdown_tx` — held and never fired, so the process simply died
+    // on Ctrl-C. A wallet checkpoints only every `CHECKPOINT_EVERY` blocks, so whatever
+    // it had scanned since then lived solely in RAM and was lost. For a wallet part-way
+    // through its FIRST scan that is the whole difference between the progress bar the
+    // user was watching and where it restarts: reported live 2026-08-07 as a wallet
+    // going from "syncing 80%" to "syncing 44%" across a restart. Nothing was corrupted
+    // and no funds were ever at risk — the work was simply thrown away and redone.
+    //
+    // Operators restart walletd routinely (deploys, config changes). Making that cost
+    // users their scan progress is not acceptable, so shutdown is now a real signal.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("cannot listen for SIGTERM ({e}); shutdown will not flush checkpoints");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => log::info!("SIGINT received — flushing wallet checkpoints before exit"),
+                _ = term.recv() => log::info!("SIGTERM received — flushing wallet checkpoints before exit"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            log::info!("interrupt received — flushing wallet checkpoints before exit");
+        }
+        let _ = shutdown_tx.send(());
+    });
 
     // Self-hosting mode: one flag gives TLS + bearer + a pairing QR, no proxy.
     if let Some(addr) = cli.serve_public {

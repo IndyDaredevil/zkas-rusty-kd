@@ -6374,7 +6374,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         .route("/api/wallet/sign", post(wallet_sign))
         .route("/api/verify", post(verify))
         .layer(cors)
-        .with_state(state);
+        .with_state(state.clone());
 
     // Transport auth: gate every route behind the bearer token when one is configured
     // (self-hosting / public bind). Loopback deployments pass `None` and skip it.
@@ -6406,12 +6406,37 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         None => {
             log::info!("zkas-walletd listening on http://{listen}");
             let listener = tokio::net::TcpListener::bind(listen).await.map_err(|e| format!("failed to bind {listen}: {e}"))?;
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown.await;
-                })
-                .await
-                .map_err(|e| format!("server error: {e}"))
+            // Bound the drain. `with_graceful_shutdown` waits for every in-flight
+            // connection to close, and a browser/proxy keep-alive connection may simply
+            // never close — so this waited forever. Observed 2026-08-07 on the first
+            // SIGTERM: the listener was released (API down, 000) while the process stayed
+            // alive still syncing, and the checkpoint flush below never ran. Worse, the
+            // freed port lets a restart bind while the old process is still writing the
+            // same wallet files.
+            //
+            // The TLS branch above was already bounded (`graceful_shutdown(Some(2s))`);
+            // this one was not. After the deadline we stop waiting and go flush, which is
+            // the part that actually protects the user's scan progress.
+            const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+            let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
+            let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel::<()>();
+            tokio::spawn(async move {
+                let _ = shutdown.await;
+                let _ = drain_tx.send(());
+                let _ = deadline_tx.send(());
+            });
+            tokio::select! {
+                r = axum::serve(listener, app).with_graceful_shutdown(async move { let _ = drain_rx.await; }) => {
+                    r.map_err(|e| format!("server error: {e}"))
+                }
+                _ = async move {
+                    let _ = deadline_rx.await;
+                    tokio::time::sleep(DRAIN_GRACE).await;
+                } => {
+                    log::warn!("connections did not drain within {DRAIN_GRACE:?}; proceeding to flush checkpoints anyway");
+                    Ok(())
+                }
+            }
         }
     };
     // The loops hold node connections and wallet state; kill them so a re-`serve`
@@ -6420,7 +6445,47 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     eviction_task.abort();
     mempool_task.abort();
     tip_task.abort();
+    flush_checkpoints_on_exit(&state).await;
     result
+}
+
+/// Persist every resident wallet's scan progress on the way out.
+///
+/// A wallet checkpoints only every `CHECKPOINT_EVERY` blocks, so at any moment the
+/// difference between its in-memory position and its file is unsaved work. Without this
+/// the process simply died on a signal and that work was lost — for a wallet part-way
+/// through its first scan, that is the progress bar the user was watching resetting
+/// backwards (reported live 2026-08-07: "syncing 80%" to "syncing 44%" across a
+/// restart). No funds were ever at risk and nothing was corrupted; the scan was just
+/// thrown away and redone.
+///
+/// Runs after the loops are aborted, so nothing is mutating a wallet underneath us, and
+/// every lock is taken uncontended. A wallet in an error state is skipped for the same
+/// reason the periodic path skips it: its checkpoint already lags and the reload path
+/// re-derives what it can.
+async fn flush_checkpoints_on_exit(state: &Arc<AppState>) {
+    let started = std::time::Instant::now();
+    let resident: Vec<(String, Wallet)> = { state.wallets.lock().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect() };
+    let total = resident.len();
+    let (mut saved, mut blocks) = (0usize, 0usize);
+    for (token, w) in resident {
+        let mut e = w.lock().await;
+        if e.error.is_some() || e.saved_scanned == e.scanned {
+            continue;
+        }
+        let advanced = e.scanned.saturating_sub(e.saved_scanned);
+        if save_checkpoint(&state.wallet_dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue, e.blind_below)
+            .is_ok()
+        {
+            e.saved_scanned = e.scanned;
+            saved += 1;
+            blocks += advanced;
+        }
+    }
+    log::info!(
+        "shutdown: flushed {saved}/{total} wallet checkpoint(s) in {:.1?}, preserving {blocks} block(s) of scan progress that a restart would otherwise redo",
+        started.elapsed()
+    );
 }
 
 #[cfg(test)]
