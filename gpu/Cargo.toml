@@ -1,0 +1,18 @@
+[package]
+name = "gpucheck"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "gpucheck"
+path = "src/main.rs"
+
+[dependencies]
+pasta_curves = "0.5"
+group = "0.13"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1

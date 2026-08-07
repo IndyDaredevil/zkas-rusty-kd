@@ -1,4 +1,7 @@
 [workspace]
+# `gpu/` is a standalone CUDA benchmark + differential test, not part of the
+# node or wallet build. Excluded so a normal `cargo build` never needs a GPU.
+exclude = ["gpu"]
 resolver = "2"
 members = [
     "daemon",
