@@ -232,8 +232,16 @@ pub struct WalletDb {
     /// The note-commitment stream **after** `base_size`, in append order. Retaining
     /// it lets the wallet build a membership witness for any owned position **on
     /// demand** (see [`Self::witness_path`]) instead of advancing a per-note witness
-    /// on every append — the difference between an O(N) and an O(N²) scan. At 32
-    /// bytes/leaf this is ~1 MB per million notes, cheap next to 625M hashes.
+    /// on every append — the difference between an O(N) and an O(N²) scan.
+    ///
+    /// **Cost, corrected.** This previously read "~1 MB per million notes, cheap next
+    /// to 625M hashes". That is wrong by 32×: 32 bytes × 1M leaves is **32 MB**, and
+    /// [`Self::decoded`] holds a second copy of the same size, so a wallet at the
+    /// current ~2.05 M leaves carries **~130 MB** of purely public data. It is not
+    /// cheap and it is not per-wallet data — every wallet's copy is byte-identical.
+    /// Multiplied across a hosted daemon's resident wallets this is the dominant
+    /// term in its RSS (measured: 6.8 GB across 39 wallets). Keeping ONE keyless copy
+    /// for everyone is what [`Self::set_leaves_only`] exists for.
     leaves: Vec<[u8; 32]>,
     /// The leaf stream decoded to curve points, built on first use.
     ///
