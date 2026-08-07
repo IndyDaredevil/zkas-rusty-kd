@@ -4354,19 +4354,44 @@ struct BalanceResp {
     synced: bool,
     scanned_blocks: usize,
     chain_len: u64,
-    notes: Vec<NoteInfo>,
+    /// Every owned note, **only when asked for** (`?notes=1`).
+    ///
+    /// This used to be unconditional, and it is the most frequently polled
+    /// endpoint in the product. On a miner/pool wallet that is ~273 K entries —
+    /// about **11 MB per poll** — serialised while holding the wallet lock, so
+    /// the cost lands on both the client and every other request for that
+    /// wallet. Nothing consumed it: the web wallet declares the field in its
+    /// API type and never reads it, the SDK does not reference it, and the
+    /// mobile bundle uses `note_count` from `/api/status` instead. A balance
+    /// call should answer "how much do I have", and `note_count` already
+    /// carries the only part of this a UI actually shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<Vec<NoteInfo>>,
+    /// How many owned notes there are — the part callers actually used the
+    /// `notes` array for. Always present, and O(1).
+    note_count: usize,
     updated_unix: u64,
     error: Option<String>,
 }
 
+/// `?notes=1` restores the full per-note array for a caller that genuinely
+/// needs it (consolidation planning, support tooling).
+#[derive(Deserialize, Default)]
+struct BalanceQuery {
+    notes: Option<String>,
+}
+
 async fn wallet_balance(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<BalanceQuery>,
     headers: HeaderMap,
 ) -> Result<Json<BalanceResp>, (StatusCode, Json<serde_json::Value>)> {
     let token = token_from(&headers, state.allow_default_token)?;
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let e = w.lock().await;
-    let notes = e.db.notes().iter().map(|n| NoteInfo { position: n.position, value: n.value() }).collect();
+    let want_notes = matches!(query.notes.as_deref(), Some("1" | "true" | "yes"));
+    let note_count = e.db.notes().len();
+    let notes = want_notes.then(|| e.db.notes().iter().map(|n| NoteInfo { position: n.position, value: n.value() }).collect());
     Ok(Json(BalanceResp {
         balance_sompi: e.db.balance().to_string(),
         balance_fc: fmt_fc(e.db.balance()),
@@ -4378,6 +4403,7 @@ async fn wallet_balance(
         scanned_blocks: e.scanned,
         chain_len: e.chain_len,
         notes,
+        note_count,
         updated_unix: e.updated_unix,
         error: e.error.clone(),
     }))
