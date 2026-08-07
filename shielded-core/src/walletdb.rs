@@ -1330,6 +1330,21 @@ impl WalletDb {
     /// O(leaves-below-target) rebuild bounded so the caller can spread it across sync passes.
     /// Returns `true` if the base can still be rolled further toward `target`.
     pub fn advance_base_capped(&mut self, target: u64, max_leaves: u64) -> bool {
+        // A shared tree NEVER compacts. Compaction is bounded by the earliest note the
+        // wallet still holds — and a `leaves_only` tree holds none, so that bound is
+        // `size` and it would roll the base straight to the tip, discarding the entire
+        // leaf stream it exists to keep. Observed live 2026-08-07 within minutes of
+        // enabling it: `base_size=2061411 == matured 2061411`, i.e. the shared stream
+        // had summarised away every leaf and could witness nothing for anybody. It also
+        // made the off-lock cache build unable to ever install (`built.base_size !=
+        // self.base_size` on every attempt, logged as "the stream moved under it").
+        //
+        // Its whole job is to hold positions 0..tip on behalf of wallets whose own
+        // bases have moved far past them, so "no notes" means "keep everything", not
+        // "keep nothing".
+        if self.leaves_only {
+            return false;
+        }
         // Never roll past a note we still hold, or past what we've ingested. A note
         // parked in `pending_spends` counts as HELD: it left `notes` when its spend
         // was submitted, but `reclaim_expired` returns it if the transaction never
@@ -2975,6 +2990,44 @@ mod tests {
             assert_eq!(a.position(), b.position(), "position differs at note {i}");
             assert_eq!(a.auth_path(), b.auth_path(), "auth path differs at note {i} across divergent bases");
         }
+    }
+
+    /// A shared (`leaves_only`) tree refuses to compact its base.
+    ///
+    /// Compaction is capped at the earliest note the wallet still holds. A shared tree
+    /// holds none, so that cap is `size` and it would summarise away the whole stream —
+    /// which is the one thing it exists to keep. Live, it did exactly that within
+    /// minutes (`base_size == matured`), leaving it able to witness nothing for anyone
+    /// and unable to ever install a subtree cache.
+    #[test]
+    fn leaves_only_tree_never_compacts_the_stream_away() {
+        let mut shared = WalletDb::from_seed([21u8; 32]).unwrap();
+        shared.set_leaves_only(true);
+        let mut ordinary = WalletDb::from_seed([21u8; 32]).unwrap();
+        for b in 0..40u32 {
+            let block = vec![coinbase_for(address_of([22u8; 32]), format!("x-{b}").as_bytes(), 100)];
+            shared.ingest_block(&block, &[]);
+            ordinary.ingest_block(&block, &[]);
+        }
+        let tip = shared.size();
+
+        // The ordinary wallet owns nothing either, so it compacts freely — this is the
+        // behaviour the shared tree must NOT inherit.
+        while ordinary.advance_base_capped(tip, u64::MAX) {}
+        assert_eq!(ordinary.base_size(), tip, "an ordinary noteless wallet does roll its base to the tip");
+
+        assert!(!shared.advance_base_capped(tip, u64::MAX), "shared tree refuses to compact");
+        assert_eq!(shared.base_size(), 0, "shared tree still holds the stream from position 0");
+        assert_eq!(shared.size(), tip, "and still has every leaf");
+
+        // The consequence that matters: it can still witness an arbitrary early position
+        // that a compacted wallet could not.
+        let paths = shared.witness_paths_at(&[3, 17], tip);
+        assert!(paths.iter().all(|p| p.is_some()), "shared tree witnesses early positions");
+        assert!(
+            ordinary.witness_paths_at(&[3, 17], tip).iter().all(|p| p.is_none()),
+            "the compacted wallet cannot — which is precisely why the shared tree must not compact",
+        );
     }
 
     /// A **watch-only** wallet loaded from just the FVK discovers exactly the same

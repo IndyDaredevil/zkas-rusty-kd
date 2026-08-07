@@ -6030,8 +6030,33 @@ async fn wallet_submit(
         device_sigs.push((s.index, sig));
     }
 
-    let bundle = finalize_payment(payment, device_sigs)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("could not finalize payment (bad/missing signatures?): {e:?}")))?;
+    // Log both failure modes below. A send that fails is the single most alarming
+    // thing a user experiences, and until now neither of them left ANY trace in the
+    // daemon log — the reason went out in the HTTP body and nowhere else, so an
+    // operator asked "why did my send fail?" had nothing to read. Reported live
+    // 2026-08-07 as "bad signature" after a two-minute wait, undiagnosable after the
+    // fact. The user-facing text is plain English; the detail goes to the log.
+    let n_sigs = device_sigs.len();
+    let sig_indices: Vec<usize> = device_sigs.iter().map(|(i, _)| *i).collect();
+    let bundle = finalize_payment(payment, device_sigs).map_err(|e| {
+        // Log WHICH wallet and which action indices. `InvalidExternalSignature` means
+        // the device's signature did not verify against the bundle's randomized key —
+        // that is about the signing key, the randomizer, or the sighash, never the
+        // Merkle witness. Knowing the token separates "this one wallet's device key
+        // does not match the wallet the token addresses" from a general fault: seen
+        // live 2026-08-07, one wallet failed 3/3 while another succeeded in between.
+        log::error!(
+            "submit REJECTED for session {} (wallet token {}): finalize_payment failed with {n_sigs} device \
+             signature(s) for action index/es {sig_indices:?}: {e:?}",
+            req.session,
+            token.as_deref().unwrap_or("<none>"),
+        );
+        err(
+            StatusCode::BAD_REQUEST,
+            "This payment could not be completed: the signatures from your device did not match the \
+             prepared transaction. Nothing was sent and no coins moved. Please try the payment again.",
+        )
+    })?;
     let tx: Transaction = payment_tx(bundle.to_bytes());
     match state.client.submit_transaction(RpcTransaction::from(&tx), false).await {
         Ok(accepted) => {
@@ -6062,7 +6087,10 @@ async fn wallet_submit(
                 tx_count: 1,
             }))
         }
-        Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("node rejected the payment: {e}"))),
+        Err(e) => {
+            log::error!("submit REJECTED by the node for session {}: {e}", req.session);
+            Err(err(StatusCode::BAD_GATEWAY, format!("The node would not accept this payment: {e}. No coins moved.")))
+        }
     }
 }
 
