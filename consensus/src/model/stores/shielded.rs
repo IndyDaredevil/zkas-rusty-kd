@@ -713,12 +713,68 @@ impl DbShieldedScanBlockStore {
     }
 }
 
+/// `ShieldedScanBlockData` exactly as it was written BEFORE `coinbase_commitments`
+/// existed. Kept so one binary can read a database containing both layouts.
+///
+/// This is not hypothetical tidiness. A node was upgraded across the field addition on
+/// 2026-08-07, wrote ~20 minutes of new-layout records at the tip, and was then rolled
+/// back — leaving a database neither binary could read end to end. Every wallet stalled
+/// at the first new-layout block (99.7% of the chain) and retried it forever, because a
+/// failed page fetch does not advance the sync cursor.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LegacyShieldedScanBlockData {
+    blue_score: u64,
+    daa_score: u64,
+    timestamp: u64,
+    coinbase_txid: Hash,
+    coinbase_outputs: Vec<(Vec<u8>, u64)>,
+    accepted: Vec<ShieldedScanTx>,
+}
+
+impl From<LegacyShieldedScanBlockData> for ShieldedScanBlockData {
+    fn from(l: LegacyShieldedScanBlockData) -> Self {
+        // A pre-field record genuinely carries no commitments. Empty is the truthful
+        // value, and `GetShieldedBlocks` already serves `None` commitments per output
+        // for such records — the wallet derives them itself, as it always did.
+        Self {
+            blue_score: l.blue_score,
+            daa_score: l.daa_score,
+            timestamp: l.timestamp,
+            coinbase_txid: l.coinbase_txid,
+            coinbase_outputs: l.coinbase_outputs,
+            coinbase_commitments: Vec::new(),
+            accepted: l.accepted,
+        }
+    }
+}
+
 impl ShieldedScanBlockStoreReader for DbShieldedScanBlockStore {
     fn get(&self, block: Hash) -> StoreResult<Option<ShieldedScanBlockData>> {
         match self.access.read(block) {
             Ok(d) => Ok(Some(d)),
             Err(StoreError::KeyNotFound(_)) => Ok(None),
-            Err(e) => Err(e),
+            // A decode failure here is the layout ambiguity, not a corrupt database:
+            // bincode is positional, so a record written without `coinbase_commitments`
+            // makes this reader consume the NEXT field's bytes as that vector's length
+            // and run off the end. Retry the bytes as the pre-field layout before giving
+            // up — the two are distinguished by which one decodes, since a wrong guess
+            // overruns the buffer.
+            Err(_) => {
+                let db_key = kaspa_database::prelude::DbKey::new(
+                    &[DatabaseStorePrefixes::ShieldedScanBlock.into()][..],
+                    block,
+                );
+                match self.db.get_pinned(&db_key)? {
+                    Some(slice) => match bincode::deserialize::<LegacyShieldedScanBlockData>(&slice) {
+                        Ok(legacy) => Ok(Some(legacy.into())),
+                        // Neither layout decodes: now it really is unreadable, and the
+                        // caller must see that rather than a silently empty block, which
+                        // would present a block's notes as absent.
+                        Err(e) => Err(StoreError::DeserializationError(e)),
+                    },
+                    None => Ok(None),
+                }
+            }
         }
     }
 }
@@ -742,6 +798,63 @@ mod tests {
     /// the scan records IT ITSELF wrote earlier, so `GetShieldedBlocks` starts failing and wallet
     /// history serving breaks on upgrade.
     #[test]
+    /// The repair for that incompatibility: one reader, both layouts.
+    ///
+    /// A node upgraded across the `coinbase_commitments` addition, wrote records at the
+    /// tip, and was rolled back — leaving a database with both layouts in it. Neither
+    /// binary could read it end to end, and every wallet froze at the first record of
+    /// the other layout because a failed page fetch does not advance the sync cursor.
+    ///
+    /// Asserts the property the fix depends on: a record of EITHER layout decodes to the
+    /// right values, and the pre-field layout is recognised by the current one FAILING
+    /// first (it overruns the buffer), never by silently mis-decoding.
+    #[test]
+    fn both_record_layouts_decode_to_the_same_block() {
+        let modern = ShieldedScanBlockData {
+            blue_score: 7,
+            daa_score: 8,
+            timestamp: 9,
+            coinbase_txid: Hash::from_bytes([3u8; 32]),
+            coinbase_outputs: vec![(vec![1, 2, 3], 500)],
+            coinbase_commitments: vec![[8u8; 32]],
+            accepted: vec![ShieldedScanTx { txid: Hash::from_bytes([4u8; 32]), action_bytes: vec![9, 9] }],
+        };
+        let legacy = LegacyShieldedScanBlockData {
+            blue_score: 7,
+            daa_score: 8,
+            timestamp: 9,
+            coinbase_txid: Hash::from_bytes([3u8; 32]),
+            coinbase_outputs: vec![(vec![1, 2, 3], 500)],
+            accepted: vec![ShieldedScanTx { txid: Hash::from_bytes([4u8; 32]), action_bytes: vec![9, 9] }],
+        };
+
+        // A modern record still decodes as modern.
+        let modern_bytes = bincode::serialize(&modern).unwrap();
+        let back: ShieldedScanBlockData = bincode::deserialize(&modern_bytes).unwrap();
+        assert_eq!(back.blue_score, 7);
+        assert_eq!(back.coinbase_commitments.len(), 1);
+
+        // A legacy record must FAIL as modern — that failure is exactly the signal the
+        // store's fallback keys on. If this ever starts succeeding, the fallback becomes
+        // unreachable and legacy records get silently mis-decoded instead.
+        let legacy_bytes = bincode::serialize(&legacy).unwrap();
+        assert!(
+            bincode::deserialize::<ShieldedScanBlockData>(&legacy_bytes).is_err(),
+            "a pre-field record decoded as the current layout — the store fallback would never fire"
+        );
+
+        // ...and decodes correctly as legacy, carrying no commitments.
+        let recovered: ShieldedScanBlockData =
+            bincode::deserialize::<LegacyShieldedScanBlockData>(&legacy_bytes).unwrap().into();
+        assert_eq!(recovered.blue_score, 7);
+        assert_eq!(recovered.daa_score, 8);
+        assert_eq!(recovered.coinbase_txid, Hash::from_bytes([3u8; 32]));
+        assert_eq!(recovered.coinbase_outputs, vec![(vec![1, 2, 3], 500)]);
+        assert!(recovered.coinbase_commitments.is_empty());
+        assert_eq!(recovered.accepted.len(), 1);
+        assert_eq!(recovered.accepted[0].action_bytes, vec![9, 9]);
+    }
+
     fn serde_default_does_not_make_bincode_records_forward_compatible() {
         // Exactly `ShieldedScanBlockData` as it was BEFORE `coinbase_commitments` was added.
         #[derive(Serialize)]
