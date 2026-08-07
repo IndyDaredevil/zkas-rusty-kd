@@ -1857,6 +1857,12 @@ struct WalletEntry {
     /// Last logged completion percentage of a sliced subtree-cache build, so progress is
     /// reported once per 10% instead of on every 250 ms slice.
     subtree_build_pct_logged: u64,
+    /// Wall time spent WAITING for pages, and the wall time spent ingesting them.
+    /// Kept next to the scan-cost counters so the log can no longer report a slice of
+    /// the work as though it were the work.
+    page_fetch_ns: u128,
+    page_ingest_ns: u128,
+    page_count: u64,
     /// Leaf count at the last scan-cost report, so it is emitted per unit of WORK
     /// rather than per tick (a tick can be a whole chunk or almost nothing).
     scan_cost_reported: u64,
@@ -1959,6 +1965,9 @@ impl WalletEntry {
             wants_cache_build: false,
             build_in_flight: false,
             subtree_build_pct_logged: 0,
+            page_fetch_ns: 0,
+            page_ingest_ns: 0,
+            page_count: 0,
             scan_cost_reported: 0,
             subtree_low_mem_logged: false,
             force_checkpoint: false,
@@ -2049,7 +2058,21 @@ impl WalletEntry {
             // preview roll → only the newest few blocks (the roll already covers
             // the unsettled window, hash-verified); anything else → a full page.
             let page_limit = if !need_full_page && !self.preview_roll.is_empty() { CAUGHT_UP_PAGE } else { SHIELDED_PAGE };
+            // Time the FETCH separately from the ingest below.
+            //
+            // The `scan cost so far` counters measure trial decryption and the tree, and
+            // nothing else — so for months they described a slice of the work and were
+            // read as if they described the work. Tracked against wall clock, decryption
+            // turned out to be ~2% of a wallet's sync time (9,514 -> 10,722 ms of decrypt
+            // across 67 s of syncing). Everything spent making it faster moved ~2% of the
+            // total, which is why a 1.8x on decrypt did not show up as a faster wallet.
+            //
+            // A page is ~536 ms at the observed 1,865 blocks/s, of which ~10 ms is
+            // decryption. This says where the other ~526 ms goes.
+            let t_fetch = std::time::Instant::now();
             let fetched = tokio::time::timeout(SYNC_RPC_TIMEOUT, fetch_shielded_page(client, cache, self.low, page_limit)).await;
+            self.page_fetch_ns += t_fetch.elapsed().as_nanos();
+            self.page_count += 1;
             let resp = match fetched {
                 Ok(Ok(r)) => r,
                 Err(_elapsed) => {
@@ -2111,6 +2134,7 @@ impl WalletEntry {
             // This section is synchronous trial-decryption/tree work. Mark it as
             // blocking so Tokio starts replacement workers for HTTP and RPC tasks
             // while up to three wallets continue ingesting in parallel.
+            let t_ingest = std::time::Instant::now();
             let (advanced, at_margin) = tokio::task::block_in_place(|| {
                 let mut advanced = false;
                 let mut at_margin = false;
@@ -2235,6 +2259,7 @@ impl WalletEntry {
                 }
                 (advanced, at_margin)
             });
+            self.page_ingest_ns += t_ingest.elapsed().as_nanos();
             // A FULL small page means more blocks arrived than CAUGHT_UP_PAGE
             // carried: this wallet is not at the tip after all — take a full
             // page next iteration instead of declaring victory.
@@ -3828,6 +3853,23 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
                 c.leaves,
                 c.tree_ns as f64 / 1000.0 / c.leaves.max(1) as f64,
             );
+            // The percentages above are shares of decrypt+tree, NOT of the sync. Report
+            // the page pipeline next to them so the two can never again be confused: a
+            // 1.8x on decryption moved ~2% of a wallet's sync time, and the counters as
+            // they stood gave no way to see that.
+            if e.page_count > 0 {
+                let fetch_ms = (e.page_fetch_ns / 1_000_000) as u64;
+                let ingest_ms = (e.page_ingest_ns / 1_000_000) as u64;
+                log::info!(
+                    "page pipeline: fetch {} ms ({:.0} ms/page) | ingest {} ms ({:.0} ms/page) | {} pages -> fetch is {}% of the two",
+                    fetch_ms,
+                    fetch_ms as f64 / e.page_count as f64,
+                    ingest_ms,
+                    ingest_ms as f64 / e.page_count as f64,
+                    e.page_count,
+                    fetch_ms * 100 / (fetch_ms + ingest_ms).max(1),
+                );
+            }
         }
     }
     // NB: the eager witness pre-advance and base compaction live in `sync_chunk`'s
