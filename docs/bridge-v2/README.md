@@ -9,11 +9,11 @@ they version alongside the code they describe and survive machine changes.
 1. **`SESSION-STATE-2026-08-06.md`** — CURRENT state. Where every branch, PR,
    config, port, and open item stands; the bug ledger; the process rules.
    Read this first; it supersedes both archived state docs.
-2. **`merged-bridge-v2-spec.md`** — the design spec (Draft 3, 2026-08-04).
-   Architecture contract, workstreams WS1–WS8, the seven consensus invariants,
-   the V1–V7 validation gates, rollout plan. **Draft 4 pending** — see the
-   spec-drift list in §6 of the state doc; Draft 3 predates WS1/WS2 completion
-   and the WS3 telemetry work.
+2. **`merged-bridge-v2-spec.md`** — the design spec (**Draft 4, 2026-08-06**).
+   Architecture contract (incl. as-built attach lifecycle, commitment wire
+   format, and template budget), workstreams WS1–WS8 with status marks, the
+   **eight** consensus invariants, the V2–V7 validation gates, rollout plan
+   with the cutover deviation recorded. Draft 3 remains in git history.
 3. Archived state docs (`archive-*`) — kept for provenance only; every fact in
    them that still matters is carried forward into the current state doc.
 
