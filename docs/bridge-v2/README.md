@@ -6,7 +6,7 @@ they version alongside the code they describe and survive machine changes.
 
 ## Reading order for a cold start
 
-1. **`SESSION-STATE-2026-08-06.md`** — CURRENT state. Where every branch, PR,
+1. **`SESSION-STATE-2026-08-07.md`** — CURRENT state. Where every branch, PR,
    config, port, and open item stands; the bug ledger; the process rules.
    Read this first; it supersedes both archived state docs.
 2. **`merged-bridge-v2-spec.md`** — the design spec (**Draft 4, 2026-08-06**).
