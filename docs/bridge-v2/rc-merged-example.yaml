@@ -1,0 +1,38 @@
+# Example RC config for the v2 merged bridge — copy to the repo root, adjust,
+# and launch with:  start-rc-bridge.cmd   (which supplies the env + flags)
+#
+# Ports here are the RC's (+200 from production RKStratum's 5555-5563) so the
+# RC coexists with the production bridges instead of colliding with them.
+# Prometheus/dashboard/health listeners are left EMPTY: an empty string
+# disables that listener entirely, which is what lets three bridges run on one
+# host. Enable them (offset ports) only for the V7 A/B comparison.
+
+kaspad_address: "127.0.0.1:16110"   # Kaspa node gRPC. NOT 17110 — that is
+                                    # wRPC-Borsh, which this bridge does not
+                                    # speak (symptom: accept-then-abort).
+block_wait_time: 200                # ticker FALLBACK only since WS2; real jobs
+                                    # arrive by node push (~22/s at 10 BPS)
+print_stats: true
+log_to_file: false
+health_check_port: ""
+web_dashboard_port: ""              # e.g. ":3034" to enable, offset from prod
+var_diff: false
+shares_per_min: 15
+var_diff_stats: false
+extranonce_size: 2
+pow2_clamp: true
+
+instances:
+  - stratum_port: ":5755"           # KS0 Ultra class
+    min_share_diff: 1024
+    prom_port: ""
+  - stratum_port: ":5765"           # KS7 Lite class
+    min_share_diff: 4096
+    prom_port: ""
+
+# Merged mining is enabled by ENVIRONMENT, not by this file (WS5 yaml-first
+# config is still owed — see the state doc's open items):
+#   ZKAS_MERGED_NODE=127.0.0.1:16810
+#   ZKAS_TREASURY_ADDRESS=zkas:...
+# BOTH are required; one alone logs a loud warning and runs plain KAS.
+# Unset entirely, this binary is byte-for-byte RKStratum.
