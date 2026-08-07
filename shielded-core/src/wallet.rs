@@ -405,9 +405,16 @@ pub mod scan {
             return None;
         }
 
-        let mut candidates: Vec<usize> = Vec::new();
-        for (i, (rec, secret)) in actions.iter().zip(secrets.iter()).enumerate() {
-            let Some(secret) = secret else { continue };
+        // The filter below is per-action independent, so it runs across cores.
+        //
+        // This mattered more than the device did. Handing the key agreement to the GPU
+        // made that part nearly free (74.98 -> ~3.1 us/action) but left the KDF and
+        // ChaCha20 — the other 25% — running SERIALLY on one core, and this function
+        // returns before it can ever reach the rayon path below. So the whole GPU win
+        // was capped by the one piece still single-threaded: 3.1 + 26.7 = 29.8 us/action
+        // predicted, against 31.4 measured live. The device was waiting on a for-loop.
+        let filter = |i: usize, rec: &CompactActionRecord, secret: &Option<pallas::Affine>| -> Option<usize> {
+            let secret = secret.as_ref()?;
             // The Orchard KDF, exactly as the spec defines it (§5.4.5.6): BLAKE2b-256
             // personalised "Zcash_OrchardKDF" over the affine shared secret then the
             // ephemeral key bytes.
@@ -418,22 +425,36 @@ pub mod scan {
                 .update(&secret.to_bytes())
                 .update(&rec.ephemeral_key)
                 .finalize();
-
             // ChaCha20, zero nonce, SEEKED TO BYTE 64 — block 0 is the Poly1305 keying
             // output and is skipped. Spelled out because getting it wrong decrypts to
             // noise and then silently finds nothing at all.
-            //
-            // Only the first byte is needed, but ChaCha20 is a stream cipher over a
-            // 52-byte buffer; there is nothing cheaper to ask for.
             let mut pt = rec.enc_ciphertext;
             let mut cipher = chacha20::ChaCha20::new(key.as_bytes().into(), &[0u8; 12].into());
             cipher.seek(64u32);
             cipher.apply_keystream(&mut pt);
+            (pt[0] == 0x02).then_some(i)
+        };
 
-            if pt[0] == 0x02 {
-                candidates.push(i);
-            }
-        }
+        // Same threshold reasoning as the CPU path: below this the fork/join costs more
+        // than the work. `collect` on an indexed parallel iterator preserves order, so
+        // `candidates` stays ascending either way — which the index remap below needs.
+        const FILTER_PAR_MIN: usize = 512;
+        let candidates: Vec<usize> = if actions.len() >= FILTER_PAR_MIN {
+            use rayon::prelude::*;
+            actions
+                .par_iter()
+                .zip(secrets.par_iter())
+                .enumerate()
+                .filter_map(|(i, (rec, secret))| filter(i, rec, secret))
+                .collect()
+        } else {
+            actions
+                .iter()
+                .zip(secrets.iter())
+                .enumerate()
+                .filter_map(|(i, (rec, secret))| filter(i, rec, secret))
+                .collect()
+        };
 
         if candidates.is_empty() {
             return Some(Vec::new());
