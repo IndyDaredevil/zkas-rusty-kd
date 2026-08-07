@@ -138,7 +138,15 @@ impl Gpu {
         if idx.is_empty() {
             return Some(vec![None; epks.len()]);
         }
-        let affine: Vec<pallas::Affine> = idx.iter().map(|&i| epks[i].unwrap().to_affine()).collect();
+        // ONE inversion for the whole batch, not one per point.
+        //
+        // `to_affine()` performs a modular inversion each time it is called, so mapping
+        // it over the batch cost ~10 us/point — dwarfing the 1.567 us the kernel takes
+        // and making the whole GPU path look like a marshalling problem. Montgomery's
+        // trick turns N inversions into one plus 3N multiplications.
+        let proj: Vec<pallas::Point> = idx.iter().map(|&i| epks[i].unwrap()).collect();
+        let mut affine = vec![pallas::Affine::default(); proj.len()];
+        pallas::Point::batch_normalize(&proj, &mut affine);
 
         let mut input = vec![0u32; idx.len() * 2 * LIMBS];
         for (k, a) in affine.iter().enumerate() {

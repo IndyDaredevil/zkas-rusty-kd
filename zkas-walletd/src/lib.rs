@@ -4363,19 +4363,26 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
                 // snapshot (real balance + progress) instead of a zero default. This is the
                 // fix for the balance/scan-progress flickering to 0 mid-scan.
                 fill_status_from_snap(&mut resp, &snap);
-                if resp.error.is_none() {
-                    resp.error = Some("updating…".into());
-                }
+                // Deliberately NOT an error. `error` is rendered by every client as a
+                // red failure box, and this condition — the sync loop happening to hold
+                // the wallet lock at this instant — is the most ordinary thing the
+                // daemon does. It flickered on and off with the lock, so a healthy
+                // wallet showed a red "updating…" strobing under its balance.
+                //
+                // The snapshot above already carries the real balance and progress, and
+                // the client's own status model decides what to call the state. There is
+                // nothing here a user needs told.
             } else {
-                // Loaded but not yet snapshotted (very first pass) — report presence only.
+                // Loaded but not yet snapshotted (very first pass) — report presence
+                // only. `scanned_blocks: 0` with `synced: false` is what the client reads
+                // as "opening", so this needs no message either.
                 resp.has_wallet = true;
-                resp.error = Some("updating…".into());
             }
         } else if wallet_exists(&state.wallet_dir, &token) {
-            // Known wallet, not yet in memory — load it in the background.
+            // Known wallet, not yet in memory — load it in the background. Same again:
+            // a load in flight is a state, not a fault.
             state.spawn_load(&token);
             resp.has_wallet = true;
-            resp.error = Some("loading…".into());
         }
     }
     Json(resp)
