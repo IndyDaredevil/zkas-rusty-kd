@@ -257,21 +257,45 @@ pub mod scan {
         agree_scalar: Option<&pallas::Scalar>,
         actions: &[CompactActionRecord],
     ) -> Vec<ReceivedNote> {
-        // Below this, a device is slower than the CPU and must not be asked. Measured
-        // on an RTX 2080 Ti against this crate's own CPU path:
+        // Below this, the device is not worth asking — measured against the code that
+        // would otherwise run, which is the correction that matters here.
         //
-        //     batch      2      5     50    200   1000   5000  100000
-        //     speedup 0.03x  0.08x  0.71x 2.42x  7.02x 13.1x   15.3x
+        // The old threshold (256) came from comparing the GPU with `cpu_batch_agree`, a
+        // naive single-threaded `p * ivk` at ~192 us/pt. The daemon would never run that:
+        // orchard uses a PREPARED-Wnaf multiply (74.98 us/pt) and the path below spreads
+        // it over every core. So the honest baseline is ~15-17 us/pt, and the device has
+        // to clear a bar an order of magnitude higher than the one it was calibrated on.
         //
-        // Break-even is ~100 points. Fixed per-call cost — the launch, the transfers,
-        // the synchronise — is what dominates a small batch, and no kernel improvement
-        // touches it. Deploying without this guard turned trial decryption from
-        // 105.6 us/action into ~700 us/action on the live daemon, a 7x regression,
-        // because the ingest path calls this once per TRANSACTION: a handful of actions.
+        // Re-measured on an RTX 2080 Ti against parallel prepared-Wnaf on 12 threads:
         //
-        // So the guard is not a tuning knob, it is the difference between "faster when
-        // it can be" and "slower whenever it is on". Until the ingest batches a whole
-        // page, this simply keeps the CPU path — correct, and never worse.
+        //     batch      500    1000    2000    4000    8000   16000   32000
+        //     GPU      32.05   13.68    7.06    3.93    2.52    2.95    2.87  us/pt
+        //     CPU-par  16.06   15.70   15.41   18.01   16.79   15.19   17.13  us/pt
+        //     GPU wins    NO   1.15x   2.18x   4.58x   6.65x   5.14x   5.96x
+        //
+        // The shape is not a fixed launch overhead, which is what I first assumed. It is
+        // the LATENCY OF ONE LADDER: ~12 ms, flat from n=2 all the way to n=1000, and
+        // only growing once n passes the device's core count, in waves. A quarter-full
+        // device costs the same wall-clock as a full one.
+        //
+        // Hence 256 — restored to the value that actually measured fastest end to end.
+        //
+        // I raised this to 2048, then 32768, chasing a per-batch table that said bigger
+        // batches suit the device. Both made the live daemon SLOWER, and a user watching
+        // a scan reported the estimate climbing. The table was measured with ONE caller;
+        // the daemon runs 8 wallets against a device held by a single global mutex
+        // (`g_lock` in pallas.cu), so per-call efficiency and end-to-end throughput are
+        // different questions and only the second one matters.
+        //
+        // End-to-end, cold wallet from birthday 0, only this and the page size changing:
+        //
+        //     256  + page 1000    2,219 blocks/s   <- fastest, restored
+        //     2048 + page 2000      892 blocks/s
+        //
+        // The lesson is not about a number. Every time this constant moved on the
+        // strength of a microbenchmark it got worse, and every regression was visible in
+        // the live counters within minutes. Change it only against a cold-scan blocks/s
+        // measurement, and only with no unrelated test wallets syncing.
         const GPU_MIN_BATCH: usize = 256;
 
         if actions.len() >= GPU_MIN_BATCH {
@@ -395,10 +419,29 @@ pub mod scan {
         }
         // An ephemeral key that is not a valid encoding can never yield a note; it is
         // carried as `None` so positions stay aligned with `actions`.
-        let epks: Vec<Option<pallas::Point>> = actions
-            .iter()
-            .map(|r| Option::<pallas::Affine>::from(pallas::Affine::from_bytes(&r.ephemeral_key)).map(pallas::Point::from))
-            .collect();
+        // Decompressing an ephemeral key is CURVE ARITHMETIC, not parsing.
+        //
+        // `from_bytes` recovers y from x, which needs a modular square root — an
+        // exponentiation costing 6.79 us/action measured, versus 0.15 for the KDF and
+        // 0.12 for ChaCha20. It was running serially on one core here, immediately
+        // before handing the batch to a device, which is the same mistake as the serial
+        // filter below it: offload one half of the curve work and leave the other half
+        // single-threaded.
+        //
+        // I had reported the non-agreement cost as a ~26.7 us/action "floor" for the
+        // hash and cipher. That figure was a residual (105.6 - 78.87), never a
+        // measurement, and measuring it directly showed the hash and cipher are 1% of
+        // it. Decompression is the part that was real.
+        let decompress = |r: &CompactActionRecord| {
+            Option::<pallas::Affine>::from(pallas::Affine::from_bytes(&r.ephemeral_key)).map(pallas::Point::from)
+        };
+        const DECOMPRESS_PAR_MIN: usize = 512;
+        let epks: Vec<Option<pallas::Point>> = if actions.len() >= DECOMPRESS_PAR_MIN {
+            use rayon::prelude::*;
+            actions.par_iter().map(decompress).collect()
+        } else {
+            actions.iter().map(decompress).collect()
+        };
 
         let secrets = agree(&epks)?;
         if secrets.len() != actions.len() {

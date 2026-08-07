@@ -105,12 +105,15 @@ const DEFAULT_ANCHOR_DEPTH: u64 = 600;
 // synchronous decode burst under the wallet lock and starves the axum HTTP handlers
 // during a scan — it took wallet.zkas.info's /health/status to timeouts on 2026-07-15.
 const PAGES_PER_CHUNK: usize = 4;
-/// Chain blocks requested per `GetShieldedBlocks` page (node max 2000). Raised
-/// 200→1000 for fewer round-trips and bigger ingest bursts between the node's
-/// pruning-lock stalls — safe now that (a) the RPC target is the local node
-/// (~ms/page), (b) the eager witness advance is gone from the sync path, and
-/// (c) status reads lock-free snapshots, so a longer burst under the wallet
-/// lock no longer blocks status calls.
+/// Chain blocks requested per `GetShieldedBlocks` page (node max 2000, see
+/// `MAX_LIMIT` in `rpc/service/src/service.rs:774`). Raised 200→1000 for fewer
+/// round-trips and bigger ingest bursts between the node's pruning-lock stalls.
+///
+/// I briefly took this to the node's 2000 cap on the theory that a bigger page means
+/// a bigger trial-decryption batch. It measured worse end to end (892 blocks/s
+/// against 2,219), so it is back at 1000. Page size is not free: it is also the unit
+/// of work held under the wallet lock, and eight wallets each holding a doubled page
+/// cost more than the batching saved.
 const SHIELDED_PAGE: u64 = 1000;
 /// Blocks requested per page once a wallet is CAUGHT UP and holding a healthy
 /// preview roll: the roll already covers the ~200-block unsettled window (its
