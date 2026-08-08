@@ -70,6 +70,19 @@ impl DbSelectedChainStore {
         self.write_entry(batch, new_index, hash)
     }
 
+    /// Remove one `(index, hash)` pair, both directions.
+    ///
+    /// The undo of [`Self::write_entry`], used when a backfilled history range fails
+    /// verification. Both directions must go: leaving `index_by_hash` behind would let
+    /// `get_shielded_chain_range` resolve a block whose `hash_by_index` entry no longer exists,
+    /// and a page fetch that fails does not advance a wallet's cursor — so a half-deleted index
+    /// is not a smaller archive, it is a permanently stalled wallet.
+    pub fn delete_entry(&mut self, batch: &mut WriteBatch, index: u64, hash: Hash) -> StoreResult<()> {
+        self.access_hash_by_index.delete(BatchDbWriter::new(batch), index.into())?;
+        self.access_index_by_hash.delete(BatchDbWriter::new(batch), hash)?;
+        Ok(())
+    }
+
     /// Set the highest chain index. Only for the offline restore tool; see [`Self::rebase_entry`].
     pub fn set_highest_index(&mut self, batch: &mut WriteBatch, index: u64) -> StoreResult<()> {
         self.access_highest_index.write(BatchDbWriter::new(batch), &index)

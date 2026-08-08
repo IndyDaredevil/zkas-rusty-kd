@@ -23,7 +23,6 @@ use kaspa_hashes::Hash;
 use kaspa_shielded_core::ExtractedNoteCommitment;
 use kaspa_shielded_core::coinbase::{coinbase_note, derive_coinbase_note_desc};
 use kaspa_shielded_core::nullifier::{MemNullifierSet, NullifierBytes, NullifierConflictResolver, NullifierSet};
-#[cfg(test)]
 use kaspa_shielded_core::state::CoinbaseNote;
 use kaspa_shielded_core::state::{BlockShieldedOutcome, CoinbaseMint, ShieldedStateError, ShieldedTx, apply_chain_block_to};
 use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree, TreeStateError};
@@ -36,7 +35,8 @@ use kaspa_muhash::MuHash;
 
 use crate::model::stores::shielded::{
     AnchorBlockStoreReader, AnchorProducersStoreReader, BurnReceipts, DbAnchorBlockStore, DbAnchorProducersStore,
-    DbNullifierDiffStore, DbNullifierSetStore, DbShieldedBurnStore, DbShieldedDevAccruedStore, DbShieldedNullifierMuHashStore,
+    DbNullifierDiffStore, DbNullifierSetStore, DbShieldedAnchorSourceScoreStore, DbShieldedBurnStore, DbShieldedDevAccruedStore,
+    DbShieldedNullifierMuHashStore,
     DbShieldedScanBlockStore, DbShieldedSupplyStore, DbShieldedTreeStore, NullifierDiffStoreReader, NullifierSetStore,
     NullifierSetStoreReader, ShieldedBurnStoreReader, ShieldedNullifierMuHashStoreReader, ShieldedScanBlockData,
     ShieldedScanBlockStoreReader, ShieldedSupplyStoreReader, ShieldedTreeStoreReader, SupplyTotals,
@@ -157,6 +157,41 @@ pub struct PruningPointShieldedMetadata {
     /// `bincode::deserialize` allows trailing bytes, so an older peer simply ignores it.
     #[serde(default)]
     pub dev_accrued: u64,
+
+    /// Blue score of each block named as a source in [`Self::in_window_anchors`].
+    ///
+    /// Without this a fast-synced node still cannot use those anchors, and
+    /// [`Self::in_window_anchors`] alone does not fix the bug it was added for.
+    /// `is_shielded_anchor_final` needs two things: WHICH block produced the root (the
+    /// mapping, transferred above) and WHETHER that block is a matured chain ancestor. The
+    /// second is read from `ghostdag_store.get_blue_score(source)` — and for a source below
+    /// the pruning point, a fast-synced node has no ghostdag data at all, so the lookup fails
+    /// and the anchor is judged non-final exactly as if it had never been transferred.
+    ///
+    /// `params.rs` asserts the opposite — that an in-window anchor's source "always has
+    /// ghostdag/reachability data on every synced node (full, pruned or IBD-seeded)" because
+    /// `max_shielded_anchor_age < pruning_depth - finality_depth`. That reasoning measures the
+    /// anchor's age from the TIP. A node in IBD validates blocks sitting AT its pruning point,
+    /// so their anchors reach BELOW it by construction. Measured on mainnet 2026-08-08:
+    /// pruning point blue score 993,600; the first disqualified block 993,652 (+52); its
+    /// anchor's source 990,606 — 2,994 BELOW the pruning point, at a perfectly legal age of
+    /// 3,046 inside the `[600, 27000]` window. The node dropped the spend, omitted its
+    /// 24,578,600 fee from the coinbase it expected, and disqualified the block; every later
+    /// block inherited. That is the whole failure.
+    ///
+    /// Ancestry needs no transfer: the server builds this walking its OWN selected chain below
+    /// the pruning point, and the pruning point is PoW-committed and on the syncee's chain too,
+    /// so every source here is a selected-chain ancestor of every block above it.
+    ///
+    /// Not fail-open (audit F-04): an anchor whose source is absent from this set is still
+    /// judged non-final. It only lets a node use anchors the serving peer explicitly attested,
+    /// bounded to the window below the adopted pruning point.
+    ///
+    /// Wire compatibility: appended LAST, so a peer that predates it sends a shorter blob and
+    /// [`Self::from_wire_bytes`] falls back — the same positional-bincode discipline
+    /// `dev_accrued` needed. Empty means "peer cannot attest", which fails closed.
+    #[serde(default)]
+    pub in_window_anchor_source_scores: Vec<(Hash, u64)>,
 }
 
 /// The pre-accrual wire layout, kept only so [`PruningPointShieldedMetadata::from_wire_bytes`]
@@ -184,6 +219,42 @@ impl From<LegacyPruningPointShieldedMetadata> for PruningPointShieldedMetadata {
             state_root: v.state_root,
             in_window_anchors: v.in_window_anchors,
             dev_accrued: 0,
+            in_window_anchor_source_scores: Vec::new(),
+        }
+    }
+}
+
+/// The layout as of `dev_accrued` but before `in_window_anchor_source_scores`, so a peer that
+/// carries the accrual but not the scores still decodes. Must stay byte-identical to the current
+/// struct minus the trailing field — this is the third wire generation, and each one only works
+/// because the new field went on the END.
+#[derive(serde::Deserialize)]
+struct PreAnchorScoresPruningPointShieldedMetadata {
+    frontier: FrontierState,
+    supply: SupplyTotals,
+    nullifier_muhash: MuHash,
+    #[serde(default)]
+    burns: BurnReceipts,
+    state_root: [u8; 32],
+    #[serde(default)]
+    in_window_anchors: Vec<([u8; 32], Hash)>,
+    #[serde(default)]
+    dev_accrued: u64,
+}
+
+impl From<PreAnchorScoresPruningPointShieldedMetadata> for PruningPointShieldedMetadata {
+    fn from(v: PreAnchorScoresPruningPointShieldedMetadata) -> Self {
+        Self {
+            frontier: v.frontier,
+            supply: v.supply,
+            nullifier_muhash: v.nullifier_muhash,
+            burns: v.burns,
+            state_root: v.state_root,
+            in_window_anchors: v.in_window_anchors,
+            dev_accrued: v.dev_accrued,
+            // Empty, not a guess: the peer never claimed any blue scores, so nothing is
+            // attested and every in-window anchor keeps failing closed.
+            in_window_anchor_source_scores: Vec::new(),
         }
     }
 }
@@ -201,11 +272,16 @@ impl PruningPointShieldedMetadata {
     /// the accrual to zero — which is the correct value for any chain that has not yet
     /// activated accrual, i.e. exactly the chains an older peer can be serving.
     pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, String> {
+        // Newest layout first, then each older one in turn. Order matters and must stay
+        // newest-to-oldest: an older layout is a strict prefix of a newer one, and
+        // `bincode::deserialize` ignores trailing bytes — so trying an old layout first would
+        // succeed against a NEW blob and silently discard the fields it does not know.
         match bincode::deserialize::<Self>(bytes) {
             Ok(md) => Ok(md),
-            Err(primary) => bincode::deserialize::<LegacyPruningPointShieldedMetadata>(bytes)
+            Err(primary) => bincode::deserialize::<PreAnchorScoresPruningPointShieldedMetadata>(bytes)
                 .map(Into::into)
-                .map_err(|_| format!("malformed shielded pruning-point metadata: {primary}")),
+                .or_else(|_| bincode::deserialize::<LegacyPruningPointShieldedMetadata>(bytes).map(Into::into))
+                .map_err(|_: bincode::Error| format!("malformed shielded pruning-point metadata: {primary}")),
         }
     }
 
@@ -293,10 +369,30 @@ impl From<StoreError> for ShieldedManagerError {
 /// Mixing the block hash in makes the root unique per block. There is no circularity:
 /// a block's coinbase commits its parent's shielded state, never its own notes.
 pub fn build_coinbase_mint(coinbase_tx: &Transaction, block_hash: Option<Hash>) -> Result<CoinbaseMint, ShieldedManagerError> {
-    let txid = coinbase_tx.id();
-    let mut notes = Vec::with_capacity(coinbase_tx.outputs.len());
-    for (i, out) in coinbase_tx.outputs.iter().enumerate() {
-        let script = out.script_public_key.script();
+    let outputs: Vec<(&[u8], u64)> =
+        coinbase_tx.outputs.iter().map(|out| (out.script_public_key.script(), out.value)).collect();
+    Ok(CoinbaseMint::new(coinbase_notes_from_outputs(coinbase_tx.id(), &outputs, block_hash)?))
+}
+
+/// The coinbase notes a block mints, derived from the **public output descriptions**
+/// rather than from the coinbase transaction itself.
+///
+/// This is the same derivation [`build_coinbase_mint`] performs, factored out because the
+/// scan archive keeps `(script_public_key bytes, value)` pairs and not the transaction — so
+/// history replay would otherwise have to re-implement the seed rule in a second place. It
+/// must not: a replay that derived even one commitment differently would fail against
+/// honest data and reject a good peer. One function, both callers.
+///
+/// `block_hash` is the F-02 fork gate, decided by the caller against
+/// `shielded_coinbase_seed_activation` — see [`build_coinbase_mint`] for what each value
+/// means and why the choice cannot be defaulted.
+pub fn coinbase_notes_from_outputs(
+    coinbase_txid: Hash,
+    outputs: &[(&[u8], u64)],
+    block_hash: Option<Hash>,
+) -> Result<Vec<CoinbaseNote>, ShieldedManagerError> {
+    let mut notes = Vec::with_capacity(outputs.len());
+    for (i, (script, value)) in outputs.iter().enumerate() {
         if script.len() < 43 {
             return Err(ShieldedManagerError::MalformedCoinbaseNote("coinbase reward script too short for an Orchard address"));
         }
@@ -306,15 +402,29 @@ pub fn build_coinbase_mint(coinbase_tx: &Transaction, block_hash: Option<Hash>) 
         if let Some(h) = block_hash {
             seed.extend_from_slice(&h.as_bytes());
         }
-        seed.extend_from_slice(&txid.as_bytes());
+        seed.extend_from_slice(&coinbase_txid.as_bytes());
         seed.extend_from_slice(&(i as u32).to_le_bytes());
         let desc = derive_coinbase_note_desc(recipient, &seed);
-        let note = coinbase_note(&desc, out.value).map_err(|_| {
+        let note = coinbase_note(&desc, *value).map_err(|_| {
             ShieldedManagerError::MalformedCoinbaseNote("coinbase reward recipient is not a canonical Orchard address")
         })?;
         notes.push(note);
     }
-    Ok(CoinbaseMint::new(notes))
+    Ok(notes)
+}
+
+/// Why a history replay stopped — and the distinction the caller acts on.
+///
+/// [`ReplayError::Source`] means the replay could not read its own input; the range is
+/// **unverified**, which is not the same as failed, and discarding history on it would delete
+/// good data because a local disk read hiccuped. [`ReplayError::Data`] means the leaves
+/// themselves are wrong, which is a real rejection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayError {
+    /// The iterator could not supply a block (missing record, index gap, read error).
+    Source(String),
+    /// A leaf was non-canonical or the tree refused it.
+    Data(TreeStateError),
 }
 
 /// A finalized nullifier set layered over the persisted global set plus the
@@ -431,6 +541,8 @@ pub struct ShieldedStateManager {
     anchor_producers: DbAnchorProducersStore,
     scan_block: DbShieldedScanBlockStore,
     burn_store: DbShieldedBurnStore,
+    /// Peer-attested blue scores for in-window anchor sources below the pruning point.
+    anchor_source_scores: DbShieldedAnchorSourceScoreStore,
 }
 
 impl ShieldedStateManager {
@@ -449,8 +561,15 @@ impl ShieldedStateManager {
             anchor_block: DbAnchorBlockStore::new(Arc::clone(&db), cache_policy),
             anchor_producers: DbAnchorProducersStore::new(Arc::clone(&db), cache_policy),
             scan_block: DbShieldedScanBlockStore::new(Arc::clone(&db), cache_policy),
-            burn_store: DbShieldedBurnStore::new(db, cache_policy),
+            burn_store: DbShieldedBurnStore::new(Arc::clone(&db), cache_policy),
+            anchor_source_scores: DbShieldedAnchorSourceScoreStore::new(db, cache_policy),
         }
+    }
+
+    /// Peer-attested blue score of an in-window anchor source, or `None` if nothing was
+    /// attested. See [`DbShieldedAnchorSourceScoreStore`]; `None` must fail closed.
+    pub fn attested_source_blue_score(&self, source: Hash) -> StoreResult<Option<u64>> {
+        self.anchor_source_scores.get(source)
     }
 
     /// Read-only access to the compact scan archive (for `GetShieldedBlocks`).
@@ -504,28 +623,56 @@ impl ShieldedStateManager {
         blocks: &[kaspa_consensus_core::api::ShieldedChainBlockData],
         coinbase_leaves: impl Fn(&kaspa_consensus_core::api::ShieldedChainBlockData) -> Vec<[u8; 32]>,
     ) -> Result<FrontierState, TreeStateError> {
+        match Self::replay_frontier_streaming(blocks.iter().map(|b| Ok((coinbase_leaves(b), b.accepted_actions.clone())))) {
+            Ok((frontier, _)) => Ok(frontier),
+            Err(ReplayError::Data(e)) => Err(e),
+            // Unreachable: an in-memory slice cannot fail to yield an item.
+            Err(ReplayError::Source(_)) => Err(TreeStateError::Inconsistent),
+        }
+    }
+
+    /// The replay itself, over a **stream** of `(coinbase leaves, accepted action blobs)` in
+    /// ascending chain order. Returns the resulting frontier and the number of leaves appended.
+    ///
+    /// Streaming rather than slice-based because verifying a real chain means replaying the whole
+    /// archive — ~1.98M actions and ~293 MB of records today — and materialising that to check it
+    /// would cost more memory than the node uses for everything else. The tree keeps only its
+    /// frontier, so this runs in constant space regardless of chain length.
+    ///
+    /// Each item is a `Result` so a caller reading from disk can abort on a missing or corrupt
+    /// record instead of silently replaying a short range and reporting a mismatch that is
+    /// really its own read error.
+    pub fn replay_frontier_streaming(
+        blocks: impl IntoIterator<Item = Result<(Vec<[u8; 32]>, Vec<Vec<u8>>), String>>,
+    ) -> Result<(FrontierState, u64), ReplayError> {
         let mut tree = GlobalTree::default();
-        for b in blocks {
-            for cmx in coinbase_leaves(b) {
-                let c = ExtractedNoteCommitment::from_bytes(&cmx);
-                if c.is_none().into() {
-                    return Err(TreeStateError::NonCanonicalNode);
-                }
-                tree.append(c.unwrap()).map_err(|_| TreeStateError::Inconsistent)?;
+        let mut leaves = 0u64;
+        let append = |tree: &mut GlobalTree, cmx: &[u8; 32], leaves: &mut u64| -> Result<(), ReplayError> {
+            let c = ExtractedNoteCommitment::from_bytes(cmx);
+            if c.is_none().into() {
+                return Err(ReplayError::Data(TreeStateError::NonCanonicalNode));
             }
-            for actions in &b.accepted_actions {
+            tree.append(c.unwrap()).map_err(|_| ReplayError::Data(TreeStateError::Inconsistent))?;
+            *leaves += 1;
+            Ok(())
+        };
+        for block in blocks {
+            let (coinbase, accepted) = block.map_err(ReplayError::Source)?;
+            // Coinbase mint first, then accepted actions in consensus applied order — the
+            // order `compute` appended them in at validation time. Any other order yields a
+            // different frontier from identical data.
+            for cmx in &coinbase {
+                append(&mut tree, cmx, &mut leaves)?;
+            }
+            for actions in &accepted {
                 for rec in actions.chunks_exact(CompactActionRecord::SERIALIZED_LEN) {
                     let mut cmx = [0u8; 32];
                     cmx.copy_from_slice(&rec[32..64]);
-                    let c = ExtractedNoteCommitment::from_bytes(&cmx);
-                    if c.is_none().into() {
-                        return Err(TreeStateError::NonCanonicalNode);
-                    }
-                    tree.append(c.unwrap()).map_err(|_| TreeStateError::Inconsistent)?;
+                    append(&mut tree, &cmx, &mut leaves)?;
                 }
             }
         }
-        Ok(tree.to_state())
+        Ok((tree.to_state(), leaves))
     }
 
     /// Read-only access to the nullifier store (for validation / queries).
@@ -597,10 +744,20 @@ impl ShieldedStateManager {
     /// over the stored index; see [`DbAnchorBlockStore::iter_all`] for why this is not derived
     /// per block.
     pub fn anchors_for_blocks(&self, blocks: &BlockHashSet) -> StoreResult<Vec<([u8; 32], Hash)>> {
+        // BOTH indexes, unioned. `anchor_block` is single-valued and last-write-wins, so a root
+        // whose most recent writer is an orphan — or any block outside `blocks` — does not appear
+        // there at all, and the syncee is left with NO mapping for it: `anchor is not a known tree
+        // root`, spend dropped, coinbase short by that fee, block disqualified. Measured
+        // 2026-08-08 on a fresh sync: anchor 9224320b resolved to nothing while the chain
+        // accepted the spend. `anchor_producers` records every producer of every root, which is
+        // precisely what the multi-producer upgrade added and what this export never read.
+        //
+        // Deduplicated because the same pair is normally in both.
+        let mut seen: std::collections::HashSet<([u8; 32], Hash)> = std::collections::HashSet::new();
         let mut out = Vec::with_capacity(blocks.len());
-        for entry in self.anchor_block.iter_all() {
+        for entry in self.anchor_producers.iter_all().chain(self.anchor_block.iter_all()) {
             let (anchor, source) = entry?;
-            if blocks.contains(&source) {
+            if blocks.contains(&source) && seen.insert((anchor, source)) {
                 out.push((anchor, source));
             }
         }
@@ -889,8 +1046,11 @@ impl ShieldedStateManager {
             nullifier_muhash,
             burns,
             state_root,
+            // Both filled by the caller (`pruning_point_shielded_metadata`), which owns the
+            // selected-chain walk and the ghostdag reads this layer has no business doing.
             in_window_anchors: Vec::new(),
             dev_accrued,
+            in_window_anchor_source_scores: Vec::new(),
         }))
     }
 
@@ -1002,6 +1162,12 @@ impl ShieldedStateManager {
             self.anchor_block.set_batch(batch, *hist_anchor, *source)?;
             self.anchor_producers.add_producer_batch(batch, *hist_anchor, *source)?;
         }
+        // And the blue score of each of those sources. Without this the mappings above resolve
+        // and then fail the maturity check, because a fast-synced node has no ghostdag data
+        // below its pruning point — the mapping alone was never enough.
+        for (source, blue_score) in md.in_window_anchor_source_scores.iter() {
+            self.anchor_source_scores.set_batch(batch, *source, *blue_score)?;
+        }
         if md.supply.cumulative_coinbase > 0 || md.supply.cumulative_fees > 0 {
             self.supply_store.set_batch(batch, block, md.supply)?;
         }
@@ -1085,6 +1251,45 @@ mod tests {
     use kaspa_database::prelude::ConnBuilder;
     use kaspa_shielded_core::ExtractedNoteCommitment;
 
+    /// History replay derives coinbase leaves from the archive's `(script, value)` pairs, while
+    /// validation derives them from the coinbase transaction. If those two ever disagree by a
+    /// single byte, replay reproduces a different frontier from identical data — and the verifier
+    /// would reject HONEST peers while a dishonest one is no easier to catch. So they are the same
+    /// function, and this pins that they stay so, on both sides of the F-02 fork boundary.
+    #[test]
+    fn replay_and_validation_derive_identical_coinbase_leaves() {
+        use kaspa_consensus_core::subnets::SUBNETWORK_ID_COINBASE;
+        use kaspa_consensus_core::tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionOutput};
+        use kaspa_shielded_core::wallet::scan::address_bytes_from_seed;
+
+        let recipients = [address_bytes_from_seed([21u8; 32]).unwrap(), address_bytes_from_seed([22u8; 32]).unwrap()];
+        let values = [5_000_000_000u64, 1_234_567u64];
+        let outputs: Vec<TransactionOutput> = recipients
+            .iter()
+            .zip(values.iter())
+            .map(|(r, v)| TransactionOutput::new(*v, ScriptPublicKey::new(0, ScriptVec::from_slice(&r[..]))))
+            .collect();
+        let tx = Transaction::new(0, vec![], outputs, 0, SUBNETWORK_ID_COINBASE, 0, vec![]);
+
+        // The archive keeps only what the scan record keeps: the script bytes and the value.
+        let record_outputs: Vec<(&[u8], u64)> =
+            tx.outputs.iter().map(|o| (o.script_public_key.script(), o.value)).collect();
+
+        for seed_block in [None, Some(Hash::from_bytes([0xab; 32]))] {
+            let from_tx = build_coinbase_mint(&tx, seed_block).expect("validation builds the mint");
+            let from_record = coinbase_notes_from_outputs(tx.id(), &record_outputs, seed_block).expect("replay derives leaves");
+            assert_eq!(from_record.len(), from_tx.notes.len(), "same note count ({seed_block:?})");
+            for (r, v) in from_record.iter().zip(from_tx.notes.iter()) {
+                assert_eq!(r.value, v.value, "same public value ({seed_block:?})");
+                assert_eq!(
+                    r.commitment.to_bytes(),
+                    v.commitment.to_bytes(),
+                    "replay-derived coinbase commitment matches validation byte-for-byte ({seed_block:?})"
+                );
+            }
+        }
+    }
+
     /// The IBD metadata gained `dev_accrued` after the field order was already on the
     /// wire, so both directions of a mixed-version network are pinned here rather than
     /// argued from bincode's documentation: an upgraded node must read a legacy peer's
@@ -1101,6 +1306,7 @@ mod tests {
             state_root: [7u8; 32],
             in_window_anchors: vec![([3u8; 32], Hash::from_bytes([4u8; 32]))],
             dev_accrued: 123_456,
+            in_window_anchor_source_scores: vec![(Hash::from_bytes([4u8; 32]), 990_606)],
         };
 
         // Round-trip through the current layout.
@@ -1109,19 +1315,91 @@ mod tests {
         assert_eq!(back.dev_accrued, 123_456);
         assert_eq!(back.supply, md.supply);
         assert_eq!(back.in_window_anchors, md.in_window_anchors);
+        assert_eq!(back.in_window_anchor_source_scores, md.in_window_anchor_source_scores);
 
-        // A legacy peer's blob is the same bytes minus the trailing u64. It must decode,
-        // with the accrual defaulted to zero — correct for any chain that has not activated.
-        let legacy_bytes = &bytes[..bytes.len() - std::mem::size_of::<u64>()];
+        // A peer that has the accrual but not the anchor scores: our blob minus the trailing
+        // vec. Decodes, with no attested scores — which fails closed rather than inventing one.
+        let pre_scores = PruningPointShieldedMetadata {
+            in_window_anchor_source_scores: Vec::new(),
+            nullifier_muhash: md.nullifier_muhash.clone(),
+            burns: md.burns.clone(),
+            ..md.clone()
+        };
+        let pre_scores_bytes = pre_scores.to_wire_bytes();
+        let truncated = &pre_scores_bytes[..pre_scores_bytes.len() - std::mem::size_of::<u64>()];
+        let from_pre_scores = PruningPointShieldedMetadata::from_wire_bytes(truncated).expect("pre-scores layout decodes");
+        assert!(from_pre_scores.in_window_anchor_source_scores.is_empty(), "no scores claimed means none attested");
+        assert_eq!(from_pre_scores.dev_accrued, 123_456, "the accrual before it still survives");
+        assert_eq!(from_pre_scores.in_window_anchors, md.in_window_anchors);
+
+        // The oldest layout: also minus the accrual u64.
+        let legacy_bytes = &truncated[..truncated.len() - std::mem::size_of::<u64>()];
         let from_legacy = PruningPointShieldedMetadata::from_wire_bytes(legacy_bytes).expect("legacy layout decodes");
         assert_eq!(from_legacy.dev_accrued, 0, "a peer without the field means no accrual, not a failure");
         assert_eq!(from_legacy.state_root, md.state_root, "everything before the new field survives");
+        assert!(from_legacy.in_window_anchor_source_scores.is_empty());
 
-        // And the other direction: a legacy reader sees our longer blob as its own layout
+        // And the other direction: an older reader sees our longer blob as its own layout
         // plus trailing bytes, which bincode ignores.
         let as_legacy: LegacyPruningPointShieldedMetadata =
-            bincode::deserialize(&bytes).expect("older node tolerates the extra field");
+            bincode::deserialize(&bytes).expect("older node tolerates the extra fields");
         assert_eq!(as_legacy.state_root, md.state_root);
+
+        // The trap this ordering exists to avoid: a NEW blob must never be decoded by an OLD
+        // layout in `from_wire_bytes`, because bincode ignores trailing bytes and would silently
+        // drop the very fields the fix depends on — a node would then fail closed exactly as
+        // before, with nothing in the log to say why.
+        assert_eq!(
+            PruningPointShieldedMetadata::from_wire_bytes(&bytes).unwrap().in_window_anchor_source_scores,
+            md.in_window_anchor_source_scores,
+            "newest layout must win when several can decode the same bytes"
+        );
+    }
+
+    /// The fix, at the store level: a source with no local ghostdag data is judged from the
+    /// blue score the pruning-point peer attested, and a source nobody attested still cannot be
+    /// judged at all. `judge_anchor_source` turns the first into a usable anchor and the second
+    /// into the same fail-closed rejection as before; this pins the data layer both rest on.
+    #[test]
+    fn attested_anchor_source_scores_are_seeded_and_absent_ones_stay_unjudgeable() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = ShieldedStateManager::new(db.clone(), CachePolicy::Empty);
+
+        // Real shape of the mainnet failure: pruning point 993,600, spending block 993,652,
+        // anchor source 990,606 — 2,994 BELOW the pruning point, age 3,046, legally in window.
+        let source = Hash::from_bytes([9u8; 32]);
+        let anchor = [11u8; 32];
+        let md = PruningPointShieldedMetadata {
+            frontier: FrontierState::default(),
+            supply: SupplyTotals::default(),
+            nullifier_muhash: MuHash::new(),
+            burns: BurnReceipts::default(),
+            state_root: [0u8; 32],
+            in_window_anchors: vec![(anchor, source)],
+            dev_accrued: 0,
+            in_window_anchor_source_scores: vec![(source, 990_606)],
+        };
+
+        let mut batch = WriteBatch::default();
+        mgr.seed_pruning_point_shielded(&mut batch, Hash::from_bytes([1u8; 32]), &md, std::iter::empty())
+            .expect("seeding the pruning-point state succeeds");
+        db.write(batch).unwrap();
+
+        assert_eq!(
+            mgr.attested_source_blue_score(source).unwrap(),
+            Some(990_606),
+            "the attested score must survive the import, or the anchor mapping is useless on its own"
+        );
+        assert_eq!(
+            mgr.anchor_source_block(&anchor).unwrap(),
+            Some(source),
+            "the mapping itself still lands (this half already worked)"
+        );
+        assert_eq!(
+            mgr.attested_source_blue_score(Hash::from_bytes([42u8; 32])).unwrap(),
+            None,
+            "an unattested source must read as None so finality still fails CLOSED (F-04)"
+        );
     }
 
     /// Retention must drop the recomputation snapshots while leaving intact the two
@@ -1340,6 +1618,7 @@ mod tests {
             state_root: [0u8; 32],
             in_window_anchors: vec![(hist_anchor, hist_source)],
             dev_accrued: 0,
+            in_window_anchor_source_scores: Vec::new(),
         };
 
         let mut batch = WriteBatch::default();
@@ -1814,7 +2093,6 @@ mod tests {
     /// The anchor→block index records a block's tree root so a spend can later be
     /// resolved to its source block (finality/canonicality is then decided by the
     /// virtual processor via reachability + depth, tested at that layer).
-    #[test]
     /// The backfill verifier must reproduce the exact frontier an honest range builds, and must
     /// reject any tampering. Without this the whole history-backfill path would be "trust the
     /// peer", which is precisely what it exists to avoid.

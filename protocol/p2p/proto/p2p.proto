@@ -382,6 +382,12 @@ message RequestShieldedHistoryMessage {
 message ShieldedHistoryChunkMessage {
   repeated ShieldedHistoryEntry entries = 1;  // oldest-last (descending chain order)
   bool done = 2;                              // true when the server reached genesis
+  // The anchor's own GENESIS-based index on the server. The requester needs this to align the
+  // two numbering spaces: its index is re-based so ITS pruning point is 0, and the walk below
+  // is EXCLUSIVE of the anchor, so the anchor block is never in `entries` and its index cannot
+  // be inferred from them. Without it the ingest searched each chunk for a block the protocol
+  // guarantees is absent, found nothing, and wrote nothing — silently, for every chunk.
+  uint64 anchorIndex = 3;
 }
 
 message ShieldedHistoryEntry {

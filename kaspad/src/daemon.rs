@@ -696,6 +696,40 @@ Do you confirm? (y/n)";
         cache_budget,
     ));
     let consensus_manager = Arc::new(ConsensusManager::new(consensus_factory));
+
+    // `--verify-shielded-history`: replay the archive against this node's own anchored frontier
+    // and report, before serving anything.
+    //
+    // The p2p backfill verifies itself, but the OFFLINE restore path (`zkas-scan-import`) has no
+    // such moment — a file can be truncated, stale, or from another chain, and the symptom would
+    // be wallets quietly reporting wrong balances rather than an error. This gives an operator a
+    // way to ask the question directly. Read-only: it never deletes on this path, because a human
+    // ran it deliberately and should decide what to do about the answer.
+    if args.verify_shielded_history {
+        use kaspa_consensus_core::api::ShieldedHistoryVerdict;
+        let consensus = consensus_manager.consensus().unguarded_session_blocking();
+        // Against the SINK, not the history base. The base is the lowest block this node can
+        // enumerate — on a full-history node that is genesis itself, so verifying "up to the base"
+        // would replay one block and prove nothing. The sink is the top of the archive, so this
+        // checks all of it.
+        let base = consensus.get_sink();
+        info!("Verifying the shielded archive against the anchored frontier at {base} (reads the whole archive)...");
+        let started = std::time::Instant::now();
+        match consensus.verify_shielded_history(base) {
+            Ok(ShieldedHistoryVerdict::Verified { blocks, leaves }) => {
+                info!("Shielded archive VERIFIED: {blocks} chain blocks, {leaves} note commitments, in {:?}", started.elapsed())
+            }
+            Ok(ShieldedHistoryVerdict::Mismatch { reason }) => warn!(
+                "Shielded archive does NOT match the chain: {reason}. Nothing was deleted. Wallets served from this \
+                 node may report wrong balances; re-import a verified export before serving them."
+            ),
+            Ok(ShieldedHistoryVerdict::Unverifiable { reason }) => {
+                warn!("Shielded archive could NOT be verified: {reason}. This is not a pass — the check did not run.")
+            }
+            Err(e) => warn!("Shielded archive verification failed to run: {e}"),
+        }
+    }
+
     let consensus_monitor = Arc::new(ConsensusMonitor::new(processing_counters.clone(), tick_service.clone()));
 
     let perf_monitor_builder = PerfMonitorBuilder::new()

@@ -278,7 +278,7 @@ impl ConsensusSessionOwned {
         &self,
         anchor: Hash,
         max_blocks: usize,
-    ) -> ConsensusResult<(Vec<(u64, kaspa_consensus_core::api::ShieldedChainBlockData)>, bool)> {
+    ) -> ConsensusResult<(Vec<(u64, kaspa_consensus_core::api::ShieldedChainBlockData)>, bool, u64)> {
         self.clone().spawn_blocking(move |c| c.get_shielded_history_indexed_below(anchor, max_blocks)).await
     }
 
@@ -291,9 +291,25 @@ impl ConsensusSessionOwned {
     /// `backfill_shielded_history`.
     pub async fn async_backfill_shielded_history(
         &self,
+        anchor: Hash,
+        anchor_index: u64,
         records: Vec<(u64, kaspa_consensus_core::api::ShieldedChainBlockData)>,
     ) -> ConsensusResult<(u64, u64)> {
-        self.clone().spawn_blocking(move |c| c.backfill_shielded_history(&records)).await
+        self.clone().spawn_blocking(move |c| c.backfill_shielded_history(anchor, anchor_index, &records)).await
+    }
+
+    /// Replay the archive against the PoW-anchored frontier at `base` and report; read-only.
+    /// See `verify_shielded_history`.
+    pub async fn async_verify_shielded_history(
+        &self,
+        base: Hash,
+    ) -> ConsensusResult<kaspa_consensus_core::api::ShieldedHistoryVerdict> {
+        self.clone().spawn_blocking(move |c| c.verify_shielded_history(base)).await
+    }
+
+    /// Discard the backfilled range below `base`; see `purge_shielded_history_below`.
+    pub async fn async_purge_shielded_history_below(&self, base: Hash) -> ConsensusResult<u64> {
+        self.clone().spawn_blocking(move |c| c.purge_shielded_history_below(base)).await
     }
 
     pub async fn async_get_sink_timestamp(&self) -> u64 {

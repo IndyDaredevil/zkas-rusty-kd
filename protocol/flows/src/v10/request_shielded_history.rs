@@ -67,7 +67,7 @@ impl RequestShieldedHistoryFlow {
 
     async fn handle_request(&mut self, anchor: kaspa_hashes::Hash, max_blocks: usize) -> Result<(), ProtocolError> {
         let session = self.ctx.consensus().session().await;
-        let (records, done) = session.async_get_shielded_history_indexed_below(anchor, max_blocks).await?;
+        let (records, done, anchor_index) = session.async_get_shielded_history_indexed_below(anchor, max_blocks).await?;
         drop(session);
 
         let entries: Vec<ShieldedHistoryEntry> = records
@@ -82,7 +82,7 @@ impl RequestShieldedHistoryFlow {
             .collect::<Result<_, _>>()?;
 
         debug!("serving {} shielded history records below {} (done={})", entries.len(), anchor, done);
-        self.router.enqueue(make_message!(Payload::ShieldedHistoryChunk, ShieldedHistoryChunkMessage { entries, done })).await?;
+        self.router.enqueue(make_message!(Payload::ShieldedHistoryChunk, ShieldedHistoryChunkMessage { entries, done, anchor_index })).await?;
         Ok(())
     }
 }

@@ -58,6 +58,7 @@ pub struct Args {
     /// Directory for consensus-divergence reports. `Some("")` means "use the default
     /// location under appdir". See `kaspa_consensus::processes::shielded_diag`.
     pub consensus_diag: Option<String>,
+    pub verify_shielded_history: bool,
     /// File of pinned anchor→source-block mappings. See
     /// `kaspa_consensus::processes::shielded::load_anchor_overrides`.
     pub shielded_anchor_overrides: Option<String>,
@@ -127,6 +128,7 @@ impl Default for Args {
             async_threads: num_cpus::get(),
             utxoindex: false,
             consensus_diag: None,
+            verify_shielded_history: false,
             shielded_anchor_overrides: None,
             reset_db: false,
             outbound_target: 8,
@@ -394,6 +396,17 @@ pub fn cli() -> Command {
                 ),
         )
         .arg(
+            Arg::new("verify-shielded-history")
+                .long("verify-shielded-history")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "On startup, replay the whole shielded scan archive and check it reproduces this node's \
+                     PoW-anchored frontier. Use after restoring an archive with zkas-scan-import: an archive \
+                     that is truncated, stale or from another chain makes wallets report wrong balances \
+                     silently, and this is what turns that into an answer. Reports only; deletes nothing.",
+                ),
+        )
+        .arg(
             Arg::new("max-tracked-addresses")
                 .long("max-tracked-addresses")
                 .env("KASPAD_MAX_TRACKED_ADDRESSES")
@@ -585,6 +598,7 @@ impl Args {
             enable_mainnet_mining: arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", defaults.enable_mainnet_mining),
             utxoindex: arg_match_unwrap_or::<bool>(&m, "utxoindex", defaults.utxoindex),
             consensus_diag: m.get_one::<String>("consensus-diag").cloned(),
+            verify_shielded_history: m.get_one::<bool>("verify-shielded-history").cloned().unwrap_or(false),
             shielded_anchor_overrides: m.get_one::<String>("shielded-anchor-overrides").cloned(),
             testnet: arg_match_unwrap_or::<bool>(&m, "testnet", defaults.testnet),
             testnet_suffix: arg_match_unwrap_or::<u32>(&m, "netsuffix", defaults.testnet_suffix),

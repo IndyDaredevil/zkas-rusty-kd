@@ -328,6 +328,53 @@ impl DbShieldedDevAccruedStore {
     }
 }
 
+/// Blue score of a block that produced an anchor in the window below the pruning point, as
+/// attested by the peer that served the shielded IBD import.
+///
+/// Anchor finality asks two questions of a source block: is it a selected-chain ancestor of the
+/// spending block, and is its age in `[shielded_anchor_depth, max_shielded_anchor_age]`. Both are
+/// answered from ghostdag/reachability, which a fast-synced node does not have below its pruning
+/// point — so it judged every such anchor non-final and disqualified the first block above the
+/// pruning point that spent against one. Transferring the anchor→source mapping (`60abbfb`) was
+/// necessary and not sufficient: the mapping resolved and the blue-score lookup still failed.
+///
+/// An absent key means "the peer did not attest this source", which keeps the old fail-closed
+/// behaviour. Ancestry is not stored because it is implied: the server enumerates these by walking
+/// its own selected chain below the pruning point, and the pruning point is PoW-committed, so
+/// every source here is a selected-chain ancestor of every block above it.
+#[derive(Clone)]
+pub struct DbShieldedAnchorSourceScoreStore {
+    db: Arc<DB>,
+    access: CachedDbAccess<Hash, u64, BlockHasher>,
+}
+
+impl DbShieldedAnchorSourceScoreStore {
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
+        Self {
+            db: Arc::clone(&db),
+            access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedAnchorSourceScore.into()),
+        }
+    }
+
+    pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
+        Self::new(Arc::clone(&self.db), cache_policy)
+    }
+
+    pub fn set_batch(&self, batch: &mut WriteBatch, source: Hash, blue_score: u64) -> StoreResult<()> {
+        self.access.write(BatchDbWriter::new(batch), source, blue_score)
+    }
+
+    /// The attested blue score of `source`, or `None` when nothing was attested — which the
+    /// caller must treat as "cannot judge", never as zero.
+    pub fn get(&self, source: Hash) -> StoreResult<Option<u64>> {
+        match self.access.read(source) {
+            Ok(v) => Ok(Some(v)),
+            Err(StoreError::KeyNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 // --------------------------- Bridge burn accumulator ---------------------------
 
 /// Persisted bridge burn accumulator at a chain block: the ordered exit receipts burned out of the
@@ -540,6 +587,25 @@ impl DbAnchorProducersStore {
         }
         producers.push(block);
         self.access.write(BatchDbWriter::new(batch), AnchorKey(anchor), producers)
+    }
+
+    /// Every `(anchor, producer)` pair in the index, one row per producer.
+    ///
+    /// The pruning-point export needs this rather than `DbAnchorBlockStore::iter_all`: that index
+    /// is single-valued and last-write-wins, so a root whose most recent writer happens to be an
+    /// orphan (or any block outside the exported window) is invisible there, and the syncee ends
+    /// up with no mapping for it at all — `anchor is not a known tree root`, spend dropped, block
+    /// disqualified. Recording every producer is exactly what the multi-producer upgrade added;
+    /// the export simply never read it.
+    pub fn iter_all(&self) -> impl Iterator<Item = StoreResult<([u8; 32], Hash)>> + '_ {
+        self.access.iterator().flat_map(|r| match r {
+            Ok((key, producers)) => {
+                let mut anchor = [0u8; 32];
+                anchor.copy_from_slice(&key);
+                producers.into_iter().map(move |p| Ok((anchor, p))).collect::<Vec<_>>()
+            }
+            Err(e) => vec![Err(StoreError::DataInconsistency(format!("anchor-producers iteration failed: {e}")))],
+        })
     }
 }
 

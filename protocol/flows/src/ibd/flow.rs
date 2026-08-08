@@ -7,7 +7,7 @@ use futures::future::{Either, join_all, select, try_join_all};
 use itertools::Itertools;
 use kaspa_consensus_core::{
     BlockHashSet,
-    api::BlockValidationFuture,
+    api::{BlockValidationFuture, ShieldedHistoryVerdict},
     block::Block,
     config::params::{ForkActivation, Params},
     header::Header,
@@ -20,6 +20,7 @@ use kaspa_core::{debug, info, time::unix_now, warn};
 use kaspa_hashes::Hash;
 use kaspa_muhash::MuHash;
 use kaspa_p2p_lib::{
+    PeerKey,
     IncomingRoute, Router,
     common::ProtocolError,
     convert::{
@@ -41,7 +42,10 @@ use std::{
 use tokio::time::sleep;
 
 use super::{HeadersChunk, IBD_BATCH_SIZE, PruningPointUtxosetChunkStream, progress::ProgressReporter};
+use std::collections::HashSet;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+
 type BlockBody = Vec<Transaction>;
 
 /// Flow for managing IBD - Initial Block Download
@@ -67,9 +71,26 @@ impl Flow for IbdFlow {
     }
 }
 
-/// Guards the shielded-history backfill to a single attempt per process. See the call site for
-/// why retrying is actively harmful against peers that do not support the request.
-static SHIELDED_HISTORY_BACKFILL_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+/// Set once shielded history has been obtained, so no further peer is ever asked.
+static SHIELDED_HISTORY_BACKFILL_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Which peers have been asked for shielded history this process, by identity — NOT a count.
+///
+/// A single global attempt was too few and unlimited retries were far too many. A peer on a build
+/// without `RequestShieldedHistory` closes the connection rather than ignoring it, so each ask
+/// costs one dropped link: retrying per-IBD walked the entire peer set (459 attempts / 28 minutes
+/// observed, node frozen at 0 UTXO-validated blocks), while one attempt per PROCESS spent itself
+/// on whichever peer happened to be first — measured, an incapable one — and the node then never
+/// tried again although a capable peer was available.
+///
+/// Keyed by peer identity because a counter is not enough: a failed ask ends the IBD, the node
+/// reconnects to the SAME peer, and a counter happily spends the whole budget on it. Observed
+/// 2026-08-08 on a node with exactly one peer, logging "3 of 8 peers asked" — three drops of the
+/// one link, a miniature of the storm the guard exists to prevent.
+static SHIELDED_HISTORY_ASKED_PEERS: Mutex<Option<HashSet<PeerKey>>> = Mutex::new(None);
+
+/// Peer budget for the history backfill; see [`SHIELDED_HISTORY_ASKED_PEERS`].
+const SHIELDED_HISTORY_MAX_PEERS: usize = 8;
 
 pub enum IbdType {
     Sync {
@@ -262,24 +283,43 @@ impl IbdFlow {
         // Failure is logged, not fatal: the node is fully valid and correctly validating without
         // it; it just cannot serve pre-pruning-point wallet history until a later IBD retries.
         //
-        // ONE attempt per process, not per IBD. Measured 2026-08-06: a peer running a build
-        // without `RequestShieldedHistory` does not ignore it — its router does not recognise the
-        // payload and CLOSES THE CONNECTION. Retrying per-IBD therefore walked the whole peer set
-        // dropping every link in turn (459 attempts / 28 minutes observed). One shot bounds that
-        // to a single dropped connection for the node's lifetime.
+        // Bounded across peers rather than one shot. A peer without `RequestShieldedHistory`
+        // CLOSES THE CONNECTION instead of ignoring it, so an ask costs a dropped link — but
+        // stopping after one ask meant an incapable first peer permanently denied this node its
+        // history (observed: the first peer closed the connection and nothing retried). See
+        // [`SHIELDED_HISTORY_ASKED_PEERS`].
         //
-        // The proper fix is a protocol-version gate so the request is never sent to a peer that
+        // The eventual fix is a protocol-version gate so the request is never sent to a peer that
         // cannot serve it. That needs `PROTOCOL_VERSION` bumped to 11 plus a `v11` flow registry
         // AND an explicit `10 => v10::register(...)` arm in `handle_handshake` — without that arm
         // every pre-bump peer is rejected with `VersionMismatch` instead of merely lacking the
-        // feature. Until then, one-shot keeps the cost bounded.
-        if self.ctx.config.is_archival && !SHIELDED_HISTORY_BACKFILL_ATTEMPTED.swap(true, Ordering::SeqCst) {
-            if let Err(e) = self.backfill_shielded_history(&session).await {
-                warn!(
-                    "archival: shielded history backfill did not complete ({e}); wallet history below \
-                     the pruning point is unavailable. Peers running a build without shielded-history \
-                     support close the connection on this request; will not retry this session."
-                );
+        // feature. It also only pays once v11 peers exist, so the peer budget is what makes the
+        // feature work on today's mixed network.
+        // Ask this peer only if it is one we have not already asked, and only while under the
+        // peer budget. Both conditions are evaluated once, under the lock, so a concurrent IBD
+        // cannot slip a second ask to the same peer through.
+        let should_ask = self.ctx.config.is_archival
+            && !SHIELDED_HISTORY_BACKFILL_DONE.load(Ordering::SeqCst)
+            && {
+                let mut guard = SHIELDED_HISTORY_ASKED_PEERS.lock().unwrap();
+                let asked = guard.get_or_insert_with(HashSet::new);
+                asked.len() < SHIELDED_HISTORY_MAX_PEERS && asked.insert(self.router.key())
+            };
+        if should_ask {
+            match self.backfill_shielded_history(&session).await {
+                Ok(()) => {
+                    SHIELDED_HISTORY_BACKFILL_DONE.store(true, Ordering::SeqCst);
+                }
+                Err(e) => {
+                    let asked = SHIELDED_HISTORY_ASKED_PEERS.lock().unwrap().as_ref().map_or(0, |s| s.len());
+                    warn!(
+                        "archival: shielded history backfill did not complete from {} ({e}); {} of {} \
+                         peers asked. Peers on a build without shielded-history support close the \
+                         connection on this request. Wallet history below the pruning point is \
+                         unavailable until a peer that supports it is reached.",
+                        self.router, asked, SHIELDED_HISTORY_MAX_PEERS
+                    );
+                }
             }
         }
 
@@ -887,6 +927,10 @@ impl IbdFlow {
 
         const MAX_BLOCKS_PER_CHUNK: u32 = 4_000;
         let mut anchor = consensus.async_get_shielded_history_base().await;
+        // The base BEFORE any backfill: this node's own pruning point, and the only block down
+        // here whose shielded frontier came from the chain rather than from the peer. Captured
+        // now because ingesting the first chunk renumbers the index and moves the base.
+        let verify_base = anchor;
         let (mut total_idx, mut total_rec, mut rounds) = (0u64, 0u64, 0u32);
         info!("archival: backfilling shielded history below {} from {}", anchor, self.router);
 
@@ -916,19 +960,89 @@ impl IbdFlow {
             records.sort_by_key(|(i, _)| *i);
             let lowest = records.first().map(|(_, r)| r.hash).unwrap_or(anchor);
 
-            let (idx, rec) = consensus.async_backfill_shielded_history(records).await?;
+            let (idx, rec) = consensus.async_backfill_shielded_history(anchor, msg.anchor_index, records).await?;
             total_idx += idx;
             total_rec += rec;
             rounds += 1;
 
+            // Progress, not silence. This moves ~460k records over ~116 round trips while the
+            // node does nothing else; with only a start and an end line, a run that wrote NOTHING
+            // for 34 minutes looked exactly like one that was working. Reporting what was
+            // actually WRITTEN is what makes that failure visible at a glance.
+            if rounds % 10 == 0 {
+                info!("archival: shielded history {total_rec} records / {total_idx} index entries after {rounds} chunks (at {lowest})");
+            }
+
             if msg.done {
                 info!("archival: reached genesis after {rounds} rounds");
+                break;
+            }
+            // A chunk that stored nothing means our state is not advancing. Continuing would walk
+            // to genesis writing nothing and then report success — the exact 34-minute no-op this
+            // path used to perform. Stop loudly instead.
+            if idx == 0 && rec == 0 {
+                return Err(ProtocolError::OtherOwned(format!(
+                    "shielded history chunk below {anchor} (peer index {}) stored nothing; refusing to spin",
+                    msg.anchor_index
+                )));
+            }
+            // If the walk stops descending, stop — otherwise this loops forever on one block.
+            if lowest == anchor {
+                warn!("archival: shielded history stopped descending at {anchor} after {rounds} rounds; stopping");
                 break;
             }
             anchor = lowest;
         }
 
         info!("archival: shielded history backfill wrote {total_idx} index entries and {total_rec} scan records");
+
+        // Verify before this history is served to anyone.
+        //
+        // Nothing above this point checked the peer's work. The scan archive is never read by
+        // validation, so a dishonest peer cannot fork this node — but it can make every wallet
+        // querying it report a wrong balance and a wrong history, with no symptom the user could
+        // notice. Replaying the range reproduces this node's own PoW-anchored frontier only if
+        // the peer supplied exactly the right leaves in exactly the right order, so omission,
+        // reordering, fabrication and truncation are all caught by one comparison.
+        //
+        // Cost is dominated by re-reading the archive, not by the tree: appending is ~0.1 us/leaf
+        // (~2.2M leaves today), while the replay also does one store read per chain block (~1.07M).
+        // Unconditional anyway — it runs once per process, after a backfill that took far longer,
+        // and the alternative is serving wallets history nobody ever checked.
+        if total_rec > 0 {
+            match consensus.async_verify_shielded_history(verify_base).await {
+                Ok(ShieldedHistoryVerdict::Verified { blocks, leaves }) => {
+                    info!("archival: shielded history VERIFIED against the anchored frontier ({blocks} blocks, {leaves} leaves)");
+                }
+                Ok(ShieldedHistoryVerdict::Mismatch { reason }) => {
+                    // Discard what this peer gave us. Safe, not drastic: the node returns to the
+                    // history it can prove, which is exactly where it started.
+                    let discarded = match consensus.async_purge_shielded_history_below(verify_base).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            // Could not undo. Say so loudly and precisely — the archive is now
+                            // holding unverified records and no log line further up says that.
+                            warn!(
+                                "archival: shielded history from {} FAILED verification ({reason}) AND could not be \
+                                 discarded ({e}); the archive holds UNVERIFIED records below {verify_base}. Re-verify \
+                                 with --verify-shielded-history.",
+                                self.router
+                            );
+                            return Err(ProtocolError::OtherOwned(format!("shielded history failed verification: {reason}")));
+                        }
+                    };
+                    warn!(
+                        "archival: shielded history from {} FAILED verification ({reason}); discarded {discarded} scan records",
+                        self.router
+                    );
+                    return Err(ProtocolError::OtherOwned(format!("shielded history failed verification: {reason}")));
+                }
+                Ok(ShieldedHistoryVerdict::Unverifiable { reason }) => {
+                    warn!("archival: shielded history could NOT be verified ({reason}); it is retained but unproven");
+                }
+                Err(e) => warn!("archival: shielded history verification did not run ({e}); history is retained but unproven"),
+            }
+        }
         Ok(())
     }
 

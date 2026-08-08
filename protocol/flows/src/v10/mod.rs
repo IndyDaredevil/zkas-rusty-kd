@@ -53,6 +53,15 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
                 KaspadMessagePayloadType::SmtLaneChunk,
                 KaspadMessagePayloadType::ShieldedMetadata,
                 KaspadMessagePayloadType::ShieldedNullifierChunk,
+                // The backfill REPLY. Without this the router has no flow registered for the
+                // message and closes the connection the moment a peer answers — so the request
+                // was only ever answerable by a peer that ignored it. Measured 2026-08-08
+                // between two nodes that both support the request: the server served the chunk
+                // correctly and the REQUESTER dropped the link, logging
+                // "no flow has been registered for message type ShieldedHistoryChunk".
+                // That was read as "peers do not support this" and it is the reason the backfill
+                // has never once completed.
+                KaspadMessagePayloadType::ShieldedHistoryChunk,
             ]),
             relay_receiver,
             body_only_ibd_permitted,

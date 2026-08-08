@@ -127,6 +127,17 @@ pub enum DatabaseStorePrefixes {
     /// prefix has no such problem: a missing key reads as zero, which is exactly
     /// the right answer for every block mined before dev-fee accrual activates.
     ShieldedDevAccrued = 90,
+    /// Blue score of each block that produced an in-window anchor below the pruning point,
+    /// seeded from `PruningPointShieldedMetadata` during shielded IBD.
+    ///
+    /// Exists because anchor finality needs the source's blue score and a fast-synced node has
+    /// no ghostdag data below its pruning point — so the anchor→source mapping alone leaves
+    /// every such anchor judged non-final, which disqualifies the first block above the pruning
+    /// point that spends against one. A fresh prefix rather than a field on an existing value:
+    /// these stores are bincode-encoded and growing a written value type makes every existing
+    /// row undecodable, and a missing key here reads as "not attested", which is exactly the
+    /// fail-closed answer for a node that was never given the data.
+    ShieldedAnchorSourceScore = 91,
 
     // ---- Separator ----
     /// Reserved as a separator

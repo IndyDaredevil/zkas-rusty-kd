@@ -17,10 +17,17 @@
 //! # Self-verification
 //!
 //! `GlobalTree::append` is pure append-only, so the note-commitment tree is a deterministic
-//! function of the leaf sequence. The export replays every `cmx` it writes into a fresh tree and
-//! compares the result against the node's own stored frontier at the final block. A truncated,
-//! reordered or corrupt export cannot match. `VERIFIED` in the output means the file provably
-//! reconstructs the chain's tree.
+//! function of the leaf sequence. The export replays every leaf it writes — coinbase mints first,
+//! then accepted actions, the order consensus appended them — into a fresh tree and requires the
+//! result to EQUAL the node's own stored frontier at the final block. A truncated, reordered or
+//! corrupt export cannot match. `VERIFIED` means the file provably reconstructs the chain's tree;
+//! anything else exits non-zero.
+//!
+//! It did not always mean that. Until 2026-08-08 the replay skipped coinbase leaves while the
+//! stored frontier contained them, so the two sides were incomparable — measured 841,577 replayed
+//! against 2,239,146 stored — and the check had been weakened to `replayed.size > stored.size`,
+//! which printed `VERIFIED` for a truncated file, a reordered one, or a one-leaf one. Treat a
+//! `VERIFIED` from an older build as unproven.
 //!
 //! # Usage
 //!
@@ -48,6 +55,7 @@ use kaspa_consensus::model::stores::shielded::{
 use kaspa_database::prelude::{CachePolicy, ConnBuilder};
 use kaspa_shielded_core::ExtractedNoteCommitment;
 use kaspa_shielded_core::tree::{GlobalTree, NoteCommitmentTree};
+use kaspa_consensus::processes::shielded::coinbase_notes_from_outputs;
 use kaspa_shielded_core::wallet::CompactActionRecord;
 use std::io::{BufWriter, Write};
 
@@ -77,6 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the file is a faithful, complete copy without a second pass over the data.
     let mut tree = GlobalTree::default();
     let (mut written, mut leaves, mut bytes) = (0u64, 0u64, 0u64);
+    let mut action_leaves = 0u64;
     let mut bad = 0u64;
     let mut last_with_state = None;
 
@@ -98,6 +107,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+        // Coinbase mint FIRST, then the accepted actions — the order consensus appended them in.
+        // The coinbase leaves are not optional decoration: the node's stored frontier contains
+        // them, so a replay that skips them can never equal it, which is how this tool's own
+        // check came to compare sizes loosely instead of proving anything.
+        let coinbase = if !data.coinbase_commitments.is_empty() {
+            data.coinbase_commitments.clone()
+        } else {
+            // Records written before commitments were stored: derive with the SAME function
+            // consensus validates with.
+            //
+            // `None` is the pre-F-02 seed (`txid || index`), which is correct because
+            // `shielded_coinbase_seed_activation` is `never()` on every configured network. This
+            // tool has no params handle to check that against — but it does not need to guess
+            // safely, because the frontier equality check below is what catches a wrong rule: a
+            // mis-derived coinbase leaf changes the tree and the comparison fails loudly. If a
+            // network ever activates F-02, this exits non-zero rather than exporting silent junk.
+            let outputs: Vec<(&[u8], u64)> = data.coinbase_outputs.iter().map(|(s, v)| (s.as_slice(), *v)).collect();
+            coinbase_notes_from_outputs(data.coinbase_txid, &outputs, None)
+                .map_err(|e| format!("cannot derive coinbase commitments for {block}: {e:?}"))?
+                .iter()
+                .map(|n| n.commitment.to_bytes())
+                .collect()
+        };
+        for cmx in &coinbase {
+            let c = ExtractedNoteCommitment::from_bytes(cmx);
+            if bool::from(c.is_none()) {
+                return Err(format!("non-canonical coinbase cmx in block {block} at chain index {index}").into());
+            }
+            tree.append(c.unwrap()).map_err(|_| "note commitment tree full")?;
+            leaves += 1;
+        }
         for tx in &data.accepted {
             for rec in tx.action_bytes.chunks_exact(CompactActionRecord::SERIALIZED_LEN) {
                 let mut cmx = [0u8; 32];
@@ -108,6 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 tree.append(c.unwrap()).map_err(|_| "note commitment tree full")?;
                 leaves += 1;
+                action_leaves += 1;
             }
         }
 
@@ -132,9 +173,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("UNREADABLE RECORDS: {bad}");
     }
 
-    // The proof: our replayed tree must equal the node's own stored frontier at the last block
-    // that had shielded state. Coinbase mints are excluded from both sides — this compares the
-    // action-leaf sequence, which is what the archive uniquely carries.
+    // The proof: the replayed tree must EQUAL the node's own stored frontier at the last block
+    // with shielded state — same size and same frontier bytes.
+    //
+    // This used to compare `replayed.size > stored.size` and print VERIFIED for everything else,
+    // which passed a truncated export, a reordered one, and a one-leaf one. It could not do
+    // better, because the replay omitted coinbase leaves while the stored frontier includes them,
+    // so the two sides were never comparable: measured 841,577 replayed against 2,239,146 stored,
+    // and it still said VERIFIED. Both sides now cover the same leaves, so equality is the test.
     match last_with_state {
         Some(block) => {
             let stored = trees.get(block)?;
@@ -142,15 +188,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("stored   frontier @ {}: size {}", &block.to_string()[..16], stored.size);
             eprintln!("replayed frontier        : size {}", replayed.size);
             if stored.size == 0 {
-                eprintln!("NOTE: node holds no frontier for that block (pruned checkpoint) — size check skipped");
-            } else if replayed.size > stored.size {
-                eprintln!("INCONSISTENT: replayed more leaves than the node's frontier holds");
+                eprintln!("NOTE: node holds no frontier for that block (pruned checkpoint) — cannot verify");
+                eprintln!("UNVERIFIED: export written but NOT proven complete");
+                std::process::exit(1);
+            } else if replayed != stored {
+                eprintln!(
+                    "INCONSISTENT: replayed frontier does not match the node's ({} vs {} leaves){}",
+                    replayed.size,
+                    stored.size,
+                    if replayed.size == stored.size { " — same size, different contents" } else { "" }
+                );
+                eprintln!("The export is NOT a complete copy; do not restore from it.");
                 std::process::exit(1);
             } else {
-                eprintln!("VERIFIED: export replays cleanly, {} action leaves recovered", leaves);
+                eprintln!(
+                    "VERIFIED: replayed frontier equals the node's at {} leaves ({action_leaves} action + {} coinbase)",
+                    stored.size,
+                    leaves - action_leaves
+                );
             }
         }
-        None => eprintln!("WARNING: no scan records found — is this the right database?"),
+        None => {
+            eprintln!("WARNING: no scan records found — is this the right database?");
+            std::process::exit(1);
+        }
     }
     Ok(())
 }

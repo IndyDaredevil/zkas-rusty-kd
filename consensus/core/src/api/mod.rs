@@ -71,6 +71,49 @@ pub struct ShieldedChainBlockData {
     pub timestamp: u64,
 }
 
+/// The outcome of checking backfilled shielded history against the chain.
+///
+/// History arrives from a peer, and the scan archive it lands in is never read by validation —
+/// so bad data cannot fork this node. What it *can* do is make wallets report a wrong balance
+/// and a wrong history, silently and with no way for the user to tell. That is the failure this
+/// verdict exists to prevent, which is why an unverified range is discarded rather than kept
+/// with a warning: a wallet cannot act on a log line.
+///
+/// The check is cryptographic, not reputational. Appending to the note-commitment tree is
+/// order-dependent and pure, so replaying every `cmx` from genesis reproduces this node's
+/// frontier at `base` only if the peer supplied exactly the right leaves in exactly the right
+/// order. That frontier is PoW-anchored (the pruning point's selected child commits the
+/// shielded state root in its coinbase, bound by `hash_merkle_root`), and this node learned it
+/// from the chain — never from the peer being checked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShieldedHistoryVerdict {
+    /// The replayed range reproduced the anchored frontier exactly. History is trustworthy.
+    Verified {
+        /// Chain blocks replayed, genesis through `base`.
+        blocks: u64,
+        /// Note commitments appended during the replay.
+        leaves: u64,
+    },
+    /// The replay did not reproduce the anchored frontier: records were omitted, reordered,
+    /// fabricated or truncated.
+    ///
+    /// Deliberately says nothing about deletion. Verifying and discarding are separate
+    /// operations because the right response depends on who asked: the p2p backfill purges the
+    /// range it just accepted, while an operator running a check on their own archive wants an
+    /// answer, not for a diagnostic to delete their history.
+    Mismatch {
+        /// Why the range failed, for the operator log.
+        reason: String,
+    },
+    /// Verification could not run — a gap in the local index, a missing record, or no
+    /// anchored frontier at `base`. NOT a pass: history is left in place but must be
+    /// treated as unverified, because the check never happened.
+    Unverifiable {
+        /// What prevented the check.
+        reason: String,
+    },
+}
+
 pub type BlockValidationFuture = BoxFuture<'static, BlockProcessResult<BlockStatus>>;
 
 /// A struct returned by consensus for block validation processing calls
@@ -573,7 +616,15 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
-    fn backfill_shielded_history(&self, _records: &[(u64, ShieldedChainBlockData)]) -> ConsensusResult<(u64, u64)> {
+    /// Ingest a backfilled chunk. `anchor` and `anchor_index` are the block the chunk was
+    /// requested below and its index in the SERVER's genesis-based numbering — together they are
+    /// what aligns the two index spaces, since the chunk itself never contains the anchor.
+    fn backfill_shielded_history(
+        &self,
+        _anchor: Hash,
+        _anchor_index: u64,
+        _records: &[(u64, ShieldedChainBlockData)],
+    ) -> ConsensusResult<(u64, u64)> {
         unimplemented!()
     }
 
@@ -581,7 +632,27 @@ pub trait ConsensusApi: Send + Sync {
         &self,
         _anchor: Hash,
         _max_blocks: usize,
-    ) -> ConsensusResult<(Vec<(u64, ShieldedChainBlockData)>, bool)> {
+    ) -> ConsensusResult<(Vec<(u64, ShieldedChainBlockData)>, bool, u64)> {
+        unimplemented!()
+    }
+
+    /// Replay the scan archive from genesis up to and including `base`, and report whether it
+    /// reproduces this node's own frontier at `base`. Read-only — see [`ShieldedHistoryVerdict`].
+    ///
+    /// `base` must be a block whose frontier this node did NOT learn from the data being checked:
+    ///   - after a p2p backfill, the history base captured *before* it ran (the pruning point);
+    ///   - for an operator check of a whole archive, the chain tip.
+    fn verify_shielded_history(&self, _base: Hash) -> ConsensusResult<ShieldedHistoryVerdict> {
+        unimplemented!()
+    }
+
+    /// Delete every scan record and chain-index entry below `base`, restoring the index numbering
+    /// `init_with_pruning_point` produces. Returns the number of scan records discarded.
+    ///
+    /// The undo of a failed [`Self::verify_shielded_history`]. Separate from it on purpose: only
+    /// the caller knows whether the range under test was just accepted from a peer (discard it) or
+    /// is the node's own history being audited (never touch it).
+    fn purge_shielded_history_below(&self, _base: Hash) -> ConsensusResult<u64> {
         unimplemented!()
     }
 

@@ -412,6 +412,24 @@ impl VirtualStateProcessor {
             // block: the derive-per-block version overran the 120s IBD timeout at 27,000 blocks
             // and made every shielded import fail. Observed live 2026-07-31.
             md.in_window_anchors = self.shielded_state_manager.anchors_for_blocks(&window_blocks)?;
+            // Attach each source's blue score. The mapping alone leaves the syncee unable to
+            // judge maturity — it has no ghostdag data below its pruning point — so it drops the
+            // spend anyway and disqualifies the block. Only the blocks actually named as sources
+            // are sent (deduplicated), not the whole window, so this adds 40 B per distinct
+            // source rather than per window block.
+            let mut scores: Vec<(Hash, u64)> = Vec::new();
+            let mut seen = BlockHashSet::default();
+            for (_, source) in md.in_window_anchors.iter() {
+                if !seen.insert(*source) {
+                    continue;
+                }
+                // Skip rather than fail on a source we cannot score: partial attestation still
+                // helps, and claiming a score we do not have would be worse than claiming none.
+                if let Ok(blue_score) = self.ghostdag_store.get_blue_score(*source) {
+                    scores.push((*source, blue_score));
+                }
+            }
+            md.in_window_anchor_source_scores = scores;
         }
         let nullifier_count = self.pruning_point_nullifier_set(pp)?.len() as u64;
         Ok(Some(kaspa_consensus_core::api::ShieldedExportMetadata { data: md.to_wire_bytes(), nullifier_count }))
@@ -803,12 +821,35 @@ impl VirtualStateProcessor {
     /// Decide whether one candidate source block makes an anchor final: it must be a selected-chain
     /// ancestor of the spending block and lie inside the maturity window.
     fn judge_anchor_source(&self, source: Hash, selected_parent: Hash, block_blue_score: u64) -> AnchorVerdict {
-        // F-04: a source block below the pruning point has had its ghostdag data
-        // pruned. With the age window above, such a source is necessarily older
-        // than any acceptable anchor (or abandoned) — fail CLOSED. (Fail-open was
-        // the F-04 inflation vector; see the doc comment.)
-        let Ok(source_blue_score) = self.ghostdag_store.get_blue_score(source) else {
-            return AnchorVerdict { source: Some(source), reject_reason: Some("source ghostdag data pruned"), ..Default::default() };
+        // No local ghostdag data for the source. Two very different situations share this
+        // symptom, and telling them apart is the whole point of the fallback below:
+        //
+        //  - A genuinely ancient or abandoned source: older than any acceptable anchor, and
+        //    failing CLOSED is right. (Fail-OPEN here was the F-04 inflation vector.)
+        //  - A source inside the anchor window but below THIS node's pruning point. A
+        //    fast-synced node has no ghostdag below its pruning point, so a perfectly legal
+        //    anchor lands here too. `params.rs` asserts this cannot happen, reasoning from the
+        //    tip; but a node in IBD validates blocks sitting AT its pruning point, whose anchors
+        //    reach below it by construction. Measured on mainnet 2026-08-08: pruning point blue
+        //    score 993,600, first disqualified block 993,652, its anchor's source 990,606 — age
+        //    3,046, legal, and 2,994 below the pruning point. Failing closed there dropped the
+        //    spend, shrank the expected coinbase by its 24,578,600 fee, and disqualified the
+        //    block; everything after inherited.
+        //
+        // So consult the blue scores the pruning-point peer attested for exactly those in-window
+        // sources. Still not fail-open: a source nobody attested is rejected as before.
+        let (source_blue_score, attested) = match self.ghostdag_store.get_blue_score(source) {
+            Ok(s) => (s, false),
+            Err(_) => match self.shielded_state_manager.attested_source_blue_score(source) {
+                Ok(Some(s)) => (s, true),
+                _ => {
+                    return AnchorVerdict {
+                        source: Some(source),
+                        reject_reason: Some("source ghostdag data pruned and no attested blue score"),
+                        ..Default::default()
+                    };
+                }
+            },
         };
         // Canonical: the source block is on this block's selected chain. Use the
         // pruning-aware `try_is_chain_ancestor_of` (not the panicking `is_chain_ancestor_of`)
@@ -816,7 +857,16 @@ impl VirtualStateProcessor {
         // never crash the virtual processor here either. With the age window, an in-window
         // source's reachability is never pruned, so `Err` means out-of-window/abandoned —
         // fail closed (F-04); only an explicit `Ok(true)` is canonical.
-        let is_chain_ancestor = source == selected_parent
+        //
+        // An ATTESTED source is the exception, and it needs no reachability lookup: it would
+        // have none either, for the same reason it had no ghostdag. Ancestry is implied by how
+        // the attestation is built — the serving node enumerates these by walking its OWN
+        // selected chain below the pruning point, and this node adopted that same PoW-committed
+        // pruning point, so a source on that chain is a selected-chain ancestor of every block
+        // above it. Without this the blue-score fallback would resolve and then die one line
+        // later on the identical missing-data problem.
+        let is_chain_ancestor = attested
+            || source == selected_parent
             || matches!(self.reachability_service.try_is_chain_ancestor_of(source, selected_parent), Ok(true));
         if !is_chain_ancestor {
             return AnchorVerdict {
