@@ -59,6 +59,7 @@ pub struct Args {
     /// location under appdir". See `kaspa_consensus::processes::shielded_diag`.
     pub consensus_diag: Option<String>,
     pub verify_shielded_history: bool,
+    pub shielded_history: Option<bool>,
     /// File of pinned anchor→source-block mappings. See
     /// `kaspa_consensus::processes::shielded::load_anchor_overrides`.
     pub shielded_anchor_overrides: Option<String>,
@@ -129,6 +130,7 @@ impl Default for Args {
             utxoindex: false,
             consensus_diag: None,
             verify_shielded_history: false,
+            shielded_history: None,
             shielded_anchor_overrides: None,
             reset_db: false,
             outbound_target: 8,
@@ -189,6 +191,7 @@ impl Args {
         config.enable_unsynced_mining = self.enable_unsynced_mining;
         config.enable_mainnet_mining = self.enable_mainnet_mining;
         config.is_archival = self.archival;
+        config.shielded_history = self.shielded_history;
         // TODO: change to `config.enable_sanity_checks = self.sanity` when we reach stable versions
         config.enable_sanity_checks = true;
         config.user_agent_comments.clone_from(&self.user_agent_comments);
@@ -396,6 +399,24 @@ pub fn cli() -> Command {
                 ),
         )
         .arg(
+            Arg::new("shielded-history")
+                .long("shielded-history")
+                .value_name("on|off")
+                .num_args(0..=1)
+                .default_missing_value("on")
+                .value_parser(["on", "off"])
+                .require_equals(true)
+                .help(
+                    "Fetch shielded note history below the pruning point from peers (default: on with \
+                     --archival, off otherwise). IBD transfers a frontier and a nullifier MuHash, which \
+                     are aggregates and cannot yield anyone's notes, so without this a node serves wallets \
+                     history only from its pruning point forward and balances read as silently partial. \
+                     Turn it ON for a pruned wallet-serving node: the scan archive and chain index both \
+                     survive pruning, so such a node can serve complete history. Turn it OFF to skip the \
+                     transfer and its verification pass.",
+                ),
+        )
+        .arg(
             Arg::new("verify-shielded-history")
                 .long("verify-shielded-history")
                 .action(ArgAction::SetTrue)
@@ -599,6 +620,7 @@ impl Args {
             utxoindex: arg_match_unwrap_or::<bool>(&m, "utxoindex", defaults.utxoindex),
             consensus_diag: m.get_one::<String>("consensus-diag").cloned(),
             verify_shielded_history: m.get_one::<bool>("verify-shielded-history").cloned().unwrap_or(false),
+            shielded_history: m.get_one::<String>("shielded-history").map(|v| v != "off"),
             shielded_anchor_overrides: m.get_one::<String>("shielded-anchor-overrides").cloned(),
             testnet: arg_match_unwrap_or::<bool>(&m, "testnet", defaults.testnet),
             testnet_suffix: arg_match_unwrap_or::<u32>(&m, "netsuffix", defaults.testnet_suffix),

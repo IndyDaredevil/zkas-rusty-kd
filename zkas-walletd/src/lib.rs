@@ -365,10 +365,7 @@ fn build_chain_tree(dir: &str, genesis: RpcHash) -> Wallet {
             // stream it holds), so re-arm it on every load or the tree would start
             // trial-decrypting against a key that matches nothing.
             db.set_leaves_only(true);
-            log::info!(
-                "shared chain tree resumed from checkpoint: {} leaves, scanned {scanned} blocks",
-                db.size()
-            );
+            log::info!("shared chain tree resumed from checkpoint: {} leaves, scanned {scanned} blocks", db.size());
             WalletEntry::from_parts(key, false, db, genesis, low, scanned, boundaries, sink_blue)
         }
         None => {
@@ -3792,19 +3789,10 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // Published, not peeked. A `try_lock` here read 0 nearly always (the shared tree
     // holds its own lock across a whole chunk) and so disabled borrowing entirely.
     // The shared tree itself must not borrow from itself, hence the token check.
-    let shared_tree_covers = if token == CHAIN_TREE_TOKEN {
-        0
-    } else {
-        state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed)
-    };
-    e.sync_chunk(
-        &state.sync_client,
-        &state.page_cache,
-        &state.warm_gate,
-        state.resources.subtree_free_floor_mb,
-        shared_tree_covers,
-    )
-    .await;
+    let shared_tree_covers =
+        if token == CHAIN_TREE_TOKEN { 0 } else { state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed) };
+    e.sync_chunk(&state.sync_client, &state.page_cache, &state.warm_gate, state.resources.subtree_free_floor_mb, shared_tree_covers)
+        .await;
     // A borrowing wallet's mirror tree is stale by construction; make it current again
     // by taking the shared tree's frontier. `adopt_tip_frontier` REFUSES unless the
     // frontier describes exactly this wallet's leaf count — the frontier at N leaves is
@@ -4054,7 +4042,14 @@ async fn evict_idle_wallets(state: &Arc<AppState>) {
     // guaranteeing it is rebuilt from scratch. Filtering it out here is why it needs no
     // special case in either rule below.
     let resident: Vec<(String, Wallet)> = {
-        state.wallets.lock().await.iter().filter(|(k, _)| k.as_str() != CHAIN_TREE_TOKEN).map(|(k, v)| (k.clone(), v.clone())).collect()
+        state
+            .wallets
+            .lock()
+            .await
+            .iter()
+            .filter(|(k, _)| k.as_str() != CHAIN_TREE_TOKEN)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     };
     let mut victims: Vec<String> = resident
         .iter()
@@ -5386,7 +5381,9 @@ async fn wallet_send(
 struct Payee {
     /// Recipient `zkas:` shielded address.
     to: String,
-    amount_sompi: Option<u64>,
+    /// Exact integer amount. Decimal strings preserve the full u64 range for
+    /// JavaScript clients; numeric JSON remains accepted for compatibility.
+    amount_sompi: Option<JsonU64>,
     amount_fc: Option<f64>,
     /// Optional memo, carried inside THIS payee's encrypted note only.
     memo: Option<String>,
@@ -5396,7 +5393,7 @@ struct Payee {
 struct SendManyReq {
     payees: Vec<Payee>,
     /// Fee floor per transaction; raised to the node's byte-proportional minimum.
-    fee: Option<u64>,
+    fee: Option<JsonU64>,
 }
 
 #[derive(Serialize)]
@@ -5458,8 +5455,10 @@ async fn wallet_send_many(
     let mut resolved: Vec<([u8; 43], u64, [u8; 512])> = Vec::with_capacity(req.payees.len());
     let mut requested: u64 = 0;
     for (i, p) in req.payees.iter().enumerate() {
-        let amount = match (p.amount_sompi, p.amount_fc) {
-            (Some(s), _) => s,
+        let amount = match (p.amount_sompi.as_ref(), p.amount_fc) {
+            (Some(s), _) => s.parse("amount_sompi").map_err(|_| {
+                err(StatusCode::BAD_REQUEST, format!("payee {i}: amount_sompi must be an unsigned 64-bit decimal integer"))
+            })?,
             (None, Some(fc)) => (fc * SOMPI_PER_ZKAS as f64).round() as u64,
             (None, None) => return Err(err(StatusCode::BAD_REQUEST, format!("payee {i}: specify amount_sompi or amount_fc"))),
         };
@@ -5474,7 +5473,10 @@ async fn wallet_send_many(
         resolved.push((recipient, amount, memo_bytes(p.memo.as_deref())?));
     }
 
-    let base_fee = req.fee.unwrap_or(DEFAULT_FEE_SOMPI);
+    let base_fee = match req.fee.as_ref() {
+        Some(fee) => fee.parse("fee")?,
+        None => DEFAULT_FEE_SOMPI,
+    };
     let per_tx = max_payees_per_tx();
     let groups: Vec<Vec<([u8; 43], u64, [u8; 512])>> = resolved.chunks(per_tx).map(|c| c.to_vec()).collect();
     let net: [u8; 32] = state.genesis.as_bytes();
@@ -5790,9 +5792,9 @@ enum JsonU64 {
 }
 
 impl JsonU64 {
-    fn parse(self, field: &'static str) -> Result<u64, (StatusCode, Json<serde_json::Value>)> {
+    fn parse(&self, field: &'static str) -> Result<u64, (StatusCode, Json<serde_json::Value>)> {
         match self {
-            Self::Number(value) => Ok(value),
+            Self::Number(value) => Ok(*value),
             Self::Decimal(value) => {
                 value.parse().map_err(|_| err(StatusCode::BAD_REQUEST, format!("{field} must be an unsigned 64-bit decimal integer")))
             }
@@ -6747,8 +6749,18 @@ async fn flush_checkpoints_on_exit(state: &Arc<AppState>) {
             continue;
         }
         let advanced = e.scanned.saturating_sub(e.saved_scanned);
-        if save_checkpoint(&state.wallet_dir, &token, &e.genesis, &e.low, e.scanned as u64, &e.db, &e.boundaries, e.sink_blue, e.blind_below)
-            .is_ok()
+        if save_checkpoint(
+            &state.wallet_dir,
+            &token,
+            &e.genesis,
+            &e.low,
+            e.scanned as u64,
+            &e.db,
+            &e.boundaries,
+            e.sink_blue,
+            e.blind_below,
+        )
+        .is_ok()
         {
             e.saved_scanned = e.scanned;
             saved += 1;
@@ -6789,6 +6801,31 @@ mod sdk_api_tests {
         .unwrap();
         assert_eq!(request.amount_sompi.unwrap().parse("amount_sompi").unwrap(), 100);
         assert_eq!(request.fee.unwrap().parse("fee").unwrap(), 3);
+    }
+
+    #[test]
+    fn send_many_accepts_exact_decimal_u64_values() {
+        let request: SendManyReq = serde_json::from_value(serde_json::json!({
+            "payees": [{
+                "to": "zkas:test",
+                "amount_sompi": "18446744073709551615"
+            }],
+            "fee": "3000000"
+        }))
+        .unwrap();
+        assert_eq!(request.payees[0].amount_sompi.as_ref().unwrap().parse("amount_sompi").unwrap(), u64::MAX);
+        assert_eq!(request.fee.as_ref().unwrap().parse("fee").unwrap(), 3_000_000);
+    }
+
+    #[test]
+    fn send_many_keeps_legacy_numeric_values_compatible() {
+        let request: SendManyReq = serde_json::from_value(serde_json::json!({
+            "payees": [{ "to": "zkas:test", "amount_sompi": 100 }],
+            "fee": 3
+        }))
+        .unwrap();
+        assert_eq!(request.payees[0].amount_sompi.as_ref().unwrap().parse("amount_sompi").unwrap(), 100);
+        assert_eq!(request.fee.as_ref().unwrap().parse("fee").unwrap(), 3);
     }
 
     /// A backup must restore the SAME wallet on another device, and must refuse

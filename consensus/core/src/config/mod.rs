@@ -35,6 +35,18 @@ pub struct Config {
     /// Indicates whether this node is an archival node
     pub is_archival: bool,
 
+    /// Whether to fetch the shielded note history below the pruning point from peers.
+    ///
+    /// `None` means "follow `is_archival`", which is the right default in both directions: an
+    /// archival node claims to hold everything and would otherwise silently serve wallets a
+    /// partial balance, while an ordinary node should not spend ~234 MB and a verification pass
+    /// on history it does not intend to serve.
+    ///
+    /// Explicit `Some(true)` matters for a PRUNED wallet-serving node: the scan archive and the
+    /// selected-chain index both survive pruning by design, so such a node can hold and serve
+    /// complete note history without being archival. Without this flag it had no way to ask.
+    pub shielded_history: Option<bool>,
+
     /// Enable various sanity checks which might be compute-intensive (mostly performed during pruning)
     pub enable_sanity_checks: bool,
 
@@ -77,6 +89,17 @@ pub struct Config {
 }
 
 impl Config {
+    /// Whether this node should obtain shielded note history below its pruning point.
+    ///
+    /// Defaults to `is_archival`: an archival node that lacks it silently serves wallets a
+    /// partial balance, and a non-archival node should not pay for history it will not serve.
+    /// The explicit setting exists mainly for a PRUNED wallet-serving node, which can hold and
+    /// serve complete history (the scan archive and chain index both survive pruning) without
+    /// being archival.
+    pub fn wants_shielded_history(&self) -> bool {
+        self.shielded_history.unwrap_or(self.is_archival)
+    }
+
     pub fn new(params: Params) -> Self {
         Self::with_perf(params, PERF_PARAMS)
     }
@@ -87,6 +110,7 @@ impl Config {
             perf,
             process_genesis: true,
             is_archival: false,
+            shielded_history: None,
             enable_sanity_checks: false,
             utxoindex: false,
             unsafe_rpc: false,

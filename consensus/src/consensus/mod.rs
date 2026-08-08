@@ -179,7 +179,9 @@ impl Consensus {
     ///
     /// Returns the number of scan records discarded.
     fn purge_backfilled_shielded_history(&self, base: Hash) -> ConsensusResult<u64> {
-        let _guard = self.pruning_lock.blocking_write();
+        // No pruning-lock write here either: this is called from the IBD flow while it holds the
+        // read side, and would deadlock for the same reason as the ingest. The caller's guard
+        // pins the pruning point; `selected_chain_store.write()` serialises the mutation.
         let mut sc = self.storage.selected_chain_store.write();
         let Some(base_index) = sc.get_by_hash(base).optional().unwrap() else {
             return Ok(0);
@@ -790,9 +792,18 @@ impl ConsensusApi for Consensus {
         if records.is_empty() {
             return Ok((0, 0));
         }
-        // Hold the pruning lock for the whole write: the index must not move under us between
-        // learning the local base and rebasing it.
-        let _guard = self.pruning_lock.blocking_write();
+        // NO pruning-lock acquisition here, deliberately.
+        //
+        // This runs inside the IBD flow, which holds an owned pruning-lock READ guard for its
+        // whole duration (the `session` it passes in IS that guard). Asking for the WRITE side of
+        // the same lock from underneath it can never be granted: the read guard is not released
+        // until IBD finishes, and IBD does not finish until this returns. Deadlock, with every
+        // thread idle and the connection healthy — which is exactly how it presented, and why the
+        // 120s dequeue timeout never fired: the wait was on a lock, not on the peer.
+        //
+        // The caller's read guard is also what makes this safe: it already pins the pruning point
+        // for the duration, so the index cannot move under us, and `selected_chain_store.write()`
+        // below still serialises the mutation itself.
         let mut sc = self.storage.selected_chain_store.write();
 
         // Align the two numbering spaces from the ANCHOR, which both sides know by hash.
@@ -831,11 +842,20 @@ impl ConsensusApi for Consensus {
 
         let (mut idx_written, mut rec_written) = (0u64, 0u64);
         for (index, r) in records.iter() {
-            if *index >= ours_from {
-                continue; // inside our own validated range; ours is authoritative
+            if *index > ours_from {
+                continue; // above the anchor is our own validated range; ours is authoritative
             }
-            sc.write_entry(&mut batch, *index, r.hash).unwrap();
-            idx_written += 1;
+            // The anchor's own record is the exception, and dropping it was a real bug. Its INDEX
+            // entry we already hold, so we must not rewrite it — but its scan RECORD we may not
+            // hold at all, because adopting a block as a pruning point seeds the tree, supply and
+            // anchor indexes and never writes a record. Its leaves are nonetheless part of the
+            // frontier every replay is checked against, so omitting them makes an otherwise
+            // perfect transfer fail by exactly one block. Measured 2026-08-08: 2,007,143 replayed
+            // vs 2,007,184 anchored — a 41-leaf gap that discarded 404,928 good records.
+            if *index < ours_from {
+                sc.write_entry(&mut batch, *index, r.hash).unwrap();
+                idx_written += 1;
+            }
             if self.virtual_processor.shielded_state_manager_ref().scan_block(r.hash).unwrap_or(None).is_none() {
                 let accepted = r
                     .accepted_actions
@@ -864,8 +884,10 @@ impl ConsensusApi for Consensus {
     }
 
     fn verify_shielded_history(&self, base: Hash) -> ConsensusResult<kaspa_consensus_core::api::ShieldedHistoryVerdict> {
+        use crate::model::stores::shielded::ShieldedScanBlockData;
         use crate::processes::shielded::{ReplayError, ShieldedStateManager, coinbase_notes_from_outputs};
         use kaspa_consensus_core::api::ShieldedHistoryVerdict;
+        use rayon::prelude::*;
 
         let sm = self.virtual_processor.shielded_state_manager_ref();
 
@@ -877,9 +899,12 @@ impl ConsensusApi for Consensus {
             Err(e) => return Ok(ShieldedHistoryVerdict::Unverifiable { reason: format!("no anchored frontier at {base}: {e}") }),
         };
 
-        // Hold the pruning lock across the whole replay: the index must not move underneath a
-        // walk that depends on its numbering being stable from 0 to `base`.
-        let _guard = self.pruning_lock.blocking_read();
+        // No pruning-lock acquisition, for the same reason as the ingest: the p2p caller runs
+        // inside the IBD flow, which already holds the read side for its whole duration, and
+        // re-taking it here would queue behind any pending writer that the caller's own guard is
+        // blocking. That guard is also what keeps the index stable across this walk. The startup
+        // `--verify-shielded-history` path holds no guard, but it runs once before any service
+        // starts, so nothing is moving the index there either.
         let sc = self.storage.selected_chain_store.read();
         let Some(base_index) = sc.get_by_hash(base).optional().unwrap() else {
             return Ok(ShieldedHistoryVerdict::Unverifiable { reason: format!("base {base} is not in the selected chain index") });
@@ -893,30 +918,80 @@ impl ConsensusApi for Consensus {
         let seed_activation = self.config.shielded_coinbase_seed_activation;
         // Replay genesis..=base. `base` is INCLUDED because `frontier_at(base)` is the tree after
         // that block's own leaves were appended; stopping one short would mismatch on honest data.
-        let stream = (0..=base_index).map(|index| {
-            let hash = sc.get_by_index(index).map_err(|e| format!("chain index gap at {index}: {e}"))?;
-            let Some(d) = sm.scan_block(hash).map_err(|e| format!("scan record read failed for {hash}: {e}"))? else {
-                // No record means the block contributed no leaves — a normal state, not a gap, so
-                // it must not abort the replay. Soundness is unaffected: if a block DID have
-                // leaves and the peer withheld its record, skipping it changes the leaf sequence
-                // and the frontier comparison fails, which is exactly the outcome we want.
-                return Ok((Vec::new(), Vec::new()));
-            };
-            // Prefer the commitments consensus computed and stored. Deriving is the fallback for
-            // records written before that field existed; it uses the SAME function validation
-            // uses, gated on the same fork activation, so a replay cannot drift from the chain.
-            let coinbase = if !d.coinbase_commitments.is_empty() {
-                d.coinbase_commitments.clone()
-            } else {
-                let outputs: Vec<(&[u8], u64)> = d.coinbase_outputs.iter().map(|(s, v)| (s.as_slice(), *v)).collect();
-                let seed_block = seed_activation.is_active(d.daa_score).then_some(hash);
-                coinbase_notes_from_outputs(d.coinbase_txid, &outputs, seed_block)
-                    .map_err(|e| format!("cannot derive coinbase commitments for {hash}: {e:?}"))?
-                    .iter()
-                    .map(|n| n.commitment.to_bytes())
-                    .collect()
-            };
-            Ok((coinbase, d.accepted.iter().map(|t| t.action_bytes.clone()).collect()))
+        //
+        // Read in batches, derive in PARALLEL, yield in order. The replay is ~95% coinbase note
+        // commitments: measured 404,928 records in ~30 minutes, 4.4 ms each over 3.46 notes per
+        // record, i.e. ~1.28 ms per Sinsemilla commitment, against ~0.2 s total for all 2.24M tree
+        // appends. Those derivations are independent, so they parallelise cleanly; the tree
+        // appends stay strictly ordered because the frontier depends on leaf order. Batching keeps
+        // memory bounded — the whole archive is ~255 MB and must never be materialised at once.
+        //
+        // (The other obvious win, batching the per-note `to_affine` inversions with Montgomery's
+        // trick, is NOT reachable: orchard's `NoteCommitment` keeps its Pallas point `pub(crate)`
+        // unless the `unstable-voting-circuits` feature is on, so the projective points cannot be
+        // collected for a batch inversion from here.)
+        const REPLAY_BATCH: usize = 4096;
+        let indices: Vec<u64> = (0..=base_index).collect();
+        let total_blocks = indices.len() as u64;
+        let started = std::time::Instant::now();
+        let done = std::cell::Cell::new(0u64);
+        let last_report = std::cell::Cell::new(std::time::Instant::now());
+        let stream = indices.chunks(REPLAY_BATCH).flat_map(|chunk| {
+            // Progress, because this takes minutes and looks exactly like a hang otherwise: the
+            // node logs "0 blocks processed" throughout while one pass re-derives ~1.4M coinbase
+            // note commitments. Reported on a time interval rather than every batch so a fast
+            // machine does not spam, and with an ETA so an operator can decide to wait.
+            done.set(done.get() + chunk.len() as u64);
+            if last_report.get().elapsed() >= std::time::Duration::from_secs(15) {
+                last_report.set(std::time::Instant::now());
+                let pct = done.get() as f64 * 100.0 / total_blocks as f64;
+                let elapsed = started.elapsed().as_secs_f64();
+                let eta = if done.get() > 0 { elapsed * (total_blocks - done.get()) as f64 / done.get() as f64 } else { 0.0 };
+                kaspa_core::info!(
+                    "shielded history: verifying {:.0}% ({}/{} blocks), about {:.0}s left",
+                    pct,
+                    done.get(),
+                    total_blocks,
+                    eta
+                );
+            }
+            // Reads stay sequential: RocksDB point lookups are a small fraction of the cost, and
+            // keeping them on one thread avoids contending with the derivation workers.
+            let raw: Vec<Result<Option<(Hash, ShieldedScanBlockData)>, String>> = chunk
+                .iter()
+                .map(|&index| {
+                    let hash = sc.get_by_index(index).map_err(|e| format!("chain index gap at {index}: {e}"))?;
+                    // No record means the block contributed no leaves — a normal state, not a gap,
+                    // so it must not abort the replay. Soundness is unaffected: if a block DID
+                    // have leaves and the peer withheld its record, skipping it changes the leaf
+                    // sequence and the frontier comparison fails, which is what we want.
+                    match sm.scan_block(hash).map_err(|e| format!("scan record read failed for {hash}: {e}"))? {
+                        Some(d) => Ok(Some((hash, d))),
+                        None => Ok(None),
+                    }
+                })
+                .collect();
+            raw.into_par_iter()
+                .map(|entry| {
+                    let Some((hash, d)) = entry? else { return Ok((Vec::new(), Vec::new())) };
+                    // Prefer the commitments consensus computed and stored. Deriving is the
+                    // fallback for records written before that field existed; it uses the SAME
+                    // function validation uses, gated on the same fork activation, so a replay
+                    // cannot drift from the chain.
+                    let coinbase = if !d.coinbase_commitments.is_empty() {
+                        d.coinbase_commitments.clone()
+                    } else {
+                        let outputs: Vec<(&[u8], u64)> = d.coinbase_outputs.iter().map(|(s, v)| (s.as_slice(), *v)).collect();
+                        let seed_block = seed_activation.is_active(d.daa_score).then_some(hash);
+                        coinbase_notes_from_outputs(d.coinbase_txid, &outputs, seed_block)
+                            .map_err(|e| format!("cannot derive coinbase commitments for {hash}: {e:?}"))?
+                            .iter()
+                            .map(|n| n.commitment.to_bytes())
+                            .collect()
+                    };
+                    Ok((coinbase, d.accepted.iter().map(|t| t.action_bytes.clone()).collect()))
+                })
+                .collect::<Vec<_>>()
         });
 
         match ShieldedStateManager::replay_frontier_streaming(stream) {

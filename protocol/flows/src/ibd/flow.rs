@@ -298,7 +298,7 @@ impl IbdFlow {
         // Ask this peer only if it is one we have not already asked, and only while under the
         // peer budget. Both conditions are evaluated once, under the lock, so a concurrent IBD
         // cannot slip a second ask to the same peer through.
-        let should_ask = self.ctx.config.is_archival
+        let should_ask = self.ctx.config.wants_shielded_history()
             && !SHIELDED_HISTORY_BACKFILL_DONE.load(Ordering::SeqCst)
             && {
                 let mut guard = SHIELDED_HISTORY_ASKED_PEERS.lock().unwrap();
@@ -932,7 +932,12 @@ impl IbdFlow {
         // now because ingesting the first chunk renumbers the index and moves the base.
         let verify_base = anchor;
         let (mut total_idx, mut total_rec, mut rounds) = (0u64, 0u64, 0u32);
-        info!("archival: backfilling shielded history below {} from {}", anchor, self.router);
+        info!(
+            "shielded history: fetching note history below {anchor} from {} — a fresh node holds \
+             none, so wallets would otherwise see a partial balance",
+            self.router
+        );
+        let started = std::time::Instant::now();
 
         loop {
             self.router
@@ -942,6 +947,7 @@ impl IbdFlow {
                 ))
                 .await?;
 
+            let chunk_started = std::time::Instant::now();
             let msg = dequeue_with_timeout!(self.incoming_route, Payload::ShieldedHistoryChunk)?;
             if msg.entries.is_empty() {
                 info!("archival: peer has no further shielded history below {anchor}");
@@ -969,9 +975,10 @@ impl IbdFlow {
             // node does nothing else; with only a start and an end line, a run that wrote NOTHING
             // for 34 minutes looked exactly like one that was working. Reporting what was
             // actually WRITTEN is what makes that failure visible at a glance.
-            if rounds % 10 == 0 {
-                info!("archival: shielded history {total_rec} records / {total_idx} index entries after {rounds} chunks (at {lowest})");
-            }
+            info!(
+                "archival: shielded history chunk {rounds}: +{rec} records (+{idx} index) in {:?}, total {total_rec} (at {lowest})",
+                chunk_started.elapsed()
+            );
 
             if msg.done {
                 info!("archival: reached genesis after {rounds} rounds");
@@ -994,7 +1001,11 @@ impl IbdFlow {
             anchor = lowest;
         }
 
-        info!("archival: shielded history backfill wrote {total_idx} index entries and {total_rec} scan records");
+        info!(
+            "shielded history: received {total_rec} block records ({total_idx} index entries) in {:.1}s; verifying \
+             against the chain's own committed state before serving any of it",
+            started.elapsed().as_secs_f64()
+        );
 
         // Verify before this history is served to anyone.
         //
@@ -1012,7 +1023,13 @@ impl IbdFlow {
         if total_rec > 0 {
             match consensus.async_verify_shielded_history(verify_base).await {
                 Ok(ShieldedHistoryVerdict::Verified { blocks, leaves }) => {
-                    info!("archival: shielded history VERIFIED against the anchored frontier ({blocks} blocks, {leaves} leaves)");
+                    // Say what this proves, not just that it passed: the replayed leaves reproduce
+                    // a frontier this node learned from PoW, never from the peer that sent them.
+                    info!(
+                        "shielded history: VERIFIED — {leaves} note commitments over {blocks} blocks replay exactly \
+                         to this node's proof-of-work-committed state. History is complete from genesis and safe \
+                         to serve to wallets."
+                    );
                 }
                 Ok(ShieldedHistoryVerdict::Mismatch { reason }) => {
                     // Discard what this peer gave us. Safe, not drastic: the node returns to the
