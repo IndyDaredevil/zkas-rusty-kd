@@ -130,7 +130,21 @@ jobs:
 
       - name: Build on MacOS
         if: runner.os == 'macOS'
+        # Pin the deployment target, or the binary only runs on the runner's own macOS.
+        #
+        # Without this the toolchain links against whatever libc++ the runner ships — macos-15-intel
+        # is Sequoia — and the result aborts at launch on any older Mac with
+        # `dyld: Symbol not found: __ZNSt3__117bad_function_callD1Ev ... Expected in
+        # /usr/lib/libc++.1.dylib`. That symbol is a libc++ (C++ runtime) export, pulled in by the
+        # C++ dependencies (RocksDB), so it bites even though this is a Rust project. Reported by an
+        # operator on the v1.0.5 Intel build.
+        #
+        # 10.13 on Intel covers essentially every Intel Mac still running; arm64 cannot go below
+        # 11.0 because Apple Silicon did not exist before it.
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.os == 'macos-15-intel' && '10.13' || '11.0' }}
         run: |
+          echo "building with MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET on $(uname -m)"
           cargo build --bin kaspad --release
           cargo build --bin zkas-miner --release
           cargo build --bin zkas-walletd --release
