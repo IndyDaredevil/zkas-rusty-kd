@@ -1,0 +1,64 @@
+# ===========================================================================
+# Prometheus — KDSM mining stack (Kron K1)
+#
+# DEPLOYED COPY lives in Prometheus's own config directory on the Kron.
+# Find it authoritatively: http://localhost:9090/status -> Command-Line Flags
+# -> --config.file. alert_rules.yml resolves RELATIVE to this file's
+# directory, so the two must sit together.
+#
+# This file is a MIRROR for docs/bridge-v2/monitoring/. Edit the live copy,
+# then sync. Never edit the repo copy expecting it to take effect.
+#
+# Revision 2026-08-09:
+#   - REMOVED the zkas_merged_bridge (:3033) job. The fleet cut over to the
+#     RC; that bridge has been down, its scrape has been failing silently,
+#     and its stale gauge was the fallback source for the zKAS network
+#     hashrate. Removing the job removes the possibility of it silently
+#     taking that number back over. If you deliberately bring :3033 back,
+#     re-add the job AND settle the "*10 or not" question before any rule
+#     reads its gauge again.
+# ===========================================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  # Punch-list item from the 08-05 overnight soak: the bridge's dashboard
+  # port can answer /metrics slowly while it is busy with template work;
+  # give scrapes most of the interval before declaring the target dead.
+  scrape_timeout: 12s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - localhost:9093
+
+rule_files:
+  - "alert_rules.yml"
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          app: "prometheus"
+
+  # RC v2.1 merged bridge (:3034) — PRODUCTION. In-tree zkas-rusty v2
+  # stratum core, KAS-primary with zKAS merged via AuxPoW.
+  - job_name: 'rc_merged_bridge'
+    static_configs:
+      - targets: ["localhost:3034"]
+    metric_relabel_configs:
+      # The RC's warm-up zero-init registers a SECOND series per worker
+      # carrying miner="IceRiverMiner-v1.1" (all zeros, forever); the live
+      # counting path rides miner="". With labeldrop alone those two
+      # collapse into identical labelsets and Prometheus keeps whichever
+      # came first in exposition order — silently. Drop the warm-up
+      # duplicates BEFORE the labeldrop so the collision can't happen.
+      # (Real fix is bridge-side: warm-up should init in the same label
+      # context the counting path uses — punch list.)
+      - source_labels: [miner]
+        regex: "IceRiverMiner.*"
+        action: drop
+      - action: labeldrop
+        regex: "miner"

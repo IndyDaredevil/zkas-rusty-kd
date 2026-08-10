@@ -1,0 +1,114 @@
+# ===========================================================================
+# Alertmanager Ã¢â‚¬â€ KDSM mining stack (Kron K1)
+#
+# *** READ BEFORE DEPLOYING ***
+# This file uses bot_token_file, NOT an inline token. Alertmanager will
+# REFUSE TO START if that file is missing or unreadable. Create it first:
+#
+#   1. Rotate the bot token via BotFather (/revoke then /token).
+#   2. Write the NEW token, and nothing else, to telegram_token.txt:
+#        Set-Content -Path .\telegram_token.txt -Value '<TOKEN>' `
+#          -NoNewline -Encoding ascii
+#      NOT Notepad Ã¢â‚¬â€ it writes a UTF-8 BOM and those bytes become part of
+#      the token string, producing a 401 with a config that looks perfect.
+#      Verify: (Get-Item .\telegram_token.txt).Length  ->  46
+#   3. Set the ABSOLUTE path in bot_token_file below. Single quotes are
+#      mandatory: YAML double-quotes treat \t \p etc. as escapes and the
+#      parse fails outright on a Windows path.
+#   4. Add telegram_token.txt to .gitignore.
+#   5. amtool check-config alertmanager.yml
+#
+# This is what makes the config committable to a PUBLIC repo. The prior
+# revision carried the live token in cleartext.
+#
+# Revision 2026-08-09:
+#   - bot_token -> bot_token_file
+#   - report_type matcher daily -> hourly (the rules always fired hourly;
+#     the label was wrong). MUST stay in sync with alert_rules.yml.
+#   - info route: group_wait 0s -> 15s, repeat_interval 1m -> 5m
+#   - warning route added (previously fell through to the root route)
+#   - inhibit_rules added: one solve produces one message (Invariant 8)
+# ===========================================================================
+
+global:
+  resolve_timeout: 5m
+
+# ---------------------------------------------------------------------------
+# A double is ONE solve with TWO chain-hashes. Without this, a double fired
+# three Telegram messages (RcKasBlockFound + RcZkasBlockFound +
+# RcMergedDoubleBlockFound) Ã¢â‚¬â€ Invariant 8 violated in messaging form.
+#
+# All three rules live in the same rule group, so they reach Alertmanager in
+# a single POST and inhibition resolves cleanly. The 15s group_wait on the
+# info route below is belt-and-braces for that.
+#
+# If you would rather see all three, delete this block and set the info
+# route's group_wait back to 0s.
+# ---------------------------------------------------------------------------
+inhibit_rules:
+  - source_matchers:
+      - alertname="RcMergedDoubleBlockFound"
+    target_matchers:
+      - alertname=~"RcKasBlockFound|RcZkasBlockFound"
+    equal: ['worker']
+
+route:
+  group_by: ['alertname']
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 3h
+  receiver: 'telegram-bot'
+
+  routes:
+    # 1. Scheduled reports (hourly cards). Each hour is a FRESH firing, so
+    #    repeat_interval never throttles them Ã¢â‚¬â€ by construction.
+    - matchers:
+        - report_type="hourly"
+      receiver: 'telegram-bot'
+      group_by: ['report_type']
+      group_wait: 0s
+      group_interval: 10s
+      repeat_interval: 23h
+
+    # 2. Blocks: near-immediate. 15s of group_wait buys correct double
+    #    attribution (see inhibit_rules) at a cost nobody will notice on a
+    #    block notification.
+    - matchers:
+        - severity="info"
+      receiver: 'telegram-bot'
+      group_wait: 15s
+      repeat_interval: 5m
+
+    # 3. Critical: bridge down, rig silent, merged leg off, red block.
+    - matchers:
+        - severity="critical"
+      receiver: 'telegram-bot'
+      group_wait: 5s
+      repeat_interval: 1h
+
+    # 4. Warnings: latency and cadence precursors. Slower re-nag so they
+    #    can't drown the critical channel.
+    - matchers:
+        - severity="warning"
+      receiver: 'telegram-bot'
+      group_wait: 30s
+      repeat_interval: 6h
+
+receivers:
+  - name: 'telegram-bot'
+    telegram_configs:
+      # REPLACE THIS PATH. Single quotes, absolute, no trailing slash.
+      - bot_token_file: 'C:\path\to\alertmanager\telegram_token.txt'
+        chat_id: 8180943473
+        # Plain text. Do NOT set 'Markdown': legacy Markdown 400s on
+        # unbalanced underscores, and the alert descriptions are full of
+        # metric names that contain them. A 400 drops the message silently.
+        # For monospace alignment use 'HTML' with the <pre> variant in the
+        # alert_rules.yml appendix Ã¢â‚¬â€ and test it with amtool first.
+        parse_mode: ''
+        send_resolved: false
+        message: |
+          {{ range .Alerts }}
+          {{ .Annotations.summary }}
+          {{ .Annotations.description }}
+          {{ end }}

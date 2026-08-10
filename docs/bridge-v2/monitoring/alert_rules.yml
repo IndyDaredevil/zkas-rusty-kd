@@ -1,0 +1,389 @@
+# ===========================================================================
+# Alert + recording rules — KDSM mining stack (Kron K1)
+#
+# DEPLOYED COPY sits beside prometheus.yml on the Kron (rule_files: is a
+# bare relative name). This file is a MIRROR for docs/bridge-v2/monitoring/.
+#
+# Revision 2026-08-09b. Metric names VERIFIED against localhost:3034/metrics.
+#   b: round() on 24h counters; not-confirmed-blue metric name corrected
+#      (RC has no zkas_ infix); RcZkasTemplateAgeClimbing added; dead
+#      rejection-rule stub replaced with the real finding (no such metric);
+#      kaspa_failover group + :3030 job removed (no failover tier — all
+#      three IceRiver pool slots point at the RC by design, their failover
+#      trigger being unreliable).
+#
+# Revision 2026-08-09. Changes from the prior revision:
+#   1. zKAS network hashrate re-pinned 18.06 -> 34.2 PH/s, and the
+#      ":3033 gauge x10" fallback branch DELETED (§ rc_recording).
+#   2. Recording-rule group added so the pin, the effort figure and the
+#      luck maths each live in exactly ONE place.
+#   3. Dead zkas_merged_mining group (:3033) deleted — that bridge is not
+#      running; seven rules were evaluating against an empty vector.
+#   4. NEW: RcBridgeDown, RcMergedTelemetryAbsent, RcWorkerSilent. The
+#      production bridge previously had NO down-alert of any kind: if the
+#      RC died, every rule went empty and Telegram went quiet. Silence was
+#      indistinguishable from health.
+#   5. Hourly report reformatted (literal block scalar, one metric per
+#      line). report_type: daily -> hourly (it always fired hourly; the
+#      label lied). MUST match the alertmanager.yml route matcher.
+#   6. Group renamed from "test candidate" — the RC is production.
+#
+# Deploy: promtool check rules alert_rules.yml   BEFORE reloading.
+# CRLF caution: the parser hard-rejects \r. Keep this file LF.
+# ===========================================================================
+
+groups:
+
+  # =========================================================================
+  # RECORDING RULES — the single source for every number in the hourly card.
+  # Everything is guarded with `or vector(0)` so a fresh TSDB or a restarted
+  # bridge renders 0 rather than a blank field.
+  # =========================================================================
+  - name: rc_recording
+    interval: 30s
+    rules:
+
+      # ---- block counters, 24h rolling ------------------------------------
+      # NOTE THE METRIC NAMES. On the RC, ks_blocks_mined is the KAS counter
+      # and ks_zkas_blocks_mined is the zKAS counter. This is INVERTED from
+      # the old :3033 bridge's convention. Any rule copied between jobs by
+      # metric name alone is silently wrong.
+      - record: rc:kas_24h
+        expr: (round(sum(increase(ks_blocks_mined{job="rc_merged_bridge"}[24h])))) or vector(0)
+      - record: rc:zkas_24h
+        expr: (round(sum(increase(ks_zkas_blocks_mined{job="rc_merged_bridge"}[24h])))) or vector(0)
+      - record: rc:doubles_24h
+        expr: (round(sum(increase(ks_double_blocks_mined{job="rc_merged_bridge"}[24h])))) or vector(0)
+      # Invariant 8 (spec Draft 4): a double is ONE solve with TWO
+      # chain-hashes.  solves = kas + zkas - doubles
+      - record: rc:solves_24h
+        expr: rc:kas_24h + rc:zkas_24h - rc:doubles_24h
+
+      # ---- block counters, since restart -----------------------------------
+      - record: rc:kas_total
+        expr: (sum(ks_blocks_mined{job="rc_merged_bridge"})) or vector(0)
+      - record: rc:zkas_total
+        expr: (sum(ks_zkas_blocks_mined{job="rc_merged_bridge"})) or vector(0)
+      - record: rc:doubles_total
+        expr: (sum(ks_double_blocks_mined{job="rc_merged_bridge"})) or vector(0)
+
+      # ---- effort ----------------------------------------------------------
+      # Rig line = instantaneous (a "now" reading).
+      - record: rc:rig_ths
+        expr: (sum(rate(ks_valid_share_diff_counter{job="rc_merged_bridge"}[5m])) * 0.001073741824) or vector(0)
+      # Luck denominator = TOTAL HASHES over the same 24h window as the
+      # numerator. Restart-tolerant by construction; do not swap this for a
+      # rate()-based figure. (share_diff x 2^30 = hashes.)
+      - record: rc:effort_hashes_24h
+        expr: ((sum(increase(ks_valid_share_diff_counter{job="rc_merged_bridge"}[24h])) * 1073741824)) or vector(0)
+
+      # ---- network hashrate ------------------------------------------------
+      # KAS: the RC's gauge is NATIVE Kaspa (KAS-primary architecture),
+      # live-verified. No *10, no constant. 3.30e17 is a dead-gauge fallback
+      # only.
+      - record: rc:kas_net_hs
+        expr: (max(ks_estimated_network_hashrate_gauge{job="rc_merged_bridge"})) or vector(330000000000000000)
+
+      # zKAS: PINNED 34.2 PH/s — 2026-08-09.
+      #   Source: explorer.zkas.info, 24h-avg difficulty 17,100.42 T.
+      #   Calibration: H = D x BPS x 2. zKAS is 1 BPS, so H = D x 2. The
+      #   explorer's own two figures (34,200.85 TH/s vs 17,100.42 T) give
+      #   ratio 2.000 exactly, which IS the calibration — not an assumption.
+      #   Cross-check from our own blocks: Z/K = 42/50 = 0.84 implies
+      #   D_zkas = D_kas/0.84 = 1.61e16 -> 32.1 PH/s. Within 7%.
+      #   The prior 18.06 pin (an 08-05 :3033 reading) ran zKAS Luck ~1.9x
+      #   low: it predicted 75 zKAS blocks against 50 KAS; we logged 42.
+      #
+      # RETIRE THIS PIN. Replacement, once the bridge exports it:
+      #   expr: (max(ks_zkas_network_hashrate_gauge{job="rc_merged_bridge"}))
+      #           or vector(34200000000000000)
+      # The bridge already holds a gRPC client to 16810 — the value is
+      # get_block_dag_info().difficulty * 2. Deriving it kills both the
+      # re-pin chore and the silent-staleness failure mode.
+      #
+      # The old ":3033 gauge * 10 or vector(...)" fallback is deleted
+      # deliberately. If that bridge ever comes back up it must not
+      # silently take this number over again with an unvalidated *10.
+      - record: rc:zkas_net_hs
+        expr: vector(34200000000000000)
+
+      # ---- luck ------------------------------------------------------------
+      # luck = blocks / expected;  expected = hashes / (net / BPS)
+      # KAS: 10 BPS -> net/10.   zKAS: 1 BPS -> net/1.
+      # >= 0 is the NaN clamp (fresh-TSDB render fix). clamp_max guards the
+      # blocks>0/effort=0 divide-by-zero that would otherwise print +Inf.
+      - record: rc:kas_luck_pct
+        expr: clamp_max(((rc:kas_24h / (rc:effort_hashes_24h / (rc:kas_net_hs / 10))) * 100) >= 0, 999) or vector(0)
+      - record: rc:zkas_luck_pct
+        expr: clamp_max(((rc:zkas_24h / (rc:effort_hashes_24h / rc:zkas_net_hs)) * 100) >= 0, 999) or vector(0)
+
+  # =========================================================================
+  # RC v2.1 merged bridge (:3034) — PRODUCTION.
+  # KAS-primary, zKAS attached as a background enhancement.
+  # =========================================================================
+  - name: rc_merged_mining
+    rules:
+
+      # ---- LIVENESS --------------------------------------------------------
+      # Previously absent. If the RC process dies, every rule below evaluates
+      # against an empty vector and fires nothing. This is the rule that
+      # makes silence mean something.
+      - alert: RcBridgeDown
+        expr: up{job="rc_merged_bridge"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "🛑 RC merged bridge is DOWN"
+          description: ":3034 has not answered /metrics for 2m+. Rigs are falling back to RKStratum pool #2 — KAS only, zero zKAS yield. Relaunch via the launcher .cmd (env vars are per-window; any other restart method silently drops merged mining)."
+
+      # ks_merged_zk_state is load-bearing for three alerts below. `== 0`
+      # against an absent series returns EMPTY, not true — so a build that
+      # stops exporting the gauge disarms all three silently.
+      - alert: RcMergedTelemetryAbsent
+        expr: absent(ks_merged_zk_state{job="rc_merged_bridge"})
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "🛑 RC zk_state gauge MISSING — merged alerting is blind"
+          description: "Target is up but ks_merged_zk_state is absent. RcMergedMiningDisabled / TemplateStale / TemplateGoingPlain cannot fire. Wrong binary deployed?"
+
+      # A rig that dies outright hashes nowhere. KaspaFailoverActive only
+      # catches rigs that successfully reached :3030.
+      # Known gap: if the series disappears entirely (bridge restart) this
+      # returns empty rather than firing — RcBridgeDown covers that case.
+      - alert: RcWorkerSilent
+        expr: sum by (worker) (increase(ks_valid_share_diff_counter{job="rc_merged_bridge"}[15m])) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "⚠️ Rig silent on the RC"
+          description: "{{ $labels.worker }} — no accepted shares for 15m+, and not on the failover bridge either. Check the rig itself."
+
+      # ---- MERGED-LEG HEALTH (zk_state ladder) ------------------------------
+      # The exact failure class that cost two solo KAS blocks: both
+      # ZKAS_MERGED_NODE and ZKAS_TREASURY_ADDRESS unset — mining KAS-only,
+      # byte-for-byte RKStratum, zero zKAS yield, healthy-looking console.
+      - alert: RcMergedMiningDisabled
+        expr: ks_merged_zk_state{job="rc_merged_bridge"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "🛑 RC merged mining is OFF (env vars not set at boot)"
+          description: "zk_state has read OFF for 1m+. Check the boot log for both MERGED MINING ENABLED lines; relaunch via the launcher .cmd with both vars baked in."
+
+      # zKAS leg attached but every template goes out uncommitted — the KAS
+      # leg mines fine, zero zKAS blocks are possible until this clears.
+      # This is also the WS4(a) detach-on-loss cover: a zKAS node death
+      # mid-session should land here.
+      # *** UNVERIFIED ASSUMPTION: that a HARD node kill drives zk_state to
+      # 3 rather than freezing it at 1. The RPC-latency gauge is known to
+      # freeze rather than climb on a dead RPC. TEST THIS: kill the zkas
+      # node for 3 minutes and confirm this alert fires. Until you have,
+      # WS4(a) is unmonitored — not monitored. ***
+      - alert: RcMergedTemplateGoingPlain
+        expr: ks_merged_zk_state{job="rc_merged_bridge"} == 3
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "🛑 RC serving PLAIN parents — zKAS leg not decorating"
+          description: "zk_state has read PLAIN for 2m+. Check ks_merged_zkas_rpc_ms and the zKAS node's own health on 16810 before assuming a bridge bug."
+
+      # Precursor: cache aging past its 500ms TTL, not yet past the 5s
+      # PLAIN threshold.
+      - alert: RcMergedTemplateStale
+        expr: ks_merged_zk_state{job="rc_merged_bridge"} == 2
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "⚠️ RC zKAS template cache aging — node lagging"
+          description: "zk_state has read stale for 3m+ (age 1-5s). Precedes RcMergedTemplateGoingPlain if it keeps climbing."
+
+      # Independent of the zk_state ladder, and a better WS4(a) detector:
+      # a monotonically CLIMBING value on node death rather than a state
+      # that might freeze. Budget is 250ms and healthy age is sub-second,
+      # so 30s is unambiguous. Keep BOTH this and the zk_state rules — if
+      # the kill-the-node test shows zk_state freezing at 1, this is the
+      # rule that still fires.
+      - alert: RcZkasTemplateAgeClimbing
+        expr: ks_merged_zk_template_age_seconds{job="rc_merged_bridge"} > 30
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "🛑 zKAS template age over 30s — leg is not fetching"
+          description: "No successful zKAS template fetch in 30s+. WS4(a) detach-on-loss: the leg stays attached while every template silently misses its budget, KAS keeps earning, zKAS earns nothing. Check the zKAS node on 16810."
+
+      # ---- PERFORMANCE WATCHDOGS -------------------------------------------
+      # Healthy baseline (live-verified) ~3.2/s — 10 BPS push coalesced by
+      # the 250ms limiter. Sustained sub-1/s = fallback to ticker-only, the
+      # exact defect WS2 was built to eliminate.
+      - alert: RcMergedJobCadenceLow
+        expr: ks_merged_jobs_per_sec{job="rc_merged_bridge"} < 1.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "⚠️ RC job dispatch rate below 1/s — WS2 push regression?"
+          description: "5m+ sustained below 1 job/s. Baseline is ~3.2/s; investigate before it compounds with a template-timing issue."
+
+      # Baseline sub-millisecond. A sustained climb means a settlement arm is
+      # blocking the submit path instead of staying spawned — the regression
+      # c.5's design (never gate the KAS arm on the zkas claim) prevents.
+      # Reads 0 during no-submit windows by design; safe against idle
+      # false positives.
+      - alert: RcMergedSubmitLatencyHigh
+        expr: ks_merged_submit_avg_ms{job="rc_merged_bridge"} > 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "⚠️ RC share-submit processing averaging over 20ms"
+          description: "Baseline is sub-millisecond (soak: ~0.4-2ms). Check ks_merged_submit_max_ms for spikes vs. a genuine average shift."
+
+      # Budget ceiling is 250ms (ZKAS_FETCH_BUDGET). Catches "slow but still
+      # succeeding"; total RPC failure is caught by the zk_state alerts
+      # instead, since a dead RPC freezes this gauge rather than raising it.
+      - alert: RcMergedRpcLatencyHigh
+        expr: ks_merged_zkas_rpc_ms{job="rc_merged_bridge"} > 100
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "⚠️ zKAS node RPC latency over 100ms — approaching the 250ms budget"
+          description: "Baseline ~1ms. Direct precursor to RcMergedTemplateGoingPlain if it keeps climbing."
+
+      # ---- SUBMISSION REJECTED — NO METRIC EXISTS ---------------------
+      # Verified 2026-08-09 against localhost:3034/metrics: the RC exports
+      # NO submit-outcome counter of any kind. The old :3033 bridge had
+      # ks_merged_parent_submit_total{outcome=...}; the v2 port does not.
+      #
+      # CONSEQUENCE, and it is not small: the RC can have 100% of its
+      # merged submissions rejected by the node and nothing here would
+      # show it. zk_state reads healthy (templates ARE being decorated),
+      # the KAS leg looks normal, and the only symptom is zKAS blocks
+      # failing to appear. This is exactly the FCMM/ZKMM failure mode.
+      #
+      # It also cannot currently distinguish, for a missing zKAS block:
+      #   submission rejected / block went red / no block found
+      # All three look identical.
+      #
+      # THIS IS A BRIDGE-SIDE GAP, NOT A CONFIG GAP. WS3 punch list:
+      # export a submit-outcome counter labelled by chain and outcome,
+      # e.g. ks_submit_total{chain="kas|zkas", outcome="accepted|rejected"}.
+      # Then add the birth-safe rejection alert here.
+
+      # ---- BLOCK EVENTS ----------------------------------------------------
+      # Birth-safe idiom throughout: increase() cannot see the FIRST-ever
+      # increment of a new series (born mid-window at value 1 => delta 0).
+      # The "unless offset" clause fires when the series exists now but did
+      # not exist one window ago.
+      - alert: RcKasBlockFound
+        expr: >
+          increase(ks_blocks_mined{job="rc_merged_bridge"}[1m]) > 0
+          or
+          (ks_blocks_mined{job="rc_merged_bridge"}
+           unless ks_blocks_mined{job="rc_merged_bridge"} offset 1m)
+        for: 30s
+        labels:
+          severity: info
+        annotations:
+          summary: "🎯 RC: KAS Block Found!"
+          description: "{{ $labels.worker }}!"
+
+      - alert: RcZkasBlockFound
+        expr: >
+          increase(ks_zkas_blocks_mined{job="rc_merged_bridge"}[1m]) > 0
+          or
+          (ks_zkas_blocks_mined{job="rc_merged_bridge"}
+           unless ks_zkas_blocks_mined{job="rc_merged_bridge"} offset 1m)
+        for: 30s
+        labels:
+          severity: info
+        annotations:
+          summary: "⚡ RC: ZKAS Block Found!"
+          description: "{{ $labels.worker }}!"
+
+      # This is the event the whole port exists to produce.
+      # An inhibit_rule in alertmanager.yml suppresses the two singles above
+      # when this fires, so one solve produces ONE message (Invariant 8).
+      - alert: RcMergedDoubleBlockFound
+        expr: >
+          increase(ks_double_blocks_mined{job="rc_merged_bridge"}[2m]) > 0
+          or
+          (ks_double_blocks_mined{job="rc_merged_bridge"}
+           unless ks_double_blocks_mined{job="rc_merged_bridge"} offset 2m)
+        for: 30s
+        labels:
+          severity: info
+        annotations:
+          summary: "🎉 RC: DOUBLE BLOCK! KAS + ZKAS, one hash!"
+          description: "{{ $labels.worker }} — both legs confirmed blue from the same solve."
+
+      # A first occurrence right after a fresh deploy may mean the node
+      # doesn't answer GetCurrentBlockColor rather than a genuine red block
+      # — the exhaust branch looks identical for both. Cross-check
+      # explorer.zkas.info for this block before assuming a reorg.
+      - alert: RcBlockNotConfirmedBlue
+        expr: >
+          increase(ks_blocks_not_confirmed_blue{job="rc_merged_bridge"}[10m]) > 0
+          or
+          (ks_blocks_not_confirmed_blue{job="rc_merged_bridge"}
+           unless ks_blocks_not_confirmed_blue{job="rc_merged_bridge"} offset 10m)
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "🔴 RC: block NOT confirmed blue"
+          description: "{{ $labels.worker }} — a node-accepted block did not go blue within the 60s window (30 attempts x 2s). WHICH LEG IS UNCONFIRMED: the exported counter carries no chain qualifier — check both explorer.zkas.info and the Kaspa explorer."
+
+      # ---- HOURLY REPORT ---------------------------------------------------
+      # Cadence: minute()==0 raises a FRESH alert each hour (it resolves a
+      # few minutes later once the expr goes false), so every hour is a new
+      # firing and Alertmanager's repeat_interval never throttles it. That
+      # is by construction, not by accident — do not "fix" it.
+      #
+      # It also doubles as a dead-man's switch: a missing hourly card means
+      # Prometheus, Alertmanager or the Telegram bot is down, and no other
+      # alert can tell you that.
+      #
+      # `description: |` (literal) not `>` (folded). The folded scalar
+      # collapses newlines into spaces — that was the wall-of-text cause.
+      # parse_mode is '' (plain text) in alertmanager.yml, so Telegram
+      # renders in a proportional font: every line is short and
+      # self-labelling rather than column-aligned. See the file footer for
+      # the HTML <pre> variant if you want true monospace alignment.
+      - alert: HourlyMergedReport
+        expr: minute() == 0
+        for: 0m
+        labels:
+          report_type: hourly
+          severity: info
+        annotations:
+          summary: "📊 RC MERGED — 24h"
+          description: |
+            KAS     {{ with query "rc:kas_24h or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }}  ·  luck {{ with query "rc:kas_luck_pct or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }}%
+            ZKAS    {{ with query "rc:zkas_24h or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }}  ·  luck {{ with query "rc:zkas_luck_pct or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }}%
+            DOUBLE  {{ with query "rc:doubles_24h or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }}
+            SOLVE   {{ with query "rc:solves_24h or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }}   (K+Z-D)
+
+            restart  K{{ with query "rc:kas_total or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }} / Z{{ with query "rc:zkas_total or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }} / D{{ with query "rc:doubles_total or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }}
+            net      KAS {{ with query "(rc:kas_net_hs / 1e15) or vector(0)" }}{{ . | first | value | printf "%.1f" }}{{ end }}  ·  ZKAS {{ with query "(rc:zkas_net_hs / 1e15) or vector(0)" }}{{ . | first | value | printf "%.1f" }}{{ end }}  PH/s
+            rig      {{ with query "rc:rig_ths or vector(0)" }}{{ . | first | value | printf "%.2f" }}{{ end }} TH/s  ·  up {{ with query "(time() - min(ks_worker_start_time{job='rc_merged_bridge'})) or vector(0)" }}{{ . | first | value | humanizeDuration }}{{ end }}
+
+# ===========================================================================
+# NOTE: the kaspa_failover group (:3030 / job="kaspa_bridge") was REMOVED
+# 2026-08-09. There is no failover tier: all three IceRiver pool slots on
+# every rig point at the RC, because the miners' own failover trigger is
+# unreliable and three identical pools is the only configuration whose
+# behaviour is predictable.
+#
+# CONSEQUENCE: RcBridgeDown is the ONLY thing between an RC crash and a
+# silently idle fleet. There is no second bridge to catch the rigs. Do not
+# relax its 2m `for:` and do not route it below critical.
+# ===========================================================================

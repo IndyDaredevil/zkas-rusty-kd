@@ -22,3 +22,5 @@ auxtest.log
 *.bundle
 notes-before.json
 notes-after.json
+
+telegram_token.txt
