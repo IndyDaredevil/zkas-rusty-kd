@@ -21,6 +21,16 @@ struct Cli {
     /// Network: mainnet | testnet | devnet | simnet.
     #[arg(long, default_value = "mainnet")]
     network: String,
+    /// Stop the daemon after N minutes with no wallet API request (0 or unset = run
+    /// forever, the default).
+    ///
+    /// Meant for a daemon exposed on a network to pair a phone: it holds the viewing
+    /// keys of every wallet it serves, and it is routinely left running long after the
+    /// payment that needed it. `/health` does not count as use, so an uptime monitor
+    /// cannot hold the door open. In-flight requests finish; the process then exits and
+    /// a supervisor may restart it on demand.
+    #[arg(long, value_name = "MINUTES")]
+    idle_timeout: Option<u64>,
     /// Permit binding a non-loopback address directly (prefer a TLS proxy instead).
     #[arg(long, default_value_t = false)]
     allow_remote: bool,
@@ -302,6 +312,10 @@ async fn run(cli: Cli) {
         let _ = shutdown_tx.send(());
     });
 
+    // 0 is spelled "never" rather than "shut down immediately", which is the reading
+    // a user who types 0 to disable it expects.
+    let idle_timeout = cli.idle_timeout.filter(|m| *m > 0).map(|m| std::time::Duration::from_secs(m * 60));
+
     // Self-hosting mode: one flag gives TLS + bearer + a pairing QR, no proxy.
     if let Some(addr) = cli.serve_public {
         // SelfHostConfig is shared with kaspad's embedded mode and stays custodial;
@@ -327,6 +341,7 @@ async fn run(cli: Cli) {
             wallet_secret,
             allow_default_token: cli.allow_default_token,
             resources,
+            idle_timeout,
         };
         if let Err(e) = zkas_walletd::run_selfhost(sh, shutdown_rx).await {
             log::error!("{e}");
@@ -366,6 +381,7 @@ async fn run(cli: Cli) {
             .filter(|n| *n > 0)
             .unwrap_or_else(zkas_walletd::default_max_concurrent_proves),
         resources,
+        idle_timeout,
     };
 
     if let Err(e) = serve(cfg, shutdown_rx).await {

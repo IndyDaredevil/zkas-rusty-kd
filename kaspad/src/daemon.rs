@@ -650,6 +650,11 @@ Do you confirm? (y/n)";
                                 wallet_secret,
                                 allow_default_token: true,
                                 resources: zkas_walletd::ResourceLimits::default(),
+                                // The wallet API lives and dies with the node here, so
+                                // an idle bound would stop it while the node it is
+                                // attached to keeps running — a service that silently
+                                // disappears from under the node hosting it.
+                                idle_timeout: None,
                             };
                             if let Err(e) = rt.block_on(zkas_walletd::run_selfhost(cfg, rx)) {
                                 warn!("wallet API exited: {e}");

@@ -55,6 +55,11 @@ pub struct SelfHostConfig {
     pub allow_default_token: bool,
     /// Runtime resource policy supplied by the standalone CLI or embedding node.
     pub resources: crate::ResourceLimits,
+    /// Stop after this long with no wallet API request. A self-hosted daemon is the
+    /// one most likely to be left exposed and forgotten, so the bound matters most
+    /// here — but it stays opt-in, because a daemon that vanishes mid-sync would be
+    /// its own kind of surprise.
+    pub idle_timeout: Option<std::time::Duration>,
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -190,6 +195,7 @@ pub async fn run_selfhost(cfg: SelfHostConfig, shutdown: tokio::sync::oneshot::R
         allow_custodial: true,
         max_concurrent_proves: crate::default_max_concurrent_proves(),
         resources: cfg.resources,
+        idle_timeout: cfg.idle_timeout,
     };
     crate::serve(daemon, shutdown).await
 }
