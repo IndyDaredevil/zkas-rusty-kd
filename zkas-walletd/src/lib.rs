@@ -2823,6 +2823,14 @@ async fn replay_matured(client: &GrpcClient, genesis: RpcHash, mut db: WalletDb)
 
 type Wallet = Arc<Mutex<WalletEntry>>;
 
+/// The two node channels, swapped together so a reconnect can never leave the
+/// request path talking to one connection and the sync loop to another.
+#[derive(Clone)]
+struct NodeClients {
+    request: GrpcClient,
+    sync: GrpcClient,
+}
+
 struct AppState {
     /// gRPC connection for the REQUEST path — wallet loads, the tip ticker, prepare /
     /// submit. Kept separate from `sync_client` so the background sync loop's continuous
@@ -2830,9 +2838,19 @@ struct AppState {
     /// RPCs) queue for seconds. Sharing one connection for both was the root cause of the
     /// "wallet won't connect": loads timed out behind the sync loop, so wallets never
     /// cached and every poll re-ran a slow, timing-out load.
-    client: GrpcClient,
-    /// Dedicated gRPC connection for the background sync loop's block fetches.
-    sync_client: GrpcClient,
+    /// Node connectivity is deliberately OPTIONAL.
+    ///
+    /// The wallet API must stay up while its node is starting, restarting or simply
+    /// unreachable. When `serve` blocked on the first connection instead, an
+    /// unreachable node meant the HTTP listener was never bound at all, so the
+    /// embedding app reported "wallet engine didn't start" and hid the user's cached
+    /// wallet state — a node problem presenting as a wallet problem.
+    ///
+    /// A connector task fills this slot and retries forever; the tip monitor clears it
+    /// after repeated failures so a fresh pair of channels is established.
+    clients: std::sync::Arc<tokio::sync::RwLock<Option<NodeClients>>>,
+    /// Why the node is unreachable, for status to report instead of guessing.
+    node_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     wallet_dir: String,
     prefix: Prefix,
     network: String,
@@ -3104,6 +3122,25 @@ impl Drop for PreparingGuard {
 }
 
 impl AppState {
+    /// The request-path channel, or `None` while the node is unreachable.
+    ///
+    /// Every caller already tolerates an RPC failure, so "no node yet" travels the
+    /// same path a failed call does: the wallet keeps serving what it knows and
+    /// reports the node as disconnected, rather than the whole service vanishing.
+    async fn request_client(&self) -> Option<GrpcClient> {
+        self.clients.read().await.as_ref().map(|c| c.request.clone())
+    }
+
+    /// The sync-loop channel, or `None` while the node is unreachable.
+    async fn sync_client(&self) -> Option<GrpcClient> {
+        self.clients.read().await.as_ref().map(|c| c.sync.clone())
+    }
+
+    /// Why the node is unreachable, if it is.
+    fn node_error(&self) -> Option<String> {
+        self.node_error.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
     /// Merkle paths for `positions` at `matured`, served from the **shared chain tree**
     /// instead of the calling wallet's own copy of the stream.
     ///
@@ -3215,7 +3252,7 @@ impl AppState {
         // node's finality-point walk can be pathologically slow on a degenerate DAG
         // (e.g. difficulty collapsed to the floor). Time it out and fall back to a full
         // scan rather than hanging the wallet.
-        let cp = match tokio::time::timeout(std::time::Duration::from_secs(5), self.client.get_shielded_tree_state(None)).await {
+        let cp = match tokio::time::timeout(std::time::Duration::from_secs(5), self.request_client().await?.get_shielded_tree_state(None)).await {
             Ok(Ok(cp)) => cp,
             _ => return None,
         };
@@ -3269,7 +3306,7 @@ impl AppState {
         let mut base_below: Option<RpcHash> = None;
         // Bound the walk (a 2000-block page × this cap covers many millions of blocks).
         for _ in 0..4000 {
-            let page = self.client.get_shielded_block_metadata(cursor, WALK_PAGE).await.ok()?;
+            let page = self.request_client().await?.get_shielded_block_metadata(cursor, WALK_PAGE).await.ok()?;
             if page.reorged {
                 return None;
             }
@@ -3286,7 +3323,7 @@ impl AppState {
                 // No block below birthday anywhere (birthday <= first block past the
                 // checkpoint) → nothing to skip; let the caller start from the checkpoint.
                 let base = base_below?;
-                let ts = self.client.get_shielded_tree_state(Some(base)).await.ok()?;
+                let ts = self.request_client().await?.get_shielded_tree_state(Some(base)).await.ok()?;
                 return Some((ts.block_hash, ts.daa_score, ts.size, ts.leaf, ts.ommers));
             }
             base_below = Some(last.hash);
@@ -3299,7 +3336,7 @@ impl AppState {
             // blocks of history it could not possibly appear in.
             if (page.blocks.len() as u64) < WALK_PAGE {
                 let base = base_below?;
-                let ts = self.client.get_shielded_tree_state(Some(base)).await.ok()?;
+                let ts = self.request_client().await?.get_shielded_tree_state(Some(base)).await.ok()?;
                 return Some((ts.block_hash, ts.daa_score, ts.size, ts.leaf, ts.ommers));
             }
         }
@@ -3322,7 +3359,7 @@ impl AppState {
         // Prefer genesis. A node that has pruned answers for a block it no longer
         // holds with an error or a different hash; both fall through to the
         // pruning point, which is the most history that node can honestly offer.
-        let genesis_ts = match self.client.get_shielded_tree_state(Some(guard)).await {
+        let genesis_ts = match self.request_client().await?.get_shielded_tree_state(Some(guard)).await {
             Ok(ts) if ts.block_hash == guard => Some(ts),
             _ => None,
         };
@@ -3332,8 +3369,8 @@ impl AppState {
                 (guard, ts)
             }
             None => {
-                let start = self.client.get_block_dag_info().await.ok()?.pruning_point_hash;
-                let ts = self.client.get_shielded_tree_state(Some(start)).await.ok()?;
+                let start = self.request_client().await?.get_block_dag_info().await.ok()?.pruning_point_hash;
+                let ts = self.request_client().await?.get_shielded_tree_state(Some(start)).await.ok()?;
                 if ts.block_hash != start {
                     log::error!("node ignored the explicit tree-state checkpoint (update the node)");
                     return None;
@@ -3503,7 +3540,7 @@ impl AppState {
         // (pruned cursor, RPC hiccup), we simply restore the old way.
         let mut abandoned_checkpoint = false;
         let tip = match checkpoint_cursor(&self.wallet_dir, token, &genesis) {
-            Some(cursor) => match self.client.get_shielded_tree_state(Some(cursor)).await {
+            Some(cursor) => match self.request_client().await?.get_shielded_tree_state(Some(cursor)).await {
                 Ok(ts) => Some(kaspa_shielded_core::tree::FrontierState {
                     size: ts.size,
                     leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
@@ -3657,7 +3694,14 @@ async fn mempool_loop(state: Arc<AppState>) {
         if !active.is_empty() {
             // One decode of the mempool, shared by every wallet.
             let bundles: Vec<ShieldedBundle> =
-                match tokio::time::timeout(SYNC_RPC_TIMEOUT, state.client.get_mempool_entries(false, false)).await {
+                match tokio::time::timeout(SYNC_RPC_TIMEOUT, async {
+                    match state.request_client().await {
+                        Some(c) => c.get_mempool_entries(false, false).await,
+                        None => Err(kaspa_rpc_core::RpcError::General("node unavailable".into())),
+                    }
+                })
+                .await
+                {
                     Ok(Ok(entries)) => entries
                         .iter()
                         .filter(|e| e.transaction.version == TX_VERSION_SHIELDED)
@@ -3829,7 +3873,11 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // The shared tree itself must not borrow from itself, hence the token check.
     let shared_tree_covers =
         if token == CHAIN_TREE_TOKEN { 0 } else { state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed) };
-    e.sync_chunk(&state.sync_client, &state.page_cache, &state.warm_gate, state.resources.subtree_free_floor_mb, shared_tree_covers)
+    // No node means no block stream to advance along. Report the wallet as still
+    // behind rather than idle: "caught up" would be a claim about the chain that this
+    // daemon currently cannot see, and the UI would show a partial balance as final.
+    let Some(sync_client) = state.sync_client().await else { return SyncOutcome::Behind };
+    e.sync_chunk(&sync_client, &state.page_cache, &state.warm_gate, state.resources.subtree_free_floor_mb, shared_tree_covers)
         .await;
     // A borrowing wallet's mirror tree is stale by construction; make it current again
     // by taking the shared tree's frontier. `adopt_tip_frontier` REFUSES unless the
@@ -3923,7 +3971,10 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
         // silently hides every note minted below it, and both `/prepare` paths are SPEND
         // paths, so those notes become "insufficient funds" while the user holds the coins.
         let serves_genesis = matches!(
-            state.client.get_shielded_tree_state(Some(e.genesis)).await,
+            match state.request_client().await {
+                Some(c) => c.get_shielded_tree_state(Some(e.genesis)).await,
+                None => Err(kaspa_rpc_core::RpcError::General("node unavailable".into())),
+            },
             Ok(ts) if ts.block_hash == e.genesis
         );
         if !serves_genesis {
@@ -4210,7 +4261,14 @@ async fn sync_loop(state: Arc<AppState>) {
             // presents a PARTIAL balance as final. Observed live 2026-07-30: one wallet
             // under four tokens reporting 2,038,348 / 1,902,767 / 1,902,767 / 0.00 ZKAS,
             // all four "synced". Fall back to the last tip actually observed.
-            let chain_len = match tokio::time::timeout(SYNC_RPC_TIMEOUT, state.sync_client.get_block_dag_info()).await {
+            let chain_len = match tokio::time::timeout(SYNC_RPC_TIMEOUT, async {
+                match state.sync_client().await {
+                    Some(c) => c.get_block_dag_info().await,
+                    None => Err(kaspa_rpc_core::RpcError::General("node unavailable".into())),
+                }
+            })
+            .await
+            {
                 Ok(Ok(d)) => d.virtual_daa_score,
                 _ => state.node_tip.lock().await.0,
             };
@@ -4468,6 +4526,16 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
             resp.has_wallet = true;
         }
     }
+    // Name the node fault when there is one and the wallet itself has nothing to
+    // report. Without this the app shows a wallet that is simply not progressing and
+    // no reason for it, which reads as the wallet being broken rather than its node
+    // being unreachable — the same confusion in a different place.
+    if !resp.node_connected && resp.error.is_none() {
+        resp.error = Some(match state.node_error() {
+            Some(detail) => format!("cannot reach the ZKas node: {detail}"),
+            None => "cannot reach the ZKas node".to_string(),
+        });
+    }
     Json(resp)
 }
 
@@ -4498,7 +4566,10 @@ async fn wallet_create(
     };
     // A brand-new wallet holds no historical funds: birth it at the current tip so
     // it is instantly ready to receive — no full-history scan needed.
-    let tip = state.client.get_block_dag_info().await.map(|d| d.virtual_daa_score).unwrap_or(0);
+    let tip = match state.request_client().await {
+        Some(c) => c.get_block_dag_info().await.map(|d| d.virtual_daa_score).unwrap_or(0),
+        None => 0,
+    };
     load_new_wallet(&state, &token, seed, tip, false).await?;
     Ok(Json(CreateResp {
         address,
@@ -4976,14 +5047,21 @@ async fn wallet_rescan(
     let force = body.as_ref().map(|b| b.force).unwrap_or(false);
     if !force {
         let serves_genesis = matches!(
-            state.client.get_shielded_tree_state(Some(state.genesis)).await,
+            match state.request_client().await {
+                Some(c) => c.get_shielded_tree_state(Some(state.genesis)).await,
+                None => Err(kaspa_rpc_core::RpcError::General("node unavailable".into())),
+            },
             Ok(ts) if ts.block_hash == state.genesis
         );
         if !serves_genesis {
-            let pp = state.client.get_block_dag_info().await.ok().map(|d| d.pruning_point_hash);
-            let below = match pp {
-                Some(pp) => state.client.get_shielded_tree_state(Some(pp)).await.ok().map(|ts| (ts.daa_score, ts.size)),
+            let node = state.request_client().await;
+            let pp = match &node {
+                Some(c) => c.get_block_dag_info().await.ok().map(|d| d.pruning_point_hash),
                 None => None,
+            };
+            let below = match (&node, pp) {
+                (Some(c), Some(pp)) => c.get_shielded_tree_state(Some(pp)).await.ok().map(|ts| (ts.daa_score, ts.size)),
+                _ => None,
             };
             let detail = match below {
                 Some((daa, size)) => format!(
@@ -5128,7 +5206,11 @@ async fn ensure_canonical_checkpoint(state: &Arc<AppState>, w: &Wallet) -> Resul
         }
         (e.low, e.db.size(), e.db.anchor())
     };
-    let ts = tokio::time::timeout(SYNC_RPC_TIMEOUT, state.client.get_shielded_tree_state(Some(cursor)))
+    let node = state
+        .request_client()
+        .await
+        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "the wallet service cannot reach its node right now; retry shortly"))?;
+    let ts = tokio::time::timeout(SYNC_RPC_TIMEOUT, node.get_shielded_tree_state(Some(cursor)))
         .await
         .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "node timed out while validating the wallet checkpoint; retry"))?
         .map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("cannot validate wallet checkpoint: {e}")))?;
@@ -5206,7 +5288,8 @@ async fn wallet_send(
     // byte-proportional minimum for however many notes that chunk spends.
     let fee = req.fee.unwrap_or(DEFAULT_FEE_SOMPI);
 
-    let client = &state.client;
+let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "the wallet service cannot reach its node right now; retry shortly"))?;
+    let client = &client;
     // The shielded sighash network domain: the GENESIS hash — what consensus
     // verifies signatures against (`params.genesis.hash`). The moving pruning
     // point only coincides with it on a young, unpruned chain.
@@ -5547,7 +5630,8 @@ async fn wallet_send_many(
     let per_tx = max_payees_per_tx();
     let groups: Vec<Vec<([u8; 43], u64, [u8; 512])>> = resolved.chunks(per_tx).map(|c| c.to_vec()).collect();
     let net: [u8; 32] = state.genesis.as_bytes();
-    let client = &state.client;
+let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "the wallet service cannot reach its node right now; retry shortly"))?;
+    let client = &client;
 
     // Select notes and build witnesses for EVERY group under one lock, so no note is
     // selected twice and all witnesses share one matured anchor.
@@ -5824,7 +5908,11 @@ async fn consolidate_once(
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to build consolidation: {e:?}")))?;
 
     let tx: Transaction = payment_tx(payload);
-    match state.client.submit_transaction(RpcTransaction::from(&tx), false).await {
+    let node = state
+        .request_client()
+        .await
+        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "the wallet service cannot reach its node to broadcast; nothing was sent"))?;
+    match node.submit_transaction(RpcTransaction::from(&tx), false).await {
         Ok(accepted) => {
             let mut e = w.lock().await;
             let now_daa = e.scanned as u64;
@@ -6002,7 +6090,8 @@ async fn wallet_prepare(
     };
     let mut fee = chunk_fee(base_fee, 1);
 
-    let client = &state.client;
+let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "the wallet service cannot reach its node right now; retry shortly"))?;
+    let client = &client;
     let net: [u8; 32] = state.genesis.as_bytes();
 
     let to_addr =
@@ -6343,7 +6432,11 @@ async fn wallet_submit(
         )
     })?;
     let tx: Transaction = payment_tx(bundle.to_bytes());
-    match state.client.submit_transaction(RpcTransaction::from(&tx), false).await {
+    let node = state
+        .request_client()
+        .await
+        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "the wallet service cannot reach its node to broadcast; nothing was sent"))?;
+    match node.submit_transaction(RpcTransaction::from(&tx), false).await {
         Ok(accepted) => {
             // The node has the transaction: park the notes it spends so they leave the
             // unspent set NOW rather than ~3 minutes from now when the block carrying
@@ -6552,15 +6645,32 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
             }
         }
     }
-    let client = tokio::select! {
-        c = connect_node(&cfg.rpc_server, "request") => c,
-        _ = &mut shutdown => return Ok(()),
-    };
-    let sync_client = tokio::select! {
-        c = connect_node(&cfg.rpc_server, "sync") => c,
-        _ = &mut shutdown => return Ok(()),
-    };
-    log::info!("connected to node at {} (2 connections: request + sync)", cfg.rpc_server);
+    // NOT awaited here. Blocking startup on the node is what turned an unreachable
+    // node into "the wallet engine didn't start": the HTTP listener was never bound,
+    // so the app could not even show the cached wallet state it already had, and a
+    // node problem was indistinguishable from a broken wallet. The connector runs in
+    // the background and publishes the channels when they exist; every RPC path
+    // already copes with not having them.
+    let node_clients: std::sync::Arc<tokio::sync::RwLock<Option<NodeClients>>> = Default::default();
+    let node_error: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    {
+        let rpc_server = cfg.rpc_server.clone();
+        let slot = node_clients.clone();
+        let err_slot = node_error.clone();
+        tokio::spawn(async move {
+            loop {
+                if slot.read().await.is_some() {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    continue;
+                }
+                let request = connect_node(&rpc_server, "request").await;
+                let sync = connect_node(&rpc_server, "sync").await;
+                log::info!("connected to node at {rpc_server} (2 connections: request + sync)");
+                *err_slot.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                *slot.write().await = Some(NodeClients { request, sync });
+            }
+        });
+    }
 
     let wallet_secret = cfg.wallet_secret;
     // Pulled out before `cfg` is partially moved into AppState below.
@@ -6591,8 +6701,8 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     log::info!("wallet resource limits: {:?}", resources);
     let chain_tree = build_chain_tree(&wallet_dir, genesis);
     let state = Arc::new(AppState {
-        client,
-        sync_client,
+        clients: node_clients.clone(),
+        node_error: node_error.clone(),
         chain_tree: chain_tree.clone(),
         chain_tree_size: std::sync::atomic::AtomicU64::new(0),
         chain_tree_frontier: Mutex::new(None),
@@ -6691,9 +6801,31 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     let tip_task = {
         let state = state.clone();
         tokio::spawn(async move {
+            let mut failures = 0u32;
             loop {
-                if let Ok(d) = state.client.get_block_dag_info().await {
-                    *state.node_tip.lock().await = (d.virtual_daa_score, std::time::Instant::now());
+                match state.request_client().await {
+                    None => {
+                        // No channel yet; the connector is working on it.
+                    }
+                    Some(c) => match c.get_block_dag_info().await {
+                        Ok(d) => {
+                            failures = 0;
+                            *state.node_error.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                            *state.node_tip.lock().await = (d.virtual_daa_score, std::time::Instant::now());
+                        }
+                        Err(e) => {
+                            failures += 1;
+                            *state.node_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
+                            // A channel can stay "open" onto a node that has gone away, so
+                            // reconnecting has to be driven by failures rather than by the
+                            // transport noticing. Three strikes keeps a blip from cycling it.
+                            if failures >= 3 {
+                                log::warn!("node connection failed {failures} health probes ({e}); reconnecting");
+                                *state.clients.write().await = None;
+                                failures = 0;
+                            }
+                        }
+                    },
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
