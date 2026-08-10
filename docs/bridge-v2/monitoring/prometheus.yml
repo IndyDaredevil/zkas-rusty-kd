@@ -49,6 +49,15 @@ scrape_configs:
     static_configs:
       - targets: ["localhost:3034"]
     metric_relabel_configs:
+      # The RC exports ip as host:port. The ephemeral source port changes on
+      # every reconnect, minting a NEW permanent series each time — the old
+      # one freezes at its last value forever. Strip the port so a reconnect
+      # reuses the existing series.
+      - source_labels: [ip]
+        regex: "([^:]+):.*"
+        target_label: ip
+        replacement: "$1"
+
       # The RC's warm-up zero-init registers a SECOND series per worker
       # carrying miner="IceRiverMiner-v1.1" (all zeros, forever); the live
       # counting path rides miner="". With labeldrop alone those two

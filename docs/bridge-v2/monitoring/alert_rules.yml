@@ -4,6 +4,9 @@
 # DEPLOYED COPY sits beside prometheus.yml on the Kron (rule_files: is a
 # bare relative name). This file is a MIRROR for docs/bridge-v2/monitoring/.
 #
+# Revision 2026-08-09c: `> 0` guard added to all four birth clauses —
+# without it the zero-init warm-up series fire false alerts on restart.
+#
 # Revision 2026-08-09b. Metric names VERIFIED against localhost:3034/metrics.
 #   b: round() on 24h counters; not-confirmed-blue metric name corrected
 #      (RC has no zkas_ infix); RcZkasTemplateAgeClimbing added; dead
@@ -283,11 +286,20 @@ groups:
       # increment of a new series (born mid-window at value 1 => delta 0).
       # The "unless offset" clause fires when the series exists now but did
       # not exist one window ago.
+      #
+      # THE `> 0` IN THE BIRTH CLAUSE IS LOAD-BEARING. The RC zero-inits
+      # per-worker series at warm-up (see the drop relabel in
+      # prometheus.yml). Without `> 0` the birth clause fires on every
+      # freshly-born series AT VALUE ZERO — so a bridge restart or a worker
+      # reconnect produces one false alert per worker. This shipped on
+      # 2026-08-09 and fired nine bogus "block NOT confirmed blue" alerts
+      # across all seven workers against a true count of zero reds.
+      # Do not remove the `> 0`.
       - alert: RcKasBlockFound
         expr: >
           increase(ks_blocks_mined{job="rc_merged_bridge"}[1m]) > 0
           or
-          (ks_blocks_mined{job="rc_merged_bridge"}
+          (ks_blocks_mined{job="rc_merged_bridge"} > 0
            unless ks_blocks_mined{job="rc_merged_bridge"} offset 1m)
         for: 30s
         labels:
@@ -300,7 +312,7 @@ groups:
         expr: >
           increase(ks_zkas_blocks_mined{job="rc_merged_bridge"}[1m]) > 0
           or
-          (ks_zkas_blocks_mined{job="rc_merged_bridge"}
+          (ks_zkas_blocks_mined{job="rc_merged_bridge"} > 0
            unless ks_zkas_blocks_mined{job="rc_merged_bridge"} offset 1m)
         for: 30s
         labels:
@@ -316,7 +328,7 @@ groups:
         expr: >
           increase(ks_double_blocks_mined{job="rc_merged_bridge"}[2m]) > 0
           or
-          (ks_double_blocks_mined{job="rc_merged_bridge"}
+          (ks_double_blocks_mined{job="rc_merged_bridge"} > 0
            unless ks_double_blocks_mined{job="rc_merged_bridge"} offset 2m)
         for: 30s
         labels:
@@ -333,7 +345,7 @@ groups:
         expr: >
           increase(ks_blocks_not_confirmed_blue{job="rc_merged_bridge"}[10m]) > 0
           or
-          (ks_blocks_not_confirmed_blue{job="rc_merged_bridge"}
+          (ks_blocks_not_confirmed_blue{job="rc_merged_bridge"} > 0
            unless ks_blocks_not_confirmed_blue{job="rc_merged_bridge"} offset 10m)
         for: 30s
         labels:
