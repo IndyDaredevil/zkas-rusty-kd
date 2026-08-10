@@ -45,8 +45,10 @@ const SOMPI_PER_ZKAS: u64 = 100_000_000;
 /// Blocks per second. The chain relaunched at 1 BPS (v0.2.0); the halving and
 /// countdown math below is in blocks, so it must track this.
 const BPS: u64 = 1;
-/// Blocks per halving ≈ 3 months (90d · 86400s · BPS).
-const HALVING_INTERVAL_BLOCKS: u64 = 90 * 86_400 * BPS;
+// No halving-interval constant lives here on purpose. The emission schedule is a
+// decayed monthly table floored by a perpetual tail, evaluated by consensus in
+// `CoinbaseManager::calc_block_subsidy`; a local "blocks per halving" figure was a
+// second, wrong source of truth for it. See `next_emission_step`.
 /// Keep enough history for a real trailing-hour pulse while limiting the public
 /// live-feed response separately.
 const RECENT_CAP: usize = 6_000;
@@ -1044,20 +1046,103 @@ async fn info_blockreward(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({ "blockreward": agg.emission_per_block_fc })).into_response()
 }
 
+/// How far ahead to look for the next emission step before reporting that there
+/// isn't one. Two years covers the tail step-down at real month 24; beyond that
+/// the schedule is flat forever and a countdown would be a fiction.
+const EMISSION_SEARCH_HORIZON_BLOCKS: u64 = 2 * 365 * 86_400 * BPS;
+
+/// The next DAA score at which the block subsidy actually goes DOWN, or `None` if
+/// it does not change again within the horizon.
+///
+/// `calc_block_subsidy` is monotonically non-increasing in DAA score, so the first
+/// decrease can be found by bisection instead of walking tens of millions of scores.
+/// Asking consensus is the point: the schedule is a decaying table read at a scaled
+/// month index and then floored by a two-step perpetual tail, and any reimplementation
+/// here would be a second source of truth that drifts from the chain.
+fn next_emission_step(cbm: &CoinbaseManager, daa_score: u64) -> Option<(u64, u64)> {
+    let current = cbm.calc_block_subsidy(daa_score);
+    let horizon = daa_score.saturating_add(EMISSION_SEARCH_HORIZON_BLOCKS);
+    if cbm.calc_block_subsidy(horizon) >= current {
+        return None;
+    }
+    let (mut lo, mut hi) = (daa_score, horizon); // subsidy(lo) == current > subsidy(hi)
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if cbm.calc_block_subsidy(mid) < current {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Some((hi, cbm.calc_block_subsidy(hi)))
+}
+
+/// When the block reward next steps down, and by how much.
+///
+/// Named "halving" for the endpoint's original callers, but ZKas does not halve in
+/// one visible event: the curve decays through the monthly table four times faster
+/// than Kaspa's, so a step lands every ~7.6 days and takes twelve steps to halve.
+/// The previous implementation counted 90-day intervals of BLUE score from zero and
+/// reported the current reward divided by two — wrong counter, wrong period, wrong
+/// amount, and it ignored the perpetual tail floor entirely, so it promised a
+/// reduction on a schedule where reductions had stopped.
 async fn info_halving(State(s): State<Arc<AppState>>) -> impl IntoResponse {
-    let (blue_score, subsidy) = {
-        let agg = s.shielded.read().await;
-        (agg.blue_score, agg.emission_per_block_fc)
+    // Consensus keys emission off DAA score, not blue score. They differ by the red
+    // blocks the DAG merged — thousands apart on a live chain — so using blue score
+    // silently reports the wrong point on the curve.
+    let daa_score = match s.client.get_block_dag_info().await {
+        Ok(d) => d.virtual_daa_score,
+        Err(e) => return err(e.to_string()),
     };
-    let next_h = ((blue_score / HALVING_INTERVAL_BLOCKS) + 1) * HALVING_INTERVAL_BLOCKS;
-    let blocks_left = next_h.saturating_sub(blue_score);
+    let cbm = coinbase_manager();
+    let current_sompi = cbm.calc_block_subsidy(daa_score);
+    let current = current_sompi as f64 / SOMPI_PER_ZKAS as f64;
+
+    let Some((next_daa, next_sompi)) = next_emission_step(&cbm, daa_score) else {
+        // The curve has decayed into the perpetual tail: the reward is pinned at the
+        // floor and does not fall again. Saying "in ~N days" here would be inventing
+        // an event. Nulls, so a client shows nothing rather than a stale countdown.
+        return Json(json!({
+            "nextHalvingTimestamp": Value::Null,
+            "nextHalvingDate": "no further reductions scheduled",
+            "nextHalvingAmount": current,
+            "currentAmount": current,
+            "reductionPending": false,
+            "atTailFloor": true,
+        }))
+        .into_response();
+    };
+
+    let blocks_left = next_daa.saturating_sub(daa_score);
     let secs_left = blocks_left / BPS;
-    let ts = now_secs() + secs_left;
-    let days = secs_left / 86400;
+    let next = next_sompi as f64 / SOMPI_PER_ZKAS as f64;
+    let cut_pct = if current_sompi > 0 { (1.0 - next_sompi as f64 / current_sompi as f64) * 100.0 } else { 0.0 };
+
+    // Hours matter here. A step lands every ~7.6 days, so "in ~0 days" is the normal
+    // reading for most of the final day and reads as broken.
+    let when = if secs_left >= 172_800 {
+        format!("in ~{} days", secs_left / 86_400)
+    } else if secs_left >= 7_200 {
+        format!("in ~{} hours", secs_left / 3_600)
+    } else if secs_left >= 120 {
+        format!("in ~{} minutes", secs_left / 60)
+    } else {
+        "in under a minute".to_string()
+    };
+
     Json(json!({
-        "nextHalvingTimestamp": ts,
-        "nextHalvingDate": format!("in ~{days} days"),
-        "nextHalvingAmount": subsidy / 2.0,
+        // Original keys, with values that are now true.
+        "nextHalvingTimestamp": now_secs() + secs_left,
+        "nextHalvingDate": when,
+        "nextHalvingAmount": next,
+        // What the reduction actually is, so a client need not guess.
+        "currentAmount": current,
+        "reductionPercent": (cut_pct * 100.0).round() / 100.0,
+        "reductionPending": true,
+        "atTailFloor": false,
+        "nextReductionDaaScore": next_daa,
+        "blocksRemaining": blocks_left,
+        "daaScore": daa_score,
     }))
     .into_response()
 }
@@ -1628,4 +1713,65 @@ async fn main() {
         tokio::net::TcpListener::bind(&cli.listen).await.unwrap_or_else(|e| fatal(format!("failed to bind {}: {e}", cli.listen)));
     log::info!("ZKas explorer API listening on http://{}", cli.listen);
     axum::serve(listener, app).await.unwrap_or_else(|e| fatal(format!("server error: {e}")));
+}
+
+#[cfg(test)]
+mod emission_tests {
+    use super::*;
+
+    /// The schedule the chain actually runs, pinned so a UI countdown cannot drift
+    /// from it again. ZKas traverses Kaspa's monthly subsidy table four times faster
+    /// (a halving every 3 months rather than 12), which puts a step every
+    /// `2629800 * 3 / 12` = 657,450 seconds — ~7.61 days at 1 BPS — each cutting the
+    /// reward by ~5.6%, NOT halving it.
+    #[test]
+    fn steps_land_every_seven_and_a_half_days_and_are_not_halvings() {
+        let cbm = coinbase_manager();
+        let daa = 1_276_152; // a real mainnet score
+        let (next_daa, next_sompi) = next_emission_step(&cbm, daa).expect("curve is still decaying here");
+
+        assert_eq!(next_daa % 657_450, 0, "steps fall on table-index boundaries");
+        assert!(next_daa > daa && next_daa - daa <= 657_450, "the next step is within one interval");
+
+        let current = cbm.calc_block_subsidy(daa);
+        assert!(next_sompi < current, "a step reduces the reward");
+        // One twelfth of a halving: 2^(-1/12) ≈ 0.9439.
+        let ratio = next_sompi as f64 / current as f64;
+        assert!((0.94..0.95).contains(&ratio), "a step cuts ~5.6%, got {:.4}", 1.0 - ratio);
+        assert!(next_sompi > current / 2, "a step is emphatically not a halving");
+    }
+
+    /// Consecutive steps are exactly one interval apart, so "every ~7.6 days" is a
+    /// claim the schedule actually supports.
+    #[test]
+    fn consecutive_steps_are_one_interval_apart() {
+        let cbm = coinbase_manager();
+        let (first, _) = next_emission_step(&cbm, 1_276_152).unwrap();
+        let (second, _) = next_emission_step(&cbm, first).unwrap();
+        assert_eq!(second - first, 657_450);
+    }
+
+    /// Once the decaying curve sinks to the perpetual tail the reward stops falling.
+    /// A countdown must go quiet rather than promise a reduction that never arrives —
+    /// the failure the old 90-day interval produced forever.
+    #[test]
+    fn no_step_is_reported_once_emission_reaches_the_tail_floor() {
+        let cbm = coinbase_manager();
+        // Far past the month-24 tail step-down, where the floor is flat forever.
+        let deep = 40 * 365 * 86_400;
+        assert!(next_emission_step(&cbm, deep).is_none());
+        assert_eq!(cbm.calc_block_subsidy(deep), cbm.calc_block_subsidy(deep + 5 * 365 * 86_400));
+    }
+
+    /// Bisection is only valid because the schedule never rises.
+    #[test]
+    fn emission_never_increases() {
+        let cbm = coinbase_manager();
+        let mut previous = u64::MAX;
+        for month in 0..60u64 {
+            let subsidy = cbm.calc_block_subsidy(month * 657_450);
+            assert!(subsidy <= previous, "emission rose at index {month}");
+            previous = subsidy;
+        }
+    }
 }
