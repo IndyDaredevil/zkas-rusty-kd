@@ -1182,6 +1182,12 @@ const CONSOLIDATE_IDLE_POLL: std::time::Duration = std::time::Duration::from_sec
 /// step drops to ~1 leaf/block and idles. See [`WalletEntry::last_witness_advance`].
 const WITNESS_ADVANCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
 
+/// How long `/prepare` waits for a borrowing wallet's mirror tree to line up with the
+/// shared tree before giving up. The two advance from the same block stream, so a
+/// mismatch is a mid-flight artifact that clears within a sync pass; waiting a moment
+/// is what the old "retry in a moment" error was asking the USER to do by hand.
+const CHECKPOINT_ADOPT_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
+
 /// A wallet is synced by the background loop only while it has been touched by a
 /// request within this window; after that it is parked until the next request. Keeps a
 /// public daemon's CPU proportional to *active* wallets, not total tokens ever seen.
@@ -2979,7 +2985,13 @@ fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSn
         // wallet. Users read that as the app contradicting itself, correctly, because it
         // was. The readiness a UI shows has to be the readiness the spend path enforces,
         // so it is published here rather than guessed there.
-        spend_ready: tip > 0 && (e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= tip) && e.db.tree_is_valid(),
+        // Deliberately NOT `tree_is_valid()`. A borrowing wallet clears that flag on
+        // every appended leaf, so on a live chain it is false almost always — gating on
+        // it would report a healthy wallet as permanently unable to spend. The mirror
+        // tree is instead brought into line by `ensure_canonical_checkpoint`, which
+        // waits for the shared tree rather than refusing. What remains, and what this
+        // reports, is whether the scan is far enough along for a spend to be sound.
+        spend_ready: tip > 0 && (e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= tip),
     }
 }
 
@@ -5063,13 +5075,37 @@ async fn ensure_canonical_checkpoint(state: &Arc<AppState>, w: &Wallet) -> Resul
     // against the node would report a divergence that does not exist and retire a
     // perfectly good checkpoint — turning an optimisation into data loss. So: make it
     // valid first, and if that is not possible, say "retry" rather than "diverged".
+    //
+    // One attempt is not enough, and this was a live bug. A borrowing wallet clears
+    // `tree_valid` on EVERY appended leaf, so on a 1-block/s chain it is invalid nearly
+    // all the time, and `adopt_tip_frontier` refuses unless the shared tree's frontier
+    // is at EXACTLY this wallet's leaf count. The two advance from the same block
+    // stream, so they are equal between passes and unequal mid-flight — meaning a
+    // perfectly healthy, fully synced wallet failed here whenever the user happened to
+    // press the button while the sizes differed by a few leaves. `synced` additionally
+    // tolerates a 200-block margin, so the UI could legitimately read "Ready" at that
+    // instant. The result was a wallet that said Ready and then answered "still
+    // catching up" on the very next tap, which is what users reported.
+    //
+    // The gap closes on its own within a sync pass, so wait for it instead of telling
+    // the user to retry something the daemon can simply do itself.
     {
-        let needs = { !w.lock().await.db.tree_is_valid() };
-        if needs {
+        let deadline = std::time::Instant::now() + CHECKPOINT_ADOPT_WAIT;
+        loop {
+            if w.lock().await.db.tree_is_valid() {
+                break;
+            }
             let fs = state.chain_tree.lock().await.db.tip_frontier_state();
             if let Some(fs) = fs {
-                w.lock().await.db.adopt_tip_frontier(&fs);
+                // Refused only on a size mismatch, which is transient by construction.
+                if w.lock().await.db.adopt_tip_frontier(&fs) {
+                    break;
+                }
             }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
         }
     }
     let (cursor, wallet_size, wallet_anchor) = {
