@@ -2547,10 +2547,28 @@ impl WalletEntry {
                     // maintaining witnesses; the climb is slow but it is the only path left.
                     self.warm_via_subtree_cache = false;
                     self.witnesses_warm = false;
-                    log::warn!(
-                        "subtree cache unavailable at matured={matured} (failed={}); resuming the witness climb for this wallet",
-                        self.db.subtree_cache_failed()
-                    );
+                    // Only worth a warning when there is actually a climb to resume.
+                    //
+                    // This fired for every empty or freshly fast-synced wallet, where
+                    // `matured == base_size` and there are no notes: a warning about
+                    // resuming work that amounts to nothing. It ran tens of thousands of
+                    // times and buried the lines that mattered — a wallet stuck
+                    // re-quarantining its checkpoint every 60 s, and a payment spending
+                    // 392 s on a witness climb, both of which had to be found by
+                    // filtering this message out. A log nobody can read is not a log.
+                    let climb = matured.saturating_sub(self.db.witnessed_upto());
+                    let idle = self.db.notes().is_empty() || climb == 0;
+                    if idle {
+                        log::debug!(
+                            "subtree cache not serving at matured={matured}, but nothing to climb (notes={}, climb={climb})",
+                            self.db.notes().len()
+                        );
+                    } else {
+                        log::warn!(
+                            "subtree cache unavailable at matured={matured} (failed={}); resuming a {climb}-leaf witness climb for this wallet",
+                            self.db.subtree_cache_failed()
+                        );
+                    }
                 }
                 // Take a warm permit, or leave the heavy catch-up to another tick. This is
                 // `try_acquire`, not `acquire`: a wallet that can't warm right now should
@@ -5319,6 +5337,35 @@ async fn ensure_canonical_checkpoint(state: &Arc<AppState>, w: &Wallet) -> Resul
     let (cursor, wallet_size, wallet_anchor) = {
         let e = w.lock().await;
         if !e.db.tree_is_valid() {
+            // A BORROWING wallet has no tree of its own to check.
+            //
+            // `borrow_tree` invalidates its mirror on the very next leaf, and validity
+            // returns only by adopting the shared frontier at EXACTLY this wallet's
+            // size — an alignment that exists between sync passes and not during them.
+            // So on a one-block-per-second chain this is the resting state, not a
+            // fault, and refusing here made a four-second race decide whether a fully
+            // synced wallet was allowed to pay. Users saw "Ready", tapped Send, and
+            // were told the wallet was still catching up.
+            //
+            // Worse, the anchor being demanded is the shared tree's frontier: for a
+            // borrower this check compares the SHARED tree to the node, once per
+            // payment, per wallet. That is a property of the shared tree, and it
+            // belongs in one background place rather than on everybody's spend path.
+            //
+            // Skipping costs nothing the spend relies on. Every witness path handed to
+            // a payment is verified to root at `matured` by `subtree_paths` before it
+            // is used, so a tree that had diverged declines rather than lying, and a
+            // cursor that has left the selected chain is caught by the sync loop's own
+            // reorg strikes. What is genuinely being given up is divergence detection
+            // for a wallet's PERSISTED checkpoint — which only has meaning for a wallet
+            // that maintains its own tree, and those still get the full check below.
+            if e.db.is_borrowing() {
+                log::debug!(
+                    "checkpoint canonicality skipped for a borrowing wallet (size {}): its anchor is the shared tree's",
+                    e.db.size()
+                );
+                return Ok(());
+            }
             return Err(err(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "wallet is still catching up with the shared chain state; retry in a moment",

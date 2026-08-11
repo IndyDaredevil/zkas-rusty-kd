@@ -1690,6 +1690,18 @@ impl WalletDb {
         self.borrow_tree = on;
     }
 
+    /// Is this wallet relying on the shared tree rather than maintaining its own?
+    ///
+    /// Callers need this to know what a `false` from [`Self::tree_is_valid`] MEANS. For
+    /// a wallet keeping its own tree it is a fault worth refusing over. For a borrowing
+    /// wallet it is the normal resting state — `borrow_tree` invalidates the mirror on
+    /// the very next leaf — and the anchor it would produce is the shared tree's
+    /// frontier anyway, so demanding one asks the wallet to answer for a tree it does
+    /// not own.
+    pub fn is_borrowing(&self) -> bool {
+        self.borrow_tree
+    }
+
     /// This wallet's tip frontier, as a portable [`FrontierState`] — how the shared
     /// tree hands its tree to everyone else.
     ///
