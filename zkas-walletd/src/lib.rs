@@ -812,12 +812,20 @@ fn write_wallet_file(dir: &str, token: &str, wf: &WalletFile) -> std::io::Result
 /// the older blocks into the frontier and the balance comes back ZERO (the 2026-07-27
 /// "rescan wiped my balance" reports). The node is archival, so a full scan loses
 /// nothing, and the rebuilt checkpoint keeps future restarts fast.
-fn reset_wallet_birthday(dir: &str, token: &str) -> std::io::Result<()> {
+/// Point the wallet's stored birthday at `birthday` so the reload scans from there.
+///
+/// `0` means genesis, which is what a recovery with no idea when the wallet was made
+/// has to do. But a full replay of this chain is millions of leaves, and most people
+/// know roughly WHEN they made the wallet even though nobody knows a block height —
+/// so the caller can supply one and skip the years before it. Scanning a little too
+/// far back costs seconds; starting too late costs notes, which is why the client
+/// applies a margin rather than trusting the date exactly.
+fn set_wallet_birthday(dir: &str, token: &str, birthday: u64) -> std::io::Result<()> {
     let path = wallet_path(dir, token);
     let bytes = std::fs::read(&path)?;
     let mut v: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    v["birthday"] = serde_json::json!(0u64);
+    v["birthday"] = serde_json::json!(birthday);
     std::fs::write(&path, serde_json::to_vec_pretty(&v).expect("serializes"))?;
     #[cfg(unix)]
     {
@@ -3718,10 +3726,41 @@ impl AppState {
             None => match key.fvk_bytes() {
                 Some(fvk) => match self.adopt_twin(token, &fvk, birthday).await {
                     Some((donor, keep_birthday)) => {
-                        log::info!(
-                            "wallet {token}: adopted checkpoint from twin token {donor} (birthday {keep_birthday}) instead of rescanning from {birthday}"
-                        );
-                        load_checkpoint(&self.wallet_dir, token, key, &genesis, tip.as_ref())
+                        match load_checkpoint(&self.wallet_dir, token, key, &genesis, tip.as_ref()) {
+                            Some(restored) => {
+                                log::info!(
+                                    "wallet {token}: adopted checkpoint from twin token {donor} (birthday {keep_birthday}) instead of rescanning from {birthday}"
+                                );
+                                Some(restored)
+                            }
+                            None => {
+                                // The donor's checkpoint is no better than the one just
+                                // rejected — twins share a viewing key, so they share a
+                                // cursor, and a cursor that has left the selected chain has
+                                // left it for BOTH of them.
+                                //
+                                // `adopt_twin_checkpoint` cannot see that: it runs on a
+                                // blocking thread and the test needs the node. So it copies
+                                // the donor's file into place and only then is the copy
+                                // rejected — leaving a known-bad checkpoint as THIS wallet's
+                                // own. The next load rejects it, adopts the twin again, and
+                                // so on: measured on the public daemon, one wallet did this
+                                // 20,087 times over 30 hours and never once completed a scan.
+                                // A wallet that cannot finish a scan cannot see the notes
+                                // being paid to it, so money arrived on-chain and never
+                                // appeared in the app.
+                                //
+                                // Discard the copy. Scanning from scratch is slow; looping
+                                // forever is permanent.
+                                let scan = scan_path(&self.wallet_dir, token);
+                                if std::fs::remove_file(&scan).is_ok() {
+                                    log::warn!(
+                                        "wallet {token}: twin {donor}'s checkpoint was rejected too (same cursor); discarded it and scanning clean"
+                                    );
+                                }
+                                None
+                            }
+                        }
                     }
                     None => None,
                 },
@@ -5164,6 +5203,11 @@ struct RescanReq {
     /// would forget anything is refused with the exact damage it would do.
     #[serde(default)]
     force: bool,
+    /// DAA height to scan from. Omitted (or 0) means genesis — correct, and slow: a
+    /// full replay of this chain is millions of leaves. A caller that knows when the
+    /// wallet was created can start there instead.
+    #[serde(default)]
+    birthday: Option<u64>,
 }
 
 async fn wallet_rescan(
@@ -5217,13 +5261,21 @@ async fn wallet_rescan(
             ));
         }
     }
-    // A rescan is the "find my funds" recovery action, so it must not trust the
-    // stored birthday — fast-syncing from a birthday set later than the wallet's
-    // real notes skips those older blocks and the balance returns ZERO. Force a
-    // full scan from genesis, which the check above has just proven is available.
-    match reset_wallet_birthday(&state.wallet_dir, &token) {
-        Ok(()) => log::info!("wallet '{token}': rescan reset birthday to 0 — reload will full-scan from genesis"),
-        Err(e) => log::warn!("wallet '{token}': could not reset birthday for rescan ({e}); reload uses stored birthday"),
+    // A rescan is the "find my funds" action, so it must not trust the birthday the
+    // wallet already has — fast-syncing from one set later than the wallet's real
+    // notes skips those blocks and the balance comes back ZERO.
+    //
+    // The CALLER may supply one, and that is a different matter: it is a deliberate
+    // statement about when this wallet started existing, made by someone who knows.
+    // Genesis remains the default and the only safe assumption in the absence of
+    // that knowledge, but it replays millions of leaves, so a user who remembers
+    // roughly when they made the wallet should not have to wait for years of chain
+    // they were never part of.
+    let from = body.as_ref().and_then(|b| b.birthday).unwrap_or(0);
+    match set_wallet_birthday(&state.wallet_dir, &token, from) {
+        Ok(()) if from == 0 => log::info!("wallet '{token}': rescan from genesis (no birthday given)"),
+        Ok(()) => log::info!("wallet '{token}': rescan from DAA {from} — the caller supplied a birthday"),
+        Err(e) => log::warn!("wallet '{token}': could not set birthday for rescan ({e}); reload uses stored birthday"),
     }
     // Poison any in-flight sync pass first: checkpoint writes are gated on
     // `error.is_none()`, so this stops a concurrent pass from re-persisting the
