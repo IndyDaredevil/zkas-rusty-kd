@@ -3457,6 +3457,40 @@ mod tests {
         }
     }
 
+    /// A growing chain must not cost a wallet its cache.
+    ///
+    /// `append_leaf` folds each new leaf in as it arrives — one combine, amortised —
+    /// but ONLY while `upto == size`. That invariant is what keeps a caught-up wallet
+    /// serving witnesses from the cache instead of replaying the stream, and it is
+    /// load-bearing: on a 1-BPS chain the stream grows every second, so a cache that
+    /// fell one leaf behind could never catch up on its own, and every spend from that
+    /// wallet would pay the O(chain) climb the cache exists to delete.
+    #[test]
+    fn subtree_cache_keeps_serving_as_the_chain_grows() {
+        let mine = [36u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for b in 0..80u32 {
+            let recipient = if b % 9 == 0 { address_of(mine) } else { address_of([(b % 250 + 1) as u8; 32]) };
+            db.ingest_block(&[coinbase_for(recipient, &b.to_le_bytes(), 1_000 + b as u64)], &[]);
+        }
+        db.build_subtree_cache();
+        assert!(db.subtree_cache_ready(db.size()), "cache serves once built");
+        let upto_before = db.subtree_build_upto();
+
+        // The chain moves on, exactly as it does every second in production.
+        for b in 80..96u32 {
+            db.ingest_block(&[coinbase_for(address_of(mine), &b.to_le_bytes(), 2_000 + b as u64)], &[]);
+        }
+
+        assert!(db.subtree_cache_ready(db.size()), "appended leaves keep the cache in step");
+        assert!(db.subtree_build_upto() > upto_before, "and it advanced with them");
+        assert!(!db.subtree_cache_failed());
+
+        // The witnesses it serves must be the real ones, not merely present.
+        let positions: Vec<u64> = db.notes().iter().map(|n| n.position).collect();
+        assert!(db.witness_paths_at(&positions, db.size()).iter().all(Option::is_some));
+    }
+
     #[test]
     fn v8_checkpoint_persists_root_gated_subtree_cache() {
         let mine = [35u8; 32];
