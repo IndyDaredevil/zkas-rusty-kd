@@ -4224,7 +4224,42 @@ async fn eviction_loop(state: Arc<AppState>) {
     loop {
         tokio::time::sleep(EVICT_SWEEP_INTERVAL).await;
         evict_idle_wallets(&state).await;
+        prune_token_bookkeeping(&state).await;
     }
+}
+
+/// Forget the per-token bookkeeping of wallets that are no longer resident.
+///
+/// `last_touch` and `snapshots` are keyed by a token the CLIENT supplies, and
+/// nothing was removing them. `touch` runs on every `/api/status` before anything
+/// checks whether that wallet exists, so a caller sending fresh random tokens grew
+/// `last_touch` without bound — a public daemon's memory, driven by a header. And a
+/// snapshot carries an address and balances, so keeping one for every wallet that
+/// ever loaded retains viewing-key-derived data about wallets long since evicted.
+///
+/// Neither map is a cache of anything expensive: `last_touch` only decides whether a
+/// token is inside the active-sync window, and a snapshot is rebuilt from the wallet
+/// the first time it is polled again. Dropping what is out of scope costs nothing.
+/// Keep a `last_touch` entry? Yes while it is inside the active-sync window, and yes
+/// for a resident wallet whatever its age — a parked wallet still in memory must not
+/// have its activity record dropped out from under the sync loop's active-set check.
+fn keep_touch(age: std::time::Duration, window: std::time::Duration, resident: bool) -> bool {
+    age < window || resident
+}
+
+async fn prune_token_bookkeeping(state: &Arc<AppState>) {
+    let resident: HashSet<String> = state.wallets.lock().await.keys().cloned().collect();
+    // Anything past the active window can never make a token active again, so it has
+    // no bearing on any decision. Keep the window itself as the retention rule rather
+    // than inventing a second one that could drift from it.
+    let window = std::time::Duration::from_secs(state.resources.active_sync_secs);
+    let now = std::time::Instant::now();
+    state
+        .last_touch
+        .lock()
+        .await
+        .retain(|token, at| keep_touch(now.duration_since(*at), window, resident.contains(token)));
+    state.snapshots.lock().await.retain(|token, _| resident.contains(token));
 }
 
 async fn sync_loop(state: Arc<AppState>) {
@@ -6702,7 +6737,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     // already copes with not having them.
     let node_clients: std::sync::Arc<tokio::sync::RwLock<Option<NodeClients>>> = Default::default();
     let node_error: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
-    {
+    let connector_task = {
         let rpc_server = cfg.rpc_server.clone();
         let slot = node_clients.clone();
         let err_slot = node_error.clone();
@@ -6718,8 +6753,8 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
                 *err_slot.lock().unwrap_or_else(|p| p.into_inner()) = None;
                 *slot.write().await = Some(NodeClients { request, sync });
             }
-        });
-    }
+        })
+    };
 
     let wallet_secret = cfg.wallet_secret;
     // Pulled out before `cfg` is partially moved into AppState below.
@@ -6843,7 +6878,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     // (see mempool_loop): it must never queue behind block scanning.
     let mempool_task = tokio::spawn(mempool_loop(state.clone()));
     // No-op unless --auto-consolidate is set; returns immediately when it is not.
-    tokio::spawn(consolidate_loop(state.clone()));
+    let consolidate_task = tokio::spawn(consolidate_loop(state.clone()));
 
     // Keep the cached node tip fresh independently of loaded wallets, so `status` can
     // report node connectivity + chain height without ever calling the node on the
@@ -7071,10 +7106,20 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     };
     // The loops hold node connections and wallet state; kill them so a re-`serve`
     // starts clean instead of double-scanning the same wallet files.
+    //
+    // EVERY endless loop belongs here. `serve` is re-callable by design — the desktop
+    // shell calls it again whenever the user switches nodes — and the two that were
+    // missing leaked on every such switch. The connector kept two gRPC channels open
+    // and went on reconnecting to the node the user had just left, and the merger held
+    // an `Arc<AppState>`, so the previous daemon's wallets, trees and caches were never
+    // reclaimed: switch nodes five times and five full wallet states stay resident,
+    // each still talking to a node nobody asked about.
     sync_task.abort();
     eviction_task.abort();
     mempool_task.abort();
     tip_task.abort();
+    connector_task.abort();
+    consolidate_task.abort();
     flush_checkpoints_on_exit(&state).await;
     result
 }
@@ -7126,6 +7171,31 @@ async fn flush_checkpoints_on_exit(state: &Arc<AppState>) {
         "shutdown: flushed {saved}/{total} wallet checkpoint(s) in {:.1?}, preserving {blocks} block(s) of scan progress that a restart would otherwise redo",
         started.elapsed()
     );
+}
+
+#[cfg(test)]
+mod token_bookkeeping_tests {
+    use super::keep_touch;
+    use std::time::Duration;
+
+    /// `touch` records a token on every /api/status, BEFORE anything establishes that
+    /// the wallet exists, and the token comes straight from a client header. Nothing
+    /// removed those entries, so a caller sending fresh random tokens grew the map
+    /// without bound — a public daemon's memory driven by a request header.
+    #[test]
+    fn a_stranger_token_is_forgotten_once_it_leaves_the_window() {
+        let window = Duration::from_secs(120);
+        assert!(keep_touch(Duration::from_secs(1), window, false), "recent tokens still decide the active set");
+        assert!(!keep_touch(Duration::from_secs(600), window, false), "a stale token nobody owns is dropped");
+    }
+
+    /// A resident wallet is kept whatever its age: it is parked, not gone, and the
+    /// sync loop reads this map to decide what is active. Dropping it would strand a
+    /// wallet that is still in memory.
+    #[test]
+    fn a_resident_wallet_is_kept_however_long_it_has_been_quiet() {
+        assert!(keep_touch(Duration::from_secs(86_400), Duration::from_secs(120), true));
+    }
 }
 
 #[cfg(test)]
