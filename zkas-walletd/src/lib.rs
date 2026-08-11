@@ -1692,6 +1692,9 @@ fn decode_compact_actions(bytes: &[u8]) -> Option<Vec<CompactActionRecord>> {
 struct PageCache {
     map: HashMap<(RpcHash, u64), (std::time::Instant, Arc<DecodedPage>)>,
     order: VecDeque<(RpcHash, u64)>,
+    /// Pages being fetched right now, so simultaneous askers wait for one answer
+    /// instead of each fetching and decoding the same page. See `fetch_shielded_page`.
+    in_flight: HashMap<(RpcHash, u64), Arc<tokio::sync::Semaphore>>,
     pool: Arc<rayon::ThreadPool>,
     ttl: std::time::Duration,
     cap: usize,
@@ -1707,6 +1710,7 @@ impl PageCache {
         Self {
             map: HashMap::new(),
             order: VecDeque::new(),
+            in_flight: HashMap::new(),
             pool: Arc::new(pool),
             ttl: std::time::Duration::from_secs(resources.page_cache_ttl_secs.max(1)),
             cap: resources.page_cache_entries.max(1),
@@ -1734,8 +1738,50 @@ async fn fetch_shielded_page(
             }
         }
     }
+    // Miss. Everyone who misses the SAME page queues behind one fetch rather than
+    // each running their own.
+    //
+    // The cache only ever helped askers who arrived after a fetch had finished. The
+    // ones that matter arrive together: the sync loop advances several wallets at once
+    // (`--sync-wallets 8`) and, once they are caught up, they all want the same tip
+    // page in the same pass. Each was doing its own `get_shielded_blocks` AND its own
+    // parallel decode of the identical bytes — and the decode is the expensive half
+    // (~1 ms/block of Sinsemilla), burning cores on the box that is also proving
+    // somebody's payment.
+    let gate = {
+        let mut c = cache.lock().await;
+        // This call is wrapped in a timeout by the sync loop, so a caller can be
+        // dropped between taking the slot and clearing it — Drop cannot clear it,
+        // since releasing needs the cache lock and Drop cannot await. Abandoned slots
+        // are therefore collected here: a strong count of one means the map is the
+        // only holder, so nobody is fetching or waiting on it. Cheap, and it keeps a
+        // map keyed by page from growing on every cancelled fetch.
+        c.in_flight.retain(|k, gate| *k == key || Arc::strong_count(gate) > 1);
+        c.in_flight.entry(key).or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1))).clone()
+    };
+    let _lead = gate.acquire().await;
+    // The leader may have filled the cache while we waited, which is the whole point.
+    {
+        let c = cache.lock().await;
+        if let Some((at, resp)) = c.map.get(&key) {
+            if at.elapsed() < c.ttl {
+                return Ok(resp.clone());
+            }
+        }
+    }
+
     let pool = { cache.lock().await.pool.clone() };
-    let raw = client.get_shielded_blocks(low, limit).await?;
+    // Not held across the fetch/decode below: `_lead` is what serialises duplicates,
+    // and taking the cache lock here would serialise every page instead of this one.
+    let raw = match client.get_shielded_blocks(low, limit).await {
+        Ok(raw) => raw,
+        Err(e) => {
+            // Release the slot on the way out or the next asker inherits a gate whose
+            // leader is gone and waits for an answer nobody is producing.
+            cache.lock().await.in_flight.remove(&key);
+            return Err(e);
+        }
+    };
     // Decode the page ACROSS CORES. The per-block coinbase Sinsemilla commitment is the
     // dominant scan cost (~1 ms/block — it, not decryption, set the measured ~900 blk/s
     // single-thread ceiling), and each block decodes independently. `block_in_place`
@@ -1749,13 +1795,23 @@ async fn fetch_shielded_page(
     });
     let decoded = Arc::new(DecodedPage { reorged: raw.reorged, sink_blue_score: raw.sink_blue_score, blocks });
     let mut c = cache.lock().await;
-    c.map.insert(key, (std::time::Instant::now(), decoded.clone()));
+    // Re-inserting a key must not leave a second copy in the eviction queue. A page
+    // refetched after its TTL used to be pushed again while `map` still held one
+    // entry, so `order` counted it twice: the queue hit `cap` early, and popping the
+    // stale first copy deleted the freshly inserted page from `map` — evicting a hot
+    // entry and leaving the cache holding fewer pages than it was configured for.
+    if c.map.insert(key, (std::time::Instant::now(), decoded.clone())).is_some() {
+        if let Some(pos) = c.order.iter().position(|k| *k == key) {
+            c.order.remove(pos);
+        }
+    }
     c.order.push_back(key);
     if c.order.len() > c.cap {
         if let Some(old) = c.order.pop_front() {
             c.map.remove(&old);
         }
     }
+    c.in_flight.remove(&key);
     Ok(decoded)
 }
 
