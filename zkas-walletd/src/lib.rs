@@ -2979,7 +2979,10 @@ struct AppState {
     /// Wallets (by FVK) with a preparation already in flight. A second concurrent
     /// prepare for the SAME wallet is a duplicate — a retry, a double-clicked button —
     /// and is rejected immediately rather than queued: it would select the same notes.
-    preparing: std::sync::Mutex<HashSet<String>>,
+    /// Wallets with a preparation in flight → when it started, and whether it is the
+    /// wallet paying itself (background note merging) rather than a payment the user is
+    /// waiting on. Both are needed to explain a refusal instead of merely issuing one.
+    preparing: std::sync::Mutex<HashMap<String, (std::time::Instant, bool)>>,
     /// Permits for the one-time cold warm; configured by
     /// [`ResourceLimits::warm_wallets`].
     warm_gate: std::sync::Arc<tokio::sync::Semaphore>,
@@ -6136,33 +6139,48 @@ async fn wallet_prepare(
 ) -> Result<Json<PrepareResp>, (StatusCode, Json<serde_json::Value>)> {
     use rand::RngCore;
 
-    // A duplicate prepare for THIS wallet is a retry or a double-click — reject it fast,
-    // since it would select the same notes as the run already in flight.
-    let _preparing = {
-        let mut set = state.preparing.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare tracker poisoned"))?;
-        if !set.insert(req.fvk_hex.clone()) {
-            return Err(err(
-                StatusCode::TOO_MANY_REQUESTS,
-                "a payment from this wallet is already being prepared; wait for it to finish before retrying",
-            ));
-        }
-        PreparingGuard { state: state.clone(), key: req.fvk_hex.clone() }
-    };
-
     // Watch-only: authenticated by possession of the FVK, not a token/seed.
     let fvk_bytes = unhex(&req.fvk_hex)
         .and_then(|b| <[u8; FVK_LEN]>::try_from(b.as_slice()).ok())
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex must be 96 bytes of hex"))?;
 
-    // Is this wallet paying ITSELF? That is consolidation, whatever the caller calls it,
-    // and it is decided here — from the viewing key and the recipient, both cheap to
-    // derive — so the answer is known BEFORE queueing for a proving slot. A client
-    // cannot opt out of the classification by declining to declare its intent.
+    // Is this wallet paying ITSELF? Decided from the viewing key and the recipient,
+    // both cheap to derive, so it is known before anything is reserved.
     let self_payment = Address::try_from(req.to.as_str())
         .ok()
         .and_then(|to| orchard_recipient_bytes(&to))
         .zip(WalletDb::from_fvk(&fvk_bytes))
         .is_some_and(|(recipient, db)| db.my_address_bytes() == recipient);
+
+    // One preparation per wallet: a second would select the same notes as the one in
+    // flight. Rejecting is right; the old wording was not. It said "wait for it to
+    // finish before retrying", which reads as an accusation of impatience — while the
+    // truth is that the first attempt is STILL RUNNING and cannot be stopped. Cancelling
+    // in the app only drops the HTTP request; the work behind it is a witness climb and
+    // a Halo2 proof inside `block_in_place`, which no dropped connection interrupts. One
+    // measured on this daemon took 392 s for a 273,676-note wallet. So say what is
+    // happening, how long it has been going, and that waiting is the only option.
+    let _preparing = {
+        let mut set = state.preparing.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare tracker poisoned"))?;
+        if let Some((since, was_self)) = set.get(&req.fvk_hex) {
+            let secs = since.elapsed().as_secs();
+            let elapsed = if secs >= 60 { format!("{}m {}s", secs / 60, secs % 60) } else { format!("{secs}s") };
+            return Err(err(
+                StatusCode::TOO_MANY_REQUESTS,
+                if *was_self {
+                    format!(
+                        "this wallet is merging its own notes in the background ({elapsed} so far). It finishes on its own; your payment can be sent straight after."
+                    )
+                } else {
+                    format!(
+                        "the previous payment from this wallet is still being prepared ({elapsed} so far). Closing or cancelling the screen does not stop it — the proof runs to completion on the server. Wait for it rather than starting another."
+                    )
+                },
+            ));
+        }
+        set.insert(req.fvk_hex.clone(), (std::time::Instant::now(), self_payment));
+        PreparingGuard { state: state.clone(), key: req.fvk_hex.clone() }
+    };
 
     let _consolidate_permit = if self_payment {
         Some(state.consolidate_gate.try_acquire().map_err(|_| {
@@ -6860,7 +6878,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         // proving is CPU-heavy, and unbounded overlap is a CPU DoS on a hosted daemon.
         prepare_gate: tokio::sync::Semaphore::new(cfg.max_concurrent_proves.max(1)),
         consolidate_gate: tokio::sync::Semaphore::new(1),
-        preparing: std::sync::Mutex::new(HashSet::new()),
+        preparing: std::sync::Mutex::new(HashMap::new()),
         warm_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(resources.warm_wallets.max(1))),
         node_tip: Mutex::new((0, std::time::Instant::now())),
         prepared: Mutex::new(HashMap::new()),
