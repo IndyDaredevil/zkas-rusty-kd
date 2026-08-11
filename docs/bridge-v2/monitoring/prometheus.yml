@@ -9,6 +9,30 @@
 # This file is a MIRROR for docs/bridge-v2/monitoring/. Edit the live copy,
 # then sync. Never edit the repo copy expecting it to take effect.
 #
+# Revision 2026-08-10:
+#   - REVERTED the ip port-strip metric_relabel added 08-09. Stripping the
+#     port collapsed each worker's retired and live session series into one
+#     labelset within a single scrape; Prometheus kept whichever appeared
+#     first in exposition order and discarded the rest. It kept the zeroes.
+#
+#     Symptoms, all one cause: four phantom "Rig silent on the RC" alerts
+#     (w1m/w7m/w8m/w9m — exactly the four workers that had reconnected);
+#     rc:kas_24h = 7 against a true 54; rc:rig_ths = 1.00 TH/s against a
+#     true 15.27; restart K/Z/D = 0/0/0; and a card printing DOUBLE 44 >
+#     KAS 7, which is structurally impossible.
+#
+#     VERIFIED after this revert: sum(ks_blocks_mined) = 145, matching
+#     count(ks_mined_blocks_gauge) = 145. Two independent metric families
+#     — one per-worker, one per-block — agreeing. They read 14 vs 145
+#     before. Allow ~5 min after reload for the stale port-stripped series
+#     to leave the staleness window; a transitional reading is old + new
+#     (159), not a failure.
+#
+#     The series-churn problem the relabel was written to solve is real
+#     (unbounded cardinality; breaks any per-series zero test) and is now
+#     handled in PromQL by aggregating ip away AFTER ingest, until the
+#     bridge-side fix lands.
+#
 # Revision 2026-08-09:
 #   - REMOVED the zkas_merged_bridge (:3033) job. The fleet cut over to the
 #     RC; that bridge has been down, its scrape has been failing silently,
@@ -49,14 +73,45 @@ scrape_configs:
     static_configs:
       - targets: ["localhost:3034"]
     metric_relabel_configs:
-      # The RC exports ip as host:port. The ephemeral source port changes on
-      # every reconnect, minting a NEW permanent series each time — the old
-      # one freezes at its last value forever. Strip the port so a reconnect
-      # reuses the existing series.
-      - source_labels: [ip]
-        regex: "([^:]+):.*"
-        target_label: ip
-        replacement: "$1"
+      # ---------------------------------------------------------------------
+      # DO NOT STRIP THE PORT FROM `ip` HERE. Removed 2026-08-10.
+      #
+      # The RC exports ip as host:port, and the ephemeral source port changes
+      # on every reconnect. The obvious fix — rewrite ip to just the host so a
+      # reconnect "reuses" the series — is wrong, because the RC NEVER RETIRES
+      # the old session's series. Both are present in the SAME scrape:
+      #
+      #   ks_blocks_mined{ip="192.168.1.27:36754", miner="", worker="w7m"}  0
+      #   ks_blocks_mined{ip="192.168.1.27:36756", miner="", worker="w7m"} 40
+      #
+      # Strip the port and those become identical labelsets in one scrape.
+      # That is a duplicate, not a continuation: Prometheus keeps whichever
+      # comes first in exposition order and silently discards the rest. On
+      # 2026-08-10 it kept the ZEROES for w1m/w7m/w8m/w9m — the four workers
+      # that had reconnected — which produced:
+      #   - four phantom "Rig silent on the RC" alerts,
+      #   - rc:kas_24h = 7 against a true 54,
+      #   - rc:rig_ths = 1.00 TH/s against a true 15.27,
+      #   - restart K/Z/D = 0/0/0,
+      #   - a card printing DOUBLE 44 > KAS 7, which is structurally
+      #     impossible (a double IS a KAS block, so D <= min(K,Z)).
+      # ZKAS and DOUBLE read correctly only because those metric families
+      # happened to expose the live series first. Same defect, opposite coin
+      # flip.
+      #
+      # Series churn from the port is a REAL problem — it is an unbounded
+      # cardinality leak and it breaks any per-series zero test. Handle it in
+      # PromQL instead, by aggregating ip away AFTER ingest:
+      #   sum by (worker) (increase(ks_valid_share_diff_counter[15m]))
+      #   sum by (worker) (max by (worker, ip) (ks_blocks_mined))
+      # The retired session's series contributes increase()=0 and its frozen
+      # counter value, both of which are correct in a sum.
+      #
+      # REAL FIX is bridge-side: drop `ip` from the counter label sets
+      # entirely (worker already identifies the rig on a loopback fleet), or
+      # de-register a worker's series on disconnect. WS3 punch list, next to
+      # the warm-up label-context fix.
+      # ---------------------------------------------------------------------
 
       # The RC's warm-up zero-init registers a SECOND series per worker
       # carrying miner="IceRiverMiner-v1.1" (all zeros, forever); the live
@@ -66,6 +121,10 @@ scrape_configs:
       # duplicates BEFORE the labeldrop so the collision can't happen.
       # (Real fix is bridge-side: warm-up should init in the same label
       # context the counting path uses — punch list.)
+      #
+      # NOTE: this pair is safe ONLY because ip still carries the port and
+      # therefore still distinguishes sessions. If you ever remove ip, the
+      # collision this prevents comes back in a different shape.
       - source_labels: [miner]
         regex: "IceRiverMiner.*"
         action: drop
