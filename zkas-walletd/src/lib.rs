@@ -2913,6 +2913,13 @@ struct AppState {
     /// *same* wallet — the browser-retry storm this was really written for — are caught
     /// by `preparing` below, which is the check that should be a fast rejection.
     prepare_gate: tokio::sync::Semaphore,
+    /// One permit for CONSOLIDATION — a payment a wallet makes to itself to merge its
+    /// own notes.
+    ///
+    /// Two wallets consolidating would otherwise trade the prover between them, each
+    /// taking the slot the moment the other released it, and a payment arriving in that
+    /// gap would find it busy every time it looked.
+    consolidate_gate: tokio::sync::Semaphore,
     /// Wallets (by FVK) with a preparation already in flight. A second concurrent
     /// prepare for the SAME wallet is a duplicate — a retry, a double-clicked button —
     /// and is rejected immediately rather than queued: it would select the same notes.
@@ -6051,19 +6058,61 @@ async fn wallet_prepare(
         PreparingGuard { state: state.clone(), key: req.fvk_hex.clone() }
     };
 
-    // Then queue for the proving slot shared with every other wallet. Waiting here is
-    // correct: another tenant's send is not this caller's error.
-    let _prepare_permit = tokio::time::timeout(PREPARE_QUEUE_WAIT, state.prepare_gate.acquire())
-        .await
-        .map_err(|_| {
-            err(StatusCode::SERVICE_UNAVAILABLE, "the daemon is still busy preparing other payments; please try again shortly")
-        })?
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare gate closed"))?;
-
     // Watch-only: authenticated by possession of the FVK, not a token/seed.
     let fvk_bytes = unhex(&req.fvk_hex)
         .and_then(|b| <[u8; FVK_LEN]>::try_from(b.as_slice()).ok())
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex must be 96 bytes of hex"))?;
+
+    // Is this wallet paying ITSELF? That is consolidation, whatever the caller calls it,
+    // and it is decided here — from the viewing key and the recipient, both cheap to
+    // derive — so the answer is known BEFORE queueing for a proving slot. A client
+    // cannot opt out of the classification by declining to declare its intent.
+    let self_payment = Address::try_from(req.to.as_str())
+        .ok()
+        .and_then(|to| orchard_recipient_bytes(&to))
+        .zip(WalletDb::from_fvk(&fvk_bytes))
+        .is_some_and(|(recipient, db)| db.my_address_bytes() == recipient);
+
+    let _consolidate_permit = if self_payment {
+        Some(state.consolidate_gate.try_acquire().map_err(|_| {
+            err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "another wallet is consolidating right now; consolidation yields to payments — try again shortly",
+            )
+        })?)
+    } else {
+        None
+    };
+
+    // Then take the proving slot shared with every other wallet.
+    //
+    // A PAYMENT queues: somebody is watching it, and another tenant's send is not this
+    // caller's error. CONSOLIDATION does not queue — it starts only if the prover is
+    // free this instant, and otherwise tells the caller to come back.
+    //
+    // The difference matters most where it is easiest to miss. The hosted daemon runs
+    // `--max-concurrent-proves 1`, so "at most one consolidation at a time" would be an
+    // empty promise there: that one consolidation IS the only slot, and a round
+    // deliberately spends the maximum notes a transaction allows (~38, tens of seconds
+    // of proving) while every payment waits. Yielding rather than queueing is the rule
+    // the daemon's own background merger already follows — "never take cores from a
+    // payment somebody is waiting on" — applied to the merge a user asks for, and to the
+    // background maintenance the wallet app now performs on its own.
+    let _prepare_permit = if self_payment {
+        state.prepare_gate.try_acquire().map_err(|_| {
+            err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "payments are using the prover right now; consolidation waits for a quiet moment — try again shortly",
+            )
+        })?
+    } else {
+        tokio::time::timeout(PREPARE_QUEUE_WAIT, state.prepare_gate.acquire())
+            .await
+            .map_err(|_| {
+                err(StatusCode::SERVICE_UNAVAILABLE, "the daemon is still busy preparing other payments; please try again shortly")
+            })?
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare gate closed"))?
+    };
 
     let requested = match (req.amount_sompi, req.amount_fc) {
         (Some(s), _) => s.parse("amount_sompi")?,
@@ -6719,6 +6768,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         // Concurrent preparations are capped by config (`--max-concurrent-proves`):
         // proving is CPU-heavy, and unbounded overlap is a CPU DoS on a hosted daemon.
         prepare_gate: tokio::sync::Semaphore::new(cfg.max_concurrent_proves.max(1)),
+        consolidate_gate: tokio::sync::Semaphore::new(1),
         preparing: std::sync::Mutex::new(HashSet::new()),
         warm_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(resources.warm_wallets.max(1))),
         node_tip: Mutex::new((0, std::time::Instant::now())),
