@@ -2726,11 +2726,30 @@ impl WalletEntry {
     /// So: skip outright when the subtree cache can serve the anchor, and otherwise cap
     /// the inline climb the same way for everyone. A skipped climb costs nothing but a
     /// slower first witness build; an uncapped one costs the user the whole payment.
-    fn advance_spend_witnesses_bounded(&mut self) {
+    fn advance_spend_witnesses_bounded(&mut self, shared_tree_covers: u64) {
         let Some(matured) = self.matured_leaves() else { return };
         let note_count = self.db.notes().len() as u64;
         // `subtree_paths`' preconditions: if it can serve, the climb is pure waste.
-        if self.db.subtree_cache_ready(matured) && matured > self.db.base_size() {
+        //
+        // The SHARED tree counts too, and forgetting it was expensive. Sync deliberately
+        // stops a wallet building its own cache once the shared tree covers it — that is
+        // the ~324 s per wallet the shared tree exists to save — so a borrowing wallet
+        // has no cache of its own BY DESIGN. Asking only about its own cache therefore
+        // concluded "no cache, build one" for precisely the wallets that need none, and
+        // the spend then took its witnesses from the shared tree anyway
+        // (`batch_witness_paths`), discarding everything the climb had built.
+        //
+        // Measured on the hosted daemon, one payment: 392.0 s climbing 2,770,988 leaves
+        // with `witnessed_upto` ending where it began (2 → 2), then 102.6 s to
+        // batch-witness the 13 notes actually being spent, and only then did the proof
+        // start. Eight minutes before any cryptography, six and a half of them on work
+        // nothing read. The user's app gave up first.
+        //
+        // Mirrors `shared_serves` in the sync path so the two cannot drift apart again:
+        // a leaves-only wallet is not a borrower, and the shared tree must be at or past
+        // the anchor being spent against.
+        let shared_serves = !self.db.is_leaves_only() && shared_tree_covers >= matured && matured > 0;
+        if (self.db.subtree_cache_ready(matured) || shared_serves) && matured > self.db.base_size() {
             return;
         }
         let climb = matured.saturating_sub(self.db.witnessed_upto());
@@ -5435,7 +5454,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         // block landed since the last sync tick), so witnessing below is a lookup.
         // block_in_place: this is CPU-bound Sinsemilla; run inline on the async
         // runtime it can capture the tokio I/O driver and freeze ALL of HTTP.
-        tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded());
+        let shared_covers = state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed);
+        tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers));
         let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
         if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
             let (mut candidates, stranded_value) = matured_candidates(&e.db, matured);
@@ -5745,7 +5765,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
     let mut batches: Vec<Batch> = Vec::with_capacity(groups.len());
     {
         let mut e = w.lock().await;
-        tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded());
+        let shared_covers = state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed);
+        tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers));
         let matured = e.matured_leaves().ok_or_else(|| err(StatusCode::CONFLICT, "wallet has no matured anchor yet"))?;
         let (mut candidates, stranded) = matured_candidates(&e.db, matured);
         candidates.sort_by(|a, b| b.value().cmp(&a.value()));
@@ -6300,7 +6321,9 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                 let t_w = std::time::Instant::now();
                 // Bounded + block_in_place: the uncapped inline climb here is what froze
                 // the whole daemon for ~50 min on 2026-07-17 (3,304-note wallet).
-                tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded());
+                // The shared tree's reach decides whether this wallet must climb at all.
+                let shared_covers = state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed);
+                tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers));
                 log::info!(
                     "prepare: witness advance took {:.1?} (notes={}, base_size={}, witnessed_upto {}→{} of matured {}, climbed {} leaves; {} at send time)",
                     t_w.elapsed(),
