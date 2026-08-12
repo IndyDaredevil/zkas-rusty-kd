@@ -397,6 +397,27 @@ than running out of memory.
 | Wallet sync concurrency | sync scheduler | cores − 1, memory-capped | **`--sync-wallets N`**, **`--sync-wallet-memory-mb MIB`** |
 | Checkpoint load / cold warm concurrency | semaphores | hardware-derived / 1 | **`--load-wallets N`**, **`--warm-wallets N`** |
 | Shared page decode threads | dedicated rayon pool | cores − 2 | **`--page-decode-threads N`** |
+| Shared block-page cache | one fetch serves every wallet on the same page | hardware-derived | **`--page-cache-entries N`**, **`--page-cache-ttl SECS`** |
+| Resident wallet ceiling | evicts idle wallets, checkpoint flushed first | hardware-derived | **`--max-resident-wallets N`**, **`--idle-evict SECS`** |
+| Active-sync window | only wallets touched this recently are swept | hardware-derived | **`--active-sync-window SECS`** |
+| Subtree-cache memory floor | skips cache builds when the kernel reports memory tight | hardware-derived | **`--subtree-free-floor-mb MIB`** |
+
+Two of these matter more than their names suggest:
+
+**`--page-cache-entries` / `--page-cache-ttl` size a shared cache, not a per-wallet one.**
+Wallets are swept in cursor order specifically so laggards land on the same page and share
+one fetch and one decode. Many wallets of the same seed — a second device, or a service
+with several tokens over one key — scan the identical blocks, so a cache large enough to
+span the spread between the slowest and fastest wallet turns N fetches into one. Raise the
+TTL if your wallets arrive minutes apart.
+
+**`--max-resident-wallets` is bounded by RAM, not by CPU.** Each resident wallet holds its
+own view; the cap is what stops a public daemon with thousands of tokens from swapping.
+Raising it past what memory supports is the one setting here that can make a box slower.
+
+The sync round itself has a fixed time budget rather than a flag: a wallet that overruns
+finishes on its own while the next round proceeds without it, so one pathological wallet
+cannot hold up the rest.
 
 **`--proof-threads` only ever costs you time.** Total CPU work is fixed at ~2.4
 core-seconds per note spent; the flag just decides how many cores divide it:
@@ -449,6 +470,25 @@ The Tokio worker count is separate and does **not** bound proving: proofs run on
 - A spend roots at the **matured anchor** (`DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK` = 630
   blue below the sink), so funds must be ~10 minutes old to be spendable. The anchor
   trails the tip *by design* — this is not a sync deficiency.
+- A wallet **never ingests the newest `SYNC_TIP_MARGIN` (200) blue units**. Blocks that
+  close to the sink can still be reorged out, so they are previewed, not applied. A
+  healthy, fully caught-up wallet therefore rests ~200 blocks behind the tip; that is the
+  resting state, not lag.
+- **Spendability is decided by the anchor, not the tip.** `spend_ready` is true when the
+  wallet's view reaches the anchor depth and its commitment tree is usable — so a wallet
+  a few hundred blocks behind can still pay, because the blocks above the anchor
+  contribute nothing a proof consumes. `blocks_behind` reports the gap so a UI can say
+  what is not yet counted.
+- **Progress is published during a scan, not only after it.** A pass republishes its
+  snapshot every couple of seconds, so `scanned_blocks` moves while work is happening
+  instead of jumping when the pass ends.
+- **One wallet cannot stall the others.** A sync round has a time budget; a wallet that
+  overruns keeps working on its own and the next round proceeds without it. Before this,
+  a single wallet with a very large note count could hold the round open and freeze every
+  other wallet on the daemon, including the shared chain tree they all borrow from.
+- `/api/status` answers for a wallet that exists but is not open yet with
+  `loading: true` **and its address** — read from the wallet file, not from loaded state.
+  A wallet that is merely opening must never be mistaken for one the daemon has lost.
 
 ---
 
@@ -673,6 +713,37 @@ Poll `/api/status`. Two fields matter and they are not the same:
 | --- | --- |
 | `balance` | everything the wallet has seen |
 | `spendable` | notes past the maturity anchor — what a withdrawal can actually use |
+
+#### A txid in a block is not a payment
+
+This is the one that can cost real money, and it inverts the assumption every other
+chain has trained into integrators.
+
+A shielded spend can be **mined, carry a txid, appear in a block with any number of
+confirmations, and still have moved nothing.** If its anchor is not yet mature, or its
+nullifier was already spent, the spend is *dropped* during the state transition rather
+than the block being rejected. The block stays valid, the chain advances, no value moves,
+and the fee is not charged.
+
+This is deliberate. Rejecting the block instead would mean a spend already embedded in a
+mined block could make every block that merges it invalid — which halted the chain once,
+and is why the drop exists.
+
+Two consequences for an exchange:
+
+1. **Never credit from block or txid inclusion.** Not `getBlock`, not a txid lookup, not
+   "N confirmations". A confirmation count says the *block* is buried; it says nothing
+   about whether the spend inside it executed.
+2. **Credit from the applied set.** The daemon's `spendable` figure is exactly that — it
+   counts only notes that survived the state transition *and* matured, which is why the
+   rule below is "credit on `spendable`". Following it is sufficient; you do not need to
+   read the chain yourself.
+
+If you do read the chain directly (`GetShieldedBlocks`) rather than trusting the daemon,
+you must add settlement depth yourself: those records are authoritative about what was
+*applied*, but a block near the tip can still be reorged out. The daemon treats anything
+within **`SYNC_TIP_MARGIN` (200 blue units) of the sink** as preview-only and refuses to
+ingest it. Reading the applied set at the tip trades a drop risk for a reorg risk.
 
 **Credit on `spendable`, not `balance`.** A note needs ~10 minutes
 (`DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK` blue blocks) before it can be spent. Crediting on
