@@ -134,6 +134,20 @@ const CAUGHT_UP_PAGE: u64 = 16;
 /// per hour). 200 ≈ 2–3 minutes of settling; balances simply lag the tip by
 /// that much. A reorg deeper than this margin triggers a rescan.
 const SYNC_TIP_MARGIN: u64 = 200;
+
+/// How often a sync pass republishes its progress snapshot WHILE the pass is running.
+///
+/// The snapshot used to be written once, at the end of a pass. Between those writes the
+/// wallet's own mutex is held, so `/status` fell back to the cached snapshot — and for a
+/// wallet on its FIRST pass there is no cached snapshot at all, so status answered
+/// "loading" for the entire pass. A first pass is minutes for any wallet with history,
+/// and every wallet on the box is on its first pass after a daemon restart. The app
+/// showed "Opening your wallet · Found 0 ZKAS so far" that whole time, with a progress
+/// bar that never moved, because the daemon was not telling it anything.
+///
+/// Two seconds is well under the poll interval, so progress moves visibly, and far above
+/// the per-page cost, so the snapshot work stays in the noise.
+const SNAPSHOT_PUBLISH_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 /// How many consecutive sync passes must see the cursor off the selected chain
 /// before the wallet is evicted and rescanned. The virtual chain flips
 /// transiently near the tip; a single `reorged` response is usually stale within
@@ -2095,11 +2109,18 @@ impl WalletEntry {
         client: &GrpcClient,
         cache: &Mutex<PageCache>,
         warm_gate: &std::sync::Arc<tokio::sync::Semaphore>,
+        // Published to mid-pass so a long scan reports progress instead of silence; see
+        // [`SNAPSHOT_PUBLISH_EVERY`].
+        state: &AppState,
+        token: &str,
         subtree_free_floor_mb: u64,
         // Leaves the daemon-wide shared tree can already witness against, or 0 when it
         // cannot be consulted. A wallet covered by it needs no subtree cache of its own.
         shared_tree_covers: u64,
     ) {
+        // Local to the pass on purpose: a fresh pass should publish promptly rather
+        // than inherit a timer from the last one.
+        let mut last_publish = std::time::Instant::now();
         // Stop building this wallet's own mirror tree while the shared tree is at or
         // ahead of us. That tree is ~80% of a scan (measured: 319 s of Sinsemilla
         // against 79 s of trial decryption) and it is PUBLIC — the shared copy builds
@@ -2337,6 +2358,15 @@ impl WalletEntry {
                 (advanced, at_margin)
             });
             self.page_ingest_ns += t_ingest.elapsed().as_nanos();
+            // Publish what this pass has reached so far. Without this the only progress
+            // report is the one after the pass ENDS, which for an initial scan means the
+            // user watches "opening" for minutes while the daemon is in fact working
+            // through their history at full speed.
+            if last_publish.elapsed() >= SNAPSHOT_PUBLISH_EVERY {
+                let snap = snap_from_entry(state.address_of(&self.db), self, self.chain_len);
+                state.snapshots.lock().await.insert(token.to_string(), snap);
+                last_publish = std::time::Instant::now();
+            }
             // A FULL small page means more blocks arrived than CAUGHT_UP_PAGE
             // carried: this wallet is not at the tip after all — take a full
             // page next iteration instead of declaring victory.
@@ -4060,7 +4090,7 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // behind rather than idle: "caught up" would be a claim about the chain that this
     // daemon currently cannot see, and the UI would show a partial balance as final.
     let Some(sync_client) = state.sync_client().await else { return SyncOutcome::Behind };
-    e.sync_chunk(&sync_client, &state.page_cache, &state.warm_gate, state.resources.subtree_free_floor_mb, shared_tree_covers)
+    e.sync_chunk(&sync_client, &state.page_cache, &state.warm_gate, &state, &token, state.resources.subtree_free_floor_mb, shared_tree_covers)
         .await;
     // A borrowing wallet's mirror tree is stale by construction; make it current again
     // by taking the shared tree's frontier. `adopt_tip_frontier` REFUSES unless the
