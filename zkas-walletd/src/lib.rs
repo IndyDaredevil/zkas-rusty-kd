@@ -148,6 +148,31 @@ const SYNC_TIP_MARGIN: u64 = 200;
 /// Two seconds is well under the poll interval, so progress moves visibly, and far above
 /// the per-page cost, so the snapshot work stays in the noise.
 const SNAPSHOT_PUBLISH_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Longest a single wallet may hold a sync pass before it must yield.
+///
+/// A pass resumes exactly where it stopped, so yielding costs nothing but a lap.
+const PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Longest the scheduler waits for the slowest wallet before starting the next lap.
+///
+/// The lap used to `join_next()` every task with no deadline, so ONE wallet that could
+/// not finish a pass froze every other wallet on the daemon — including the shared chain
+/// tree, which is a member of the same lap. Observed live: a wallet with 273,731 notes
+/// never completed a pass (`updated_unix` stayed 0) and ~900 wallets sat at a fixed
+/// `scanned` while the chain moved on, each showing "Catching up 99.8%" that could never
+/// finish. Raising sync concurrency does nothing for this: parallelism inside a lap is
+/// irrelevant when the lap itself cannot end.
+///
+/// Stragglers are not killed — they keep their permit and finish in their own time, and
+/// [`AppState::in_pass`] keeps the next lap from stacking a second pass on the same
+/// wallet. One pathological wallet now slows itself down instead of everyone.
+const LAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Above this note count, computing a status snapshot is no longer cheap (it walks every
+/// note), so mid-pass publishing is skipped and the end-of-pass snapshot stands. Progress
+/// reporting must never become the reason a heavy wallet cannot finish.
+const SNAPSHOT_NOTE_CEILING: usize = 20_000;
 /// How many consecutive sync passes must see the cursor off the selected chain
 /// before the wallet is evicted and rescanned. The virtual chain flips
 /// transiently near the tip; a single `reorged` response is usually stale within
@@ -2121,6 +2146,7 @@ impl WalletEntry {
         // Local to the pass on purpose: a fresh pass should publish promptly rather
         // than inherit a timer from the last one.
         let mut last_publish = std::time::Instant::now();
+        let pass_started = std::time::Instant::now();
         // Stop building this wallet's own mirror tree while the shared tree is at or
         // ahead of us. That tree is ~80% of a scan (measured: 319 s of Sinsemilla
         // against 79 s of trial decryption) and it is PUBLIC — the shared copy builds
@@ -2362,7 +2388,7 @@ impl WalletEntry {
             // report is the one after the pass ENDS, which for an initial scan means the
             // user watches "opening" for minutes while the daemon is in fact working
             // through their history at full speed.
-            if last_publish.elapsed() >= SNAPSHOT_PUBLISH_EVERY {
+            if last_publish.elapsed() >= SNAPSHOT_PUBLISH_EVERY && self.db.notes().len() <= SNAPSHOT_NOTE_CEILING {
                 let snap = snap_from_entry(state.address_of(&self.db), self, self.chain_len);
                 state.snapshots.lock().await.insert(token.to_string(), snap);
                 last_publish = std::time::Instant::now();
@@ -2376,6 +2402,11 @@ impl WalletEntry {
             }
             if !advanced || (at_margin && !small_page_full) {
                 self.caught_up = true;
+                break;
+            }
+            // Out of pass budget: stop cleanly and let the lap move on. The cursor has
+            // already advanced, so the next pass resumes from here with nothing repeated.
+            if pass_started.elapsed() >= PASS_BUDGET {
                 break;
             }
             // Just yield between pages — do NOT sleep here: this runs while the wallet's
@@ -3090,6 +3121,10 @@ struct AppState {
     /// is available the instant the file is found. Cached because it costs a file read and
     /// a key expansion, and status is polled once a second per open wallet.
     addr_index: Mutex<HashMap<String, String>>,
+    /// Tokens whose sync pass from an earlier lap is still running. A lap skips these
+    /// rather than queueing a second pass behind the first one's wallet mutex, which
+    /// would consume a concurrency permit to wait on a wallet already being swept.
+    in_pass: Mutex<HashSet<String>>,
     /// Full viewing key → tokens registered with it, for twin-checkpoint adoption
     /// (see [`adopt_twin_checkpoint`]). Built in the background at startup, kept
     /// current by registrations; entries are re-verified against the wallet files
@@ -3176,7 +3211,32 @@ fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSn
         // tree is instead brought into line by `ensure_canonical_checkpoint`, which
         // waits for the shared tree rather than refusing. What remains, and what this
         // reports, is whether the scan is far enough along for a spend to be sound.
-        spend_ready: tip > 0 && (e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= tip),
+        //
+        // Gated on reaching the ANCHOR, not the tip. A payment does not prove against the
+        // chain head: it proves against a root `DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK`
+        // blocks deep, and the spend tree is built only from blocks at or below that
+        // cutoff. So a view that reaches the anchor already holds every note the payment
+        // spends and every witness it needs; the blocks above the anchor contribute
+        // nothing a proof consumes.
+        //
+        // Requiring `caught_up` conflated the two and cost real money-movement: a wallet
+        // that hovers a few hundred blocks behind was refused although its proof would
+        // verify — observed on a wallet holding 4.15M ZKAS, all of it matured, all of it
+        // unspendable purely because a sync counter had not reached the tip.
+        //
+        // The allowance is DEFAULT_ANCHOR_DEPTH while the proof needs DEPTH + SLACK, so
+        // ANCHOR_SLACK stays exactly what it is named: the cushion. It also absorbs the
+        // small DAA-vs-blue-score divergence between `scanned` and the cutoff's units.
+        //
+        // What is genuinely given up is nullifier freshness: a note spent from another
+        // device inside the lag window is unknown here, and such a spend is REJECTED by
+        // consensus rather than mis-settled. Note that this risk is not created by
+        // relaxing the gate — a wallet never ingests the last SYNC_TIP_MARGIN blocks at
+        // all, so the blind window exists even when the app says "Ready". This widens it
+        // from 200 blocks to 200 + lag; it does not open it. The UI is given
+        // `blocks_behind` so it can say so instead of silently deciding for the user.
+        spend_ready: tip > 0 && (e.caught_up || (e.scanned as u64) + DEFAULT_ANCHOR_DEPTH >= tip),
+        blocks_behind: tip.saturating_sub(e.scanned as u64),
     }
 }
 
@@ -3187,6 +3247,7 @@ fn fill_status_from_snap(resp: &mut StatusResp, s: &StatusSnap) {
     resp.watch_only = s.watch_only;
     resp.synced = s.synced;
     resp.spend_ready = s.spend_ready;
+    resp.blocks_behind = s.blocks_behind;
     resp.scanned_blocks = s.scanned;
     resp.chain_len = s.chain_len;
     resp.balance_sompi = s.balance_sompi.to_string();
@@ -3233,6 +3294,13 @@ struct StatusSnap {
     /// May a spend be STARTED right now - the same condition `/prepare` enforces,
     /// not merely "the scan is caught up". See where it is computed.
     spend_ready: bool,
+    /// How far this wallet's view trails the chain tip, in blocks.
+    ///
+    /// Published because a lagging wallet may now legitimately pay (see `spend_ready`)
+    /// and the UI has to be able to say what it is trading away: arrivals inside this
+    /// window are not counted yet, and a spend made from ANOTHER device inside it is
+    /// unknown here.
+    blocks_behind: u64,
 }
 
 /// A non-custodial payment proven and awaiting on-device spend-auth signatures.
@@ -4559,22 +4627,51 @@ async fn sync_loop(state: Arc<AppState>) {
                 if !active.contains(&token) {
                     continue; // parked: nobody is looking at this wallet right now
                 }
+                // Still being swept by an earlier lap that outran its budget — leave it be.
+                if !state.in_pass.lock().await.insert(token.clone()) {
+                    continue;
+                }
                 let permit = sem.clone().acquire_owned().await.expect("sync semaphore closed");
                 let Some(w) = state.wallets.lock().await.get(&token).cloned() else {
+                    state.in_pass.lock().await.remove(&token);
                     continue;
                 };
                 let st = state.clone();
                 set.spawn(async move {
                     let _permit = permit; // held for the wallet's whole chunk, bounding concurrency
-                    sync_one_wallet(st, token, w, chain_len).await
+                    let done = token.clone();
+                    let out = sync_one_wallet(st.clone(), token, w, chain_len).await;
+                    st.in_pass.lock().await.remove(&done);
+                    out
                 });
             }
-            while let Some(res) = set.join_next().await {
-                match res {
-                    Ok(SyncOutcome::Retired(t)) => reorged_tokens.push(t),
-                    Ok(SyncOutcome::Behind) => any_behind = true,
-                    Ok(SyncOutcome::Idle) => {}
-                    Err(join_err) => log::warn!("wallet sync task failed: {join_err}"),
+            // Wait for the lap, but not forever: one wallet that cannot finish must not
+            // hold every other wallet's next pass hostage (see [`LAP_BUDGET`]).
+            let lap_deadline = tokio::time::Instant::now() + LAP_BUDGET;
+            loop {
+                match tokio::time::timeout_at(lap_deadline, set.join_next()).await {
+                    Ok(Some(res)) => match res {
+                        Ok(SyncOutcome::Retired(t)) => reorged_tokens.push(t),
+                        Ok(SyncOutcome::Behind) => any_behind = true,
+                        Ok(SyncOutcome::Idle) => {}
+                        Err(join_err) => log::warn!("wallet sync task failed: {join_err}"),
+                    },
+                    // Lap complete.
+                    Ok(None) => break,
+                    Err(_) => {
+                        // Let the stragglers run on. They hold their permits, so
+                        // concurrency stays bounded, `in_pass` stops the next lap from
+                        // doubling up on them, and every OTHER wallet gets swept now
+                        // instead of waiting on the slowest one.
+                        let stragglers = set.len();
+                        set.detach_all();
+                        any_behind = true;
+                        log::info!(
+                            "sync lap exceeded {}s with {stragglers} wallet(s) still working; continuing without them",
+                            LAP_BUDGET.as_secs()
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -4699,6 +4796,11 @@ struct StatusResp {
     /// rendered as "opening", never as a balance.
     #[serde(default)]
     loading: bool,
+    /// Blocks between this wallet's view and the chain tip. Non-zero is NORMAL: a wallet
+    /// deliberately never ingests the last `SYNC_TIP_MARGIN` blocks. Meaningful to show
+    /// only alongside `spend_ready` — it is the caveat attached to paying while behind.
+    #[serde(default)]
+    blocks_behind: u64,
 }
 
 async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<StatusResp> {
@@ -4723,6 +4825,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
         warming: false,
         spend_ready: false,
         loading: false,
+        blocks_behind: 0,
         scanned_blocks: 0,
         chain_len: daa_score,
         balance_sompi: "0".into(),
@@ -7095,6 +7198,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         prepared: Mutex::new(HashMap::new()),
         snapshots: Mutex::new(HashMap::new()),
         addr_index: Mutex::new(HashMap::new()),
+        in_pass: Mutex::new(HashSet::new()),
         fvk_index: Mutex::new(HashMap::new()),
         auto_consolidate: cfg.auto_consolidate,
         allow_custodial: cfg.allow_custodial,
