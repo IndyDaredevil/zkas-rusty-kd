@@ -5683,6 +5683,22 @@ async fn ensure_canonical_checkpoint(state: &Arc<AppState>, w: &Wallet) -> Resul
     //
     // The gap closes on its own within a sync pass, so wait for it instead of telling
     // the user to retry something the daemon can simply do itself.
+    // Ask FIRST whether this wallet needs the wait at all.
+    //
+    // A borrowing wallet has no mirror tree of its own: its anchor IS the shared tree's,
+    // and the block below forgives it explicitly. But that forgiveness sat AFTER the wait
+    // loop, so the common healthy case burned the entire adoption budget and was then
+    // told it never needed to. With that budget at 28s, every send from a borrowing
+    // wallet paid ~28 seconds of pure waiting before any work began — invisible in the
+    // log, because the first line is only written once the wait is over. Measured against
+    // it: the daemon's own prepare→submit span was ~4s while users timed the whole
+    // payment at ~45s, three times running.
+    //
+    // Waiting for a borrowing wallet's mirror to become valid is waiting for something
+    // the spend path does not require.
+    if w.lock().await.db.is_borrowing() {
+        return Ok(());
+    }
     {
         let deadline = std::time::Instant::now() + CHECKPOINT_ADOPT_WAIT;
         loop {
