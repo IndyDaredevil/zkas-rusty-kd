@@ -1273,7 +1273,17 @@ const WITNESS_ADVANCE_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// shared tree before giving up. The two advance from the same block stream, so a
 /// mismatch is a mid-flight artifact that clears within a sync pass; waiting a moment
 /// is what the old "retry in a moment" error was asking the USER to do by hand.
-const CHECKPOINT_ADOPT_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
+/// Deliberately longer than [`PASS_BUDGET`], because the thing being waited FOR can only
+/// happen once a pass ends.
+///
+/// A borrowing wallet's mirror is invalidated by every appended leaf and becomes valid
+/// again only by adopting the shared tree's frontier at EXACTLY its own leaf count — an
+/// alignment that exists between passes, not during them. This wait was 4s while a pass
+/// could run to PASS_BUDGET (20s), so a payment started during a pass could not succeed
+/// no matter how healthy the wallet was: it gave up before the only moment that would
+/// have satisfied it. Tying the two together means the window is always reachable, and
+/// anything that outlasts it is a real fault rather than a race with the sync loop.
+const CHECKPOINT_ADOPT_WAIT: std::time::Duration = std::time::Duration::from_secs(PASS_BUDGET.as_secs() + 8);
 
 /// A wallet is synced by the background loop only while it has been touched by a
 /// request within this window; after that it is parked until the next request. Keeps a
@@ -2195,7 +2205,29 @@ impl WalletEntry {
         // Requires the shared tree to be AHEAD of us, since that is what makes a
         // frontier available to adopt afterwards; a wallet that overtakes it simply
         // keeps hashing until it is passed again.
-        self.db.set_borrow_tree(!self.db.is_leaves_only() && shared_tree_covers >= self.db.size());
+        // Borrow while the shared tree covers us — but NEVER drop the flag while this
+        // wallet's own mirror is still invalid.
+        //
+        // Turning borrowing off does not rebuild the mirror; every leaf appended while
+        // borrowing was skipped, and `tree_valid` is set true again by exactly one thing:
+        // `adopt_tip_frontier`, which refuses unless the shared tree is at EXACTLY this
+        // wallet's leaf count. So clearing the flag on an invalid mirror strands the
+        // wallet: `ensure_canonical_checkpoint` forgives a wallet that IS borrowing and
+        // refuses one that merely WAS, and a wallet behind the shared tree can never hit
+        // the exact size that would make it valid again.
+        //
+        // That is not hypothetical. When the shared tree stalled, `shared_tree_covers`
+        // stopped growing while wallets kept advancing, so healthy wallets flipped to
+        // non-borrowing with invalid mirrors and every send they attempted answered
+        // "wallet is still catching up with the shared chain state" — permanently, with
+        // the card still offering Send.
+        //
+        // A wallet that has borrowed genuinely depends on the shared tree, so it keeps
+        // saying so until it can honestly stop. Spending stays safe by the same argument
+        // as any borrower: every witness handed to a payment is verified to root before
+        // it is used, so a tree that had diverged declines rather than lying.
+        let covered = !self.db.is_leaves_only() && shared_tree_covers >= self.db.size();
+        self.db.set_borrow_tree(covered || !self.db.tree_is_valid());
 
         // Set when a small caught-up page comes back FULL: more blocks than it
         // carried arrived, so the next iteration must take a full page to catch

@@ -3503,6 +3503,53 @@ mod tests {
         assert!(db.witness_paths_at(&positions, db.size()).iter().all(Option::is_some));
     }
 
+    /// A wallet that borrowed the shared tree and then had borrowing withdrawn is left
+    /// with a mirror it cannot repair.
+    ///
+    /// `tree_valid` is cleared by every leaf appended while borrowing, and the ONLY thing
+    /// that sets it true again is `adopt_tip_frontier`, which refuses a frontier that is
+    /// not at exactly this wallet's leaf count. So once the shared tree is not at the
+    /// wallet's size, the wallet stays invalid — and the spend path forgives a wallet
+    /// that IS borrowing while refusing one that merely WAS. That combination is what
+    /// made healthy wallets answer every payment with "still catching up", and it is why
+    /// the borrow flag must not be dropped while the mirror is still invalid.
+    #[test]
+    fn a_wallet_that_stopped_borrowing_cannot_repair_its_own_mirror() {
+        let mine = [77u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+
+        db.set_borrow_tree(true);
+        for b in 0..12u32 {
+            db.ingest_block(&[coinbase_for(address_of(mine), &b.to_le_bytes(), 1_000 + b as u64)], &[]);
+        }
+        assert!(!db.tree_is_valid(), "borrowing leaves the mirror invalid, by design");
+
+        // The only repair route: a frontier at a DIFFERENT size is refused, correctly —
+        // it is not this wallet's tree.
+        let mut other = WalletDb::from_seed([78u8; 32]).unwrap();
+        other.ingest_block(&[coinbase_for(address_of([78u8; 32]), b"x", 1)], &[]);
+        let shorter = other.tip_frontier_state().expect("a non-borrowing tree is valid");
+        assert_ne!(shorter.size, db.size());
+        assert!(!db.adopt_tip_frontier(&shorter), "a frontier at another size must be refused");
+        assert!(!db.tree_is_valid());
+
+        // Withdrawing the flag repairs nothing — the wallet is neither valid nor
+        // borrowing, which is exactly the state the spend path refuses outright.
+        db.set_borrow_tree(false);
+        assert!(!db.tree_is_valid());
+        assert!(!db.is_borrowing());
+
+        // And the way out: a frontier at exactly this size restores it.
+        let mut twin = WalletDb::from_seed(mine).unwrap();
+        for b in 0..12u32 {
+            twin.ingest_block(&[coinbase_for(address_of(mine), &b.to_le_bytes(), 1_000 + b as u64)], &[]);
+        }
+        let exact = twin.tip_frontier_state().expect("valid");
+        assert_eq!(exact.size, db.size());
+        assert!(db.adopt_tip_frontier(&exact));
+        assert!(db.tree_is_valid());
+    }
+
     #[test]
     fn v8_checkpoint_persists_root_gated_subtree_cache() {
         let mine = [35u8; 32];
