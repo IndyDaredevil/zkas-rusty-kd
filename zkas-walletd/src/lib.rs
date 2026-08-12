@@ -169,10 +169,40 @@ const PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 /// wallet. One pathological wallet now slows itself down instead of everyone.
 const LAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a lap waits for a free sync slot before moving on to the next wallet.
+///
+/// Short on purpose: a full budget means other wallets are mid-pass, and waiting on them
+/// is the stall this whole mechanism exists to avoid. The skipped wallet is swept next lap.
+const PERMIT_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Above this note count, computing a status snapshot is no longer cheap (it walks every
 /// note), so mid-pass publishing is skipped and the end-of-pass snapshot stands. Progress
 /// reporting must never become the reason a heavy wallet cannot finish.
 const SNAPSHOT_NOTE_CEILING: usize = 20_000;
+
+/// Marks a token as having a sync pass in flight, and unmarks it however the pass ends —
+/// normally, by early return, or by panic. See [`AppState::in_pass`].
+struct InPassGuard {
+    state: Arc<AppState>,
+    token: String,
+}
+
+impl InPassGuard {
+    /// `None` when a pass for this token is already running.
+    fn claim(state: &Arc<AppState>, token: &str) -> Option<Self> {
+        let fresh = state.in_pass.lock().unwrap_or_else(|e| e.into_inner()).insert(token.to_string());
+        fresh.then(|| Self { state: state.clone(), token: token.to_string() })
+    }
+}
+
+impl Drop for InPassGuard {
+    fn drop(&mut self) {
+        // `unwrap_or_else(into_inner)`: a poisoned lock here means some other task panicked
+        // while holding it. The set is a plain collection of tokens with no invariant a
+        // panic could have broken, and refusing to release claims would strand wallets.
+        self.state.in_pass.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.token);
+    }
+}
 /// How many consecutive sync passes must see the cursor off the selected chain
 /// before the wallet is evicted and rescanned. The virtual chain flips
 /// transiently near the tip; a single `reorged` response is usually stale within
@@ -2138,6 +2168,9 @@ impl WalletEntry {
         // [`SNAPSHOT_PUBLISH_EVERY`].
         state: &AppState,
         token: &str,
+        // Whether this wallet was caught up BEFORE this pass reset the flag. Mid-pass
+        // progress is only published for a wallet that is genuinely scanning; see below.
+        was_caught_up: bool,
         subtree_free_floor_mb: u64,
         // Leaves the daemon-wide shared tree can already witness against, or 0 when it
         // cannot be consulted. A wallet covered by it needs no subtree cache of its own.
@@ -2388,7 +2421,19 @@ impl WalletEntry {
             // report is the one after the pass ENDS, which for an initial scan means the
             // user watches "opening" for minutes while the daemon is in fact working
             // through their history at full speed.
-            if last_publish.elapsed() >= SNAPSHOT_PUBLISH_EVERY && self.db.notes().len() <= SNAPSHOT_NOTE_CEILING {
+            // `!was_caught_up` is load-bearing, not an optimisation. `sync_one_wallet`
+            // clears `caught_up` at the start of every pass, and `synced` is computed from
+            // it — so publishing mid-pass for a wallet that WAS caught up reports
+            // `synced: false` for the duration of the pass. The fallback test
+            // (`scanned + SYNC_MARGIN >= tip`) cannot rescue it either: a caught-up wallet
+            // rests ~SYNC_TIP_MARGIN (200) blocks behind by design and SYNC_MARGIN is 32.
+            //
+            // The client holds a "synced" dip for 6s; a pass may now run to PASS_BUDGET
+            // (20s). So this would have flapped every steady-state wallet back to
+            // "Catching up" once per pass — replacing the bug this publishing exists to
+            // fix with a noisier one. A wallet already at the tip has nothing to report
+            // mid-pass anyway: its end-of-pass snapshot is the whole story.
+            if !was_caught_up && last_publish.elapsed() >= SNAPSHOT_PUBLISH_EVERY && self.db.notes().len() <= SNAPSHOT_NOTE_CEILING {
                 let snap = snap_from_entry(state.address_of(&self.db), self, self.chain_len);
                 state.snapshots.lock().await.insert(token.to_string(), snap);
                 last_publish = std::time::Instant::now();
@@ -3124,7 +3169,10 @@ struct AppState {
     /// Tokens whose sync pass from an earlier lap is still running. A lap skips these
     /// rather than queueing a second pass behind the first one's wallet mutex, which
     /// would consume a concurrency permit to wait on a wallet already being swept.
-    in_pass: Mutex<HashSet<String>>,
+    ///
+    /// A std mutex, deliberately: the entry must be removable from `Drop`, which cannot
+    /// await. Held only for a set insert/remove, never across a suspension point.
+    in_pass: std::sync::Mutex<HashSet<String>>,
     /// Full viewing key → tokens registered with it, for twin-checkpoint adoption
     /// (see [`adopt_twin_checkpoint`]). Built in the background at startup, kept
     /// current by registrations; entries are re-verified against the wallet files
@@ -3678,7 +3726,17 @@ impl AppState {
         tokio::spawn(async move {
             // `get_wallet` dedupes via the load gate + cache re-check, so racing spawns
             // for the same token collapse to one real load.
-            let _ = state.get_wallet(&token).await;
+            //
+            // A failure is LOGGED. `get_wallet` returns `None` through `?` on a dozen
+            // different paths (unreadable file, undecryptable seed, node RPC unavailable
+            // while verifying the checkpoint cursor), and this used to discard that with
+            // `let _ =`. The wallet then stayed uncached, every poll answered "loading",
+            // and the log said nothing at all — leaving "it just says Opening forever"
+            // with no thread to pull. One line here is the difference between a diagnosis
+            // and a guess.
+            if state.get_wallet(&token).await.is_none() {
+                log::warn!("wallet {token}: load did not complete; it stays 'opening' until a later request succeeds");
+            }
         });
     }
 
@@ -4158,7 +4216,7 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // behind rather than idle: "caught up" would be a claim about the chain that this
     // daemon currently cannot see, and the UI would show a partial balance as final.
     let Some(sync_client) = state.sync_client().await else { return SyncOutcome::Behind };
-    e.sync_chunk(&sync_client, &state.page_cache, &state.warm_gate, &state, &token, state.resources.subtree_free_floor_mb, shared_tree_covers)
+    e.sync_chunk(&sync_client, &state.page_cache, &state.warm_gate, &state, &token, was_caught_up, state.resources.subtree_free_floor_mb, shared_tree_covers)
         .await;
     // A borrowing wallet's mirror tree is stale by construction; make it current again
     // by taking the shared tree's frontier. `adopt_tip_frontier` REFUSES unless the
@@ -4537,6 +4595,8 @@ async fn prune_token_bookkeeping(state: &Arc<AppState>) {
 }
 
 async fn sync_loop(state: Arc<AppState>) {
+    // Shared across every lap for the lifetime of the daemon; see where it is used.
+    let sync_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(sync_concurrency(&state.resources)));
     loop {
         // Snapshot token names, not Wallet Arcs. Holding an Arc for every resident
         // wallet across the whole cohort kept evicted multi-hundred-MiB checkpoints
@@ -4621,28 +4681,48 @@ async fn sync_loop(state: Arc<AppState>) {
                 let snaps = state.snapshots.lock().await;
                 wallet_tokens.sort_by_key(|t| snaps.get(t).map(|s| s.scanned).unwrap_or(usize::MAX));
             }
-            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(sync_concurrency(&state.resources)));
+            // ONE budget for all laps, not a fresh one per lap.
+            //
+            // When a lap exceeds LAP_BUDGET its stragglers are detached and keep running.
+            // A per-lap semaphore meant those stragglers held permits from a semaphore
+            // nobody consults again, while the next lap started with full capacity — so
+            // the real number of concurrent passes was `sync_wallets + however many
+            // wallets are currently stuck`, with nothing bounding the second term. Each
+            // pass carries a memory budget, so that grows into the failure the limit
+            // exists to prevent.
+            //
+            // Sharing the semaphore bounds it. Acquisition is a TRY with a short timeout
+            // rather than an await, because blocking the lap on a permit held by a stuck
+            // wallet would restore exactly the head-of-line stall LAP_BUDGET removes: a
+            // wallet that cannot get a permit this lap is simply swept in the next one.
+            let sem = sync_sem.clone();
             let mut set = tokio::task::JoinSet::new();
             for token in wallet_tokens {
                 if !active.contains(&token) {
                     continue; // parked: nobody is looking at this wallet right now
                 }
                 // Still being swept by an earlier lap that outran its budget — leave it be.
-                if !state.in_pass.lock().await.insert(token.clone()) {
+                let Some(guard) = InPassGuard::claim(&state, &token) else { continue };
+                let Ok(Ok(permit)) =
+                    tokio::time::timeout(PERMIT_WAIT, sem.clone().acquire_owned()).await
+                else {
+                    // Every slot is busy. Skip this wallet for now — `guard` drops here and
+                    // frees the claim, so the next lap picks it up.
                     continue;
-                }
-                let permit = sem.clone().acquire_owned().await.expect("sync semaphore closed");
+                };
                 let Some(w) = state.wallets.lock().await.get(&token).cloned() else {
-                    state.in_pass.lock().await.remove(&token);
-                    continue;
+                    continue; // `guard` drops here and releases the claim
                 };
                 let st = state.clone();
                 set.spawn(async move {
                     let _permit = permit; // held for the wallet's whole chunk, bounding concurrency
-                    let done = token.clone();
-                    let out = sync_one_wallet(st.clone(), token, w, chain_len).await;
-                    st.in_pass.lock().await.remove(&done);
-                    out
+                    // Released on EVERY exit including a panic. Removing the token at the
+                    // end of the task body instead would have leaked the claim whenever a
+                    // wallet task panicked, and a leaked claim is permanent: every later
+                    // lap skips that token, so the wallet silently stops syncing until the
+                    // daemon restarts.
+                    let _guard = guard;
+                    sync_one_wallet(st, token, w, chain_len).await
                 });
             }
             // Wait for the lap, but not forever: one wallet that cannot finish must not
@@ -7198,7 +7278,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         prepared: Mutex::new(HashMap::new()),
         snapshots: Mutex::new(HashMap::new()),
         addr_index: Mutex::new(HashMap::new()),
-        in_pass: Mutex::new(HashSet::new()),
+        in_pass: std::sync::Mutex::new(HashSet::new()),
         fvk_index: Mutex::new(HashMap::new()),
         auto_consolidate: cfg.auto_consolidate,
         allow_custodial: cfg.allow_custodial,
