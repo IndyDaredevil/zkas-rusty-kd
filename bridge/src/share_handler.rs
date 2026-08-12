@@ -748,6 +748,52 @@ impl ShareHandler {
                     }
                 }
             }
+            // c.15: event-driven near-miss line (ported from the v0.3.3 pool
+            // bridge's 1024x window, ~1/min/rig empirically). Pure BigUint
+            // gate, independent of the c.12 f64 session-best path -- if the
+            // two disagree, that localizes the c.14 anomaly: sane events +
+            // implausible latch = f64 path; implausible event ratio =
+            // upstream target/job selection; latch with no event = startup
+            // edge. Window: 1<<10 = 1024x; drop to 8 (256x) if too chatty.
+            const NEAR_MISS_WINDOW_BITS: u32 = 10;
+            let k_window_hit = !network_target.is_zero()
+                && pow_value <= (network_target.clone() << NEAR_MISS_WINDOW_BITS);
+            let z_window_hit = zkas_target
+                .as_ref()
+                .is_some_and(|t| !t.is_zero() && pow_value <= (t.clone() << NEAR_MISS_WINDOW_BITS));
+            if (k_window_hit || z_window_hit) && !pow_value.is_zero() {
+                let pow_f64 = pow_value.to_f64().unwrap_or(1.0);
+                let k_pct = {
+                    let t = network_target.to_f64().unwrap_or(0.0);
+                    if t > 0.0 && pow_f64 > 0.0 { (t / pow_f64) * 100.0 } else { 0.0 }
+                };
+                let z_disp = zkas_target
+                    .as_ref()
+                    .map(|zt| {
+                        let t = zt.to_f64().unwrap_or(0.0);
+                        let p = if t > 0.0 && pow_f64 > 0.0 { (t / pow_f64) * 100.0 } else { 0.0 };
+                        format!("{:.4}%", p)
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                info!(
+                    "{} {}",
+                    LogColors::block("[NEAR-MISS]"),
+                    format!(
+                        "within {}x: k={:.4}% z={} clears={} worker={} job={}",
+                        1u64 << NEAR_MISS_WINDOW_BITS,
+                        k_pct,
+                        z_disp,
+                        match (meets_network_target, clears_zkas) {
+                            (true, true) => "BOTH",
+                            (true, false) => "K",
+                            (false, true) => "Z",
+                            (false, false) => "none",
+                        },
+                        ctx.effective_worker_name(),
+                        current_job_id,
+                    )
+                );
+            }
             if meets_network_target || clears_zkas {
                 // c.7 hook D: per-share double correlator, cloned into both
                 // settlement arms; increments D exactly once (both legs blue).
