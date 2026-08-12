@@ -3283,7 +3283,19 @@ fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSn
         // all, so the blind window exists even when the app says "Ready". This widens it
         // from 200 blocks to 200 + lag; it does not open it. The UI is given
         // `blocks_behind` so it can say so instead of silently deciding for the user.
-        spend_ready: tip > 0 && (e.caught_up || (e.scanned as u64) + DEFAULT_ANCHOR_DEPTH >= tip),
+        //
+        // The tree test is part of the predicate, not an afterthought: `/prepare` refuses
+        // a wallet whose mirror tree is invalid unless it is BORROWING the shared tree
+        // (which has no mirror of its own to check). Leaving it out here is how the app
+        // came to show "Ready" and then answer a tap with "wallet is still catching up
+        // with the shared chain state" — two flags, one wallet, seconds apart, and the
+        // user correctly reading it as the app contradicting itself.
+        //
+        // Whatever the spend path enforces, this must state. If the two ever diverge
+        // again, the card is lying rather than the daemon being strict.
+        spend_ready: tip > 0
+            && (e.caught_up || (e.scanned as u64) + DEFAULT_ANCHOR_DEPTH >= tip)
+            && (e.db.tree_is_valid() || e.db.is_borrowing()),
         blocks_behind: tip.saturating_sub(e.scanned as u64),
     }
 }
@@ -5690,6 +5702,14 @@ async fn ensure_canonical_checkpoint(state: &Arc<AppState>, w: &Wallet) -> Resul
                 );
                 return Ok(());
             }
+            // Logged because this is the one refusal a user meets mid-payment, and it
+            // left no trace at all — a report of "it said Ready then refused" was not
+            // findable in the log, which is why it survived so long.
+            log::warn!(
+                "prepare refused: wallet tree is not valid and it is not borrowing (size {}, low {}) — the status card should not have offered this send",
+                e.db.size(),
+                e.low
+            );
             return Err(err(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "wallet is still catching up with the shared chain state; retry in a moment",
