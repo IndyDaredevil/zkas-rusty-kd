@@ -3044,6 +3044,22 @@ struct AppState {
     /// is momentarily held by the sync loop (see [`StatusSnap`]). Refreshed by the sync
     /// loop each pass and by any `status` call that acquires the wallet lock.
     snapshots: Mutex<HashMap<String, StatusSnap>>,
+    /// token -> receive address, derived from the wallet FILE and independent of whether
+    /// the wallet is loaded, its mutex is free, or a snapshot exists.
+    ///
+    /// The address was previously reachable only through a loaded wallet's `WalletDb`, so
+    /// every path that answered for a known-but-not-yet-loaded wallet returned
+    /// `has_wallet: true` with `address: None`. Clients read a nameless wallet as a LOST
+    /// REGISTRATION -- the SPA's `missingKnownWallet` test is `(!has_wallet || !address)` --
+    /// and after three failed silent re-registrations it asked the user to retype their
+    /// 64-character recovery seed for a wallet that was simply still opening. The window
+    /// is normally milliseconds, which is why this survived; a daemon restart makes it
+    /// minutes for every one of ~900 wallets at once, and then it is everybody's bug.
+    ///
+    /// A wallet file always carries enough to derive the address (seed or FVK), so a name
+    /// is available the instant the file is found. Cached because it costs a file read and
+    /// a key expansion, and status is polled once a second per open wallet.
+    addr_index: Mutex<HashMap<String, String>>,
     /// Full viewing key → tokens registered with it, for twin-checkpoint adoption
     /// (see [`adopt_twin_checkpoint`]). Built in the background at startup, kept
     /// current by registrations; entries are re-verified against the wallet files
@@ -3335,6 +3351,31 @@ impl AppState {
     /// watch-only wallets alike — both know the address).
     fn address_of(&self, db: &WalletDb) -> String {
         String::from(&Address::new(self.prefix, Version::ShieldedOrchard, &db.my_address_bytes()))
+    }
+
+    /// This wallet's receive address, read from its FILE -- no scan, no loaded state, no
+    /// wallet mutex. Answers for a wallet that is merely known to exist.
+    ///
+    /// The point is that "which wallet is this" and "what is in it" are different
+    /// questions with very different costs, and only the second one needs the wallet to
+    /// be open. Conflating them is what let a still-loading wallet look like a forgotten
+    /// one (see [`AppState::addr_index`]).
+    ///
+    /// Returns `None` only when the file is absent or unreadable -- including an encrypted
+    /// seed with no passphrase available, where the daemon genuinely cannot name the
+    /// wallet. Nothing is cached in that case, so a later unlock is picked up.
+    async fn address_from_disk(&self, token: &str) -> Option<String> {
+        if let Some(addr) = self.addr_index.lock().await.get(token) {
+            return Some(addr.clone());
+        }
+        // Deliberately outside the index lock: a cold read touches the disk and expands a
+        // key, and holding the map across that would serialise every status poll behind
+        // the slowest wallet on the box. A duplicate derivation under a race is harmless
+        // -- it is a pure function of the file.
+        let (key, _, _) = load_wallet_meta(&self.wallet_dir, token, self.wallet_secret.as_deref())?;
+        let addr = self.address_of(&key.empty_db()?);
+        self.addr_index.lock().await.insert(token.to_string(), addr.clone());
+        Some(addr)
     }
 
     fn address_for_seed(&self, seed: &[u8; 32]) -> Option<String> {
@@ -4618,6 +4659,16 @@ struct StatusResp {
     /// `synced` keep working; clients that read this stop contradicting the daemon.
     #[serde(default)]
     spend_ready: bool,
+    /// The wallet exists and is being opened: its balance and scan progress are not
+    /// known YET. Distinct from `synced: false`, which means "open, and behind the
+    /// chain" -- here the daemon has nothing to report rather than something small.
+    ///
+    /// Published because the client cannot otherwise tell "still opening" from "the
+    /// daemon forgot this wallet", and it guessed wrong in the direction that asks a
+    /// user to retype their recovery seed. A zero balance under `loading` must be
+    /// rendered as "opening", never as a balance.
+    #[serde(default)]
+    loading: bool,
 }
 
 async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<StatusResp> {
@@ -4641,6 +4692,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
         synced: false,
         warming: false,
         spend_ready: false,
+        loading: false,
         scanned_blocks: 0,
         chain_len: daa_score,
         balance_sompi: "0".into(),
@@ -4691,16 +4743,23 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
                 // the client's own status model decides what to call the state. There is
                 // nothing here a user needs told.
             } else {
-                // Loaded but not yet snapshotted (very first pass) — report presence
-                // only. `scanned_blocks: 0` with `synced: false` is what the client reads
-                // as "opening", so this needs no message either.
+                // Loaded but not yet snapshotted — the wallet's own mutex is held by its
+                // first sync pass and no cached snapshot exists yet. Common after a
+                // restart, because snapshots live in memory and all of them are gone.
+                //
+                // Report presence AND identity: the balance is genuinely unknown here,
+                // but which wallet this is never was.
                 resp.has_wallet = true;
+                resp.loading = true;
+                resp.address = state.address_from_disk(&token).await;
             }
         } else if wallet_exists(&state.wallet_dir, &token) {
             // Known wallet, not yet in memory — load it in the background. Same again:
             // a load in flight is a state, not a fault.
             state.spawn_load(&token);
             resp.has_wallet = true;
+            resp.loading = true;
+            resp.address = state.address_from_disk(&token).await;
         }
     }
     // Name the node fault when there is one and the wallet itself has nothing to
@@ -7005,6 +7064,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         node_tip: Mutex::new((0, std::time::Instant::now())),
         prepared: Mutex::new(HashMap::new()),
         snapshots: Mutex::new(HashMap::new()),
+        addr_index: Mutex::new(HashMap::new()),
         fvk_index: Mutex::new(HashMap::new()),
         auto_consolidate: cfg.auto_consolidate,
         allow_custodial: cfg.allow_custodial,
