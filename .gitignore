@@ -17,3 +17,8 @@ release
 package-sizes.js
 rustbridge_*.log
 auxtest.log
+
+# Internal working notes — kept locally, not published.
+audit/
+CONSENSUS-CHANGES.md
+CONSENSUS-INHERITED.md
