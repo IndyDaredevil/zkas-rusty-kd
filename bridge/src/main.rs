@@ -164,7 +164,12 @@ fn initialize_config() -> BridgeConfig {
 /// Log the bridge configuration at startup
 fn log_bridge_configuration(config: &BridgeConfig) {
     let instance_count = config.instances.len();
+    // v2.0.1.2: release identity in the banner. Convention: engine-prefixed
+    // build number (engine 2.0.1, bridge build N). The engine echo doubles as
+    // a rebase mismatch alarm: prefix and CARGO_PKG_VERSION must agree.
+    const BRIDGE_RELEASE: &str = "v2.0.1.2";
     tracing::info!("----------------------------------");
+    tracing::info!("RC merged bridge {} (engine {})", BRIDGE_RELEASE, env!("CARGO_PKG_VERSION"));
     tracing::info!("initializing bridge ({} instance{})", instance_count, if instance_count > 1 { "s" } else { "" });
     tracing::info!("\tkaspad:          {} (shared)", config.global.kaspad_address);
     tracing::info!("\tblock wait:      {:?}", config.global.block_wait_time);

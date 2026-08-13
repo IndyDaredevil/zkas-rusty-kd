@@ -717,9 +717,14 @@ impl ShareHandler {
             // c.12: zKAS-leg near-miss — this target had ZERO near-miss
             // visibility before c.12 (K's ratio math existed, Z's never
             // did). Same session-best-only design, same reasoning.
+            // v2.0.1.2: exclude clears — a block's ratio is >100% by definition
+            // (first post-gate double latched 5.61e2% and fired a false
+            // IMPLAUSIBLE). K-leg already excludes blocks structurally
+            // (its branch sits in the pow_passed else); this makes Z match.
             if let Some(zt) = zkas_target.as_ref()
                 && !zt.is_zero()
                 && !pow_value.is_zero()
+                && !clears_zkas
             {
                 let target_f64 = zt.to_f64().unwrap_or(0.0);
                 let pow_f64 = pow_value.to_f64().unwrap_or(1.0);
