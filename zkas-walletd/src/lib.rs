@@ -7339,7 +7339,21 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         // Concurrent preparations are capped by config (`--max-concurrent-proves`):
         // proving is CPU-heavy, and unbounded overlap is a CPU DoS on a hosted daemon.
         prepare_gate: tokio::sync::Semaphore::new(cfg.max_concurrent_proves.max(1)),
-        consolidate_gate: tokio::sync::Semaphore::new(1),
+        // Scaled to the prover, with headroom reserved for payments.
+        //
+        // This was hardcoded to 1, and the reasoning for that was sound WHEN IT WAS
+        // WRITTEN: the hosted daemon ran `--max-concurrent-proves 1`, so a second
+        // concurrent consolidation was impossible anyway and the constant only said so
+        // out loud. That daemon now runs 6, and the constant did not follow — so one
+        // tenant's merge held the only consolidation slot for the ~7.5 minutes its
+        // witness build takes, while five prove slots sat idle and every other user's
+        // Consolidate button answered "another wallet is consolidating right now".
+        //
+        // Half the prover, minimum one. Consolidation still YIELDS to payments — it takes
+        // its slot with `try_acquire` and gives up rather than queueing — and capping it
+        // at half means a burst of merges can never starve the payments somebody is
+        // actually waiting on.
+        consolidate_gate: tokio::sync::Semaphore::new((cfg.max_concurrent_proves / 2).max(1)),
         preparing: std::sync::Mutex::new(HashMap::new()),
         warm_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(resources.warm_wallets.max(1))),
         node_tip: Mutex::new((0, std::time::Instant::now())),
