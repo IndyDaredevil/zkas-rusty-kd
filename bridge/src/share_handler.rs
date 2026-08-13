@@ -666,12 +666,12 @@ impl ShareHandler {
                         LogColors::block("[NEAR-MISS]"),
                         format!("New KAS session-best: {:.2e}% of target (worker {})", ratio, ctx.effective_worker_name())
                     );
-                    // c.14: at expected magnitudes (diff-thousands vs
-                    // d~1e16) any ratio above ~1e-6% is already far
-                    // beyond plausible luck -- capture raw hex forensics
-                    // the moment that line is crossed; the observed ~63%
-                    // readings can only be re-diagnosed from the bytes.
-                    if ratio > 1e-6 {
+                    // c.16: with the latch in the else-branch of pow_passed,
+                    // >100% of target is structurally impossible -- this is
+                    // now an invariant guard, not a plausibility heuristic.
+                    // (c.14's 1e-6 threshold dropped the 2^32 stratum-diff
+                    // factor and fired on every legitimate session-best.)
+                    if ratio > 100.0 {
                         warn!(
                             "{} {}",
                             LogColors::block("[NEAR-MISS-FORENSIC]"),
@@ -712,7 +712,14 @@ impl ShareHandler {
             // c.12: zKAS-leg near-miss — this target had ZERO near-miss
             // visibility before c.12 (K's ratio math existed, Z's never
             // did). Same session-best-only design, same reasoning.
+            // c.16: exclude block-winning shares, mirroring the KAS leg
+            // (whose latch lives in the else-branch of pow_passed and
+            // structurally cannot see a winner). Without this gate the
+            // latch ingests solves and reads >100% (observed 1.63e3% =
+            // a block beating the target 16.3x). Winners are counted in
+            // the block gauges; near-miss means near.
             if let Some(zt) = zkas_target.as_ref()
+                && !clears_zkas
                 && !zt.is_zero()
                 && !pow_value.is_zero()
             {
@@ -729,8 +736,8 @@ impl ShareHandler {
                             ctx.effective_worker_name()
                         )
                     );
-                    // c.14: same forensic capture as the KAS leg above.
-                    if zkas_ratio > 1e-6 {
+                    // c.16: invariant guard, same reasoning as the KAS leg.
+                    if zkas_ratio > 100.0 {
                         warn!(
                             "{} {}",
                             LogColors::block("[NEAR-MISS-FORENSIC]"),
