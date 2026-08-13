@@ -22,3 +22,9 @@ auxtest.log
 audit/
 CONSENSUS-CHANGES.md
 CONSENSUS-INHERITED.md
+sdk/bindings/typescript/node_modules/
+docs/KASPA-NATIVE-ZK-SHIELDED-POOL.md
+docs/KASPA-PRIVACY-ARCHITECTURES.md
+sdk/docs/RESEARCH.md
+sdk/docs/STATUS.md
+gateway/docs/STATUS.md
