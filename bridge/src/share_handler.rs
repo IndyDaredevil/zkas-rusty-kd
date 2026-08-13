@@ -671,7 +671,12 @@ impl ShareHandler {
                     // beyond plausible luck -- capture raw hex forensics
                     // the moment that line is crossed; the observed ~63%
                     // readings can only be re-diagnosed from the bytes.
-                    if ratio > 1e-6 {
+                    // v2.1.1: the old >1e-6% bound dropped the 2^32
+                    // stratum-diff factor and fired on every share (BL-011).
+                    // Genuine impossibility in this branch (PoW gate NOT
+                    // passed) is ratio > 100%: f64 claims a block the BigUint
+                    // path rejected -- a real cross-path disagreement.
+                    if ratio > 100.0 {
                         warn!(
                             "{} {}",
                             LogColors::block("[NEAR-MISS-FORENSIC]"),
@@ -730,7 +735,8 @@ impl ShareHandler {
                         )
                     );
                     // c.14: same forensic capture as the KAS leg above.
-                    if zkas_ratio > 1e-6 {
+                    // v2.1.1: same recalibration as the KAS leg (BL-011).
+                    if zkas_ratio > 100.0 {
                         warn!(
                             "{} {}",
                             LogColors::block("[NEAR-MISS-FORENSIC]"),
@@ -755,12 +761,18 @@ impl ShareHandler {
             // implausible latch = f64 path; implausible event ratio =
             // upstream target/job selection; latch with no event = startup
             // edge. Window: 1<<10 = 1024x; drop to 8 (256x) if too chatty.
-            const NEAR_MISS_WINDOW_BITS: u32 = 10;
+            // v2.1.1: ratio-based gate replaces the absolute 1024x window. At
+            // d~1.6e16 a diff-4096 share FLOORS at ~0.107% of target, above the
+            // old window's 0.0977% floor, so EVERY KS7L share logged (~45/min).
+            // New rule: log only shares reaching >= 1% of either target
+            // (pow <= target*100) -- every line is a genuine near-block
+            // (~5/min fleet at current d), and real clears always qualify.
+            const NEAR_MISS_MIN_RATIO_MULT: u32 = 100; // 1/MULT = 1% floor
             let k_window_hit = !network_target.is_zero()
-                && pow_value <= (network_target.clone() << NEAR_MISS_WINDOW_BITS);
+                && pow_value <= (network_target.clone() * NEAR_MISS_MIN_RATIO_MULT);
             let z_window_hit = zkas_target
                 .as_ref()
-                .is_some_and(|t| !t.is_zero() && pow_value <= (t.clone() << NEAR_MISS_WINDOW_BITS));
+                .is_some_and(|t| !t.is_zero() && pow_value <= (t.clone() * NEAR_MISS_MIN_RATIO_MULT));
             if (k_window_hit || z_window_hit) && !pow_value.is_zero() {
                 let pow_f64 = pow_value.to_f64().unwrap_or(1.0);
                 let k_pct = {
@@ -779,8 +791,8 @@ impl ShareHandler {
                     "{} {}",
                     LogColors::block("[NEAR-MISS]"),
                     format!(
-                        "within {}x: k={:.4}% z={} clears={} worker={} job={}",
-                        1u64 << NEAR_MISS_WINDOW_BITS,
+                        "ratio>={}%: k={:.4}% z={} clears={} worker={} job={}",
+                        100 / NEAR_MISS_MIN_RATIO_MULT,
                         k_pct,
                         z_disp,
                         match (meets_network_target, clears_zkas) {
@@ -793,6 +805,14 @@ impl ShareHandler {
                         current_job_id,
                     )
                 );
+                // v2.1.1: metricize -- feeds ks_near_miss_total and the
+                // near-miss silence watchdog (dense health signal vs sparse blocks).
+                if k_window_hit {
+                    crate::prom::record_near_miss(&ctx.effective_worker_name(), "kas");
+                }
+                if z_window_hit {
+                    crate::prom::record_near_miss(&ctx.effective_worker_name(), "zkas");
+                }
             }
             if meets_network_target || clears_zkas {
                 // c.7 hook D: per-share double correlator, cloned into both

@@ -39,6 +39,7 @@ static INVALID_COUNTER: OnceLock<CounterVec> = OnceLock::new();
 
 /// Block counter - number of blocks mined
 static BLOCK_COUNTER: OnceLock<CounterVec> = OnceLock::new();
+static NEAR_MISS_COUNTER: OnceLock<CounterVec> = OnceLock::new();
 
 static BLOCK_ACCEPTED_COUNTER: OnceLock<CounterVec> = OnceLock::new();
 
@@ -152,6 +153,14 @@ pub fn init_metrics() {
     });
 
     BLOCK_COUNTER.get_or_init(|| register_counter_vec!("ks_blocks_mined", "Number of blocks mined over time", WORKER_LABELS).unwrap());
+
+    // v2.1.1: near-miss events (ratio >= 1% of either target). Deliberately a
+    // slim [worker, chain] labelset (not WORKER_LABELS) -- consumed as a sum by
+    // the silence watchdog; per-series birth is handled alert-side with
+    // `or vector(0)`, so no warm-up init is needed here.
+    NEAR_MISS_COUNTER.get_or_init(|| {
+        register_counter_vec!("ks_near_miss_total", "Shares reaching >=1% of a chain target", &["worker", "chain"]).unwrap()
+    });
 
     BLOCK_ACCEPTED_COUNTER.get_or_init(|| {
         register_counter_vec!(
@@ -787,6 +796,13 @@ fn update_worker_activity(worker: &WorkerContext) {
 }
 
 /// Record a block found
+/// v2.1.1: count a near-miss event for a worker on a chain ("kas"/"zkas").
+pub fn record_near_miss(worker_name: &str, chain: &str) {
+    if let Some(counter) = NEAR_MISS_COUNTER.get() {
+        counter.with_label_values(&[worker_name, chain]).inc();
+    }
+}
+
 pub fn record_block_found(worker: &WorkerContext, nonce: u64, bluescore: u64, hash: String) {
     if let Some(counter) = BLOCK_COUNTER.get() {
         counter.with_label_values(&worker.labels()).inc();
