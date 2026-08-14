@@ -1001,6 +1001,19 @@ fn init_worker_counter_series(worker: &WorkerContext) {
     if let Some(counter) = BLOCK_NOT_CONFIRMED_BLUE_COUNTER.get() {
         counter.with_label_values(&worker.labels()).inc_by(0.0);
     }
+    // c.8 warm-up gap: the merged counters mirrored K's labelset and increment
+    // semantics but not its zero-init, so each series was born at 1 on first
+    // block -- an increment increase() structurally cannot see (BL-013).
+    // Same WORKER_LABELS as BLOCK_COUNTER above, so this is a literal mirror.
+    if let Some(counter) = ZKAS_BLOCK_COUNTER.get() {
+        counter.with_label_values(&worker.labels()).inc_by(0.0);
+    }
+    if let Some(counter) = DOUBLE_BLOCK_COUNTER.get() {
+        counter.with_label_values(&worker.labels()).inc_by(0.0);
+    }
+    if let Some(counter) = ZKAS_BLOCK_NOT_CONFIRMED_BLUE_COUNTER.get() {
+        counter.with_label_values(&worker.labels()).inc_by(0.0);
+    }
     if let Some(counter) = DISCONNECT_COUNTER.get() {
         counter.with_label_values(&worker.labels()).inc_by(0.0);
     }
