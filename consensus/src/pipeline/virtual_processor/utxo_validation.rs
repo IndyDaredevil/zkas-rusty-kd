@@ -1,6 +1,7 @@
 use super::{VirtualStateProcessor, bounds::SeqCommitBounds};
 use crate::processes::shielded::ComputedBlockShielded;
 use crate::processes::shielded_diag;
+use crate::model::stores::ghostdag::GhostdagStoreReader;
 use crate::{
     errors::{
         BlockProcessResult,
@@ -867,6 +868,42 @@ impl VirtualStateProcessor {
         Ok(())
     }
 
+    /// Would the shielded state transition APPLY this transaction, if it were mined now?
+    ///
+    /// Answers with the transition's own rules rather than a re-derivation: the same
+    /// `partition_applied` and the same anchor resolver block validation runs. A
+    /// re-implementation here that drifted would be worse than no check at all, because the
+    /// mempool would start refusing transactions consensus is happy with.
+    ///
+    /// `Ok(())` for anything it cannot evaluate — a malformed payload is the bundle
+    /// verifier's business, not this function's, and failing closed on a parse error would
+    /// reject transactions on a code path that never had an opinion about them.
+    pub(super) fn check_mempool_shielded_appliable(
+        &self,
+        tx: &kaspa_consensus_core::tx::Transaction,
+        selected_parent: Hash,
+        pov_daa_score: u64,
+    ) -> TxResult<()> {
+        let Ok(bundle) = kaspa_shielded_core::bundle::ShieldedBundle::from_bytes(&tx.payload) else {
+            return Ok(());
+        };
+        let Ok(stx) = kaspa_shielded_core::state::ShieldedTx::from_bundle(&bundle) else {
+            return Ok(());
+        };
+        // A prospective child of the selected parent: one blue unit above it. Using the
+        // parent's own score would judge the anchor one block stricter than the block that
+        // actually carries the transaction, and refusing something that is about to become
+        // valid is the one failure mode worth avoiding here.
+        let blue_score = self.ghostdag_store.get_blue_score(selected_parent).unwrap_or(0).saturating_add(1);
+        let outcomes = self.shielded_state_manager.partition_applied(std::slice::from_ref(&stx), |stx| {
+            self.resolve_shielded_anchor(&stx.anchor, selected_parent, blue_score, pov_daa_score).is_final
+        });
+        match outcomes.first().and_then(|o| o.drop_reason()) {
+            None => Ok(()),
+            Some(reason) => Err(TxRuleError::InvalidShieldedTransaction(reason)),
+        }
+    }
+
     /// Populates the mempool transaction with maximally found UTXO entry data and proceeds to validation if all found
     pub(super) fn validate_mempool_transaction_in_utxo_context(
         &self,
@@ -877,6 +914,36 @@ impl VirtualStateProcessor {
         selected_parent: Hash,
     ) -> TxResult<()> {
         self.populate_mempool_transaction_in_utxo_context(mutable_tx, utxo_view)?;
+
+        // Refuse a shielded spend the state transition would DROP.
+        //
+        // Admission never consulted the finalized nullifier set or the anchor index, so a
+        // spend of an already-spent note, or one proving against an anchor that is not (and
+        // may never be) final, was admitted, relayed and included in a block template. It
+        // then mined into a block and was dropped during the transition. Two consequences,
+        // both observed:
+        //
+        //   * The sender gets a txid and N confirmations for a transaction that moved
+        //     nothing. Anyone crediting on block inclusion — the standard integration
+        //     everywhere else — credits value that never arrived.
+        //   * A dropped spend pays NO fee (it is filtered out before the transition, so
+        //     nothing leaves the sender). Re-offering an already-spent note is therefore
+        //     free, repeatable block space, and every node Halo 2-verifies it. Normal spam
+        //     economics do not apply because there is nothing to charge.
+        //
+        // The predicate is exactly the transition's own — `partition_applied` with the same
+        // anchor resolver block validation uses — so the mempool cannot disagree with
+        // consensus about what is appliable. It is evaluated against the current selected
+        // parent, which is the best available stand-in for the block that would carry it.
+        //
+        // This is RELAY policy, and deliberately one-directional: refusing here removes a
+        // transaction that consensus would have dropped anyway, and can never make the node
+        // accept something consensus rejects. A verdict can also change with the chain — a
+        // nullifier can be reverted by a reorg, an anchor matures as blocks accumulate — so
+        // a refusal is not permanent and the transaction stays resubmittable.
+        if mutable_tx.tx.is_shielded() {
+            self.check_mempool_shielded_appliable(&mutable_tx.tx, selected_parent, pov_daa_score)?;
+        }
 
         // Calc the contextual storage mass
         let contextual_mass = self

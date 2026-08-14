@@ -61,6 +61,27 @@ pub enum TxValidationFlags {
 }
 
 impl TransactionValidator {
+    /// [`verify_shielded_bundle`], answered from cache when this exact transaction has been
+    /// verified before.
+    ///
+    /// The verdict is immutable — see `shielded_verify_cache` for why the txid is a sound
+    /// key — so a hit is as authoritative as a fresh proof check. Only the boolean is
+    /// stored; the error text is rebuilt on a cached failure, which costs nothing and keeps
+    /// the cache one machine word per entry.
+    fn verify_shielded_bundle_cached(&self, tx: &Transaction) -> TxResult<()> {
+        let id = tx.id();
+        if let Some(ok) = self.shielded_verify_cache.get(&id) {
+            return if ok == 1 {
+                Ok(())
+            } else {
+                Err(TxRuleError::InvalidShieldedBundle("bundle previously failed verification (cached)".to_string()))
+            };
+        }
+        let result = verify_shielded_bundle(tx, &self.shielded_network_domain);
+        self.shielded_verify_cache.insert(id, u8::from(result.is_ok()));
+        result
+    }
+
     pub fn validate_populated_transaction_and_get_fee(
         &self,
         tx: &(impl VerifiableTransaction + Sync),
@@ -104,7 +125,7 @@ impl TransactionValidator {
                 // cryptography here, in the same "expensive checks, once" phase as
                 // script verification (skipped on selected-parent replay).
                 if tx.tx().is_shielded() {
-                    verify_shielded_bundle(tx.tx(), &self.shielded_network_domain)?;
+                    self.verify_shielded_bundle_cached(tx.tx())?;
                 }
             }
             TxValidationFlags::SkipScriptChecks => {}

@@ -457,6 +457,156 @@ async fn real_shielded_spend_through_mined_block() {
 /// merging child stays UTXO-valid, the sink advances, and — because the spend is
 /// filtered out before the state transition — no value is ever created (drop-safety
 /// is additionally pinned by the `state`/`shielded` unit tests).
+/// The mempool must refuse a shielded spend the state transition would DROP.
+///
+/// Dropping is deliberate and stays (see `immature_shielded_anchor_spend_is_dropped_not_fatal`
+/// — rejecting the merging block froze the chain once). But admission never consulted the
+/// anchor index or the nullifier set, so a spend that could never apply was still admitted,
+/// relayed and mined. It then acquired a txid and confirmations while moving nothing, and
+/// its fee was never charged — making the whole thing free to repeat.
+///
+/// This is the anchor half: a spend proving against an anchor nowhere near mature.
+#[tokio::test]
+async fn mempool_refuses_a_spend_whose_anchor_can_never_be_final() {
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+    use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.dev_fee_recipient = None;
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.finality_depth = 5;
+            // Far deeper than this short chain can reach, so the anchor is certainly immature.
+            p.blockrate.shielded_anchor_depth = 1_000;
+        })
+        .build();
+    let net = config.genesis.hash.as_bytes();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_seed = [7u8; 32];
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed(miner_seed).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+
+    let mut block1 = None;
+    for _ in 0..2 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+        block1 = Some(b);
+    }
+    let block1 = block1.unwrap();
+    let cb = &block1.transactions[0];
+    let note_value = cb.outputs[0].value;
+
+    let recipient_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).unwrap();
+    let mut spend_tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+    let tx_ctx = spend_tx.shielded_sighash_context();
+    spend_tx.payload = kaspa_shielded_core::wallet::build::build_singleleaf_coinbase_spend(
+        miner_seed,
+        cb.id().as_bytes(),
+        0,
+        note_value,
+        recipient_addr,
+        note_value - 2_000,
+        &net,
+        &tx_ctx,
+    )
+    .expect("wallet builds a real spend bundle");
+    spend_tx.finalize();
+
+    // The proof is valid and the anchor is real — the only defect is that it is not yet
+    // final. Consensus would mine this and silently drop it; admission must not let it in.
+    let vp = ctx.consensus.virtual_processor();
+    let sink = ctx.consensus.get_sink();
+    let verdict = vp.check_mempool_shielded_appliable(&spend_tx, sink, 0);
+    let Err(error) = verdict else {
+        panic!("a spend against an immature anchor must be refused at admission, not relayed and mined");
+    };
+    let text = format!("{error:?}");
+    assert!(text.contains("anchor"), "must be refused for the anchor, not something else: {text}");
+}
+
+/// The nullifier half: re-offering a spend that has already been applied on chain.
+///
+/// This is the cheaper griefing shape. A dropped spend pays no fee — nothing leaves the
+/// sender — so replaying an already-spent note costs the sender nothing while every node
+/// Halo 2-verifies it, once at admission and again on every template build. Refusing it at
+/// the door is what makes that cost go away.
+#[tokio::test]
+async fn mempool_refuses_a_replay_of_an_already_applied_spend() {
+    use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+    use kaspa_consensus_core::tx::TX_VERSION_SHIELDED;
+
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.dev_fee_recipient = None;
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.finality_depth = 5;
+            // Shallow, so the coinbase note matures within a short test chain and the spend
+            // is genuinely APPLIED rather than dropped.
+            p.blockrate.shielded_anchor_depth = 1;
+        })
+        .build();
+    let net = config.genesis.hash.as_bytes();
+
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_seed = [7u8; 32];
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed(miner_seed).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+
+    let mut block1 = None;
+    for _ in 0..2 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b.clone()).virtual_state_task.await.unwrap();
+        block1 = Some(b);
+    }
+    let block1 = block1.unwrap();
+    let cb = &block1.transactions[0];
+    let note_value = cb.outputs[0].value;
+
+    let recipient_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).unwrap();
+    let mut spend_tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+    let tx_ctx = spend_tx.shielded_sighash_context();
+    spend_tx.payload = kaspa_shielded_core::wallet::build::build_singleleaf_coinbase_spend(
+        miner_seed,
+        cb.id().as_bytes(),
+        0,
+        note_value,
+        recipient_addr,
+        note_value - 2_000,
+        &net,
+        &tx_ctx,
+    )
+    .expect("wallet builds a real spend bundle");
+    spend_tx.finalize();
+
+    // Let the anchor mature, then mine the spend and a child that merges (and so applies) it.
+    for _ in 0..3 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+    let spend_block = ctx.mine_real_pow_block_with(vec![spend_tx.clone()]);
+    ctx.consensus.validate_and_insert_block(spend_block).virtual_state_task.await.unwrap();
+    for _ in 0..2 {
+        let b = ctx.mine_real_pow_block();
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+    }
+
+    let vp = ctx.consensus.virtual_processor();
+    let sink = ctx.consensus.get_sink();
+    // Only meaningful if the spend really was applied — otherwise this would be testing the
+    // anchor path again by accident.
+    let applied = vp.check_mempool_shielded_appliable(&spend_tx, sink, 0);
+    let Err(error) = applied else {
+        panic!("re-offering an already-applied spend must be refused: its nullifier is committed");
+    };
+    let text = format!("{error:?}");
+    assert!(text.contains("nullifier"), "must be refused for the nullifier conflict: {text}");
+}
+
 #[tokio::test]
 async fn immature_shielded_anchor_spend_is_dropped_not_fatal() {
     use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
