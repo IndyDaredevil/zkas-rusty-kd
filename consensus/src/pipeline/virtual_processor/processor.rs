@@ -1886,6 +1886,7 @@ impl VirtualStateProcessor {
         virtual_past_median_time: u64,
         args: &TransactionValidationArgs,
         selected_parent: Hash,
+        virtual_blue_score: u64,
     ) -> TxResult<()> {
         self.transaction_validator.validate_tx_in_isolation(&mutable_tx.tx)?;
         self.transaction_validator.validate_tx_in_header_context_with_args(
@@ -1893,7 +1894,14 @@ impl VirtualStateProcessor {
             virtual_daa_score,
             virtual_past_median_time,
         )?;
-        self.validate_mempool_transaction_in_utxo_context(mutable_tx, virtual_utxo_view, virtual_daa_score, args, selected_parent)?;
+        self.validate_mempool_transaction_in_utxo_context(
+            mutable_tx,
+            virtual_utxo_view,
+            virtual_daa_score,
+            args,
+            selected_parent,
+            virtual_blue_score,
+        )?;
         Ok(())
     }
 
@@ -1905,6 +1913,10 @@ impl VirtualStateProcessor {
         let virtual_past_median_time = virtual_state.past_median_time;
 
         let sp = virtual_state.ghostdag_data.selected_parent;
+        // The virtual's own blue score is the context a transaction admitted now would be
+        // judged in — not the selected parent's, which is lower by the whole mergeset and
+        // would age shielded anchors more strictly than the block that carries them.
+        let virtual_blue_score = virtual_state.ghostdag_data.blue_score;
         // Run within the thread pool since par_iter might be internally applied to inputs
         self.thread_pool.install(|| {
             self.validate_mempool_transaction_impl(
@@ -1914,6 +1926,7 @@ impl VirtualStateProcessor {
                 virtual_past_median_time,
                 args,
                 sp,
+                virtual_blue_score,
             )
         })
     }
@@ -1929,6 +1942,7 @@ impl VirtualStateProcessor {
         let virtual_daa_score = virtual_state.daa_score;
         let virtual_past_median_time = virtual_state.past_median_time;
         let virtual_sp = virtual_state.ghostdag_data.selected_parent;
+        let virtual_blue_score = virtual_state.ghostdag_data.blue_score;
         self.thread_pool.install(|| {
             mutable_txs
                 .par_iter_mut()
@@ -1940,6 +1954,7 @@ impl VirtualStateProcessor {
                         virtual_past_median_time,
                         args.get(&mtx.id()),
                         virtual_sp,
+                        virtual_blue_score,
                     )
                 })
                 .collect::<Vec<TxResult<()>>>()

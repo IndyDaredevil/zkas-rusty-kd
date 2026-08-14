@@ -519,7 +519,7 @@ async fn mempool_refuses_a_spend_whose_anchor_can_never_be_final() {
     // final. Consensus would mine this and silently drop it; admission must not let it in.
     let vp = ctx.consensus.virtual_processor();
     let sink = ctx.consensus.get_sink();
-    let verdict = vp.check_mempool_shielded_appliable(&spend_tx, sink, 0);
+    let verdict = vp.check_mempool_shielded_appliable(&spend_tx, sink, ctx.consensus.get_header(sink).unwrap().blue_score, 0);
     let Err(error) = verdict else {
         panic!("a spend against an immature anchor must be refused at admission, not relayed and mined");
     };
@@ -599,7 +599,7 @@ async fn mempool_refuses_a_replay_of_an_already_applied_spend() {
     let sink = ctx.consensus.get_sink();
     // Only meaningful if the spend really was applied — otherwise this would be testing the
     // anchor path again by accident.
-    let applied = vp.check_mempool_shielded_appliable(&spend_tx, sink, 0);
+    let applied = vp.check_mempool_shielded_appliable(&spend_tx, sink, ctx.consensus.get_header(sink).unwrap().blue_score, 0);
     let Err(error) = applied else {
         panic!("re-offering an already-applied spend must be refused: its nullifier is committed");
     };

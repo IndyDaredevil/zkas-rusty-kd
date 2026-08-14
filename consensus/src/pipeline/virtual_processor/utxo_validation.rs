@@ -1,7 +1,6 @@
 use super::{VirtualStateProcessor, bounds::SeqCommitBounds};
 use crate::processes::shielded::ComputedBlockShielded;
 use crate::processes::shielded_diag;
-use crate::model::stores::ghostdag::GhostdagStoreReader;
 use crate::{
     errors::{
         BlockProcessResult,
@@ -882,6 +881,7 @@ impl VirtualStateProcessor {
         &self,
         tx: &kaspa_consensus_core::tx::Transaction,
         selected_parent: Hash,
+        blue_score: u64,
         pov_daa_score: u64,
     ) -> TxResult<()> {
         let Ok(bundle) = kaspa_shielded_core::bundle::ShieldedBundle::from_bytes(&tx.payload) else {
@@ -890,11 +890,13 @@ impl VirtualStateProcessor {
         let Ok(stx) = kaspa_shielded_core::state::ShieldedTx::from_bundle(&bundle) else {
             return Ok(());
         };
-        // A prospective child of the selected parent: one blue unit above it. Using the
-        // parent's own score would judge the anchor one block stricter than the block that
-        // actually carries the transaction, and refusing something that is about to become
-        // valid is the one failure mode worth avoiding here.
-        let blue_score = self.ghostdag_store.get_blue_score(selected_parent).unwrap_or(0).saturating_add(1);
+        // `blue_score` is the VIRTUAL's, supplied by the caller — the context a transaction
+        // admitted now would actually be judged in.
+        //
+        // Deriving it here from the selected parent was wrong twice: it is lower than the
+        // virtual's by the whole mergeset, so anchors aged more strictly than the block that
+        // will carry them; and a store error fell back to 0, which would have made every
+        // anchor look immature and refused every shielded transaction on the node.
         let outcomes = self.shielded_state_manager.partition_applied(std::slice::from_ref(&stx), |stx| {
             self.resolve_shielded_anchor(&stx.anchor, selected_parent, blue_score, pov_daa_score).is_final
         });
@@ -912,6 +914,7 @@ impl VirtualStateProcessor {
         pov_daa_score: u64,
         args: &TransactionValidationArgs,
         selected_parent: Hash,
+        virtual_blue_score: u64,
     ) -> TxResult<()> {
         self.populate_mempool_transaction_in_utxo_context(mutable_tx, utxo_view)?;
 
@@ -942,7 +945,7 @@ impl VirtualStateProcessor {
         // nullifier can be reverted by a reorg, an anchor matures as blocks accumulate — so
         // a refusal is not permanent and the transaction stays resubmittable.
         if mutable_tx.tx.is_shielded() {
-            self.check_mempool_shielded_appliable(&mutable_tx.tx, selected_parent, pov_daa_score)?;
+            self.check_mempool_shielded_appliable(&mutable_tx.tx, selected_parent, virtual_blue_score, pov_daa_score)?;
         }
 
         // Calc the contextual storage mass
