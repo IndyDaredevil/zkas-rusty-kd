@@ -6833,7 +6833,32 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         candidates.sort_by(|a, b| b.value().cmp(&a.value()));
         have_total = Some(candidates.iter().map(|n| n.value()).sum());
         let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
-        let (take, dyn_fee) = select_spend_count(&values, amount, base_fee, max_per_tx);
+        let (mut take, mut dyn_fee) = select_spend_count(&values, amount, base_fee, max_per_tx);
+        // A SELF-payment tells us its fee budget by what it held back.
+        //
+        // Consolidation asks to move `spendable - reserve` to its own address, so the gap
+        // between what the wallet holds and what it asked for IS the fee the caller
+        // budgeted. Older wallet builds reserve a flat 0.1 ZKAS while the byte-priced
+        // relay minimum for a full 38-note merge is 0.246 — so they ask for more than they
+        // can pay for, and every consolidation fails with "insufficient matured funds".
+        // Worse, those builds also refuse to SIGN a fee above their reserve, so simply
+        // clamping the amount here would trade one refusal for another.
+        //
+        // Merging fewer notes fixes both at once: fee scales with note count, so a round
+        // sized to the caller's budget both fits their balance and passes their signing
+        // ceiling. They consolidate in smaller steps without updating anything. A caller
+        // that reserves properly still gets a full-size round, so nothing is slowed down
+        // to accommodate old builds.
+        //
+        // Only for self-payments: silently shrinking a payment to somebody else would be
+        // a different and much worse bug.
+        if self_payment {
+            let budget = have_total.unwrap_or(0).saturating_sub(amount);
+            while take > 2 && dyn_fee > budget {
+                take -= 1;
+                dyn_fee = chunk_fee(base_fee, take);
+            }
+        }
         fee = dyn_fee;
         need = amount.saturating_add(fee);
         for n in candidates.iter().take(take) {
@@ -6854,7 +6879,10 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         // the caller's next chunk would re-select the very same notes value-descending
         // and build a transaction consensus drops as a double-spend, silently. Without a
         // token we refuse to chunk and return the explicit error instead.
-        if allow_partial && session_token.is_some() && have >= need && capacity > 0 {
+        // `self_payment` joins `have >= need` here: a consolidation that asked for slightly
+        // more of its own money than the fee leaves available is not short of funds, it is
+        // off by a fee. Pay what the selected notes can carry and report the remainder.
+        if allow_partial && session_token.is_some() && (have >= need || self_payment) && capacity > 0 {
             // Change is then exactly zero: the chunk pays out every selected note less
             // the fee. `need` is not reassigned — past this point only `amount`/`fee`
             // matter, `prepare_payment` derives the change from the inputs themselves.
