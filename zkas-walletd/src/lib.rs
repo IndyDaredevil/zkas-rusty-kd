@@ -4836,8 +4836,10 @@ async fn wallet_history(
                     "amountSompi": h.amount,
                     "amountSompiExact": h.amount.to_string(),
                     "amountZkas": h.amount as f64 / SOMPI_PER_ZKAS as f64,
+                    "amountKind": if h.amount_is_net_outflow { "netOutflow" } else { "paid" },
                     "feeSompi": h.fee,
                     "feeSompiExact": h.fee.to_string(),
+                    "feeKnown": h.fee_known,
                     "recipient": h.recipient.map(|r| String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &r))),
                     "memo": (!h.memo.is_empty()).then(|| String::from_utf8_lossy(&h.memo).into_owned()),
                 })
