@@ -2185,6 +2185,9 @@ impl WalletEntry {
         // Leaves the daemon-wide shared tree can already witness against, or 0 when it
         // cannot be consulted. A wallet covered by it needs no subtree cache of its own.
         shared_tree_covers: u64,
+        // The shared tree's base (oldest witnessable position). The tree serves only
+        // `[base, covers)`; a wallet whose oldest note is below `base` is NOT covered.
+        shared_tree_base: u64,
     ) {
         // Local to the pass on purpose: a fresh pass should publish promptly rather
         // than inherit a timer from the last one.
@@ -2226,7 +2229,12 @@ impl WalletEntry {
         // saying so until it can honestly stop. Spending stays safe by the same argument
         // as any borrower: every witness handed to a payment is verified to root before
         // it is used, so a tree that had diverged declines rather than lying.
-        let covered = !self.db.is_leaves_only() && shared_tree_covers >= self.db.size();
+        // Base-aware, same as `shared_serves`: the shared tree only witnesses `[base, size)`,
+        // so a wallet whose oldest note is below the shared base is NOT covered and must keep
+        // maintaining its own tree — borrowing would strand those old notes at spend time.
+        let oldest_note = self.db.notes().iter().map(|n| n.position).min().unwrap_or(u64::MAX);
+        let covered =
+            !self.db.is_leaves_only() && shared_tree_covers >= self.db.size() && shared_tree_base <= oldest_note;
         self.db.set_borrow_tree(covered || !self.db.tree_is_valid());
 
         // Set when a small caught-up page comes back FULL: more blocks than it
@@ -2581,7 +2589,17 @@ impl WalletEntry {
                 // relying on, so it must build. `shared_tree_covers` is 0 for it anyway
                 // (its own lock is held by this very sync pass), but say so explicitly
                 // rather than depend on that.
-                let shared_serves = !self.db.is_leaves_only() && shared_tree_covers >= matured && matured > 0;
+                // The shared tree serves only positions at or above its own base. A wallet
+                // whose OLDEST note is below that base (an old miner wallet, once the shared
+                // tree's base was raised by the 2026-08 compaction bug) is not covered — the
+                // tree declines those positions and the spend climbs O(chain). Gate on the
+                // oldest note so such a wallet builds its own cache instead of relying on a
+                // shared tree that cannot reach its history.
+                let oldest_note = self.db.notes().iter().map(|n| n.position).min().unwrap_or(u64::MAX);
+                let shared_serves = !self.db.is_leaves_only()
+                    && shared_tree_covers >= matured
+                    && matured > 0
+                    && shared_tree_base <= oldest_note;
                 let needs_cache = span >= SUBTREE_CACHE_MIN_SPAN
                     && !self.db.subtree_cache_ready(matured)
                     && !self.db.subtree_cache_failed()
@@ -2890,7 +2908,7 @@ impl WalletEntry {
     /// So: skip outright when the subtree cache can serve the anchor, and otherwise cap
     /// the inline climb the same way for everyone. A skipped climb costs nothing but a
     /// slower first witness build; an uncapped one costs the user the whole payment.
-    fn advance_spend_witnesses_bounded(&mut self, shared_tree_covers: u64) {
+    fn advance_spend_witnesses_bounded(&mut self, shared_tree_covers: u64, shared_tree_base: u64) {
         let Some(matured) = self.matured_leaves() else { return };
         let note_count = self.db.notes().len() as u64;
         // `subtree_paths`' preconditions: if it can serve, the climb is pure waste.
@@ -2910,9 +2928,14 @@ impl WalletEntry {
         // nothing read. The user's app gave up first.
         //
         // Mirrors `shared_serves` in the sync path so the two cannot drift apart again:
-        // a leaves-only wallet is not a borrower, and the shared tree must be at or past
-        // the anchor being spent against.
-        let shared_serves = !self.db.is_leaves_only() && shared_tree_covers >= matured && matured > 0;
+        // a leaves-only wallet is not a borrower, the shared tree must reach the anchor,
+        // AND its base must reach down to this wallet's oldest note (else those old
+        // positions decline and the spend climbs O(chain) — the consolidation killer).
+        let oldest_note = self.db.notes().iter().map(|n| n.position).min().unwrap_or(u64::MAX);
+        let shared_serves = !self.db.is_leaves_only()
+            && shared_tree_covers >= matured
+            && matured > 0
+            && shared_tree_base <= oldest_note;
         if (self.db.subtree_cache_ready(matured) || shared_serves) && matured > self.db.base_size() {
             return;
         }
@@ -3110,6 +3133,16 @@ struct AppState {
     ///
     /// An atomic cannot fail to be read, which is the property that was actually needed.
     chain_tree_size: std::sync::atomic::AtomicU64,
+    /// The shared tree's BASE — the oldest position it can witness. Published alongside
+    /// `chain_tree_size` for the same lock-free reason.
+    ///
+    /// `chain_tree_size` alone says the shared tree reaches the tip, but NOT how far down
+    /// it reaches. The tree only serves positions in `[base, size)`; a wallet whose oldest
+    /// note is below `base` is not covered and must keep its own cache. Ignoring this made
+    /// old-note consolidations pay a full O(chain) climb even with the shared tree "ready"
+    /// — the shared tree's base was raised to ~2.06M by the 2026-08 compaction bug and can
+    /// never come back down on a pruned node, so every note below it was silently uncovered.
+    chain_tree_base: std::sync::atomic::AtomicU64,
     /// The shared tree's tip frontier, republished after each of its own passes.
     ///
     /// A short-lived lock held only long enough to clone ~32 ommers, never across
@@ -3476,11 +3509,62 @@ impl AppState {
     /// out (`subtree_paths`), so a chain tree that had somehow diverged would return
     /// `None` and decline, never a wrong witness.
     fn chain_tree_paths(&self, positions: &[u64], matured: u64) -> Option<Vec<Option<kaspa_shielded_core::MerklePath>>> {
-        let e = self.chain_tree.try_lock().ok()?;
+        // Wait BRIEFLY for the tree, don't bail on the first miss.
+        //
+        // A bare `try_lock().ok()?` returned `None` the instant the sync loop held the
+        // tree for its (sub-second) tip-follow chunk — and `None` here sends the spend
+        // down `witness_paths_at`, an O(chain) replay that is 500–700 s for an old note.
+        // Trading a ~2 s wait for the tree against a ~10-minute climb is not close. This
+        // runs under `block_in_place` (see `batch_witness_paths`), so a blocking sleep is
+        // correct here; the deadline caps it so a genuinely wedged tree still falls back.
+        let e = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if let Ok(g) = self.chain_tree.try_lock() {
+                    break g;
+                }
+                if std::time::Instant::now() >= deadline {
+                    // DIAGNOSTIC: the shared tree can witness any old note (it never
+                    // compacts), so any decline here is why a consolidation fell to the
+                    // O(chain) climb. Record which branch, once, with the numbers.
+                    log::warn!(
+                        "chain_tree_paths DECLINE=lock_timeout for {} position(s) (min={:?})",
+                        positions.len(),
+                        positions.iter().min()
+                    );
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
         if !e.db.is_leaves_only() || e.db.size() < matured {
+            log::warn!(
+                "chain_tree_paths DECLINE=size (leaves_only={}, shared_size={}, matured={}) for {} position(s) min={:?}",
+                e.db.is_leaves_only(),
+                e.db.size(),
+                matured,
+                positions.len(),
+                positions.iter().min()
+            );
             return None;
         }
         let paths = e.db.witness_paths_at(positions, matured);
+        let served = paths.iter().filter(|p| p.is_some()).count();
+        if served < positions.len() {
+            let mut unserved: Vec<u64> =
+                positions.iter().zip(paths.iter()).filter(|(_, p)| p.is_none()).map(|(pos, _)| *pos).collect();
+            unserved.sort_unstable();
+            log::warn!(
+                "chain_tree_paths DECLINE=unserved {}/{} (shared base_size={}, upto={}, cache_ready={}, matured={}); first unserved positions={:?}",
+                positions.len() - served,
+                positions.len(),
+                e.db.base_size(),
+                e.db.subtree_build_upto(),
+                e.db.subtree_cache_ready(matured),
+                matured,
+                &unserved[..unserved.len().min(6)]
+            );
+        }
         paths.iter().all(|p| p.is_some()).then_some(paths)
     }
 
@@ -4256,11 +4340,13 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // The shared tree itself must not borrow from itself, hence the token check.
     let shared_tree_covers =
         if token == CHAIN_TREE_TOKEN { 0 } else { state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed) };
+    let shared_tree_base =
+        if token == CHAIN_TREE_TOKEN { u64::MAX } else { state.chain_tree_base.load(std::sync::atomic::Ordering::Relaxed) };
     // No node means no block stream to advance along. Report the wallet as still
     // behind rather than idle: "caught up" would be a claim about the chain that this
     // daemon currently cannot see, and the UI would show a partial balance as final.
     let Some(sync_client) = state.sync_client().await else { return SyncOutcome::Behind };
-    e.sync_chunk(&sync_client, &state.page_cache, &state.warm_gate, &state, &token, was_caught_up, state.resources.subtree_free_floor_mb, shared_tree_covers)
+    e.sync_chunk(&sync_client, &state.page_cache, &state.warm_gate, &state, &token, was_caught_up, state.resources.subtree_free_floor_mb, shared_tree_covers, shared_tree_base)
         .await;
     // A borrowing wallet's mirror tree is stale by construction; make it current again
     // by taking the shared tree's frontier. `adopt_tip_frontier` REFUSES unless the
@@ -4283,6 +4369,7 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // sees it without ever touching its lock.
     if token == CHAIN_TREE_TOKEN {
         state.chain_tree_size.store(e.db.size(), std::sync::atomic::Ordering::Relaxed);
+        state.chain_tree_base.store(e.db.base_size(), std::sync::atomic::Ordering::Relaxed);
         let fs = e.db.tip_frontier_state();
         *state.chain_tree_frontier.lock().await = fs;
     }
@@ -5894,7 +5981,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         // block_in_place: this is CPU-bound Sinsemilla; run inline on the async
         // runtime it can capture the tokio I/O driver and freeze ALL of HTTP.
         let shared_covers = state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed);
-        tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers));
+        let shared_base = state.chain_tree_base.load(std::sync::atomic::Ordering::Relaxed);
+        tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers, shared_base));
         let cutoff_blue = e.sink_blue.saturating_sub(DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK);
         if let Some(matured) = e.boundaries.iter().rev().find(|(bs, _)| *bs <= cutoff_blue).map(|&(_, lc)| lc) {
             let (mut candidates, stranded_value) = matured_candidates(&e.db, matured);
@@ -6205,7 +6293,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
     {
         let mut e = w.lock().await;
         let shared_covers = state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed);
-        tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers));
+        let shared_base = state.chain_tree_base.load(std::sync::atomic::Ordering::Relaxed);
+        tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers, shared_base));
         let matured = e.matured_leaves().ok_or_else(|| err(StatusCode::CONFLICT, "wallet has no matured anchor yet"))?;
         let (mut candidates, stranded) = matured_candidates(&e.db, matured);
         candidates.sort_by(|a, b| b.value().cmp(&a.value()));
@@ -6762,7 +6851,8 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                 // the whole daemon for ~50 min on 2026-07-17 (3,304-note wallet).
                 // The shared tree's reach decides whether this wallet must climb at all.
                 let shared_covers = state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed);
-                tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers));
+                let shared_base = state.chain_tree_base.load(std::sync::atomic::Ordering::Relaxed);
+                tokio::task::block_in_place(|| e.advance_spend_witnesses_bounded(shared_covers, shared_base));
                 log::info!(
                     "prepare: witness advance took {:.1?} (notes={}, base_size={}, witnessed_upto {}→{} of matured {}, climbed {} leaves; {} at send time)",
                     t_w.elapsed(),
@@ -6781,7 +6871,27 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     have_total = Some(candidates.iter().map(|n| n.value()).sum());
                     fast_path = true;
                     let values: Vec<u64> = candidates.iter().map(|n| n.value()).collect();
-                    let (take, dyn_fee) = select_spend_count(&values, amount, base_fee, max_per_tx);
+                    let (mut take, mut dyn_fee) = select_spend_count(&values, amount, base_fee, max_per_tx);
+                    // Size a SELF-payment's round to the fee the caller held back.
+                    //
+                    // Identical to the slow path below, and it belongs here far more: the
+                    // slow path serves untracked FVK-only callers, while every wallet the
+                    // hosted daemon actually tracks — which is every wallet that presses
+                    // Consolidate in the app — arrives HERE. Landing the fix on one branch
+                    // meant shipping it to nobody, and the same "insufficient matured funds"
+                    // reports kept coming in against a daemon that supposedly fixed them.
+                    //
+                    // Fee scales with note count, so merging fewer notes both fits the
+                    // caller's reserve and stays under the signing ceiling older builds
+                    // enforce. A caller that reserves properly is untouched.
+                    if self_payment {
+                        let budget = have_total.unwrap_or(0).saturating_sub(amount);
+                        while take > 2 && dyn_fee > budget {
+                            take -= 1;
+                            dyn_fee = chunk_fee(base_fee, take);
+                        }
+                    }
+                    let take = take;
                     fee = dyn_fee;
                     need = amount.saturating_add(fee);
                     // Build every selected note's witness in ONE base→matured pass
@@ -6871,6 +6981,23 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
     }
     if selected < need {
         let have: u64 = have_total.unwrap_or(0);
+        // Log every near-miss, with the numbers that decide it.
+        //
+        // This refusal reaches the user and wrote NOTHING, so a report of "insufficient
+        // funds on a wallet that has funds" could not be traced afterwards — the numbers in
+        // the message were the only evidence, and they arrive truncated in a chat. Three
+        // separate diagnoses were attempted from arithmetic alone before this line existed.
+        //
+        // `fee_budget` is the gap the caller reserved for the fee, which is what the
+        // self-payment sizing below spends; printing it next to the fee actually chosen
+        // makes an under-reserved client obvious at a glance.
+        log::warn!(
+            "prepare shortfall: have {have}, need {need} (amount {amount} + fee {fee}), selected {selected} from {} candidate note(s), \
+             fee_budget {}, self_payment {self_payment}, allow_partial {allow_partial}, token {}",
+            inputs.len(),
+            have.saturating_sub(amount),
+            if session_token.is_some() { "yes" } else { "no" },
+        );
         // The notes exist, they just don't fit one transaction. Pay what this
         // transaction can carry and report the rest, if the caller opted in.
         let capacity = selected.saturating_sub(fee);
@@ -6901,10 +7028,35 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
                     ),
                 )
             } else {
-                err(
-                    StatusCode::CONFLICT,
-                    format!("insufficient matured funds: have {have}, need amount+fee={need} (funds must be ~10 min old to spend)"),
-                )
+                // Name the actual cause. "Insufficient matured funds" sent one user hunting
+                // for coins that were never missing: what had happened was that their
+                // consolidation SUCCEEDED, the merged note was still inside the ~10 minute
+                // maturity window, and the dust left behind was worth less than the cheapest
+                // possible fee. The old wording described the maturity rule while implying a
+                // shortfall, which is the least useful combination available.
+                // `chunk_fee(0, n)` is the relay minimum for n spends: the policy floor is 0,
+                // so the byte-priced minimum wins. Two spends is the smallest a merge can be.
+                let floor = chunk_fee(0, 2);
+                if have < floor {
+                    err(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "spendable balance {} ZKAS is below the {} ZKAS minimum network fee for a transaction, so there is nothing that can be sent or merged right now.                              If a payment or consolidation just went through, its output becomes spendable about 10 minutes after it is mined.",
+                            fmt_fc(have as u128),
+                            fmt_fc(floor as u128),
+                        ),
+                    )
+                } else {
+                    err(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "insufficient matured funds: spendable {} ZKAS, need {} ZKAS (amount plus a {} ZKAS fee). Funds become spendable about 10 minutes after they are mined.",
+                            fmt_fc(have as u128),
+                            fmt_fc(need as u128),
+                            fmt_fc(fee as u128),
+                        ),
+                    )
+                }
             });
         }
     }
@@ -7259,6 +7411,183 @@ async fn bearer_guard(State(expected): State<std::sync::Arc<String>>, req: Reque
     }
 }
 
+/// Longest a single `warm_chain_tree` call drives the shared tree before returning, so a
+/// wedged node cannot hang the request forever. The work resumes where it left off, so an
+/// operator can simply call again if `caught_up` came back false.
+const WARM_ENDPOINT_BUDGET_SECS: u64 = 90;
+
+/// Operator tool: drive the **shared chain tree** to the node tip right now.
+///
+/// The background sync advances the shared tree one chunk per lap and, after a restart,
+/// it can trail the matured tip for a long time — and while it does, every consolidation
+/// of an old note pays a full O(chain) climb (500–700 s) because `chain_tree_paths`
+/// declines until `size >= matured`. This endpoint runs the very same `sync_one_wallet`
+/// pass the background loop runs, just back-to-back until the tree reaches the tip, so an
+/// operator can close that window by hand instead of waiting it out.
+///
+/// It holds the tree's in-pass claim for the duration so the background lap does not
+/// double-sync it, and yields the tree's lock between chunks so concurrent sends can still
+/// borrow. Auth is the ordinary token gate — the work is idempotent and is exactly what
+/// the daemon already does, so any authorized caller may trigger it.
+async fn warm_chain_tree(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _token = token_from(&headers, state.allow_default_token)?;
+    let ct = state
+        .wallets
+        .lock()
+        .await
+        .get(CHAIN_TREE_TOKEN)
+        .cloned()
+        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "shared chain tree is not loaded yet"))?;
+
+    // No in-pass claim: this drives the very same `sync_one_wallet` the background lap
+    // runs, and both fully serialize on the tree's own mutex (each call holds it for one
+    // whole chunk), so running them concurrently just means they take turns advancing the
+    // same tree — correct, and never a conflict the operator has to retry around.
+
+    // Fresh tip so we know the target and don't stop short of it.
+    let chain_len = match state.sync_client().await {
+        Some(c) => match c.get_block_dag_info().await {
+            Ok(d) => d.virtual_daa_score,
+            Err(_) => state.node_tip.lock().await.0,
+        },
+        None => state.node_tip.lock().await.0,
+    };
+    if chain_len == 0 {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "node tip unknown; is the node up and synced?"));
+    }
+
+    let started = std::time::Instant::now();
+    let leaves_before = state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed);
+    let deadline = started + std::time::Duration::from_secs(WARM_ENDPOINT_BUDGET_SECS);
+    let mut chunks: u32 = 0;
+    let mut caught_up = false;
+    loop {
+        match sync_one_wallet(state.clone(), CHAIN_TREE_TOKEN.to_string(), ct.clone(), chain_len).await {
+            SyncOutcome::Idle => {
+                caught_up = true;
+                break;
+            }
+            // A reorg the tree could not follow: leave it for the sync loop's reorg path.
+            SyncOutcome::Retired(_) => break,
+            SyncOutcome::Behind => {}
+        }
+        chunks += 1;
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    let leaves_after = state.chain_tree_size.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Ensure the shared tree's subtree CACHE — the actual O(depth) index — is built.
+    //
+    // Catching up leaves is not enough on its own: `chain_tree_paths` calls
+    // `witness_paths_at`, which is an O(chain) replay until this cache exists, so an
+    // old-note consolidation stays at ~500 s even with the tree at the tip. The background
+    // builder is supposed to build it, but it is gated behind `!proving_now()` (lib.rs
+    // ~2607), and constant consolidation proving keeps that false — a self-sustaining
+    // stall, since the climbs that need the cache ARE the proofs that block it. An operator
+    // calling this means to pay for it now, so force the build unconditionally.
+    //
+    // Detached and OFF the tree's lock (snapshot -> fold -> install): the fold is a ~minutes
+    // O(chain) sweep, so holding the HTTP request (or the lock) for it would be wrong. The
+    // call returns at once with the state; re-call to see it flip to "ready". `build_in_flight`
+    // stops a second call from starting a duplicate fold.
+    let (cache_ready, cache_state) = {
+        let mut e = ct.lock().await;
+        let matured = e.matured_leaves().unwrap_or(leaves_after);
+        if e.db.subtree_cache_ready(matured) {
+            (true, "ready")
+        } else if e.build_in_flight {
+            (false, "building")
+        } else {
+            e.build_in_flight = true;
+            let job = e.db.subtree_build_job();
+            drop(e);
+            let ct2 = ct.clone();
+            tokio::spawn(async move {
+                let leaves = job.leaves();
+                let t = std::time::Instant::now();
+                log::info!("admin warm_chain_tree: shared tree subtree-cache build started ({leaves} leaves, off-lock)");
+                let built = tokio::task::spawn_blocking(move || job.run()).await.ok().flatten();
+                let mut e = ct2.lock().await;
+                e.build_in_flight = false;
+                if built.is_some_and(|b| e.db.install_subtree_cache(b)) {
+                    e.force_checkpoint = true;
+                    log::info!(
+                        "admin warm_chain_tree: shared tree subtree-cache COMPLETE in {:.1?} ({leaves} leaves) — consolidations now witness O(depth)",
+                        t.elapsed()
+                    );
+                } else {
+                    log::warn!("admin warm_chain_tree: shared tree subtree-cache did not install (stream moved under it); call again to retry");
+                }
+            });
+            (false, "started")
+        }
+    };
+
+    log::info!(
+        "admin warm_chain_tree: {leaves_before} -> {leaves_after} leaves (+{}) in {chunks} chunk(s), {:.1?}, caught_up={caught_up}, cache={cache_state}, tip_daa={chain_len}",
+        leaves_after.saturating_sub(leaves_before),
+        started.elapsed(),
+    );
+    Ok(Json(serde_json::json!({
+        "leaves_before": leaves_before,
+        "leaves_after": leaves_after,
+        "leaves_gained": leaves_after.saturating_sub(leaves_before),
+        "caught_up": caught_up,
+        "subtree_cache_ready": cache_ready,
+        "subtree_cache_state": cache_state,
+        "chunks": chunks,
+        "chain_tip_daa": chain_len,
+        "seconds": started.elapsed().as_secs_f64(),
+    })))
+}
+
+/// Operator tool: build one wallet's own **subtree cache** right now.
+///
+/// Complements [`warm_chain_tree`]: even when the shared tree cannot serve a wallet (it is
+/// borrowing, or a position falls outside what the shared stream can path), a wallet with
+/// its own cache witnesses old notes in O(depth) instead of an O(chain) replay. This is
+/// the targeted fix for a known note-heavy wallet whose consolidations are slow. The build
+/// is the one-time O(chain) pass, and its result is persisted (`force_checkpoint`) so a
+/// later restart does not repeat it.
+async fn warm_wallet(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let token = token_from(&headers, state.allow_default_token)?;
+    let w = state
+        .get_wallet(&token)
+        .await
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "wallet is not loaded; open it first, then retry"))?;
+    let started = std::time::Instant::now();
+    let (ready, matured, notes) = {
+        let mut e = w.lock().await;
+        let matured = e.matured_leaves().unwrap_or(0);
+        let notes = e.db.notes().len();
+        tokio::task::block_in_place(|| e.db.build_subtree_cache());
+        let ready = e.db.subtree_cache_ready(matured);
+        if ready {
+            // Expensive and public: persist it so a restart reloads it warm.
+            e.force_checkpoint = true;
+        }
+        (ready, matured, notes)
+    };
+    log::info!(
+        "admin warm_wallet {token}: subtree cache ready={ready} (notes={notes}, matured={matured}) in {:.1?}",
+        started.elapsed(),
+    );
+    Ok(Json(serde_json::json!({
+        "subtree_cache_ready": ready,
+        "notes": notes,
+        "matured_leaves": matured,
+        "seconds": started.elapsed().as_secs_f64(),
+    })))
+}
+
 /// Run the daemon until `shutdown` resolves (hold the sender forever to run
 /// forever). Returns once the HTTP server has stopped and the background loops are
 /// aborted, so an embedding process (the desktop app) can call `serve` again with a
@@ -7353,6 +7682,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         node_error: node_error.clone(),
         chain_tree: chain_tree.clone(),
         chain_tree_size: std::sync::atomic::AtomicU64::new(0),
+        chain_tree_base: std::sync::atomic::AtomicU64::new(0),
         chain_tree_frontier: Mutex::new(None),
         wallet_dir,
         prefix: prefix_from(&cfg.network),
@@ -7406,6 +7736,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     {
         let c = state.chain_tree.lock().await;
         state.chain_tree_size.store(c.db.size(), std::sync::atomic::Ordering::Relaxed);
+        state.chain_tree_base.store(c.db.base_size(), std::sync::atomic::Ordering::Relaxed);
         let fs = c.db.tip_frontier_state();
         drop(c);
         *state.chain_tree_frontier.lock().await = fs;
@@ -7558,6 +7889,10 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         .route("/api/wallet/submit", post(wallet_submit))
         .route("/api/wallet/sign", post(wallet_sign))
         .route("/api/verify", post(verify))
+        // Operator tools: force the shared tree / a wallet to the tip on demand, so a
+        // restart's catch-up window can be closed by hand instead of waited out.
+        .route("/api/admin/warm_chain_tree", post(warm_chain_tree))
+        .route("/api/admin/warm_wallet", post(warm_wallet))
         .with_state(state.clone());
 
     // Transport auth: gate every route behind the bearer token when one is configured
