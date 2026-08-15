@@ -2768,7 +2768,16 @@ impl WalletEntry {
                         }
                         // Phase 1: roll the base up to our notes (cost is leaves, not
                         // leaves×budget), which shortens every later replay.
-                        if tokio::task::block_in_place(|| self.db.advance_base_capped(matured, COLD_WARM_STEP)) {
+                        // Freeze base compaction while an off-lock cache build is in flight.
+                        // The build snapshots (base, leaves) and `install_subtree_cache`
+                        // rejects it if the base moved since — so a wallet whose base kept
+                        // advancing (consolidation spends its oldest note, the cap rises,
+                        // the base rolls up) rebuilt forever, never installing (117 "the
+                        // stream moved" failures live). The base is a memory optimisation;
+                        // it can wait the ~minutes a build takes, then resume.
+                        if !self.build_in_flight
+                            && tokio::task::block_in_place(|| self.db.advance_base_capped(matured, COLD_WARM_STEP))
+                        {
                             continue;
                         }
                         // A wallet holding ZERO notes has nothing to witness: phases 2-3
@@ -2854,7 +2863,9 @@ impl WalletEntry {
                         // ordinary sync (a 1-note wallet stuck at "syncing 97%").
                         let steady_cap = (COLD_WARM_BUDGET / budget as u64).clamp(WITNESS_MIN_STEP, WITNESS_ADVANCE_CAP);
                         tokio::task::block_in_place(|| {
-                            self.db.advance_base_capped(matured, BASE_ADVANCE_STEP);
+                            if !self.build_in_flight {
+                                self.db.advance_base_capped(matured, BASE_ADVANCE_STEP);
+                            }
                             // Only a WARM wallet belongs on the incremental step: it is a
                             // few appends per new leaf (one leaf per block at 1 BPS). A
                             // wallet still waiting for a warm permit must NOT do its
@@ -2965,7 +2976,11 @@ impl WalletEntry {
         // send's critical path, and an abandoned sweep keeps no progress, so yielding
         // would only make this user wait longer and repeat the work.
         let span = matured.saturating_sub(self.db.base_size());
-        if span >= SUBTREE_CACHE_MIN_SPAN && !self.db.subtree_cache_failed() {
+        // Don't build inline if a background build is already folding this stream: it
+        // would be a second O(chain) walk (blocking THIS send for ~minutes) for the same
+        // result. Let the background build install; this one send takes the O(chain) batch
+        // path once, and every send after the install is O(depth).
+        if span >= SUBTREE_CACHE_MIN_SPAN && !self.db.subtree_cache_failed() && !self.build_in_flight {
             let t = std::time::Instant::now();
             self.db.build_subtree_cache();
             if self.db.subtree_cache_ready(matured) {
@@ -3455,6 +3470,15 @@ const PREPARED_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 /// is a far better outcome for the user than being told to retry — which is what
 /// produced the retry storms in the first place.
 const PREPARE_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// How long a consolidation WAITS for a prover/consolidate slot before giving up.
+///
+/// Consolidation used to fail the instant a slot was busy ("another wallet is
+/// consolidating") — sensible when a merge took tens of seconds and was rare, but with
+/// per-wallet subtree caches a merge is ~seconds, so a slot frees almost immediately and
+/// the right thing is to WAIT a little, not reject. Kept well under `PREPARE_QUEUE_WAIT`
+/// so a user-facing PAYMENT still has priority for the prover.
+const CONSOLIDATE_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Releases this wallet's in-flight prepare marker on every exit path, including the
 /// `?` early returns and a panic in the proving task.
@@ -6732,12 +6756,20 @@ async fn wallet_prepare(
     };
 
     let _consolidate_permit = if self_payment {
-        Some(state.consolidate_gate.try_acquire().map_err(|_| {
-            err(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "another wallet is consolidating right now; consolidation yields to payments — try again shortly",
-            )
-        })?)
+        // WAIT for a consolidation slot rather than reject on the first busy instant. A
+        // merge is now ~seconds, so the slot frees quickly; blocking here means the user's
+        // request simply completes a moment later instead of bouncing with "try again".
+        Some(
+            tokio::time::timeout(CONSOLIDATE_QUEUE_WAIT, state.consolidate_gate.acquire())
+                .await
+                .map_err(|_| {
+                    err(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Still merging other wallets — your consolidation is queued and didn't get a turn this time. It's safe to try again in a minute.",
+                    )
+                })?
+                .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "consolidate gate closed"))?,
+        )
     } else {
         None
     };
@@ -6757,17 +6789,23 @@ async fn wallet_prepare(
     // payment somebody is waiting on" — applied to the merge a user asks for, and to the
     // background maintenance the wallet app now performs on its own.
     let _prepare_permit = if self_payment {
-        state.prepare_gate.try_acquire().map_err(|_| {
-            err(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "payments are using the prover right now; consolidation waits for a quiet moment — try again shortly",
-            )
-        })?
+        // WAIT for the prover instead of yielding immediately. Payments still get priority
+        // — their queue window (PREPARE_QUEUE_WAIT) is longer, and on the same fair
+        // semaphore — but a consolidation now waits its short turn rather than bouncing.
+        tokio::time::timeout(CONSOLIDATE_QUEUE_WAIT, state.prepare_gate.acquire())
+            .await
+            .map_err(|_| {
+                err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "The prover is busy with payments right now — your consolidation is queued and didn't get a turn this time. Try again in a minute.",
+                )
+            })?
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare gate closed"))?
     } else {
         tokio::time::timeout(PREPARE_QUEUE_WAIT, state.prepare_gate.acquire())
             .await
             .map_err(|_| {
-                err(StatusCode::SERVICE_UNAVAILABLE, "the daemon is still busy preparing other payments; please try again shortly")
+                err(StatusCode::SERVICE_UNAVAILABLE, "The daemon is still preparing other payments — please try again in a moment.")
             })?
             .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare gate closed"))?
     };
