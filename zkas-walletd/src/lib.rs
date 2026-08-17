@@ -936,6 +936,12 @@ const SCAN_HEADER_LEN: usize = 77;
 // checkpoint blob stays small, so frequent writes are cheap.
 const CHECKPOINT_EVERY: usize = 1000;
 
+/// Minimum block lead a twin must have over THIS wallet's own checkpoint before it is
+/// worth cloning instead of scanning the gap. Below this, the argon2 + decrypt cost of
+/// adoption outweighs just scanning the few blocks; well above it (a second device that
+/// entered the same seed and is many hours behind) the clone is the whole point.
+const TWIN_ADOPT_LEAD: u64 = 5_000;
+
 /// Max leaves the background loop advances a wallet's spend-witnesses per step before
 /// yielding, so a large catch-up never runs as one core-pinning burst.
 #[allow(dead_code)]
@@ -3538,11 +3544,21 @@ impl AppState {
         // A bare `try_lock().ok()?` returned `None` the instant the sync loop held the
         // tree for its (sub-second) tip-follow chunk — and `None` here sends the spend
         // down `witness_paths_at`, an O(chain) replay that is 500–700 s for an old note.
-        // Trading a ~2 s wait for the tree against a ~10-minute climb is not close. This
+        // Trading a wait for the tree against a ~10-minute climb is not close. This
         // runs under `block_in_place` (see `batch_witness_paths`), so a blocking sleep is
         // correct here; the deadline caps it so a genuinely wedged tree still falls back.
+        //
+        // Why 20 s, not 2 s: measured live, the chain tree's own catch-up chunk holds this
+        // lock ~8 s during a heavy `GetShieldedBlocks` ingest (1978 ms/page × 4 pages), and
+        // the pinned shared tree runs those chunks back-to-back with only a per-page sleep
+        // between them. A 2 s deadline expired inside a single ingest chunk, so ~1/3 of
+        // sends fell to the climb even with the subtree cache READY and able to answer in
+        // µs the instant the lock is free (observed: 12 climbs of 675–1520 s in 40 min).
+        // 20 s spans an ingest chunk plus its inter-page window, so the reader wins the
+        // lock and serves from the cache; only a tree wedged for longer than that — the
+        // case the fallback exists for — still declines.
         let e = {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
             loop {
                 if let Ok(g) = self.chain_tree.try_lock() {
                     break g;
@@ -3969,6 +3985,51 @@ impl AppState {
         .ok()?
     }
 
+    /// Highest `scanned` block height across same-viewing-key twins of `token`, if any.
+    ///
+    /// A read-only peek used to decide whether an already-checkpointed wallet should
+    /// jump to a sibling that is further along (see the load path). Twins share the
+    /// viewing key, so `load_checkpoint` parses their file with THIS wallet's key and
+    /// hands back the donor's `scanned` (field .2) without mutating anything. Resident
+    /// wallets are read from memory (freshest); the rest are peeked from disk. Never
+    /// takes a lock across the node and never writes.
+    async fn best_twin_scanned(&self, token: &str, fvk: &[u8; 96]) -> Option<u64> {
+        let candidates: Vec<String> = {
+            let idx = self.fvk_index.lock().await;
+            idx.get(fvk)?.iter().filter(|t| t.as_str() != token).cloned().collect()
+        };
+        if candidates.is_empty() {
+            return None;
+        }
+        // Prefer the live figure for a resident twin — its on-disk checkpoint can lag its
+        // actual progress by up to CHECKPOINT_EVERY blocks.
+        let mut best = 0u64;
+        {
+            let map = self.wallets.lock().await;
+            for t in &candidates {
+                if let Some(w) = map.get(t) {
+                    if let Ok(e) = w.try_lock() {
+                        best = best.max(e.scanned as u64);
+                    }
+                }
+            }
+        }
+        let (dir, genesis) = (self.wallet_dir.clone(), self.genesis);
+        let (fvk, candidates) = (*fvk, candidates);
+        let disk = tokio::task::spawn_blocking(move || {
+            let mut m = 0u64;
+            for t in &candidates {
+                if let Some(r) = load_checkpoint(&dir, t, WalletKey::Fvk(fvk), &genesis, None) {
+                    m = m.max(r.2 as u64);
+                }
+            }
+            m
+        })
+        .await
+        .unwrap_or(0);
+        Some(best.max(disk)).filter(|&v| v > 0)
+    }
+
     async fn get_wallet(self: &Arc<Self>, token: &str) -> Option<Wallet> {
         // Mark the wallet active so the sync loop keeps it current; idle wallets are
         // parked (see `sync_loop`).
@@ -4070,9 +4131,30 @@ impl AppState {
         // adopted file then goes through the SAME `load_checkpoint` verification as any
         // other — including the cursor-on-selected-chain test above. If any of that
         // declines, this falls through to the honest scan exactly as before.
+        // Adopt a twin even when THIS token already has a (partial) checkpoint, as long
+        // as a sibling on the same viewing key has scanned meaningfully further. The old
+        // gate was `restored.is_none()`, so two devices that entered the same seed at the
+        // same time BOTH ran a full genesis scan: whoever registered first had no
+        // checkpoint to donate yet, and once the slower device wrote its own partial
+        // checkpoint it never reconsidered the twin — it ground out the whole ~40-minute
+        // decrypt-bound scan while its sibling sat synced on the same disk. Now the slower
+        // device jumps to the faster one. Nothing is trusted: the adopted file goes
+        // through the same `load_checkpoint` verification (cursor-on-selected-chain
+        // included), so a divergent donor still declines to the honest scan.
+        let mine_scanned = restored.as_ref().map(|r| r.2 as u64).unwrap_or(0);
+        let prefer_twin = match (restored.is_some(), key.fvk_bytes()) {
+            (true, Some(fvk)) => {
+                // Only worth the argon2/decrypt of adoption if a twin is >TWIN_ADOPT_LEAD
+                // blocks ahead — a small lead is cheaper to just scan than to clone.
+                self.best_twin_scanned(token, &fvk)
+                    .await
+                    .is_some_and(|twin_scanned| twin_scanned > mine_scanned + TWIN_ADOPT_LEAD)
+            }
+            _ => false,
+        };
         let restored = match restored {
-            Some(r) => Some(r),
-            None => match key.fvk_bytes() {
+            Some(r) if !prefer_twin => Some(r),
+            _ => match key.fvk_bytes() {
                 Some(fvk) => match self.adopt_twin(token, &fvk, birthday).await {
                     Some((donor, keep_birthday)) => {
                         match load_checkpoint(&self.wallet_dir, token, key, &genesis, tip.as_ref()) {
