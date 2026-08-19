@@ -29,6 +29,8 @@
 //! `consensus::…::real_shielded_spend_through_mined_block`). The client itself is
 //! network-agnostic; once the note is ~10 minutes deep, the spend is accepted.
 
+use std::io::Read;
+
 use clap::{Parser, Subcommand};
 use kaspa_addresses::{Address, Prefix, Version};
 use kaspa_consensus_core::tx::{TX_VERSION_SHIELDED, Transaction};
@@ -154,6 +156,10 @@ enum Cmd {
         /// Test convenience: the 32-byte seed is `[byte; 32]`. Prefer `--seed-hex`.
         #[arg(long)]
         seed_byte: Option<u8>,
+        /// Read the 64-hex-character seed from standard input. This is mutually
+        /// exclusive with --seed-hex and --seed-byte.
+        #[arg(long)]
+        seed_stdin: bool,
         /// Network prefix: mainnet | testnet | devnet | simnet (scopes the signature).
         #[arg(long, default_value = "mainnet")]
         network: String,
@@ -233,18 +239,39 @@ fn resolve_seed(seed_hex: Option<String>, seed_byte: Option<u8>) -> [u8; 32] {
             }
             [b; 32]
         }
-        (Some(h), None) => {
-            let h = h.trim();
-            if h.len() != 64 {
-                fatal("--seed-hex must be exactly 32 bytes (64 hex chars)".into());
-            }
-            let bytes: Vec<u8> = (0..64)
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap_or_else(|_| fatal("--seed-hex is not valid hex".into())))
-                .collect();
-            bytes.try_into().expect("checked length 32")
-        }
+        (Some(h), None) => parse_seed_hex(&h).unwrap_or_else(|err| fatal(err)),
     }
+}
+
+fn parse_seed_hex(seed_hex: &str) -> Result<[u8; 32], String> {
+    let seed_hex = seed_hex.trim();
+    if seed_hex.len() != 64 {
+        return Err("--seed-hex must be exactly 32 bytes (64 hex chars)".into());
+    }
+
+    let mut seed = [0u8; 32];
+    for (i, byte) in seed.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&seed_hex[i * 2..i * 2 + 2], 16).map_err(|_| "--seed-hex is not valid hex")?;
+    }
+    Ok(seed)
+}
+
+fn seed_from_reader(mut reader: impl Read) -> Result<[u8; 32], String> {
+    let mut seed_hex = String::new();
+    reader.read_to_string(&mut seed_hex).map_err(|err| format!("failed to read seed from standard input: {err}"))?;
+    parse_seed_hex(&seed_hex)
+}
+
+/// Resolve a signing seed without putting a real seed in the command line. This
+/// input mode deliberately exists only for the offline `sign` subcommand: a
+/// seed read from standard input must never be routed into an RPC-spending path.
+fn resolve_sign_seed(seed_hex: Option<String>, seed_byte: Option<u8>, seed_stdin: bool) -> [u8; 32] {
+    let source_count = usize::from(seed_hex.is_some()) + usize::from(seed_byte.is_some()) + usize::from(seed_stdin);
+    if source_count != 1 {
+        fatal("give exactly one of --seed-hex, --seed-byte, or --seed-stdin".into());
+    }
+
+    if seed_stdin { seed_from_reader(std::io::stdin()).unwrap_or_else(|err| fatal(err)) } else { resolve_seed(seed_hex, seed_byte) }
 }
 
 /// Derive the bech32 shielded address string for a seed on a network. Uses
@@ -332,6 +359,24 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
         return None;
     }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::seed_from_reader;
+
+    #[test]
+    fn reads_a_seed_from_standard_input() {
+        let seed = seed_from_reader(Cursor::new("0a".repeat(32) + "\n")).expect("valid stdin seed");
+        assert_eq!(seed, [0x0a; 32]);
+    }
+
+    #[test]
+    fn rejects_an_invalid_standard_input_seed() {
+        assert!(seed_from_reader(Cursor::new("not-a-seed")).is_err());
+    }
 }
 
 /// Sign a message with a wallet seed, proving control of the wallet's shielded
@@ -715,8 +760,8 @@ async fn main() {
         Cmd::Send { rpc_server, owner_seed_hex, owner_seed_byte, to, amount, fee, anchor_depth } => {
             send(rpc_server, resolve_seed(owner_seed_hex, owner_seed_byte), to, amount, fee, anchor_depth).await;
         }
-        Cmd::Sign { seed_hex, seed_byte, network, message } => {
-            sign(resolve_seed(seed_hex, seed_byte), network, message);
+        Cmd::Sign { seed_hex, seed_byte, seed_stdin, network, message } => {
+            sign(resolve_sign_seed(seed_hex, seed_byte, seed_stdin), network, message);
         }
         Cmd::Verify { address, message, sig } => {
             verify(address, message, sig);
