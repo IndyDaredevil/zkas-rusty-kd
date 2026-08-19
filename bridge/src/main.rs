@@ -164,12 +164,14 @@ fn initialize_config() -> BridgeConfig {
 /// Log the bridge configuration at startup
 fn log_bridge_configuration(config: &BridgeConfig) {
     let instance_count = config.instances.len();
-    // v2.0.1.2: release identity in the banner. Convention: engine-prefixed
-    // build number (engine 2.0.1, bridge build N). The engine echo doubles as
-    // a rebase mismatch alarm: prefix and CARGO_PKG_VERSION must agree.
-    const BRIDGE_RELEASE: &str = "v2.0.1.2";
+    // v2.0.1.4: engine prefix DERIVED from CARGO_PKG_VERSION (the workspace/
+    // engine version), so banner and engine cannot disagree. Only the build
+    // ordinal below is hand-bumped per release -- it is the release checklist
+    // item, and the tag must match it. Convention: vE.N.G.B.
+    const BRIDGE_BUILD: u32 = 4;
+    let bridge_release = format!("v{}.{}", env!("CARGO_PKG_VERSION"), BRIDGE_BUILD);
     tracing::info!("----------------------------------");
-    tracing::info!("RC merged bridge {} (engine {})", BRIDGE_RELEASE, env!("CARGO_PKG_VERSION"));
+    tracing::info!("RC merged bridge {} (engine {})", bridge_release, env!("CARGO_PKG_VERSION"));
     tracing::info!("initializing bridge ({} instance{})", instance_count, if instance_count > 1 { "s" } else { "" });
     tracing::info!("\tkaspad:          {} (shared)", config.global.kaspad_address);
     tracing::info!("\tblock wait:      {:?}", config.global.block_wait_time);

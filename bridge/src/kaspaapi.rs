@@ -446,6 +446,12 @@ impl KaspaApi {
         tokio::spawn(async move {
             api_clone.start_stats_thread().await;
         });
+        // Start ZKas-leg network stats thread (no-op ticks in plain mode; the
+        // slot is re-read every tick, so late attach and detach are handled).
+        let api_clone = Arc::clone(&api);
+        tokio::spawn(async move {
+            api_clone.start_zkas_stats_thread().await;
+        });
 
         // Start node status polling thread (for console status display)
         let api_clone = Arc::clone(&api);
@@ -503,6 +509,48 @@ impl KaspaApi {
 
             // Record network stats
             record_network_stats(hashrate_response.network_hashes_per_second, dag_response.block_count, dag_response.difficulty);
+        }
+    }
+    /// ZKas-leg twin of `start_stats_thread`: same 30s cadence, same node-side
+    /// windowed estimator, recorded to the ks_zkas_* network gauges. Reads the
+    /// zkas slot each tick rather than binding to it, so plain mode and the
+    /// pre-attach window simply skip.
+    async fn start_zkas_stats_thread(self: Arc<Self>) {
+        use crate::prom::record_zkas_network_stats;
+        use kaspa_rpc_core::{EstimateNetworkHashesPerSecondRequest, GetBlockDagInfoRequest};
+
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+
+            let Some(leg) = self.zkas_leg() else { continue };
+
+            let dag_response = match leg.client.get_block_dag_info_call(None, GetBlockDagInfoRequest {}).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("failed to get network stats from zkas node, ks_zkas_* gauges will be stale: {}", e);
+                    continue;
+                }
+            };
+
+            let Some(tip_hash) = dag_response.tip_hashes.first().copied() else {
+                warn!("no zkas tip hashes available for network hashrate estimation");
+                continue;
+            };
+
+            let hashrate_response = match leg
+                .client
+                .estimate_network_hashes_per_second_call(None, EstimateNetworkHashesPerSecondRequest::new(1000, Some(tip_hash)))
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("failed to estimate zkas network hashrate, ks_zkas_* gauges will be stale: {}", e);
+                    continue;
+                }
+            };
+
+            record_zkas_network_stats(hashrate_response.network_hashes_per_second, dag_response.difficulty);
         }
     }
 

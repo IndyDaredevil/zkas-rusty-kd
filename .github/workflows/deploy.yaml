@@ -28,6 +28,28 @@ jobs:
 
       - name: Checkout sources
         uses: actions/checkout@v3
+      - name: Verify release tag matches banner version
+        shell: bash
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          if [[ ! "$tag" =~ ^v[0-9] ]]; then
+            echo "non-version tag '$tag' -- guard skipped (canary/rc release)"
+            exit 0
+          fi
+          engine=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          build=$(sed -n 's/.*const BRIDGE_BUILD: u32 = \([0-9]\+\);.*/\1/p' bridge/src/main.rs)
+          if [[ -z "$engine" || -z "$build" ]]; then
+            echo "FAILED to extract engine ('$engine') or build ('$build') -- guard is broken, not the release"
+            exit 1
+          fi
+          expected="v${engine}.${build}"
+          if [[ "$tag" =~ ^"$expected"([^0-9]|$) ]]; then
+            echo "OK: tag '$tag' matches banner $expected"
+          else
+            echo "TAG/BANNER MISMATCH: tag is '$tag' but the binary will announce $expected"
+            echo "Bump BRIDGE_BUILD in bridge/src/main.rs, or fix the tag. Nothing was built."
+            exit 1
+          fi
 
       - name: Install Protoc
         uses: arduino/setup-protoc@v3

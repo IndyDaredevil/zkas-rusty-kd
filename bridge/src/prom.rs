@@ -103,6 +103,11 @@ static NETWORK_DIFFICULTY: OnceLock<Gauge> = OnceLock::new();
 
 /// Network block count gauge
 static NETWORK_BLOCK_COUNT: OnceLock<Gauge> = OnceLock::new();
+/// ZKas network difficulty gauge (merged leg; 0 in plain mode / before attach)
+static ZKAS_NETWORK_DIFFICULTY: OnceLock<Gauge> = OnceLock::new();
+
+/// ZKas estimated network hashrate gauge (merged leg; 0 in plain mode / before attach)
+static ZKAS_ESTIMATED_NETWORK_HASHRATE: OnceLock<Gauge> = OnceLock::new();
 
 /// Worker start time gauge (Unix timestamp in seconds)
 static WORKER_START_TIME: OnceLock<GaugeVec> = OnceLock::new();
@@ -273,6 +278,14 @@ pub fn init_metrics() {
 
     NETWORK_BLOCK_COUNT
         .get_or_init(|| register_gauge!("ks_network_block_count", "Gauge representing the network block count").unwrap());
+    ZKAS_NETWORK_DIFFICULTY.get_or_init(|| {
+        register_gauge!("ks_zkas_network_difficulty_gauge", "ZKas network difficulty (live, from the merged leg node)").unwrap()
+    });
+
+    ZKAS_ESTIMATED_NETWORK_HASHRATE.get_or_init(|| {
+        register_gauge!("ks_zkas_estimated_network_hashrate_gauge", "ZKas estimated network hashrate (live, from the merged leg node)")
+            .unwrap()
+    });
 
     WORKER_START_TIME.get_or_init(|| {
         register_gauge_vec!("ks_worker_start_time", "Unix timestamp (seconds) when worker first connected", WORKER_LABELS).unwrap()
@@ -877,6 +890,16 @@ pub fn record_network_stats(hashrate: u64, block_count: u64, difficulty: f64) {
         gauge.set(block_count as f64);
     }
     if let Some(gauge) = NETWORK_DIFFICULTY.get() {
+        gauge.set(difficulty);
+    }
+}
+/// Record ZKas-leg network stats (merged mode). Replaces the stale rules-side
+/// network-hashrate pin (BL-016): rules should read these gauges, guarded > 0.
+pub fn record_zkas_network_stats(hashrate: u64, difficulty: f64) {
+    if let Some(gauge) = ZKAS_ESTIMATED_NETWORK_HASHRATE.get() {
+        gauge.set(hashrate as f64);
+    }
+    if let Some(gauge) = ZKAS_NETWORK_DIFFICULTY.get() {
         gauge.set(difficulty);
     }
 }
