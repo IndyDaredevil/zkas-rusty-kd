@@ -129,10 +129,20 @@ pub struct HistoryEntry {
     /// v2 `GetShieldedBlocks` fields).
     pub timestamp_ms: u64,
     /// Coinbase/Received: value arriving. Sent: value paid to others (fee not
-    /// included; OVK-recovered when available, else net outflow minus fee).
+    /// included; OVK-recovered when available, else net outflow minus fee). A
+    /// compact-only historical send instead stores its net outflow; see
+    /// [`Self::amount_is_net_outflow`].
     pub amount: u64,
     /// Sent rows: the public fee the bundle burned (`value_balance`); else 0.
     pub fee: u64,
+    /// `true` when a compact archive reconstructed a historical spend. Compact
+    /// records reveal our spent notes and change, but omit the full bundle's
+    /// recipient, memo, and fee; `amount` is therefore net outflow (paid amount
+    /// plus fee), not the amount delivered to the recipient.
+    pub amount_is_net_outflow: bool,
+    /// Whether `fee` came from the full bundle. `false` for compact-only
+    /// historical sends, where a displayed zero must not be mistaken for zero fee.
+    pub fee_known: bool,
     /// Sent rows: the recipient's raw Orchard address, when recoverable via our
     /// OVK. `None` for pre-OVK sends (recipient unknowable even to us).
     pub recipient: Option<[u8; 43]>,
@@ -993,23 +1003,39 @@ impl WalletDb {
             }
             if let Some(m) = meta {
                 if let Some(txid) = m.txids.get(bi).copied() {
-                    self.record_income_history_compact(spent, &received, txid, m);
+                    self.record_history_compact(spent, &received, txid, m);
                 }
             }
         }
     }
 
-    /// Record income history for a compact-ingested tx. Compact records carry no
-    /// out_ciphertext / value_balance, so an outgoing spend's recipient/memo/fee are
-    /// not reconstructable from the chain (that detail is recorded at send time);
-    /// here we record only income we received (memo is empty in compact form).
-    fn record_income_history_compact(&mut self, spent: u64, received: &[ReceivedNote], txid: [u8; 32], meta: &BlockMeta) {
+    /// Record history for a compact-ingested transaction. Compact records carry no
+    /// out_ciphertext / value_balance, so an outgoing spend's recipient, memo, and
+    /// exact fee are not reconstructable. Still record the spend: our nullifiers and
+    /// decryptable change give its exact net outflow, which is vital for historical
+    /// watch-only reconciliation after a rescan.
+    fn record_history_compact(&mut self, spent: u64, received: &[ReceivedNote], txid: [u8; 32], meta: &BlockMeta) {
         if !self.history_enabled {
             return;
         }
         let received_value: u64 = received.iter().map(|r| r.value()).sum();
-        if spent > 0 || received_value == 0 {
-            return; // our own spend (recorded at send time) or not our tx
+        if spent > 0 {
+            self.push_history(HistoryEntry {
+                kind: HistoryKind::Sent,
+                txid,
+                daa_score: meta.daa_score,
+                timestamp_ms: meta.timestamp_ms,
+                amount: spent.saturating_sub(received_value),
+                fee: 0,
+                amount_is_net_outflow: true,
+                fee_known: false,
+                recipient: None,
+                memo: Vec::new(),
+            });
+            return;
+        }
+        if received_value == 0 {
+            return; // not our transaction
         }
         let entry = HistoryEntry {
             kind: HistoryKind::Received,
@@ -1018,10 +1044,12 @@ impl WalletDb {
             timestamp_ms: meta.timestamp_ms,
             amount: received_value,
             fee: 0,
+            amount_is_net_outflow: false,
+            fee_known: true,
             recipient: received.first().map(|note| note.note.recipient().to_raw_address_bytes()),
             memo: Vec::new(),
         };
-        self.history.push(entry);
+        self.push_history(entry);
     }
 
     /// Value of the owned note (unspent or pending-spend) this nullifier would
@@ -1046,6 +1074,8 @@ impl WalletDb {
             timestamp_ms: meta.timestamp_ms,
             amount: value,
             fee: 0,
+            amount_is_net_outflow: false,
+            fee_known: true,
             recipient: None,
             memo: Vec::new(),
         });
@@ -1105,6 +1135,8 @@ impl WalletDb {
                 timestamp_ms: meta.timestamp_ms,
                 amount: if recipient.is_some() { recovered_paid } else { net_out.saturating_sub(fee) },
                 fee,
+                amount_is_net_outflow: false,
+                fee_known: true,
                 recipient,
                 memo,
             }
@@ -1116,6 +1148,8 @@ impl WalletDb {
                 timestamp_ms: meta.timestamp_ms,
                 amount: received_value,
                 fee: 0,
+                amount_is_net_outflow: false,
+                fee_known: true,
                 // A diversified address is private on-chain but visible to this
                 // wallet's FVK. Preserve it so a watch-only merchant gateway can
                 // reconcile one unique invoice address without amount matching.
@@ -1765,8 +1799,7 @@ impl WalletDb {
         let found = scan_compact_auto(&self.prepared_ivk, self.agree_scalar.as_ref(), all);
         self.scan_cost.decrypt_ns += t_dec.elapsed().as_nanos();
         self.scan_cost.actions += all.len() as u64;
-        let mut map: std::collections::HashMap<[u8; 32], Option<ReceivedNote>> =
-            all.iter().map(|r| (r.nullifier, None)).collect();
+        let mut map: std::collections::HashMap<[u8; 32], Option<ReceivedNote>> = all.iter().map(|r| (r.nullifier, None)).collect();
         for n in found {
             if let Some(rec) = all.get(n.action_index) {
                 map.insert(rec.nullifier, Some(n));
@@ -2444,6 +2477,7 @@ impl WalletDb {
             hsec.extend_from_slice(&h.timestamp_ms.to_le_bytes());
             hsec.extend_from_slice(&h.amount.to_le_bytes());
             hsec.extend_from_slice(&h.fee.to_le_bytes());
+            hsec.push((h.amount_is_net_outflow as u8) | ((h.fee_known as u8) << 1));
             match &h.recipient {
                 Some(r) => {
                     hsec.push(1);
@@ -2617,7 +2651,7 @@ impl WalletDb {
         if version >= CHECKPOINT_VERSION_V6 {
             if let Some(hlen) = r.u64() {
                 if let Some(hbuf) = r.take(hlen as usize) {
-                    Self::read_history_section(&mut db, hbuf);
+                    Self::read_history_section(&mut db, hbuf, version >= CHECKPOINT_VERSION_V9);
                 }
             }
         }
@@ -2739,9 +2773,10 @@ impl WalletDb {
         }
     }
 
-    /// Best-effort restore of the v6 history section. Any malformed row drops the
+    /// Best-effort restore of the v6 history section. v9 adds compact-send flags.
+    /// Any malformed row drops the
     /// whole section (history restarts from here on) — never fails the restore.
-    fn read_history_section(db: &mut Self, buf: &[u8]) {
+    fn read_history_section(db: &mut Self, buf: &[u8], has_compact_flags: bool) {
         let mut r = Cursor { buf, pos: 0 };
         let parse = |r: &mut Cursor<'_>| -> Option<Vec<HistoryEntry>> {
             let n = (r.u64()? as usize).min(HISTORY_CAP);
@@ -2758,6 +2793,15 @@ impl WalletDb {
                 let timestamp_ms = r.u64()?;
                 let amount = r.u64()?;
                 let fee = r.u64()?;
+                let (amount_is_net_outflow, fee_known) = if has_compact_flags {
+                    let flags = r.u8()?;
+                    if flags & !0b11 != 0 {
+                        return None;
+                    }
+                    (flags & 1 != 0, flags & 2 != 0)
+                } else {
+                    (false, true)
+                };
                 let recipient = match r.u8()? {
                     0 => None,
                     1 => Some(r.arr::<43>()?),
@@ -2765,7 +2809,18 @@ impl WalletDb {
                 };
                 let memo_len = u16::from_le_bytes(r.arr::<2>()?) as usize;
                 let memo = r.take(memo_len)?.to_vec();
-                out.push(HistoryEntry { kind, txid, daa_score, timestamp_ms, amount, fee, recipient, memo });
+                out.push(HistoryEntry {
+                    kind,
+                    txid,
+                    daa_score,
+                    timestamp_ms,
+                    amount,
+                    fee,
+                    amount_is_net_outflow,
+                    fee_known,
+                    recipient,
+                    memo,
+                });
             }
             r.done().then_some(out)
         };
@@ -2941,7 +2996,10 @@ fn read_witness(r: &mut Cursor<'_>) -> Option<IncrementalWitness<MerkleHashOrcha
 /// which is half of how a lost transaction became lost money.
 /// v8 persists the root-gated complete-subtree index, avoiding a full Sinsemilla
 /// rebuild after every daemon eviction/restart. It contains public chain state only.
-const CHECKPOINT_VERSION: u8 = 8;
+/// v9 annotates history rows reconstructed from compact scan data, so clients never
+/// mistake their net outflow or placeholder fee for exact payment details.
+const CHECKPOINT_VERSION: u8 = 9;
+const CHECKPOINT_VERSION_V9: u8 = 9;
 const CHECKPOINT_VERSION_V7: u8 = 7;
 /// v6 appended the history rows. A pure suffix of v5.
 const CHECKPOINT_VERSION_V6: u8 = 6;
@@ -4761,6 +4819,41 @@ mod circuit_tests {
         assert_eq!(sent.kind, HistoryKind::Sent);
         assert_eq!(sent.amount, 3_000, "net-outflow fallback still prices the send right");
         assert_eq!(sent.recipient, None, "without the OVK not even the sender can recover the recipient");
+
+        // A later watch-only rescan sees the same transaction through the compact
+        // archive. It lacks the full bundle's fee/OVK ciphertext, but it MUST still
+        // index our spend from its nullifier and the change it decrypts.
+        let mut compact = WalletDb::from_seed(miner).unwrap();
+        compact.ingest_block_compact_with_meta(
+            &[cb(address_bytes_from_seed(miner).unwrap(), b"compact||0", 8_000)],
+            &[],
+            Some(&meta1),
+        );
+        let inputs = vec![(compact.notes()[0].note.clone(), compact.witness_path(compact.notes()[0].position).unwrap())];
+        let payload = crate::wallet::build::build_wallet_payment(
+            miner,
+            inputs,
+            address_bytes_from_seed(friend).unwrap(),
+            5_000,
+            1_000,
+            &net,
+            ctx,
+            true,
+            [0u8; 512],
+        )
+        .expect("compact-history payment builds");
+        let compact_wire = ShieldedBundle::from_bytes(&payload).unwrap();
+        let compact_records = compact_wire.actions.iter().map(crate::wallet::scan::CompactActionRecord::from_wire).collect();
+        compact.ingest_block_compact_with_meta(&[], &[compact_records], Some(&meta2));
+        let compact_sent = compact.history().last().unwrap();
+        assert_eq!(compact_sent.kind, HistoryKind::Sent);
+        assert_eq!(compact_sent.amount, 6_000, "compact history records exact net outflow");
+        assert!(compact_sent.amount_is_net_outflow, "client must know this includes the unrecoverable fee");
+        assert!(!compact_sent.fee_known, "compact archive has no value_balance");
+        assert_eq!(compact_sent.recipient, None, "compact archive cannot recover recipient");
+        let compact_restored = WalletDb::from_checkpoint(miner, &compact.to_checkpoint()).unwrap();
+        let compact_sent = compact_restored.history().last().unwrap();
+        assert!(compact_sent.amount_is_net_outflow && !compact_sent.fee_known, "compact-history semantics survive restart");
     }
 
     /// The vanishing-balance regression (live report 2026-07-18): a submitted
