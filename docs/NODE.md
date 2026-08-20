@@ -6,14 +6,15 @@
 
 ```bash
 ./kaspad --appdir=./zkas-node --rpclisten=127.0.0.1:16110 --utxoindex \
-  --connect=<seed-node-ip>:16111
+  --connect=185.147.157.125:16111 --connect=160.187.211.153:16111
 ```
 
-The node syncs from the peer(s) you give it and follows the tip. ZKas mainnet ships no DNS
-seeders yet, so a fresh node needs at least one `--connect`/`--addpeer` bootstrap peer to
-start — get a current seed node from the community/Discord — after which it discovers the
-rest of the network through gossip. Keep the RPC bound to `127.0.0.1`: it is a control
+The node syncs from the seed nodes you give it and follows the tip. ZKas mainnet ships no
+DNS seeders yet, so a fresh node bootstraps from a known peer; once connected it discovers
+the rest of the network through gossip. Keep the RPC bound to `127.0.0.1`: it is a control
 interface, not something to expose.
+
+**Seed nodes (mainnet):** `185.147.157.125:16111` · `160.187.211.153:16111`
 
 ### Ports
 
@@ -66,7 +67,7 @@ below its pruning point** from peers during IBD.
 
 ```bash
 ./kaspad --appdir=./zkas-node --utxoindex --shielded-history=on \
-  --connect=<seed-node-ip>:16111
+  --connect=185.147.157.125:16111
 ```
 
 With it on, the scan archive and chain index survive pruning, so this node serves wallets
@@ -81,7 +82,7 @@ run the verification pass over the transferred history.
 
 ```bash
 ./kaspad --appdir=./zkas-node --utxoindex --archival \
-  --rocksdb-preset=hdd --connect=<seed-node-ip>:16111
+  --rocksdb-preset=hdd --connect=185.147.157.125:16111
 ```
 
 `--archival` stops the node from deleting **public** block data when the pruning point

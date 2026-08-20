@@ -38,13 +38,13 @@ see **[docs/BUILDING.md](docs/BUILDING.md)**.
 
 ```bash
 ./kaspad --appdir=./zkas-node --rpclisten=127.0.0.1:16110 --utxoindex \
-  --connect=<seed-node-ip>:16111
+  --connect=185.147.157.125:16111 --connect=160.187.211.153:16111
 ```
 
-It syncs from the peer you give it and follows the tip. ZKas mainnet has no DNS seeders
-yet, so a fresh node needs at least one `--connect` bootstrap peer to start — get a current
-seed node from the community/Discord. Only outbound access to a peer's p2p **16111** is
-needed; keep the RPC on **16110** bound to loopback.
+It syncs from these seed nodes and follows the tip. ZKas mainnet has no DNS seeders yet, so
+a fresh node bootstraps from a known peer; once connected it discovers the rest of the
+network through gossip. Only outbound access to a peer's p2p **16111** is needed; keep the
+RPC on **16110** bound to loopback.
 
 **Node types — pruned (default), archival, and shielded-history — and every flag are
 documented in [docs/NODE.md](docs/NODE.md).** Which one you want depends on whether the
