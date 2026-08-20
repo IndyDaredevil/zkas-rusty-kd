@@ -204,6 +204,36 @@ worthless until the seed-holder signs it. See `docs/NON_CUSTODIAL_WALLET.md`.
 | `POST` | `/api/verify` | Verify such a signature. |
 | `GET` | `/api/status` | Daemon/chain status. |
 
+### Admin / operator
+
+Two operator endpoints pre-build the O(depth) witness caches so that consolidations and
+old-note spends do not pay a full O(chain) climb the first time. Both are authenticated
+with `X-Wallet-Token` like every other call; they change no funds and are safe to call
+repeatedly. Use them after a fresh start, a long backfill, or when a wallet with old
+notes is about to consolidate — rather than letting the first spend absorb the cost. See
+also the perf model in §4.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/admin/warm_chain_tree` | Drive the **shared chain tree** forward (up to a 90 s budget per call) and start its subtree-cache build off-lock. Once the cache is built, every wallet the shared tree covers witnesses in O(depth). |
+| `POST` | `/api/admin/warm_wallet` | Build **this token's** wallet subtree cache now and persist it, so a restart reloads it warm. For a wallet the shared tree cannot serve (its notes predate the tree's base). |
+
+`warm_chain_tree` returns progress, not a finished cache — the build runs in the
+background:
+
+```jsonc
+{ "leaves_before": 2061000, "leaves_after": 2061450, "leaves_gained": 450,
+  "caught_up": true,                 // tree reached the node tip within this call
+  "subtree_cache_ready": false,      // true once the background build has installed
+  "subtree_cache_state": "started",  // "ready" | "building" | "started"
+  "chunks": 3, "chain_tip_daa": 2061450, "seconds": 41.2 }
+```
+
+Call it again to advance further or to retry a build that reported `stream moved`
+(state stays `building`/`started` until it installs, then `ready`). `warm_wallet` builds
+inline and returns `{ subtree_cache_ready, notes, matured, seconds }`. A `warm_chain_tree`
+that `caught_up` with `subtree_cache_ready: true` needs no follow-up.
+
 ### Examples
 
 ```bash
@@ -818,6 +848,11 @@ of the same wallet. Keep `.scan.bak` files.
 If proving is running, the payment is progressing; make sure your proxy read timeout is
 long enough (§1). Do **not** iteratively restart the daemon to debug — each restart
 re-storms sync.
+
+**First consolidation / old-note spend is slow** — the O(depth) witness cache is cold.
+Pre-warm it instead of letting the spend pay for it: `POST /api/admin/warm_chain_tree`
+(shared tree, covers most wallets), and `POST /api/admin/warm_wallet` for a wallet whose
+notes predate the shared tree's base. Poll until `subtree_cache_ready: true`.
 
 **Never rescan casually.** `rescan` rebuilds from the node's pruning point; against a
 *pruned* node that silently loses history. Both production nodes are archival for this
