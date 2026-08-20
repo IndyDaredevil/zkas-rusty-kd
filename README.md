@@ -37,17 +37,18 @@ Binaries: [Releases](https://github.com/firecash/zkas-rusty/releases) · to comp
 see **[docs/BUILDING.md](docs/BUILDING.md)**.
 
 ```bash
-./kaspad --appdir=./zkas-node --rpclisten=127.0.0.1:16810 --utxoindex \
-  --connect=185.147.157.125:16111 --connect=160.187.211.153:16111
+./kaspad --appdir=./zkas-node --rpclisten=127.0.0.1:16110 --utxoindex \
+  --connect=<seed-node-ip>:16111
 ```
 
-It syncs from the seed nodes and follows the tip. Only outbound access to p2p **16111** is
-needed; the RPC on 16810 stays local.
+It syncs from the peer you give it and follows the tip. ZKas mainnet has no DNS seeders
+yet, so a fresh node needs at least one `--connect` bootstrap peer to start — get a current
+seed node from the community/Discord. Only outbound access to a peer's p2p **16111** is
+needed; keep the RPC on **16110** bound to loopback.
 
-ZKas uses its own port block — gRPC **16810**, p2p **16811**, wRPC borsh **17810**, json
-**18810** — deliberately clear of Kaspa's 161xx, so a ZKas node and a merged-mining Kaspa
-parent run on one host with no overrides. Presets and archival mode:
-**[OPERATIONS.md](OPERATIONS.md)**.
+**Node types — pruned (default), archival, and shielded-history — and every flag are
+documented in [docs/NODE.md](docs/NODE.md).** Which one you want depends on whether the
+node just validates/mines, serves wallets complete balances, or backs an explorer.
 
 ## Run a wallet
 
@@ -91,7 +92,7 @@ Companion repos: **zkas-pool** (stratum bridge), **zkas-explorer**, **zkas-walle
 |---|---|
 | [docs/BUILDING.md](docs/BUILDING.md) | prerequisites, compiling, tests |
 | [docs/WALLETD.md](docs/WALLETD.md) | wallet daemon: API, tuning, exchange & pool integration |
-| [OPERATIONS.md](OPERATIONS.md) | running nodes: ports, presets, recovery |
+| [docs/NODE.md](docs/NODE.md) | running a node: pruned vs archival, shielded history, ports, flags, recovery |
 | [docs/CLI-WALLET.md](docs/CLI-WALLET.md) | `shielded-pay` command-line wallet |
 | [docs/archival.md](docs/archival.md) | archival nodes and history retention |
 
