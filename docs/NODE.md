@@ -39,26 +39,40 @@ block data and the shielded note history — and they are pruned independently.
 | | Pruned (default) | `--shielded-history=on` (pruned) | `--archival` |
 |---|---|---|---|
 | Public block bodies below the pruning point | discarded | discarded | **kept** |
-| Shielded note history below the pruning point | **not fetched** | **fetched + kept** | **fetched + kept** |
+| Notes/history from **before** the node first synced | **not fetched** | **fetched + kept** | **fetched + kept** |
+| Notes/history from the node's **first sync onward** | **all kept forever** | all kept forever | all kept forever |
 | Can fully validate the chain & every spend | ✅ | ✅ | ✅ |
-| Serves wallets **complete** historical balances | ❌ (partial) | ✅ | ✅ |
+| Serves wallet balances complete **since first sync** | ✅ | ✅ | ✅ |
+| Serves wallet balances complete **back to genesis** | ❌ | ✅ | ✅ |
 | Serves an explorer old **public** blocks/txs | ❌ | ❌ | ✅ |
 | Disk | light | light + note archive | **heavy** |
 
 ### 1. Pruned node — the default, and what most people should run
 
-A pruned node discards public block bodies below the pruning point but **always keeps the
-shielded consensus state** — the note-commitment tree frontier and the nullifier set. That
-state is seeded at the pruning point during IBD (as a frontier plus a nullifier MuHash,
-which are aggregates and reveal no one's notes), and it is all a node needs to **fully
-validate the chain and every future spend**. A fresh, non-archival node syncs genesis→tip
-and reaches byte-identical state; archival is **not** required for validation or mining.
+A pruned node discards public block **bodies** below the pruning point, but it keeps two
+shielded things **forever**:
 
-The one thing it cannot do: because IBD transferred only the aggregate shielded state, a
-pruned node can serve a wallet its note history **only from the pruning point forward**.
-Balances that depend on older notes read as **silently partial** — the number looks
-final but is a lower bound. Fine for a validating/mining node; not fine for one that
-answers wallet queries.
+- the **shielded consensus state** — the note-commitment tree frontier and the nullifier
+  set — everything needed to fully validate the chain and every future spend; and
+- the **per-block shielded scan archive** — the compact note/coinbase records a wallet
+  replays to recover its balance.
+
+The pruner **never touches the scan archive or the nullifier set**. Pruning deletes block
+bodies, UTXO state and acceptance data; the scan archive is deliberately retained (ZKas
+diverges from upstream here — "the reason is user funds"), along with a compact chain
+index so the records can still be enumerated in chain order after the blocks themselves are
+gone. So **from the moment a node first syncs, it writes and keeps the notes of every block
+it processes, and never prunes them.** A restore-from-seed against a plain pruned node
+returns a **complete** balance for everything at or after that node's first sync — wallet
+recovery does not depend on an archival node existing somewhere on the network.
+
+The one gap is history from **before** the node ever synced. IBD seeds a fresh node with
+only the aggregate shielded state (a frontier plus a nullifier MuHash), which reveal no
+one's notes, so a pruned node has no per-note archive below its **initial** pruning point.
+A wallet that needs notes older than the node's first sync reads a **silently partial**
+balance there — the number looks final but is a lower bound. That window, and only that
+window, is what `--shielded-history` backfills. A fresh non-archival node still syncs
+genesis→tip to byte-identical state; archival is **not** required for validation or mining.
 
 ### 2. Pruned + `--shielded-history=on` — a light wallet-serving node
 
@@ -126,8 +140,11 @@ Run `./kaspad --help` for the complete list.
 - **Node won't start / corrupt DB:** stop the node, move the appdir aside, resync from a
   peer. A pruned node resyncs quickly; an archival node is slow — snapshot it instead of
   resyncing where possible.
-- **Wallet balances look low after a resync:** the node is pruned and was not given
-  `--shielded-history=on` (or `--archival`), so it only serves history from its pruning
-  point. Re-run it with shielded history enabled and let the wallet rescan.
-- **Never point a wallet daemon at a plain pruned node and trust old balances** — see the
-  partial-balance note above.
+- **Wallet balances look low for old coins after a resync:** the node is pruned and was not
+  given `--shielded-history=on` (or `--archival`), so it lacks note history from *before it
+  first synced*. Coins received since its first sync are complete; older ones read as a
+  lower bound. Re-run with shielded history enabled (or point the wallet at a node that has
+  it) and let the wallet rescan.
+- **A plain pruned node is fine for wallets whose coins are all newer than the node's first
+  sync** — it keeps every note from that point on. Only balances reaching below its initial
+  pruning point are partial.
