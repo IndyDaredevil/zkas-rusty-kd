@@ -4,6 +4,80 @@
 # DEPLOYED COPY sits beside prometheus.yml on the Kron (rule_files: is a
 # bare relative name). This file is a MIRROR for docs/bridge-v2/monitoring/.
 #
+# Revision 2026-08-18: LABEL-CHURN FAN-OUT FIX + pin re-derive + two new
+# alerts.
+#   1. THE PHANTOM-ALERT BUG — BIRTH CLAUSE DELETED, not patched.
+#      Measured on :3034 the same day: both not-confirmed-blue counters
+#      show series=7 zeros=7 post-relabel, i.e. warm-up zero-init DOES
+#      reach the TSDB in the counting label context. increase() sees
+#      0 -> 1 unaided, so the clause had no true-positive path left and
+#      fired only on already-nonzero series — from label churn, or from
+#      any scrape gap longer than the 5m lookback (Prometheus restart,
+#      host reset, network blip), which makes every counter on every
+#      worker look newborn at once. 3 counters x 7 workers = 21 alerts.
+#      Aggregation cannot fix the scrape-gap case; deletion does.
+#      Range windows widened 1m/2m -> 3m — REQUIRED, see (4).
+#      Superseded note, kept because the reasoning is still useful:
+#      `ip` carries the worker's ephemeral source port (BL-010) and the
+#      port-strip relabel was later REVERTED, so that label is churny
+#      again. Any event that re-mints the label set fleet-wide — a
+#      prometheus.yml relabel edit + reload, or seven simultaneous rig
+#      reconnects — presents every worker's ALREADY-NONZERO counter as a
+#      brand-new series. The birth clause's `unless ... offset` finds no
+#      match, the `> 0` guard passes (the value is genuinely nonzero, just
+#      re-labelled), and one alert fires PER WORKER. Observed 2026-08-18
+#      ~17:52: seven "DOUBLE BLOCK" cards, one per worker, one per minute
+#      boundary, against zero real solves. Only the DOUBLE cards were
+#      visible because alertmanager's inhibit_rule suppressed the KAS and
+#      ZKAS singles that fired alongside them — the inhibit worked
+#      perfectly on phantom input.
+#      FIX: every block rule now evaluates under `sum without (ip) (...)`.
+#      Stripping ONLY `ip` keeps every routing/inhibit label intact
+#      (job, instance, worker) and is a no-op when a worker has a single
+#      series. The `> 0` guard STAYS — it is orthogonal and still needed.
+#   2. zKAS pin re-derived 34.2 -> 25.4 PH/s and the gauge-preferred form
+#      pre-wired, so v2.0.1.4 retires the pin with no rules edit.
+#      EXPECT A STEP AT DEPLOY: zkas luck x0.743 (34.2/25.4 = 1.346 —
+#      the pin has been running zKAS luck ~35% optimistic). That step is
+#      THIS fix, not a mining event.
+#   4. alertmanager.yml info route retimed to 90s/90s. COUPLED to the 3m
+#      windows above: an alert only stays FIRING for (window - for:), and
+#      a group that flushes after its alerts resolve notifies nothing
+#      with send_resolved: false. At the old 1m windows the firing span
+#      was ~30s and any group_interval above that would have silently
+#      DELETED block cards. Change one, revisit the other.
+#   5. ROOT CAUSE of (1) identified and MEASURED after the fact: a failed
+#      scrape writes a staleness marker, a staleness marker terminates
+#      lookback, and any `offset` read across one resolves EMPTY while the
+#      live counter is nonzero. 33 of 1918 scrapes failed in 8h (counter
+#      series carry 1885 samples, all seven workers identical) because
+#      scrape_duration hit the 12s scrape_timeout ceiling exactly
+#      (12.001298s). ONE failed scrape is sufficient — no outage, no
+#      restart, no label churn. prometheus.yml raised to 14s as
+#      mitigation; NEW RcScrapeFlaky watches for recurrence, since
+#      RcBridgeDown's `for: 2m` structurally cannot see scattered
+#      single-scrape failures.
+#   3. NEW: RcZkasBlockNotConfirmedBlue (metric name now CONFIRMED on
+#      :3034 — series=7 zeros=7; nothing watched
+#      it) and RcNearMissSilent (the FCMM-class watchdog ks_near_miss_total
+#      was built for). KaspadUnresponsive added COMMENTED OUT pending
+#      metric-behaviour verification.
+#
+# Revision 2026-08-12: UNIT-CONSTANT FIX + delivered-luck KPI group.
+#   1. rc:rig_ths and rc:effort_hashes_24h converted the counter with 2^30
+#      ("share_diff x 2^30 = hashes"). WRONG per source: the counter is in
+#      GH — each accepted share adds diff x 2^32 / 1e9
+#      (bridge/src/hasher.rs::diff_to_hash), so hashes = counter x 1e9.
+#      The 2^30 constant overstated effort by 2^30/1e9 = 7.37%; the hourly
+#      card's luck read ~6.9% LOW and rig TH/s ~7.4% HIGH since deploy.
+#      Proof: counter-derived delivered rate is 14.08 TH/s; x1.0737 = 15.12,
+#      the card's unexplained "15.14". Expect at deploy: rig_ths steps
+#      ~15.1 -> ~14.1, luck_pct steps +7.4%. That step is THIS fix, not a
+#      mining event.
+#   2. NEW GROUP rc_luck_kpis: luck against PROVEN share-work (delivered)
+#      and against nameplate, plus the delivery ratio linking them.
+#      Identity: luck_nameplate = luck_delivered x delivery_ratio.
+#
 # Revision 2026-08-09c: `> 0` guard added to all four birth clauses —
 # without it the zero-init warm-up series fire false alerts on restart.
 #
@@ -73,12 +147,14 @@ groups:
       # ---- effort ----------------------------------------------------------
       # Rig line = instantaneous (a "now" reading).
       - record: rc:rig_ths
-        expr: (sum(rate(ks_valid_share_diff_counter{job="rc_merged_bridge"}[5m])) * 0.001073741824) or vector(0)
+        expr: (sum(rate(ks_valid_share_diff_counter{job="rc_merged_bridge"}[5m])) * 0.001) or vector(0)
       # Luck denominator = TOTAL HASHES over the same 24h window as the
       # numerator. Restart-tolerant by construction; do not swap this for a
-      # rate()-based figure. (share_diff x 2^30 = hashes.)
+      # rate()-based figure. Counter unit is GH (each accepted share adds
+      # diff x 2^32 / 1e9 — hasher.rs::diff_to_hash), so hashes = x 1e9.
+      # The prior 2^30 constant here overstated effort by 7.37%.
       - record: rc:effort_hashes_24h
-        expr: ((sum(increase(ks_valid_share_diff_counter{job="rc_merged_bridge"}[24h])) * 1073741824)) or vector(0)
+        expr: ((sum(increase(ks_valid_share_diff_counter{job="rc_merged_bridge"}[24h])) * 1e9)) or vector(0)
 
       # ---- network hashrate ------------------------------------------------
       # KAS: the RC's gauge is NATIVE Kaspa (KAS-primary architecture),
@@ -87,28 +163,44 @@ groups:
       - record: rc:kas_net_hs
         expr: (max(ks_estimated_network_hashrate_gauge{job="rc_merged_bridge"})) or vector(330000000000000000)
 
-      # zKAS: PINNED 34.2 PH/s — 2026-08-09.
-      #   Source: explorer.zkas.info, 24h-avg difficulty 17,100.42 T.
-      #   Calibration: H = D x BPS x 2. zKAS is 1 BPS, so H = D x 2. The
-      #   explorer's own two figures (34,200.85 TH/s vs 17,100.42 T) give
-      #   ratio 2.000 exactly, which IS the calibration — not an assumption.
-      #   Cross-check from our own blocks: Z/K = 42/50 = 0.84 implies
-      #   D_zkas = D_kas/0.84 = 1.61e16 -> 32.1 PH/s. Within 7%.
-      #   The prior 18.06 pin (an 08-05 :3033 reading) ran zKAS Luck ~1.9x
-      #   low: it predicted 75 zKAS blocks against 50 KAS; we logged 42.
+      # zKAS: RE-PINNED 25.4 PH/s — 2026-08-18 (was 34.2 from 2026-08-09).
       #
-      # RETIRE THIS PIN. Replacement, once the bridge exports it:
-      #   expr: (max(ks_zkas_network_hashrate_gauge{job="rc_merged_bridge"}))
-      #           or vector(34200000000000000)
-      # The bridge already holds a gRPC client to 16810 — the value is
-      # get_block_dag_info().difficulty * 2. Deriving it kills both the
-      # re-pin chore and the silent-staleness failure mode.
+      # THE PIN IS NOW SELF-RETIRING. If the bridge exports
+      # ks_zkas_network_difficulty_gauge (v2.0.1.4 target), this rule uses
+      # it and the literal below never evaluates again — no rules edit
+      # needed on deploy day. H = D x BPS x 2; zKAS is 1 BPS, so H = 2D.
       #
-      # The old ":3033 gauge * 10 or vector(...)" fallback is deleted
+      # Derivation of the 25.4 fallback (2026-08-18 16:23 log):
+      #   The near-miss line prints both legs' target ratios for the SAME
+      #   share, so z/k = T_z/T_k = D_k/D_z exactly — share-invariant.
+      #     w9m block share  k=92.4738% z=118.6450% -> 1.28300
+      #     w7m normal share k= 1.7750% z=  2.2790% -> 1.28394
+      #   Agreement to 0.07% across a 100x spread in share quality, so the
+      #   ratio is 1.2835 and this is a MEASUREMENT, not an estimate.
+      #   D_k = 1.63e16 (status line) -> D_z = 1.270e16 -> H = 2.54e16.
+      #   Cross-check, independent: 79 zKAS blocks / 141,390 s at 15.15
+      #   TH/s implies a 27.1 PH/s window average (+/-3, Poisson n=79).
+      #   25.4 instantaneous sitting under a 27.1 window average is the
+      #   expected sign for a hashrate in decline.
+      #
+      # ***  z/k > 1 MEANS THE REGIME HAS INVERTED.  ***
+      #   D_z < D_k, so every hash clearing KAS now clears zKAS
+      #   automatically: K and D must be IDENTICAL while this holds.
+      #   Confirmed 08-18, all seven workers individually (3/3/3, 1/1/1,
+      #   3/5/3, 2/2/2, 19/25/19, 17/21/17, 18/22/18) and fleet 63/79/63.
+      #   Do not "fix" a card that shows K == D. See the commented
+      #   RcMergedLegBroken stub in rc_merged_mining — it is a free
+      #   FCMM-class detector, but ONLY while this inequality holds, which
+      #   is why it stays disarmed until the gauge above goes live.
+      #
+      # THIS IS A POINT MEASUREMENT ON A DECLINING TREND. It will drift.
+      # That is the argument for the gauge, not for re-pinning again.
+      #
+      # The old ":3033 gauge * 10 or vector(...)" fallback stays deleted
       # deliberately. If that bridge ever comes back up it must not
       # silently take this number over again with an unvalidated *10.
       - record: rc:zkas_net_hs
-        expr: vector(34200000000000000)
+        expr: (max(ks_zkas_network_difficulty_gauge{job="rc_merged_bridge"}) * 2) or vector(25400000000000000)
 
       # ---- luck ------------------------------------------------------------
       # luck = blocks / expected;  expected = hashes / (net / BPS)
@@ -119,6 +211,72 @@ groups:
         expr: clamp_max(((rc:kas_24h / (rc:effort_hashes_24h / (rc:kas_net_hs / 10))) * 100) >= 0, 999) or vector(0)
       - record: rc:zkas_luck_pct
         expr: clamp_max(((rc:zkas_24h / (rc:effort_hashes_24h / rc:zkas_net_hs)) * 100) >= 0, 999) or vector(0)
+
+  # =========================================================================
+  # DELIVERED-HASHRATE LUCK KPIs — added 2026-08-12.
+  # Denominator = PROVEN share work, not the network-hashrate estimate and
+  # not nameplate. An accepted share at difficulty d is cryptographic proof
+  # of ~d x 2^32 hashes; firmware cannot inflate it. The counter can only
+  # undercount (unsubmitted/lost shares), so delivered luck is conservative.
+  #
+  # Units: counter is GH -> hashes = counter x 1e9 (hasher.rs::diff_to_hash).
+  # Hashes per block = 2 x D EXACTLY: the node normalizes difficulty against
+  # 2^255 (rpc/service/src/converter/consensus.rs::get_difficulty_ratio,
+  # MAX_DIFFICULTY_TARGET = 2^255-1) while the hash space is 2^256.
+  #
+  # avg() wrapping the difficulty gauge strips its labels so the {} results
+  # of sum() arithmetic can match — WITHOUT it every division below returns
+  # EMPTY (vector matching on full label sets). Do not remove.
+  #
+  # Identity (must close on any card that prints all three):
+  #   rc:kas_luck_nameplate_24h = rc:kas_luck_delivered_24h
+  #                               x rc:fleet_delivery_ratio_24h
+  #
+  # ORDER IS LOAD-BEARING: later rules consume earlier ones in this group.
+  # rc:kas_24h comes from rc_recording (cross-group; <=30s stale, fine).
+  #
+  # zKAS twin of the delivered rule is BLOCKED on
+  # ks_zkas_network_difficulty_gauge (open item; retires the 34.2 pin).
+  # The share-hash numerator would be THE SAME series — one hash serves
+  # both chains; only D differs.
+  # =========================================================================
+  - name: rc_luck_kpis
+    interval: 60s
+    rules:
+
+      # Fleet delivered hashrate, H/s, 24h window. /1e12 -> TH/s.
+      # Sanity: ~1.40e13-1.45e13 (14-14.5 TH/s). 1.5e13+ or 1.3e13- means a
+      # rig or a unit slipped.
+      - record: rc:fleet_hashrate_delivered_hps
+        expr: (sum(rate(ks_valid_share_diff_counter{job="rc_merged_bridge"}[24h])) * 1e9) or vector(0)
+
+      # Expected KAS blocks per 24h from PROVEN work.
+      - record: rc:kas_expected_blocks_24h_delivered
+        expr: >
+          (sum(increase(ks_valid_share_diff_counter{job="rc_merged_bridge"}[24h])) * 1e9)
+          / (2 * avg(avg_over_time(ks_network_difficulty_gauge{job="rc_merged_bridge"}[24h])))
+
+      # Expected KAS blocks per 24h from NAMEPLATE.
+      # 14.2e12 = fleet nameplate (KS0 Ultras + KS7 Lites).
+      # UPDATE THIS LITERAL ON ANY FLEET CHANGE or nameplate luck lies.
+      - record: rc:kas_expected_blocks_24h_nameplate
+        expr: >
+          (14.2e12 * 86400)
+          / (2 * avg(avg_over_time(ks_network_difficulty_gauge{job="rc_merged_bridge"}[24h])))
+
+      # Luck ratios (1.00 = expectation). clamp_max guards the +Inf from a
+      # fresh-TSDB zero denominator; >= 0 is the NaN clamp (same pattern as
+      # rc:kas_luck_pct above).
+      - record: rc:kas_luck_delivered_24h
+        expr: clamp_max((rc:kas_24h / rc:kas_expected_blocks_24h_delivered) >= 0, 99) or vector(0)
+      - record: rc:kas_luck_nameplate_24h
+        expr: clamp_max((rc:kas_24h / rc:kas_expected_blocks_24h_nameplate) >= 0, 99) or vector(0)
+
+      # Delivered / nameplate hashrate, via the luck identity.
+      # >1 = fleet beats spec. Flat ~0.99 daily = rigs healthy at spec;
+      # wandering = a hardware or accounting story (w1m watch: -7%).
+      - record: rc:fleet_delivery_ratio_24h
+        expr: rc:kas_luck_nameplate_24h / rc:kas_luck_delivered_24h
 
   # =========================================================================
   # RC v2.1 merged bridge (:3034) — PRODUCTION.
@@ -139,6 +297,33 @@ groups:
         annotations:
           summary: "🛑 RC merged bridge is DOWN"
           description: ":3034 has not answered /metrics for 2m+. Rigs are falling back to RKStratum pool #2 — KAS only, zero zKAS yield. Relaunch via the launcher .cmd (env vars are per-window; any other restart method silently drops merged mining)."
+
+      # ---- ADDED 2026-08-18: the gap RcBridgeDown structurally cannot see
+      # RcBridgeDown needs `up == 0` held for 2m. Scattered single-scrape
+      # timeouts never reach that, so 33 failures across 8h passed with
+      # RcBridgeDown never leaving `pending` — invisible, and not harmless:
+      # each failure writes a staleness marker that truncates lookback.
+      #
+      # This is measured, not theoretical. 1918 scrape attempts vs 1885
+      # counter samples in the same 8h window, identical on all seven
+      # workers, matching the 33 up==0 buckets exactly.
+      #
+      # Threshold: 0.98 over 30m = ~2 failures per 120 scrapes. Tight
+      # enough to catch the observed rate (33/1918 ~ 1.7%), loose enough
+      # that a single blip stays quiet. WARNING, not critical — the fleet
+      # keeps hashing throughout; this is data integrity, not liveness.
+      #
+      # If this fires, check scrape_duration_seconds against scrape_timeout
+      # in prometheus.yml BEFORE suspecting the network. The 08-18 case was
+      # the bridge's own /metrics handler hitting the timeout ceiling.
+      - alert: RcScrapeFlaky
+        expr: avg_over_time(up{job="rc_merged_bridge"}[30m]) < 0.98
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "⚠️ RC /metrics scrapes intermittently failing"
+          description: "Under 98% scrape success over 30m without tripping RcBridgeDown — scattered timeouts, not an outage. Each failure leaves a staleness gap in every ks_* counter. Check max_over_time(scrape_duration_seconds{job='rc_merged_bridge'}[1h]) against scrape_timeout."
 
       # ks_merged_zk_state is load-bearing for three alerts below. `== 0`
       # against an absent series returns EMPTY, not true — so a build that
@@ -282,25 +467,83 @@ groups:
       # Then add the birth-safe rejection alert here.
 
       # ---- BLOCK EVENTS ----------------------------------------------------
-      # Birth-safe idiom throughout: increase() cannot see the FIRST-ever
-      # increment of a new series (born mid-window at value 1 => delta 0).
-      # The "unless offset" clause fires when the series exists now but did
-      # not exist one window ago.
+      # THE BIRTH CLAUSE IS GONE. Deleted 2026-08-18 on direct evidence.
       #
-      # THE `> 0` IN THE BIRTH CLAUSE IS LOAD-BEARING. The RC zero-inits
-      # per-worker series at warm-up (see the drop relabel in
-      # prometheus.yml). Without `> 0` the birth clause fires on every
-      # freshly-born series AT VALUE ZERO — so a bridge restart or a worker
-      # reconnect produces one false alert per worker. This shipped on
-      # 2026-08-09 and fired nine bogus "block NOT confirmed blue" alerts
-      # across all seven workers against a true count of zero reds.
-      # Do not remove the `> 0`.
+      # BL-013 added `X > 0 unless X offset <w>` because increase() cannot
+      # see a series' first increment (born mid-window at 1 => delta 0).
+      # That premise no longer holds on this bridge. Measured on
+      # localhost:3034/metrics, 2026-08-18:
+      #
+      #   ks_blocks_not_confirmed_blue{...,miner="",worker="w1m"}  0
+      #   ks_zkas_blocks_not_confirmed_blue{...,miner="",worker="w1m"}  0
+      #
+      # series=7 zeros=7 on BOTH not-confirmed-blue counters, post-drop and
+      # post-labeldrop. Those counters have never incremented on any
+      # worker, yet all seven series exist in the TSDB at zero. So warm-up
+      # zero-init reaches Prometheus in the COUNTING label context
+      # (miner=""), not only in the miner="IceRiverMiner-v1.1" context the
+      # relabel drops. Series are born at 0 and increase() sees 0 -> 1
+      # perfectly well.
+      #
+      # The birth clause therefore had NO true-positive path left. Its only
+      # remaining behaviour was firing on series that appear ALREADY
+      # NONZERO, which happens two ways and neither is a block:
+      #   (a) label-set churn re-minting a live counter, and
+      #   (b) ANY scrape gap longer than the 5m lookback — a Prometheus
+      #       restart, a host reset (Kernel-Power 41 is a known recurring
+      #       event on this box), a network blip. After such a gap
+      #       `X offset 2m` resolves to nothing, the `unless` finds no
+      #       match, and EVERY nonzero counter on EVERY worker looks
+      #       newborn. That is 3 counters x 7 workers = 21 alerts, in one
+      #       evaluation cycle, from a stack that never missed a beat.
+      #       This is the 2026-08-18 ~17:52 storm.
+      #
+      # NOTE: aggregation does NOT fix case (b) — if the whole lookback is
+      # empty it is empty at every grouping. Deleting the clause does.
+      #
+      # RESIDUAL RISK, accepted: a block found within one scrape interval
+      # of a worker authorizing would be born at 1 and go unseen. Requires
+      # a solve inside 15s of a rig connecting; at ~2 blocks/hour fleet-wide
+      # that is negligible, and the hourly card reconciles it anyway.
+      #
+      # ---- WHAT REPLACES IT: sum without (ip) ------------------------------
+      # Kept, and it is doing real work. The RC never retires a session's
+      # series, so a reconnect leaves the retired series in the SAME scrape
+      # as the live one. Aggregating ip away AFTER ingest is exactly what
+      # the deployed prometheus.yml prescribes; these rules were the last
+      # place still reading raw per-series values.
+      #
+      # ORDER MATTERS: increase() is INSIDE the sum. Per-series first (the
+      # retired series contributes 0), then summed. Inverting that would
+      # make the stale series' expiry look like a counter reset.
+      #
+      # Surviving labels after labeldrop: __name__, exported_instance,
+      # instance, ip, job, wallet, worker. Stripping only `ip` preserves
+      # `worker`, which alertmanager.yml's inhibit rule matches on with
+      # equal: ['worker'].
+      #
+      # `wallet` is a SECOND latent churn vector — the RC captures it once
+      # at authorize (BL-007), so changing a rig's wallet mints a new
+      # series. Harmless now that the birth clause is gone (the new series
+      # is born at 0 and sums correctly), but do not reintroduce a
+      # per-series zero test without accounting for it.
+      #
+      # ---- WINDOW WIDTH IS COUPLED TO alertmanager.yml ---------------------
+      # 3m, not 1m. These alerts are only FIRING while the increment sits
+      # inside the window, so the window minus `for:` is the entire span in
+      # which Alertmanager can notify. At 1m that span was ~30s — shorter
+      # than the info route's group_interval, which means a block card could
+      # be silently swallowed by a group that flushed after the alert had
+      # already resolved (send_resolved: false).
+      #   fires at   ~T+37s   (scrape <=15s + eval <=15s + for 30s)
+      #   resolves at ~T+187s (3m window)
+      #   worst-case flush T+37+90 = T+127s, inside the window with ~60s
+      #   of margin.
+      # IF YOU SHORTEN THESE WINDOWS, SHORTEN group_interval TO MATCH.
+      # Cost of 3m: two blocks on the SAME worker inside 3 minutes render
+      # as one card. At w9m's ~0.6 blocks/hr that is a ~3% event.
       - alert: RcKasBlockFound
-        expr: >
-          increase(ks_blocks_mined{job="rc_merged_bridge"}[1m]) > 0
-          or
-          (ks_blocks_mined{job="rc_merged_bridge"} > 0
-           unless ks_blocks_mined{job="rc_merged_bridge"} offset 1m)
+        expr: sum without (ip) (increase(ks_blocks_mined{job="rc_merged_bridge"}[3m])) > 0
         for: 30s
         labels:
           severity: info
@@ -309,11 +552,7 @@ groups:
           description: "{{ $labels.worker }}!"
 
       - alert: RcZkasBlockFound
-        expr: >
-          increase(ks_zkas_blocks_mined{job="rc_merged_bridge"}[1m]) > 0
-          or
-          (ks_zkas_blocks_mined{job="rc_merged_bridge"} > 0
-           unless ks_zkas_blocks_mined{job="rc_merged_bridge"} offset 1m)
+        expr: sum without (ip) (increase(ks_zkas_blocks_mined{job="rc_merged_bridge"}[3m])) > 0
         for: 30s
         labels:
           severity: info
@@ -324,12 +563,13 @@ groups:
       # This is the event the whole port exists to produce.
       # An inhibit_rule in alertmanager.yml suppresses the two singles above
       # when this fires, so one solve produces ONE message (Invariant 8).
+      #
+      # THIS IS THE RULE THAT FIRED THE 2026-08-18 PHANTOM STORM — seven
+      # cards, one per worker, zero real solves. See GUARD 3 above. The
+      # inhibit_rule below is what made it LOOK like a doubles-only event:
+      # the KAS and ZKAS singles fired too and were correctly suppressed.
       - alert: RcMergedDoubleBlockFound
-        expr: >
-          increase(ks_double_blocks_mined{job="rc_merged_bridge"}[2m]) > 0
-          or
-          (ks_double_blocks_mined{job="rc_merged_bridge"} > 0
-           unless ks_double_blocks_mined{job="rc_merged_bridge"} offset 2m)
+        expr: sum without (ip) (increase(ks_double_blocks_mined{job="rc_merged_bridge"}[3m])) > 0
         for: 30s
         labels:
           severity: info
@@ -342,17 +582,105 @@ groups:
       # — the exhaust branch looks identical for both. Cross-check
       # explorer.zkas.info for this block before assuming a reorg.
       - alert: RcBlockNotConfirmedBlue
-        expr: >
-          increase(ks_blocks_not_confirmed_blue{job="rc_merged_bridge"}[10m]) > 0
-          or
-          (ks_blocks_not_confirmed_blue{job="rc_merged_bridge"} > 0
-           unless ks_blocks_not_confirmed_blue{job="rc_merged_bridge"} offset 10m)
+        expr: sum without (ip) (increase(ks_blocks_not_confirmed_blue{job="rc_merged_bridge"}[10m])) > 0
         for: 30s
         labels:
           severity: critical
         annotations:
           summary: "🔴 RC: block NOT confirmed blue"
-          description: "{{ $labels.worker }} — a node-accepted block did not go blue within the 60s window (30 attempts x 2s). WHICH LEG IS UNCONFIRMED: the exported counter carries no chain qualifier — check both explorer.zkas.info and the Kaspa explorer."
+          description: "{{ $labels.worker }} — a node-accepted block did not go blue within the 60s window (30 attempts x 2s). WHICH LEG IS UNCONFIRMED: this counter carries no chain qualifier. If RcZkasBlockNotConfirmedBlue is NOT also firing, the red block is the KAS leg."
+
+      # ---- ADDED 2026-08-18: the zKAS-leg twin ----------------------------
+      # ks_zkas_blocks_not_confirmed_blue has existed at 0 on all seven
+      # workers since v2.0.1.3 with NOTHING watching it. A metric nobody
+      # alerts on is a metric that costs storage and buys nothing.
+      #
+      # ⚠ NAME NOT YET RE-VERIFIED. The 2026-08-09b revision note above
+      # records "RC has no zkas_ infix" — that verification predates
+      # v2.0.1.3, which added this counter. Confirm the exact name on
+      # localhost:3034/metrics before trusting this rule; a wrong name
+      # evaluates to EMPTY and fails silently, which is the whole reason
+      # RcMergedTelemetryAbsent exists.
+      - alert: RcZkasBlockNotConfirmedBlue
+        expr: sum without (ip) (increase(ks_zkas_blocks_not_confirmed_blue{job="rc_merged_bridge"}[10m])) > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "🔴 RC: zKAS block NOT confirmed blue"
+          description: "{{ $labels.worker }} — a node-accepted zKAS block did not go blue. Cross-check explorer.zkas.info for this hash. A first occurrence right after a deploy may mean the node isn't answering GetCurrentBlockColor rather than a genuine reorg — the exhaust branch looks identical for both."
+
+      # ---- ADDED 2026-08-18: near-miss SILENCE watchdog --------------------
+      # The rule ks_near_miss_total was built for. Shares flowing while the
+      # near-miss counter is frozen means the dual-target evaluation path
+      # is dead — which is precisely the FCMM/ZKMM signature, caught in
+      # minutes instead of "why have we had no zKAS blocks all day".
+      #
+      # This is the ONE detector that does not depend on a block actually
+      # being found, so it is the only thing that closes the gap the
+      # "SUBMISSION REJECTED — NO METRIC EXISTS" note above describes.
+      #
+      # Threshold rationale: BL-012 measured 1.36 events/min on a SINGLE
+      # canary rig at the >=1% gate. Fleet-wide over 10m the expected
+      # count is in the hundreds, and the 08-18 log shows the gate firing
+      # normally. Exactly zero, with shares still being accepted, is
+      # unambiguous. The `and` clause is what keeps this quiet during a
+      # genuine fleet outage — that is RcWorkerSilent's job, not this one.
+      #
+      # NOTE: the near-miss rate is difficulty-dependent. If zKAS/KAS
+      # difficulty falls far enough that the >=1% gate saturates or
+      # starves, re-baseline rather than widening the window.
+      - alert: RcNearMissSilent
+        expr: >
+          sum(increase(ks_near_miss_total{job="rc_merged_bridge"}[10m])) == 0
+          and
+          sum(increase(ks_valid_share_diff_counter{job="rc_merged_bridge"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "🛑 RC near-miss stream SILENT while shares are flowing"
+          description: "Zero near-miss events in 10m+ with accepted shares still arriving. The dual-target evaluation path is not running. This is the FCMM-class signature: KAS looks healthy, zKAS silently earns nothing. Check the boot banner and ks_merged_zk_state before assuming a metrics bug."
+
+      # ---- STUBS — DISARMED PENDING VERIFICATION --------------------------
+      # Both are cheap and both are wrong to enable on assumption.
+      #
+      # (a) KaspadUnresponsive (open item 6.4). Enable ONLY after
+      # confirming on a graph that ks_network_difficulty_gauge actually
+      # moves within any 15m window — if KAS difficulty is flat to the
+      # gauge's precision, this false-fires forever. Partial cover already
+      # exists: a dead kaspad stops job dispatch, which trips
+      # RcMergedJobCadenceLow at 5m.
+      #
+      # - alert: KaspadUnresponsive
+      #   expr: changes(ks_network_difficulty_gauge{job="rc_merged_bridge"}[15m]) == 0
+      #   for: 5m
+      #   labels:
+      #     severity: critical
+      #   annotations:
+      #     summary: "🛑 KAS network difficulty frozen — kaspad unresponsive?"
+      #     description: "No change in 15m+. Verify kaspad on 16110 before assuming a bridge fault."
+      #
+      # (b) RcMergedLegBroken — the free FCMM-class detector, valid ONLY
+      # while D_z < D_k (see rc:zkas_net_hs). In that regime every hash
+      # clearing KAS clears zKAS automatically, so K and D are identical
+      # by arithmetic and a single non-double KAS block means the merged
+      # leg is broken — detected on the FIRST block, no window, no rate
+      # maths. It inverts the instant the ratio crosses back under 1,
+      # which is why it must be gated on the live gauge and stays
+      # disarmed until rc:zkas_net_hs stops being a literal.
+      #
+      # - alert: RcMergedLegBroken
+      #   expr: >
+      #     (sum(ks_blocks_mined{job="rc_merged_bridge"})
+      #      - sum(ks_double_blocks_mined{job="rc_merged_bridge"})) > 0
+      #     and on() (rc:kas_net_hs / 10) > rc:zkas_net_hs
+      #   for: 1m
+      #   labels:
+      #     severity: critical
+      #   annotations:
+      #     summary: "🛑 KAS block WITHOUT a zKAS twin while zKAS is the easier target"
+      #     description: "D_z < D_k means every KAS solve must also clear zKAS. A non-double KAS block is structurally impossible unless the merged leg has stopped committing."
 
       # ---- HOURLY REPORT ---------------------------------------------------
       # Cadence: minute()==0 raises a FRESH alert each hour (it resolves a
@@ -399,3 +727,79 @@ groups:
 # silently idle fleet. There is no second bridge to catch the rigs. Do not
 # relax its 2m `for:` and do not route it below critical.
 # ===========================================================================
+
+  # ===========================================================================
+  # zKAS REPORTER RAIL — ADDED 2026-08-21.
+  #
+  # The dashboard's block feed: bridge log -> zkas-reporter.ps1 (ZkasReporter
+  # scheduled task) -> Supabase webhook -> zkas_blocks table. The reporter is
+  # deliberately NOT the bridge (meta-principle 8): it can die freely without
+  # touching mining, and every restart replays the newest log idempotently.
+  # These alerts exist because its ONLY failure symptom otherwise is silence:
+  # the dashboard stops moving while Telegram block cards keep arriving.
+  #
+  # Design notes, applying the 08-18 lessons on arrival rather than after:
+  #   - increase() stays INSIDE sum() (BL-025 retained rule).
+  #   - NO birth clauses (BL-025).
+  #   - Staleness works FOR us in RcReporterStarved: if the reporter target
+  #     is down its series go stale, the unless-arm evaluates empty, and the
+  #     alert fires alongside RcReporterDown — which is the correct verdict,
+  #     not a false positive.
+  #   - No coupling to alertmanager group timing (BL-026): every rule here
+  #     has a SUSTAINED firing condition, not a transient increment window.
+  # ===========================================================================
+  - name: zkas_reporter
+    rules:
+      # Process dead or main loop wedged — one rule covers both because
+      # /metrics is served inside the loop. for: 2m debounces task restarts.
+      # Blocks found while this fires are SAFE (bridge log + replay); the
+      # cost of downtime is dashboard latency, not data.
+      - alert: RcReporterDown
+        expr: up{job="zkas_reporter"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "📡 zKAS reporter down or wedged"
+          description: "No /metrics from the reporter for 2m. Dashboard feed stalled; blocks replay on restart. Check the ZkasReporter scheduled task, then C:\\zkas\\reporter.log."
+
+      # THE watchdog this rail was designed around: the bridge counted a
+      # zKAS block, the reporter registered nothing. Catches log format
+      # drift in a future bridge release, wrong-file tailing, parser fault.
+      # The bridge arm > 0 gate means block droughts CANNOT false-fire this;
+      # 30m window catches real starvation within one block at fleet rate.
+      - alert: RcReporterStarved
+        expr: sum(increase(ks_zkas_blocks_mined{job="rc_merged_bridge"}[30m])) > 0
+              unless sum(increase(zkas_reporter_blocks_total[30m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "🚱 Bridge found zKAS block(s); reporter saw NONE (30m)"
+          description: "The counter rail and the reporter rail disagree — trust the counter. Diff reporter.log against the newest RKStratum_*.log; suspect a bridge release changing the ZKAS BLOCK FOUND line format."
+
+      # Webhook-path trouble: 401 = secret mismatch (env vs
+      # C:\zkas\webhook-secret.txt — the reporter reads the file ONLY at
+      # startup, so re-arming the secret without a task restart lands here);
+      # timeouts = Supabase or egress. Beats retry, nothing is lost — this
+      # is the early warning long before Starved could fire.
+      - alert: RcReporterPostFailures
+        expr: increase(zkas_reporter_post_failures_total[15m]) > 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "📮 Reporter webhook POSTs failing"
+          description: "More than 3 failed POSTs in 15m. reporter.log has the status: 401 -> restart the ZkasReporter task after any secret change; timeouts -> Supabase/egress."
+
+      # Beat-2 starvation: blocks visible on the dashboard but frozen at the
+      # provisional amount. Walletd down or its /history failing. 30m is
+      # 30x the normal ~60s refinement; amounts flush automatically when
+      # walletd returns.
+      - alert: RcReporterPendingStuck
+        expr: zkas_reporter_pending > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "⏳ Reporter beats pending >30m (walletd?)"
+          description: "Amounts not refining. Check zkas-walletd on 127.0.0.1:8501; the reporter retries every 30s and self-heals."

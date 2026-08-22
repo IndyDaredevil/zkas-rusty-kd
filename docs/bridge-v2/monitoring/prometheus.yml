@@ -9,6 +9,16 @@
 # This file is a MIRROR for docs/bridge-v2/monitoring/. Edit the live copy,
 # then sync. Never edit the repo copy expecting it to take effect.
 #
+# Revision 2026-08-18:
+#   - scrape_timeout 12s -> 14s. Measured: max scrape duration was
+#     12.001298s against a 12s timeout — the ceiling, not headroom. 33 of
+#     1918 scrapes in 8h failed, producing 33 staleness gaps in every
+#     ks_* counter series (1885 samples vs 1918 attempts, identical on all
+#     seven workers). Those gaps are what fired the phantom alert storm;
+#     see the scrape_timeout comment below and the BLOCK EVENTS note in
+#     alert_rules.yml. Mitigation only — the 12s /metrics render is
+#     bridge-side and belongs on the v2.0.1.4 punch list.
+#
 # Revision 2026-08-10:
 #   - REVERTED the ip port-strip metric_relabel added 08-09. Stripping the
 #     port collapsed each worker's retired and live session series into one
@@ -49,7 +59,27 @@ global:
   # Punch-list item from the 08-05 overnight soak: the bridge's dashboard
   # port can answer /metrics slowly while it is busy with template work;
   # give scrapes most of the interval before declaring the target dead.
-  scrape_timeout: 12s
+  #
+  # 2026-08-18: RAISED 12s -> 14s. The 12s was not "generous headroom", it
+  # was the ceiling being hit:
+  #   max_over_time(scrape_duration_seconds{job="rc_merged_bridge"}[8h])
+  #     = 12.001298s  <- killed by the timeout, not a natural maximum
+  #   count_over_time(up[8h])                     = 1918 attempts
+  #   count_over_time(ks_double_blocks_mined[8h]) = 1885 samples, all 7 workers
+  #     -> 33 missing samples, matching 33 up==0 buckets EXACTLY.
+  #
+  # Every failed scrape writes a staleness marker, and a staleness marker
+  # terminates lookback. Any rule reading `<counter> offset <w>` across one
+  # therefore resolves to EMPTY while the live counter is nonzero — which
+  # is what fired the 2026-08-18 phantom alert storm (see the BLOCK EVENTS
+  # note in alert_rules.yml). One failed scrape is sufficient; no outage,
+  # no restart, and no bridge fault is required. RcBridgeDown never left
+  # `pending` through all 33, so nothing surfaced it.
+  #
+  # 14s is MITIGATION, not the fix, and it is the hard ceiling: scrape_timeout
+  # must stay <= scrape_interval. A /metrics handler taking 12 seconds to
+  # render ~70 series is the real defect and is bridge-side.
+  scrape_timeout: 14s
 
 alerting:
   alertmanagers:
@@ -130,3 +160,20 @@ scrape_configs:
         action: drop
       - action: labeldrop
         regex: "miner"
+
+  # =========================================================================
+  # zKAS reporter sidecar (:9151) — ADDED 2026-08-21.
+  # The dashboard block feed's reporting process (C:\zkas\zkas-reporter.ps1,
+  # ZkasReporter scheduled task). Loopback-only HttpListener; requires a
+  # one-time elevated URL ACL:
+  #   netsh http add urlacl url=http://127.0.0.1:9151/ user=inmyh
+  # Three series: zkas_reporter_blocks_total, zkas_reporter_pending,
+  # zkas_reporter_post_failures_total. Served inside the reporter's main
+  # loop, so a wedged loop fails the scrape exactly like a dead process —
+  # `up` on this job covers both (see the zkas_reporter alert group).
+  # No timing coupling to the bridge job's scrape_timeout tuning: this
+  # target renders 3 series in microseconds.
+  # =========================================================================
+  - job_name: 'zkas_reporter'
+    static_configs:
+      - targets: ["127.0.0.1:9151"]
