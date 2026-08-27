@@ -1,10 +1,10 @@
 # KICKOFF — v2.0.1.5 (Bridge Stream A + Pipeline Stream P + Host Stream H)
-### Cut 2026-08-26 (late) · r4 — SINGLE clean seed doc for the v2.0.1.5 chat.
-### Revision chain: r1 (d2a0d1b7...0402348) VOID same evening; r2 (da380662...7adc15)
-### + ADDENDUM r2 (be3a7ba5...86c2e2) SUPERSEDED BY MERGE, preserved in git history
-### at 633a285; r3 (2da14c08...0d315) VOID — cited the bridge spec by a versionless
-### filename before the naming law landed (filename carries the described artifact's
-### version; header carries content revision). r4 = r3 with that citation corrected.
+### Cut 2026-08-26 (late) · r5 — SINGLE clean seed doc for the v2.0.1.5 chat.
+### Revision chain: r1 (d2a0d1b7...0402348) VOID; r2 (da380662...7adc15) + ADDENDUM
+### r2 (be3a7ba5...86c2e2) superseded by merge, in git history at 633a285; r3
+### (2da14c08...0d315) VOID (versionless spec citation, pre-naming-law); r4
+### (fb0ae1a4...57a4ca) VOID (docs-tip and §6 self-reference went stale at the
+### 3ead9d8 naming-law commit). r5 = r4 with those two lines corrected.
 ### The r1→r2 investigation content (§2) is unchanged since r2.
 ### Supersedes the Stream-A framing of SCOPE-v2.0.1.5.md r1 — that doc's A-items
 ### were rewritten by the 08-22 stall investigation; §2 here IS the r2 scope
@@ -22,9 +22,9 @@
 
 ## 1. STATE SNAPSHOT (as of 2026-08-26 late session)
 
-- **Bridge:** v2.0.1.4 (`merged-v2.0.1.4`; docs-tip 633a285 at r3 commit time —
-  spec pair landed @ e7426e1, kickoff set @ 633a285; code identity 336b7a5
-  four-way verified 08-20, unchanged). Restarted ~16:00 ET 08-26 (operator-
+- **Bridge:** v2.0.1.4 (`merged-v2.0.1.4`; docs-tip 3ead9d8 — session chain:
+  spec pair @ e7426e1, kickoff set @ 633a285, r3 merge @ adcf7bb, naming law
+  @ 3ead9d8; code identity 336b7a5 four-way verified 08-20, unchanged). Restarted ~16:00 ET 08-26 (operator-
   reported; cause not recorded — correct here if it was a crash). Prior run:
   6 unbroken days 08-20→08-26, the best longitudinal dataset the operation has
   produced. PERISHABLE: `scrape_samples_scraped` + `scrape_duration_seconds`
@@ -172,9 +172,9 @@ H5 Revisit the global-vs-per-job scrape config (reporter back to 15s once
 5. A-stream reads session (A1′ source read + A2/A3/A4/A5/A6 reads — one
    sitting, no code).
 6. Schedule H2 maintenance window.
-7. Fold §2–§5 of this doc back into SCOPE r2 and commit it (KICKOFF r3 +
-   KRON-HARDENING are already on origin — this is the last uncommitted
-   revision debt).
+7. Fold §2–§5 of this doc back into SCOPE r2 and commit it (the KICKOFF,
+   specs, and KRON-HARDENING are already on origin — this fold-back is the
+   last uncommitted revision debt).
 
 ## 7. LEDGER CANDIDATES (BL-032+ raw list, draft in queue item 2)
 
