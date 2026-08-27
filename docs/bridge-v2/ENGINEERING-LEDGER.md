@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-031 (2026-08-20)
+### Last entry: BL-043 (2026-08-27)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -135,8 +135,10 @@ cdylib). Git-dep cdylibs get built on Windows and DLLs require full symbol
 resolution (unlike ELF). Fixed twice-over: workflow cdylib-strip step +
 `cfg(not(windows))` gating of the kaspad dep. Linux `cargo check` preflight cannot
 catch link-class errors (documented gap, held exactly).
-**Lesson:** in-workspace builds are structurally immune to this class — a core
-argument for the in-tree port.
+**Lesson:** [CORRECTED 2026-08-27 — see BL-043] in-workspace builds are
+structurally immune to the LOCKFILE-DRIFT class only (the BL-005 shape); this
+cdylib/risc0 LNK class lives in-workspace and took three fixes. Draft 4 §6
+walked the broader claim back; this entry had inherited it forward.
 
 **BL-005 · 2026-08-04 · zkas-pool Cargo.lock — FCMM→ZKMM magic bytes (THE bug)**
 Every AuxPoW zKAS submission ever made by the bridge rejected "invalid
@@ -417,7 +419,7 @@ the quantity — the near-miss pair had been printing D_z/D_k on every share
 since c.15 and nobody read it as such.
 
 **BL-029 · 2026-08-20 · Prometheus — `scrape_duration_seconds` is plausibly
-UPTIME-dependent, not load-dependent (OPEN — hypothesis with a stated test)**
+UPTIME-dependent, not load-dependent (CLOSED 2026-08-27 — causal claim REFUTED, see BL-033)**
 BL-024 measured `max_over_time(scrape_duration_seconds[8h]) = 12.001298s`, at
 the 12s timeout ceiling, on a process with days of uptime. Post-v2.0.1.4
 restart the same target reads `[15m] = 0.0057s`, `[30m] = 0.0071s` — three
@@ -538,6 +540,240 @@ Retention policy adopted: keep the current release's `.bak-*` set until that
 build has a full day in production, then delete by name.
 **Lesson:** the backup rail generates its own cleanup hazard, and the metadata
 you would naturally sort by is actively misleading.
+
+## 2026-08-22 → 08-27 — scrape-stall investigation, wedge incident, host & boundary audit
+
+**BL-032 · 2026-08-26 · Kron/zkas-node v1.0.5 — 3.8h zKAS-leg outage: RPC wedge
+during a sustained machine-degradation plateau (trigger unidentified;
+memory-pressure suspected, uninstrumented)**
+Symptom: TG "template age >30s" cards from ~12:03; zKAS leg PLAIN
+12:03:04→15:50 operator restart; KAS leg mined throughout. One zKAS block found
+12:29:16 against a ~26-min-stale template, submit failed (likely rejectable
+regardless — stale parent commitments). ~7–8 expected blocks (~380 ZKAS)
+foregone.
+Measured chain: discrete onset 12:02:04 → box enters a step-function degraded
+state (KAS RPC mean 2.5→73.3ms, 3.3%→91.2% of samples >10ms, flat plateau until
+restart — no prodrome, six-day baseline flat) → zKAS RPC dies, returns
+12:02:14–12:03:04, wedges permanently: process/p2p alive, reconnects accepted,
+requests never served (27 timeouts among 425 instant refusals prove continued
+bridge probing), no crash in Application log → cleared only by node restart,
+which also freed RSS and ended the plateau.
+Root cause: UNPROVEN. Candidates ranked: (1) memory cliff — ~24h after last
+manual relief restart, operator-observed >80% RAM, plateau + recovery-on-
+RSS-free fit; Event 2004 empty but 2004 gates on commit exhaustion, not RAM
+thrash, so absence is not exoneration. (2) eliminated: LAN gRPC covenant-client
+load (ports opened 08-24, last session ended 03:00 08-24, latency census flat
+across the gap). (3) eliminated: degradation prologue and
+bridge-reconnect-failure (both killed by first-hit ordering and the 10s
+recoveries through operator restarts — BL-027 pattern, wrong twice before
+right).
+Blip taxonomy banked: `zk=stale` singles with clean connections = the zKAS
+node's ~16-min housekeeping cycle stalling 100–250ms (chronic, benign, flat
+for six days; zKAS baseline janky at ~2× the KAS leg). `PLAIN` blips with
+`Not connected` = operator sub-60s relief restarts (incl. 08-24 03:56 —
+session ran to 03:00). Bridge auto-reconnect proven good on both legs across
+all of them.
+Fixes: windows_exporter + memory/process-RSS alerts (converts the manual >80%
+observation into a card AND the next occurrence into a diagnosis; closes the
+standing memory-slope item with data); node v1.0.6 with file logging ON (this
+wedge has no node-side witness — meta-principle 4's scalp); `--ram-scale` on
+kaspad; gRPC firewall rules scoped to the MacBook IP (BL-023 corollary: the
+08-24 LAN opening left unauthenticated RPC reachable by seven unaudited-
+firmware rigs); upstream report to firecash (wedge behavior is theirs
+regardless of trigger: RPC service hangs permanently after a stall, no fault
+raised, survives at TCP-accept level); v2.0.1.5: page-tier `ZkasLegDegraded`
+on sustained template age (the age clock ticked to 13,328s while only an info
+card fired — detection at T+30s, human at T+3.8h; the gap was escalation, not
+detection), retire the 2,872/day structurally-dead balance WARN (shielded
+treasury has no UTXOs; a call that cannot succeed firing every 30s trains
+WARN-blindness).
+**Lessons:** simultaneous drops across independent connections indict the
+hosts, not the links — a fleet of clients is a free topology probe. The status
+line's `rpc k=/z=` fields were a 10s-cadence stall seismograph printing since
+deploy, unread (BL-028 recurring: check whether an existing log line already
+contains the quantity). An incident timeline must include environment changes,
+not just code changes — the 08-24 port opening sat outside every hypothesis
+until volunteered, because it lived in no log. And Event 2004's absence bounds
+nothing below commit exhaustion: know what an instrument's silence actually
+excludes before citing it.
+
+**BL-033 · 2026-08-22..26 · Prometheus/bridge — the scrape-stall investigation:
+blocked-vs-busy; BL-029's causal claim refuted**
+A0 closed early and worse than hypothesized: 14s scrape ceiling hit at ≤37h
+uptime, then the 25s ceiling within hours of raising it; 18 scrape failures
+over 2 days (query_range table). One direct probe collapsed the hypothesis
+space: `Measure-Command` on :3034 = 230–257ms serving ~530 samples — a page
+that renders in a quarter-second cannot honestly take 25s. BL-029's causal
+claim REFUTED (pointer added at BL-029): series growth is real (~6/hr smooth
+schedule-minted ramp, 250→530 over 44h — mechanism itself still open) but
+cannot drive the render cost; series retirement demoted to hygiene. The stall
+class: episodic — floor ~230ms with rare spikes that PIN at whatever the
+timeout is (12→14→25s observed) = blocked, not busy; true stall length never
+measured (outlived every ceiling; the 55s timeout is the standing best chance).
+Sharpened A-headline: why does host pressure turn a 230ms render into a ≥25s
+freeze rather than a slow render — suspect classes: blocking write/flush on
+the render path, sync RPC reachable from the handler, runtime-pool starvation
+(blue-confirm loop 30×2s). Correlation: SOME stalls coupled to
+ks_merged_zkas_rpc_ms elevation, some not (survivorship caveat: the worst rpc
+sample dies with the failed scrape).
+**Lesson:** a scrape duration pinned at the timeout means the handler didn't
+answer, not that it worked that long; only a direct endpoint probe separates
+blocked from busy. One probe ended three days of Prometheus-side inference.
+
+**BL-034 · 2026-08-22 · instruments — three rendering-layer traps in one
+investigation**
+(a) Graph decimation: medium-res graphs hid 15 of 18 scrape failures; the
+query_range API table is the data, the graph is a picture. (b) The Prometheus
+Table tab shows one instant, not history; "peaks as a table" is a query_range
++ client-side filter job. (c) PowerShell 5.1 → curl.exe strips embedded double
+quotes even from single-quoted strings in the backtick-continuation form;
+write PromQL matcher-free and filter in PowerShell, or use the UI (extends the
+existing quoting note, which covered only the interactive one-liner form).
+**Lesson:** every instrument has a rendering layer between the operator and
+the data; know what each layer discards before citing its output.
+
+**BL-035 · 2026-08-22→26 · host — morning stalls SOLVED: Store retry-grind;
+one evidence leg reattributed, verdict stands**
+Root cause: daily Windows Store retry-grind on Microsoft.ScreenSketch failing
+0x80073D02 (app in use — the operator's own screenshot workflow kept the
+package busy and fed the failure loop). Process killed 08-22; retro-check
+08-26: newest Id-20 = 08-22 and ZERO morning-era up-dips in 4 days —
+prediction made, prediction confirmed. CORRECTION to the 08-22 record: the
+morning Winlogon 6003 events (9:05:15, 10:16:03) match RDP reconnects TO THE
+SECOND — they were the operator connecting, not TrustedInstaller servicing;
+the conviction stands on its independent legs (WU download/Id-20 events,
+SmartRetry, the confirmed quiet-mornings prediction).
+**Lessons:** host servicing can masquerade as an application bug, and the
+investigation instrument can feed the failure it is investigating.
+"Auto-updates disabled" governed none of the channels that fired —
+multi-channel verification or nothing. Evidence-leg reattribution without
+conclusion collapse is a legitimate move when independent legs hold; and
+session-scoped logs (TerminalServices LSM) belong in every host-event sweep
+alongside System/Application.
+
+**BL-036 · 2026-08-26→27 · host/bridge — night dips: composite reading
+weakened; RDP churn and Defender both refuted for the open pair**
+Six dips since 08-22, all 21:30–03:33 ET. RDP session-log verdict was
+three-way: one 9-second coupling (8/21 01:30), one circumstantial (08-26
+21:30), two uncoupled (08-26 01:31/03:33). H1 summon experiment (08-27
+00:08–00:14): 180-probe 2s loop with three event-log-verified
+disconnect/reconnect cycles overlaid — floor 214–229ms unbroken, max 323ms
+landing 0.5s after a reconnect: a second-exact coincidence at noise amplitude,
+exactly the shape that made the 8/21 coupling look convicting. RDP churn
+REFUTED as a sufficient trigger. Defender diff: a nightly 01:00:1x signature-
+update metronome sits 31 min from the 01:31 dip and hours from 03:33 —
+exonerated (a nightly cause cannot produce episodic effects without a
+coincident condition, and it is not even temporally coupled). The 01:31/03:33
+dips remain UNATTRIBUTED; the discriminating variable is likely
+bridge/node-side (rpc_ms coupling per BL-033), not host-side.
+**Lesson:** a negative harness result is a result — ten minutes of controlled
+stimulus refuted the reproducible-trigger hypothesis before any source was
+read. Second-exact coincidences at noise amplitude are how false convictions
+form; amplitude is part of the evidence, not just timing.
+
+**BL-037 · 2026-08-22 · laptop rail — auth and cwd traps**
+gh browser-auth (device flow) preferred over fine-grained PATs for interactive
+machines: two PAT scoping failures vs one un-mis-scopable device flow; PAT
+scope errors are silent. PATs remain correct for sandboxes. The `~` cwd trap,
+zsh edition: mv-to-dot from the wrong directory strands files silently; the
+prompt's directory segment is the pre-command gate (BL-021 corollary).
+**Lesson:** on interactive machines prefer auth flows that cannot be
+mis-scoped, and verify cwd before every filesystem or git command.
+
+**BL-038 · 2026-08-26 · laptop rail — the two-clone incident (BL-020 live, at
+repo scale)**
+A failed `cd` at session open was read as "checkout never stood up" while a
+clone existed at a DIFFERENT path; a second clone was created and the two
+briefly diverged (new @ e7426e1; old self-reporting "up to date with origin"
+at 5b37875 from stale refs). The old clone held the only copies of two
+uncommitted docs — exactly where the hazard analysis predicted. Resolved same
+session: verified clean, deleted. ONE canonical clone: `~/zkas/zkas-rusty-kd`.
+**Lessons:** `find` for existing clones before cloning; a clone's path is part
+of its identity and gets recorded like a sha; "up to date with origin" is a
+statement about last-fetched refs, never about origin.
+
+**BL-039 · 2026-08-27 · host — the interactive session is the production kill
+domain; single-process bridge topology confirmed**
+Session inventory (S11): SIX production processes run in RDP Session 1 —
+stratum-bridge, kaspad, zkas-node, zkas-walletd, prometheus, alertmanager;
+only ZkasReporter runs as a scheduled task. A sign-out (operator- or
+servicing-forced) kills the entire stack; the kickoff's prefer-sign-out
+recommendation was gated on this inventory, tested, and REJECTED. The
+attached-idle session stays a documented ambient variable; service/task
+migration (ZkasReporter pattern) filed to H2. Port-ownership check also
+settled topology: ONE process (name `stratum-bridge`) owns :5755, :5765 and
+:3034 — "instance 1/2" are listeners within a single OS process: one kill
+target in the deploy sequence, one crash domain across both fleets
+(BRIDGE-SPEC §2 clarification due). Name-based process greps must include
+`stratum-bridge` explicitly.
+**Lesson:** inventory session ownership before adopting any logoff or restart
+practice — a shipped recommendation that would have killed production survived
+until measured.
+
+**BL-040 · 2026-07-09→08-27 · host — uncommanded power-loss series: six
+events, an instrument conflict, and a cluster shape (OPEN: rig cross-check)**
+Six Kernel-Power 41 + 6008 pairs: 7/9, 7/21, 8/7, 8/15, 8/16, 8/17. All five
+decodable events: BugcheckCode=0, PowerButtonTimestamp=0 — no bluescreens, no
+held button; operator hands excluded by decode and recollection (clean
+operator shutdowns log 1074+6006 and appear on different dates). Bridge logs
+corroborate all four August events as mid-flight kills (no Ctrl+C, no
+"completed" lines — contrast the 08-26 15:50 deliberate tail). INSTRUMENT
+CONFLICT: 6008 message bodies claim shutdowns 8–22 min before boot; bridge log
+mtimes prove the system alive ≤~40s before each boot. Resolution: 6008's
+"shutdown time" is a stale heartbeat (lags to the last recorded timestamp) —
+the written-to log is the better clock; dark gaps compress from minutes to
+seconds, weakening sustained-outage relative to brief-transient. Cluster shape
+(intervals 12d, 17d, 8d, 1d, 1d, then 10+ quiet days with NOTHING changed)
+argues against monotonic brick degradation; episodic premises transients or an
+intermittent connector fit. DECISIVE TEST OPEN and perishable: any rig uptime
+spanning 8/17 = Kron-local fault (19V brick/barrel; UPS insufficient alone);
+rig boots clustered at event times = circuit-side (UPS sufficient). H2 UPS
+install is correct under every surviving theory.
+**Lessons:** Windows' unexpected-shutdown timestamp is a lower-bound
+heartbeat, not a death time — a file being written is the better clock. A
+fault series that self-quiesces with nothing changed is evidence about the
+fault class, not reassurance.
+
+**BL-041 · 2026-08-27 · boundary — WAN/LAN audit: expected-state corrected,
+posture verified**
+AT&T gateway (192.168.1.254): NAT/Gaming carries exactly TWO deliberate
+forwards, both to Kron (hostname-verified WIN-BEEMRR5U33V) — 16111 tcp/udp
+(kaspad P2P) and 16811 tcp/udp (zkas-node P2P); no 3389 or other forwards; IP
+Passthrough OFF; IPv6 firewall ON, no exceptions. NLA verified on
+(UserAuthentication=1). "Zero rules targeting Kron" was the EXPECTED state in
+two shipped closure statements and was WRONG — the P2P exposure is now
+recorded as policy (rationale: inbound peers for solo block propagation; risk
+class: zkas-node v1.0.5's young parser WAN-reachable on a custody box; UDP is
+surplus — narrow to TCP if the UI allows). Managed bridge = TP-Link TL-SG116E
+v2.20 (fw 20230505) at .191: pure-L2 Easy Smart switch — no L3 services or
+cloud agent by construction; VLAN off; non-default credentials; HTTP mgmt,
+LAN-only. Fleet map recorded: ports 1/2/5/6 = KS0 Ultras (.21/.22/.25/.26),
+ports 7/8/9 = KS7 Lites (.27/.28/.29). Standing inventory line: both nodes'
+gRPC opened to the LAN 08-24 for covenant testing (scope-down to MacBook IP
+filed in BL-032's fix list). OPEN riders: port-11 unidentified 100M device;
+ports 15/16 (1000MF) mapping; SG116E firmware currency check → KRON-HARDENING.
+**Lesson:** audit against the artifact, not the expected state — the boundary
+held, but for partially different reasons than the record assumed.
+
+**BL-042 · 2026-08-22 · host — clock stepping (OPEN until H4)**
+Kernel-General 1/24 pairs every ~30 min = w32time stepping the clock;
+correlation precision of every host-event join in this era rides on it. H4:
+w32tm status read; fix if the steps are seconds-scale.
+**Lesson:** before trusting second-exact joins across logs, verify the clock
+is not being stepped between them.
+
+**BL-043 · 2026-08-26 · documentation — a spec cut from secondary records
+inherits their drift (BL-004 corrected in-place this commit)**
+BRIDGE-SPEC r1 reproduced BL-004's retracted "structurally immune" claim by
+drafting from ledger + memory instead of the in-repo artifact; the pre-move
+`ls` gate surfaced the old spec and caught it before commit. Draft 4 §6 had
+walked the claim back (immunity = lockfile-drift class ONLY; the cdylib/risc0
+LNK class lives in-workspace and took three fixes); the ledger inherited the
+broad claim forward. BL-004's lesson line carries the dated correction as of
+this commit.
+**Lesson:** meta-principle 1 has a documentation tier — verify claims against
+the in-repo artifact, not downstream records of it; secondary sources
+faithfully replicate the absence of each other's corrections.
 
 ---
 
