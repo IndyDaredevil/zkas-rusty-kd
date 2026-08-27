@@ -1,19 +1,21 @@
 # KICKOFF — v2.0.1.5 (Bridge Stream A + Pipeline Stream P + Host Stream H)
-### Cut 2026-08-26 (late) · r3 — SINGLE clean seed doc for the v2.0.1.5 chat.
+### Cut 2026-08-26 (late) · r4 — SINGLE clean seed doc for the v2.0.1.5 chat.
 ### Revision chain: r1 (d2a0d1b7...0402348) VOID same evening; r2 (da380662...7adc15)
-### + ADDENDUM r2 (be3a7ba5...86c2e2) SUPERSEDED BY THIS MERGE — both are preserved
-### in git history at 633a285 and removed from the working tree per the sealed-doc
-### law (DELETE-then-ADD, never side-by-side). r3 = r2 with the 08-26 late-session
-### deltas folded in place; the r1→r2 investigation content (§2) is unchanged.
+### + ADDENDUM r2 (be3a7ba5...86c2e2) SUPERSEDED BY MERGE, preserved in git history
+### at 633a285; r3 (2da14c08...0d315) VOID — cited the bridge spec by a versionless
+### filename before the naming law landed (filename carries the described artifact's
+### version; header carries content revision). r4 = r3 with that citation corrected.
+### The r1→r2 investigation content (§2) is unchanged since r2.
 ### Supersedes the Stream-A framing of SCOPE-v2.0.1.5.md r1 — that doc's A-items
 ### were rewritten by the 08-22 stall investigation; §2 here IS the r2 scope
 ### content until folded back (queue item 7).
 ### Companion docs in docs/bridge-v2/ (all ON ORIGIN as of 633a285):
 ### SCOPE-v2.0.1.5.md (r1, Stream P still authoritative) · ENGINEERING-LEDGER.md
 ### (sealed @ BL-031) · KRON-HARDENING.md (r1, committed, NOT yet applied) ·
-### SESSION-STATE-2026-08-21.md · BRIDGE-SPEC.md (r2, as-built system spec,
-### sha 070c717d...557001) · NODE-CONTRACT-v1.0.5.md (r1, consumed-binary
-### contract, sha a94ef5b5...a2ee0) · archive-merged-bridge-v2-spec-draft4.md
+### SESSION-STATE-2026-08-21.md · BRIDGE-SPEC-v2.0.1.4.md (content r2, as-built
+### system spec, sha 070c717d...557001) · NODE-CONTRACT-v1.0.5.md (r1,
+### consumed-binary contract, sha a94ef5b5...a2ee0) ·
+### archive-merged-bridge-v2-spec-draft4.md
 ### (frozen design history: port rationale, invariants 1-8, V-gates).
 
 ---
