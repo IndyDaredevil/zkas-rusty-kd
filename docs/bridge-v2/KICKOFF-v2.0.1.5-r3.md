@@ -1,19 +1,28 @@
 # KICKOFF — v2.0.1.5 (Bridge Stream A + Pipeline Stream P + Host Stream H)
-### Cut 2026-08-26 · r2 (r1 sha d2a0d1b7...0402348 is VOID — superseded same
-### evening by the RDP session-log findings). Seed doc for the v2.0.1.5 chat. Supersedes the
-### Stream-A framing of SCOPE-v2.0.1.5.md r1 (committed @ 5b37875) — that doc's
-### A-items were rewritten by the 08-22 stall investigation, which lived only in
-### the 08-22..26 chat. This doc IS the r2 content until committed.
-### Companion docs in docs/bridge-v2/: SCOPE-v2.0.1.5.md (r1, Stream P still
-### authoritative), ENGINEERING-LEDGER.md (sealed @ BL-031), KRON-HARDENING.md
-### (r1, drafted 08-26, NOT yet applied), SESSION-STATE-2026-08-21.md.
+### Cut 2026-08-26 (late) · r3 — SINGLE clean seed doc for the v2.0.1.5 chat.
+### Revision chain: r1 (d2a0d1b7...0402348) VOID same evening; r2 (da380662...7adc15)
+### + ADDENDUM r2 (be3a7ba5...86c2e2) SUPERSEDED BY THIS MERGE — both are preserved
+### in git history at 633a285 and removed from the working tree per the sealed-doc
+### law (DELETE-then-ADD, never side-by-side). r3 = r2 with the 08-26 late-session
+### deltas folded in place; the r1→r2 investigation content (§2) is unchanged.
+### Supersedes the Stream-A framing of SCOPE-v2.0.1.5.md r1 — that doc's A-items
+### were rewritten by the 08-22 stall investigation; §2 here IS the r2 scope
+### content until folded back (queue item 7).
+### Companion docs in docs/bridge-v2/ (all ON ORIGIN as of 633a285):
+### SCOPE-v2.0.1.5.md (r1, Stream P still authoritative) · ENGINEERING-LEDGER.md
+### (sealed @ BL-031) · KRON-HARDENING.md (r1, committed, NOT yet applied) ·
+### SESSION-STATE-2026-08-21.md · BRIDGE-SPEC.md (r2, as-built system spec,
+### sha 070c717d...557001) · NODE-CONTRACT-v1.0.5.md (r1, consumed-binary
+### contract, sha a94ef5b5...a2ee0) · archive-merged-bridge-v2-spec-draft4.md
+### (frozen design history: port rationale, invariants 1-8, V-gates).
 
 ---
 
-## 1. STATE SNAPSHOT (as of 2026-08-26 ~21:40 ET)
+## 1. STATE SNAPSHOT (as of 2026-08-26 late session)
 
-- **Bridge:** v2.0.1.4 (`merged-v2.0.1.4` @ 5b37875 docs-tip; code identity
-  336b7a5 four-way verified 08-20). Restarted ~16:00 ET today (operator-
+- **Bridge:** v2.0.1.4 (`merged-v2.0.1.4`; docs-tip 633a285 at r3 commit time —
+  spec pair landed @ e7426e1, kickoff set @ 633a285; code identity 336b7a5
+  four-way verified 08-20, unchanged). Restarted ~16:00 ET 08-26 (operator-
   reported; cause not recorded — correct here if it was a crash). Prior run:
   6 unbroken days 08-20→08-26, the best longitudinal dataset the operation has
   produced. PERISHABLE: `scrape_samples_scraped` + `scrape_duration_seconds`
@@ -30,10 +39,14 @@
 - **Fleet/wallet:** unchanged from memory-state (7 rigs ~14.2 TH/s nameplate;
   ~2M ZKAS custody; cold-storage sweep sequence agreed, unexecuted).
 - **Host:** Win 11 Pro 25H2 (26200.8875). UPS units ONSITE, not installed.
-  KRON-HARDENING r1 drafted, NOT applied. Auto-updates believed disabled but
-  Store/USO channels proven active 08-22 (multi-channel lesson).
-- **Laptop rail:** sparse-clone docs path proven end-to-end 08-22; gh
-  browser-auth wired in Keychain; git identity set (indygold@gmail.com).
+  KRON-HARDENING r1 drafted AND committed (633a285), NOT applied. Auto-updates
+  believed disabled but Store/USO channels proven active 08-22 (multi-channel
+  lesson).
+- **Laptop rail:** ONE canonical clone at `~/zkas/zkas-rusty-kd` (blob:none,
+  docs/bridge-v2 sparse cone, gh browser-auth in Keychain, git identity
+  indygold@gmail.com), fast-forwarded to tip. A duplicate clone briefly
+  existed 08-26 and was verified-clean then deleted (two-clone incident, §7).
+  One clone, one path, from here forward; `find` before any future clone.
 
 ## 2. WHAT THE 08-22..26 INVESTIGATION ESTABLISHED (the r1→r2 delta)
 
@@ -93,18 +106,22 @@
 
 - **A1′ (headline): make /metrics unstallable.** Source read first: trace the
   render path for anything that can block ≥ seconds (locks shared with RPC
-  work, sync I/O, pool starvation). Fix shape decided by the read; the
-  structural end-state is a lock-free/snapshot render that nothing the bridge
-  does can starve. Acceptance: zero timeout-kills across one week INCLUDING
-  declared host-pressure windows.
+  work, sync I/O, pool starvation). The read ANCHORS ON BRIDGE-SPEC §5
+  (metrics contract) and §6 (logging contract) as the as-built reference;
+  discrepancies vs the tree are ledger entries per that spec's own
+  ground-truth clause. Fix shape decided by the read; the structural
+  end-state is a lock-free/snapshot render that nothing the bridge does can
+  starve. Acceptance: zero timeout-kills across one week INCLUDING declared
+  host-pressure windows.
 - **A1-hygiene: series lifecycle.** Explain the ~6/hr smooth mint (what runs
   hourly per worker?), then retire idle series with BL-025-aware design
   (grace ≥ 10m; full-labelset key; re-verify all five block rules +
   RcReporterStarved against the new coexistence behavior BEFORE deploy).
 - **A2 full_clear pin · A3 estimator drift · A4 K/Z/D 24h discriminator ·
   A5 submit-latency/time-to-blue · A6 stale-share/job-latency:** unchanged
-  from SCOPE r1, including their reads-first gates. A4 note: today's restart
-  re-arms the discriminator (needs ≥24h uptime; valid from ~08-27 16:00).
+  from SCOPE r1, including their reads-first gates. A4 note: the 08-26
+  restart re-arms the discriminator (needs ≥24h uptime; valid from ~08-27
+  16:00).
 - Release mechanics unchanged (r1 §A7): BRIDGE_BUILD→5, canary :5775/w1c
   12h soak, four-way identity, BL-030 banner guard.
 
@@ -115,6 +132,11 @@ continuously at 15-day retention) → P3 worker_events → P2 worker_stats
 (hourly rollups; metric-name verification first) → P4 latency consumer
 (gated on A5). Bolt briefs use the 08-21 constraints-first format + the
 never-reinit-history addendum; operator sets any secrets.
+Citations for the enrichment work: BRIDGE-SPEC §6/§9 (kaspa-parent join
+window, schema pointers) + NODE-CONTRACT §3 (RPC caveats; aux_pow is
+stripped from RPC responses). Standing constraint on ALL P-stream schemas:
+invariant 8, the accounting law — `solves = kas + zkas − doubles` — now
+codified in BRIDGE-SPEC §7 as a contract on every consumer.
 
 ## 5. STREAM H (host — new, from the investigation)
 
@@ -148,9 +170,11 @@ H5 Revisit the global-vs-per-job scrape config (reporter back to 15s once
 5. A-stream reads session (A1′ source read + A2/A3/A4/A5/A6 reads — one
    sitting, no code).
 6. Schedule H2 maintenance window.
-7. Commit SCOPE r2 (this doc's §2–§5 folded back) + KICKOFF to docs/bridge-v2.
+7. Fold §2–§5 of this doc back into SCOPE r2 and commit it (KICKOFF r3 +
+   KRON-HARDENING are already on origin — this is the last uncommitted
+   revision debt).
 
-## 7. LEDGER CANDIDATES (BL-032+ raw list, draft in queue item 1)
+## 7. LEDGER CANDIDATES (BL-032+ raw list, draft in queue item 2)
 
 - Blocked-vs-busy: a scrape duration pinned at the timeout means the handler
   didn't answer, not that it worked that long; only a direct endpoint probe
@@ -184,6 +208,33 @@ H5 Revisit the global-vs-per-job scrape config (reporter back to 15s once
   presence is therefore ambient, not evented, unless sign-out is practiced.
 - Kernel-General 1/24 pairs every ~30 min = clock stepping; correlation
   precision rides on w32time discipline (open until H4 verifies).
+- BL-004 cross-doc drift (08-26): the ledger's "structurally immune" wording
+  was retracted by Draft 4 §6 (immunity = lockfile-drift class ONLY; the
+  cdylib/risc0 LNK class lives in-workspace and took three fixes). The
+  ledger inherited forward what the spec had walked back. Correct BL-004's
+  text at reseal.
+- Meta-principle 1, documentation tier (08-26): BRIDGE-SPEC r1 reproduced
+  the retracted claim by drafting from ledger + memory instead of reading
+  the in-repo artifact; the pre-move `ls` gate surfaced the old spec and
+  caught it before commit. A spec cut from secondary records inherits their
+  drift.
+- Conduct law minted (08-26): a deliverable's destination is
+  verified-or-created within the same instruction set, and multi-step
+  sequences state their gating (deploy one-liners shipped against a
+  roadmap-item checkout; ~2 min cost, zero writes — atomic mv failures).
+- Discovery (08-26): the "incomplete docs/bridge-v2 commit" open item was
+  already closed on origin pre-session (SCOPE, ledger, session-state,
+  README, monitoring/, reporter/ all present at 5b37875).
+- Two-clone incident (08-26, resolved same session): the failed `cd` that
+  opened the session was read as "checkout never stood up" when a clone
+  existed at a DIFFERENT path — a second clone was created, and the two
+  briefly diverged (new at e7426e1, old self-reporting "up to date with
+  origin" at 5b37875 from stale refs — BL-020 live, at repo scale). The
+  old clone held the only copies of two uncommitted docs, exactly where the
+  hazard analysis predicted. Laws: `find` for existing clones before
+  cloning; a clone's path is part of its identity and gets recorded like a
+  sha; "up to date with origin" is a statement about last-fetched refs,
+  never about origin.
 
 ## 8. STANDING CARRIES (unchanged, from memory/08-21 state)
 
