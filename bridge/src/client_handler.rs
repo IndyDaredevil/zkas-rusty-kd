@@ -760,10 +760,22 @@ impl ClientHandler {
             });
         }
 
-        // Check balances periodically
+        // Check balances periodically.
+        // BL-032/A8: on nodes without the prerequisite index this call is
+        // structurally dead - it fails every cycle (~2.9k WARNs/day), and a
+        // WARN that fires every 30s forever trains WARN-blindness. Circuit-
+        // break after BALANCE_FAILURE_LIMIT consecutive failures: demote to a
+        // single INFO and stop scheduling for the life of the process (both
+        // instances share the breaker; they poll the same node). Any success
+        // resets the count.
         {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static BALANCE_CONSEC_FAILURES: AtomicU32 = AtomicU32::new(0);
+            const BALANCE_FAILURE_LIMIT: u32 = 10;
+
+            let tripped = BALANCE_CONSEC_FAILURES.load(Ordering::Relaxed) >= BALANCE_FAILURE_LIMIT;
             let mut last_check = self.last_balance_check.lock();
-            if last_check.elapsed() > BALANCE_DELAY && !addresses.is_empty() {
+            if !tripped && last_check.elapsed() > BALANCE_DELAY && !addresses.is_empty() {
                 *last_check = Instant::now();
                 drop(last_check);
 
@@ -774,11 +786,20 @@ impl ClientHandler {
                 tokio::spawn(async move {
                     match kaspa_api_clone.get_balances_by_addresses(&addresses_clone).await {
                         Ok(balances) => {
+                            BALANCE_CONSEC_FAILURES.store(0, Ordering::Relaxed);
                             // Record balances
                             crate::prom::record_balances(&instance_id, &balances);
                         }
                         Err(e) => {
-                            warn!("failed to get balances from kaspa, prom stats will be out of date: {}", e);
+                            let n = BALANCE_CONSEC_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n < BALANCE_FAILURE_LIMIT {
+                                warn!("failed to get balances from kaspa, prom stats will be out of date: {}", e);
+                            } else if n == BALANCE_FAILURE_LIMIT {
+                                tracing::info!(
+                                    "balance polling disabled after {} consecutive failures (structurally unavailable on this node); restart the bridge to re-enable",
+                                    n
+                                );
+                            }
                         }
                     }
                 });

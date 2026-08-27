@@ -587,14 +587,27 @@ async fn handle_http_request(
 async fn serve_http_loop(listener: tokio::net::TcpListener, mode: HttpMode) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::AsyncReadExt;
 
+    // BL-045: the previous serial, timeout-less loop let any slow, idle, or
+    // half-open client (canonically a browser preconnect against the bundled
+    // dashboard) park the entire server at read(), pinning every queued
+    // scrape at the Prometheus timeout while the render itself costs ~5ms.
+    // Each connection now gets its own task, and a client that sends nothing
+    // within HTTP_READ_TIMEOUT is dropped without blocking anyone else.
+    const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     loop {
         let (mut stream, _) = listener.accept().await?;
-        let mut buffer = [0; 8192];
-
-        if let Ok(n) = stream.read(&mut buffer).await {
-            let request = String::from_utf8_lossy(&buffer[..n]);
-            let _ = handle_http_request(stream, &request, &mode).await;
-        }
+        let mode = mode.clone();
+        tokio::spawn(async move {
+            let mut buffer = [0; 8192];
+            match tokio::time::timeout(HTTP_READ_TIMEOUT, stream.read(&mut buffer)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    let request = String::from_utf8_lossy(&buffer[..n]).into_owned();
+                    let _ = handle_http_request(stream, &request, &mode).await;
+                }
+                _ => {} // read timeout, io error, or empty EOF: drop the connection
+            }
+        });
     }
 }
 

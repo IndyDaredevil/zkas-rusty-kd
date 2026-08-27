@@ -168,7 +168,7 @@ fn log_bridge_configuration(config: &BridgeConfig) {
     // engine version), so banner and engine cannot disagree. Only the build
     // ordinal below is hand-bumped per release -- it is the release checklist
     // item, and the tag must match it. Convention: vE.N.G.B.
-    const BRIDGE_BUILD: u32 = 4;
+    const BRIDGE_BUILD: u32 = 5;
     let bridge_release = format!("v{}.{}", env!("CARGO_PKG_VERSION"), BRIDGE_BUILD);
     tracing::info!("----------------------------------");
     tracing::info!("RC merged bridge {} (engine {})", bridge_release, env!("CARGO_PKG_VERSION"));
