@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-043 (2026-08-27)
+### Last entry: BL-044 (2026-08-27)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -774,6 +774,42 @@ this commit.
 **Lesson:** meta-principle 1 has a documentation tier — verify claims against
 the in-repo artifact, not downstream records of it; secondary sources
 faithfully replicate the absence of each other's corrections.
+
+**BL-044 · 2026-08-27 · host — seventh power event closes BL-040's test:
+mixed etiology; UPS installed; 6008 heartbeat lag calibrated**
+Premises-wide outage 02:05–02:50 (operator-witnessed, 45 min dark) — a
+signature distinct from all six prior events (≤~40s). UPS ×3 (CyberPower)
+installed the same morning; every future uncommanded Kron drop while rigs
+ride through is now near-proof of the DC-side fault class — the UPS is an
+instrument as well as protection.
+BL-040's rig cross-check CLOSED on pre-outage readings: W7/W8 at 13d (boot
+≈8/14) rode through 8/15, 8/16 AND 8/17 → the 8/15–16 cluster is CONVICTED
+Kron-local; the 19V brick / DC barrel moves from suspect to convicted class;
+spare brick on the H2 procurement list (the fault a UPS cannot cover). KS0s
+at 10d (boot ≈8/17) leave 8/17 ambiguous — possibly leg-scoped (KS0 boot
+timestamp is the tell, low priority). Etiology formally MIXED: Kron-local
+class + premises class coexist in one series.
+Heartbeat CALIBRATED against ground truth: 6008 reported "shutdown at
+1:29:52" vs known ~02:05 death = ~35 min lag on a quiet System log; the 8/16
+boot wrote NO 6008 at all (marker not reliably written). Boot side exact:
+Event 41 at 02:50:05 vs power restored ~02:50. BL-040's log-mtime-over-6008
+resolution upgrades from inference to measurement.
+Recovery cost measured: full six-process manual relaunch in dependency order
+(nodes 02:53 → monitoring 02:53–54 → walletd 02:55:07 → bridge 02:55:25),
+power-on → mining in ~5 min, at 3 AM — BL-039's service-migration case,
+quantified. A4's discriminator clock reset by the restart (valid ~02:55
+08-28).
+W9 watch item: spontaneous rig self-reboot ~8/25, operator-witnessed (not
+initiated), no coincident host/premises event, same-circuit W7/W8 unaffected
+→ rig-internal (watchdog class). Single occurrence = watch, not
+investigation; exact timestamp recoverable from the six-day log
+(RKStratum_1787244620.log — one more reason that file is archive-grade);
+invisible to current alerting (~2-min stratum gap) → per-worker disconnect
+counter folded into SCOPE r2 A6.
+**Lessons:** an installed UPS converts every future power event into a
+one-bit diagnosis — protection and instrument in one. When a ground-truth
+event occurs, calibrate the instruments against it while it is fresh: the
+6008 lag went from argued to measured for free.
 
 ---
 

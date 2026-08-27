@@ -1,7 +1,17 @@
-# SCOPE — Bridge v2.0.1.5 + Pipeline Stream P
-### Drafted 2026-08-22 · Status: SCOPING (no code started)
-### Convention: Stream A = bridge release contents (ships as one exe). Stream P = reporter/schema work (ships independently, per WS7 discipline: bridge grows log lines/metrics, sidecar grows consumers).
-### References: BL-028, BL-029, BL-030; SESSION-STATE-2026-08-21 §4.7; 08-14 session state §2 (K/Z/D card).
+# SCOPE — Bridge v2.0.1.5 + Pipeline Stream P + Host Stream H
+### Content r2 · folded 2026-08-27 · Status: READS PENDING (no code started)
+### r1 (2026-08-22) superseded in-place per the naming law: same filename,
+### header carries the content revision. r2 absorbs KICKOFF-v2.0.1.5-r5 §2–§5
+### (the 08-22..26 investigation layer that superseded r1's Stream A) plus the
+### S11/S12 session results (H1/H1b executed, ledger resealed @ BL-043,
+### BL-044 banked, UPS installed, seventh power event). The KICKOFF hereby
+### retires to historical session seed; THIS document is the scope of record.
+### Convention: Stream A = bridge release (one exe). Stream P = reporter/schema
+### (ships independently, WS7 discipline). Stream H = host work.
+### References: ENGINEERING-LEDGER sealed @ BL-043 (commit 5179e65); BL-044
+### banked in the S11/S12 thread, appends with this document's commit.
+### Read-gated items are marked «READ-GATED»: their shape is decided by the
+### queue-5 reads sitting; post-read amendments are line edits to this doc.
 
 ---
 
@@ -13,231 +23,224 @@
 - **Pipeline is the toolchain** (BL-021): anchored-replacement PowerShell
   patches → `merged-v2.0.1.5` branch → bridge-check CI as compile gate →
   branch-targeted release → win64 zip → canary `:5775` (w1c) → production.
-  BL-030's banner guard is already in `deploy.yaml`; version derives from
+  BL-030's banner guard is in `deploy.yaml`; version derives from
   `CARGO_PKG_VERSION` + `BRIDGE_BUILD` — bump `BRIDGE_BUILD` to 5, nothing else.
-- **Investigation before code, per item.** Three items (A2, A4, A5) begin with
-  a source or query read that can shrink or delete the code change. Do the
-  read first; the scope contracts, never expands, at that gate.
+- **Investigation before code, per item.** Every surviving A-item begins with
+  a source or query read that can shrink or delete the code change. The scope
+  contracts, never expands, at that gate.
 - **Production is sacred** (meta-principle 8): every bridge change canaries on
   `:5775` before fleet exposure. Rollback = relaunch prior exe via
   `run-rc-merged.cmd` (parked copy retained per BL-031 retention policy).
+- **Single-process reality** (BL-039): both stratum "instances" are listeners
+  in ONE OS process (`stratum-bridge`, one PID owning :5755/:5765/:3034) —
+  one kill target in every deploy sequence, one crash domain across both
+  fleets. BRIDGE-SPEC §2 clarification rides this release's doc pass.
 
 ---
 
-## STREAM A — BRIDGE v2.0.1.5
+## 1. INVESTIGATION RECORD (what rewrote r1 — ledgered BL-032..BL-044)
 
-### A0 · GATE: BL-029 8h scrape-duration measurement  «blocks A1»
-**What:** After v2.0.1.4 has ≥3 days unbroken uptime, run:
-```
-max_over_time(scrape_duration_seconds{job="rc_merged_bridge"}[8h])
-```
-and record the value ALONGSIDE THE UPTIME (BL-029's lesson: a duration without
-uptime context is not evidence).
-**Pass/fail:**
-- Climbing toward seconds-scale → A1 is IN scope (mandatory; no timeout
-  headroom exists — 14s vs 15s interval is the hard ceiling, BL-024).
-- Flat at milliseconds → A1 drops to backlog; BL-029 closes as
-  "hypothesis not confirmed at current fleet size," with the number and
-  uptime recorded in the closing entry.
-**Effort:** one query + one ledger note. Do this before anything else in
-Stream A; it is the only item that changes the release's size materially.
+1. **A0 gate CLOSED, early, worse than hypothesized** (BL-033): 14s scrape
+   ceiling at ≤37h uptime, 25s ceiling within hours of raising it; 18 scrape
+   failures over 2 days. r1's A0 item is retired; its outcome is recorded
+   here and in BL-033.
+2. **BL-029's causal claim REFUTED** (BL-033, pointer at BL-029): the metrics
+   page is ~530 samples serving in ~230ms (direct probe). Series growth is
+   real (~6/hr smooth schedule-minted ramp) but cannot drive a 25s render.
+   Series retirement demoted from fix to hygiene (A1-hygiene below).
+3. **The stall class:** episodic — floor ~230ms, spikes PIN at whatever the
+   timeout is (12→14→25s observed) = blocked, not busy. True stall length
+   never measured (outlived every ceiling; the 55s timeout is the standing
+   best chance).
+4. **Morning stalls SOLVED** (BL-035): Store retry-grind on ScreenSketch;
+   killed 08-22; zero morning dips in 4 days — prediction confirmed.
+5. **Night dips: composite reading WEAKENED by experiment** (BL-036). H1
+   summon (08-27): three event-log-verified RDP churn cycles over a live 2s
+   probe — floor unbroken; churn REFUTED as sufficient trigger. Defender
+   exonerated for the 01:31/03:33 08-26 pair (31 min offset; nightly
+   metronome cannot produce episodic effects). Those two dips remain
+   UNATTRIBUTED; the discriminating variable is likely bridge/node-side
+   (rpc_ms coupling, survivorship caveat), not host-side. Consequence: A1′
+   has NO reproducible trigger harness — the source read proceeds without
+   one, and suspect ranking tilts toward what churn cannot explain.
+6. **The Stream-A headline:** why does host pressure turn a 230ms render into
+   a ≥25s freeze rather than a slow render? Suspect classes: blocking
+   write/flush on the render path, sync RPC reachable from the handler,
+   runtime-pool starvation (blue-confirm loop 30×2s sync on the async pool).
+   The single-process finding (§0) raises the stakes: whatever starves the
+   render shares a crash/starvation domain with both fleets' stratum.
+7. **Host context now instrumented-adjacent** (BL-040/BL-044): six-event
+   uncommanded power series closed as MIXED etiology — 8/15–16 convicted
+   Kron-local (19V brick/DC-barrel class; rigs rode through), 8/27 outage
+   premises-wide; UPS ×3 installed 08-27, converting every future event into
+   a one-bit discriminator. 6008 heartbeat lag calibrated ~35 min against a
+   known death time. Relevant to Stream A only as environment: night-dip
+   attribution cannot lean on power events (none coincide).
 
-### A1 · Series retirement (CONDITIONAL on A0)
-**What:** Retire a worker's Prometheus series when its session disconnects,
-so `/metrics` render cost stops growing with uptime.
-**Design constraints (from the ledger, non-negotiable):**
-- BL-025 retained `sum without (ip)` with `increase()` INSIDE the sum
-  precisely because retired series coexist with live ones in the same scrape.
-  If retirement removes that coexistence, the alert rules' assumptions change
-  — re-verify all five block rules + RcReporterStarved against the new
-  behavior BEFORE deploy, not after.
-- Retirement must not destroy a series mid-`for:` window on an active alert
-  (a retired series is a staleness marker, and BL-024 documents exactly what
-  staleness markers do to lookback). Grace period ≥ the longest rule window
-  (3m) + `for:` — suggest retiring only series idle ≥10m.
-- The `wallet` label is a second churn vector (BL-007/BL-025 note) — the
-  retirement key must be the full labelset, not just `ip`.
-**Acceptance (canary):** connect/disconnect w1c repeatedly; `/metrics` series
-count returns to baseline within the grace period; zero phantom cards; scrape
-duration flat across the churn.
-**Acceptance (production):** BL-029's 8h query re-run after 3 days on
-v2.0.1.5 reads flat. This closes BL-029.
+## 2. STREAM A — BRIDGE v2.0.1.5
 
-### A2 · `full_clear` semantics pin
-**What:** ~91% of `[ZKAS] DOUBLE` lines carry `full_clear` (566/646) against
-~25 real doubles. Pin the field's meaning against bridge source before it
-ships to the dashboard or anywhere else.
-**Step 1 (read, no code):** trace the `full_clear` write site in the RC
-source; determine what condition actually sets it.
-**Step 2 (one of three outcomes, decided by step 1):**
-- (a) Field is correct, name is misleading → rename in log line + one-line
-  doc; reporter regex updated in P-stream if it ever consumed it (it does not
-  today — verify with a grep before claiming, per the negative-claims rule).
-- (b) Field is a bug → fix, with a unit test asserting the intended
-  condition (BL-005's lesson: turn the drift into CI red).
-- (c) Field is correct and correctly named, our reading of it was wrong →
-  ledger note only, zero code.
-**Acceptance:** the next real double logs a value consistent with the pinned
-definition; the definition is written into the scope-close ledger entry.
+### A1′ · HEADLINE: make /metrics unstallable  «READ-GATED»
+**Read first:** trace the render path for anything that can block ≥ seconds
+(locks shared with RPC work, sync I/O, pool starvation — the blue-confirm
+loop is the named pool-starvation suspect). Anchors: BRIDGE-SPEC §5 (metrics
+contract) + §6 (logging contract) as as-built reference; discrepancies vs the
+tree are ledger entries per that spec's ground-truth clause. No harness
+exists (H1 negative) — the read is unassisted by reproduction.
+**Fix shape:** decided by the read; structural end-state is a lock-free /
+snapshot render nothing the bridge does can starve.
+**Acceptance:** zero timeout-kills across one week of production. (r1's
+"declared host-pressure windows" clause is retired — H1 showed we cannot
+declare such windows on demand; the week must stand on its own.)
 
-### A3 · Hashrate estimator drift
-**What:** `estimated_hashrate/difficulty` reads 2.11/2.048 vs theoretical 2.0
-at 1 BPS (BL-028 minor open) — consistent with the estimator using an
-OBSERVED blockrate window rather than the target rate.
-**Step 1 (read):** confirm in source which window the estimator uses.
-**Step 2:** either switch to target rate (one constant) or document the
-observed-rate choice as intentional with the expected drift band. Bias toward
-the smallest change — this is cosmetic; a wrong "fix" that touches the 30s
-stats loop is worse than the drift.
-**Acceptance:** gauge ratio within a stated band, or a written rationale for
-leaving it. Closes BL-028's minor-open tail either way.
+### A1-hygiene · Series lifecycle  «READ-GATED»
+Explain the ~6/hr smooth mint (what runs hourly per worker?), then retire
+idle series with BL-025-aware design: grace ≥10m; full-labelset key (wallet
+label is a second churn vector); re-verify all five block rules +
+RcReporterStarved against the new coexistence behavior BEFORE deploy
+(retired series are staleness markers — BL-024's lookback lesson).
+**Acceptance (canary):** churn w1c; series count returns to baseline within
+grace; zero phantom cards; scrape duration flat across churn.
 
-### A4 · K/Z/D "24h" card bug — discriminator first
-**What:** 24h rows displayed cumulative-since-restart values; luck divided
-since-restart blocks by 24h expectation (08-14 session state, never
-discriminated).
-**Step 1 (query, no code):** run the recording-rule expr and raw
-`increase(...[24h])` side by side. Two branches:
-- Recording rule / Grafana math at fault → this is a MONITORING fix, exits
-  Stream A entirely (config change, deployed-artifact-verified via
-  /api/v1/rules per BL-020).
-- Bridge stats loop at fault → in-scope code fix.
-**Acceptance:** after ≥24h uptime, the 24h row ≠ the since-restart row, and
-the two differ by exactly the pre-window increments.
+### A2 · `full_clear` semantics pin  «READ-GATED»
+Unchanged from r1: trace the write site; outcome (a) rename / (b) fix with
+unit test / (c) ledger note only. ~91% of DOUBLE lines carry it against ~25
+real doubles. Reporter does not consume it today (verify with grep before
+claiming, per the negative-claims rule).
+**Acceptance:** next real double logs a value consistent with the pinned
+definition; definition written into the scope-close ledger entry.
 
-### A5 · Instrumentation: submit latency + time-to-blue
-**What:** per block, per leg: solve-detected → submit-sent → node-accepted
-timestamps, plus blue-confirmation time (the 30×2s loop already polls the
-condition; it does not record when it flips).
-**Step 1 (read):** grep the RC source for existing timestamps on this path —
-some or all may already be logged, in which case this item shrinks to a log
-FORMAT change (structured, parseable line) rather than new instrumentation.
-**Step 2:** emit ONE structured log line per block carrying all four deltas
-(ms), keyed by H_zk — the reporter joins on the hash it already tracks. Also
-export as Prometheus histograms ONLY if free; the log line is the mandatory
-artifact (the accounting rail consumes logs; Prometheus retention would
-discard the longitudinal value this exists for).
-**Non-goal:** no alert rules on these in this release. Collect first,
-threshold later — we do not know the healthy distribution yet.
-**Acceptance (canary):** solve a share on w1c (or wait for a real block) and
-verify the line parses; deltas plausible (submit latency ms-scale,
-time-to-blue ~60s-scale).
+### A3 · Hashrate estimator drift  «READ-GATED»
+Unchanged from r1: confirm which window the estimator uses (observed vs
+target blockrate); smallest change wins — cosmetic; a wrong "fix" touching
+the 30s stats loop is worse than the drift. Closes BL-028's minor-open tail
+either way.
 
-### A6 · Instrumentation: stale-share rate + job delivery latency
-**What:** per-worker stale/rejected share counters (if not already exported —
-verify first) + node-notification → job-pushed-to-worker latency.
-**Step 1 (read):** inventory existing share-outcome metrics in the RC. The
-stale counter likely exists; the job-latency measurement likely does not.
-**Step 2:** counters as Prometheus metrics (cheap, aggregate by nature);
-job latency as a rolling gauge or summary — NOT per-job log lines.
-**Kill criterion:** if the first week of data shows stale rate ≈0% fleet-wide,
-this closes as "measured healthy, one ledger line" and P-stream never builds
-a consumer for it. The measurement is the deliverable, not a dashboard.
-**Acceptance (canary):** metrics present and moving on w1c under normal
-share flow.
+### A4 · K/Z/D "24h" card bug — discriminator first  «READ-GATED»
+Unchanged from r1: run the recording-rule expr and raw `increase(...[24h])`
+side by side after ≥24h bridge uptime. Monitoring at fault → exits Stream A
+(config fix, artifact-verified via /api/v1/rules). Bridge stats loop at
+fault → in-scope code fix.
+**Clock:** the 08-27 02:05 outage reset the window — bridge StartTime
+02:55:25 08-27; discriminator valid from ~02:55 08-28. (Third arming: 08-26
+16:00 restart re-armed it once already; any future restart re-arms again.)
+
+### A5 · Instrumentation: submit latency + time-to-blue  «READ-GATED»
+Unchanged from r1: grep for existing timestamps first (may shrink to a log
+FORMAT change); one structured line per block, four deltas (ms), keyed by
+H_zk; Prometheus histograms only if free — the log line is the mandatory
+artifact. No alert rules this release; collect first.
+
+### A6 · Instrumentation: stale-share rate + job delivery latency + worker
+### disconnect counter  «READ-GATED»
+r1 items unchanged (inventory existing share-outcome metrics first; counters
+as metrics; job latency as rolling gauge/summary, not per-job logs; kill
+criterion: stale ≈0% fleet-wide for a week closes it as "measured healthy").
+**Added (BL-044):** per-worker disconnect/reconnect counter — the W9
+spontaneous self-reboot (~8/25) was invisible to all current alerting
+(~2-min stratum gap, under every threshold). Cheap counter now; threshold
+only if W9 repeats.
+
+### A8 · Log/alert hygiene from BL-032 (bridge side)
+Retire the structurally-dead balance WARN (2,872/day against a shielded
+treasury that has no UTXOs — a call that cannot succeed firing every 30s
+trains WARN-blindness). Verify at the write site whether the call itself
+should be conditional or only the log level demoted; smallest change wins.
 
 ### A7 · Release mechanics + close-out
-- Branch `merged-v2.0.1.5` from `merged-v2.0.1.4` @ `336b7a5`.
+- Branch `merged-v2.0.1.5` from `merged-v2.0.1.4` (code identity 336b7a5
+  four-way verified 08-20, unchanged; docs commits since do not touch code).
 - `BRIDGE_BUILD` → 5. Banner guard verifies at release time (BL-030).
-- Canary `:5775`/w1c: minimum 12h soak (c.15 precedent), acceptance = all
-  item-level criteria above + 77/0/0-style clean share flow + zero FORENSIC
-  IMPLAUSIBLE.
-- Deploy: park/copy/hash-verify/kill/launch; four-way identity check
-  (branch = origin = tag = running exe banner).
-- Post-deploy: BL-029 8h re-measurement (if A1 shipped); ledger entries
-  drafted (A0 gate result, A2 pin, A3 close, A4 branch taken); retire
-  v2.0.1.4 `.bak-*` set after one clean production day (BL-031 policy).
+- Canary `:5775`/w1c: minimum 12h soak; acceptance = all item-level criteria
+  + clean share flow + zero FORENSIC IMPLAUSIBLE.
+- Deploy: park/copy/hash-verify/kill/launch; four-way identity check. Single
+  process (§0): one kill, one launch, both instances ride together.
+- Docs pass rides the release: BRIDGE-SPEC §2 single-process clarification;
+  ledger entries (A-item outcomes); retire v2.0.1.4 `.bak-*` set after one
+  clean production day (BL-031 policy).
 
----
+## 3. STREAM P — PIPELINE (unchanged from r1; not started)
 
-## STREAM P — PIPELINE (parallel, independent shipping)
+P1 network_history (D_z/D_k 5-min sampler) — **SHIP FIRST; the curve is
+being lost continuously at 15-day retention.** P3 worker_events → P2
+worker_stats (metric-name verification first — from `/metrics`, not memory)
+→ P4 latency consumer (gated on A5 in production). Full item specs: r1 §P1–P4
+text is carried verbatim in git history and remains authoritative for
+schemas/footprints; constraints refreshed here:
+- Bolt briefs: 08-21 constraints-first format + never-reinit-git-history
+  addendum; Bolt cannot set edge secrets (operator does); no RLS loosening.
+- Reporter updates per banked runbook: stop task → overwrite → start →
+  verify RUNNING artifact (reporter.log listener line + `:9151/metrics`).
+- Every consumer honors invariant 8 (accounting law: solves = kas + zkas −
+  doubles), codified BRIDGE-SPEC §7.
+- Enrichment citations: BRIDGE-SPEC §6/§9 (kaspa-parent join window),
+  NODE-CONTRACT §3 (aux_pow stripped from RPC).
+- First-live-day reconciliation per item (row counts vs source-of-truth
+  query), sompi-exact.
 
-### P1 · D_z/D_k history sampler  «no bridge dependency — can ship TODAY»
-**What:** reporter (or a second tiny scheduled task) samples
-`ks_zkas_network_difficulty_gauge` + KAS-leg gauge from `:9151`-adjacent
-Prometheus every 5m, POSTs a rollup row to a new `network_history` table.
-BL-028 measured 9%/20min and 30%/day moves — the curve is unrecoverable once
-it scrolls out of Prometheus retention.
-**Schema:** `network_history(sampled_at, d_z, d_k, ratio, est_hashrate_z,
-est_hashrate_k)` — no dedup key needed (append-only time series), but a
-unique on `sampled_at` truncated to the sample grid makes replay idempotent
-anyway. Cheap insurance, take it.
-**Footprint:** 288 rows/day. Negligible.
+## 4. STREAM H — HOST
 
-### P2 · `worker_stats` hourly rollup — effective hashrate
-**What:** hourly per-worker row: accepted-share difficulty sum → measured
-hashrate; share counts; stale count (once A6 lands, else omit the column).
-Closes BL-016(a) properly: Luck vs MEASURED hashrate = real Poisson luck;
-vs nameplate = capture KPI — keep both. Settles the w1m ~7% question with an
-actual average instead of snapshots.
-**Source:** existing bridge metrics via Prometheus query API (the reporter
-already knows `curl.exe -sG --data-urlencode` patterns) — verify the exact
-metric names against `/metrics` before writing the query, not from memory.
-**Schema:** `worker_stats(hour_start, worker, diff_sum, shares_accepted,
-shares_stale NULL, hashrate_measured)` — unique(hour_start, worker) as the
-idempotent replay key.
-**Footprint:** 168 rows/day at 7 workers.
+- **H1 summon experiment: DONE 08-27, negative** (BL-036) — churn refuted as
+  sufficient trigger; no harness for A1′.
+- **H1b posture: DONE 08-27** (BL-041/BL-039) — NLA on; WAN boundary audited
+  (two deliberate P2P forwards 16111/16811 recorded as policy; IP
+  Passthrough off; IPv6 firewall clean; SG116E characterized). r5's
+  prefer-sign-out recommendation RETRACTED: six production processes live in
+  Session 1; sign-out is a whole-stack kill until migration (H2).
+- **H2 maintenance window — PARTIALLY DONE.** UPS ×3 installed 08-27 (early,
+  forced by the seventh event). Remainder, one window: KRON-HARDENING §2–§6
+  application (artifact gates per that doc) + Store/OS update flush +
+  service/scheduled-task migration of the six Session-1 processes
+  (ZkasReporter pattern; kills the 3 AM manual-relaunch cost measured in
+  BL-044) + deliberate bridge relaunch. Procurement rider: spare 19V
+  brick/DC barrel (BL-040/044 convicted class — the fault the UPS cannot
+  cover). Post-window: KRON-HARDENING §8 gates.
+- **H3** Hardening acceptance: KRON-HARDENING §9, 7 quiet days from
+  application.
+- **H4** Clock discipline: w32tm status read (BL-042 OPEN); fix if the ~30-min
+  steps are seconds-scale — correlation precision of every host-event join
+  rides on it.
+- **H5** Revisit global-vs-per-job scrape config (reporter back to 15s) once
+  the bridge render is trusted again (post-A1′).
+- **H6** BL-032 instrumentation & escalation package: windows_exporter +
+  RAM% / commit-ratio / per-process-RSS / exporter-down rules (runbook
+  drafted 08-26) + page-tier `ZkasLegDegraded` on sustained template age
+  (detection existed at T+30s; the 3.8h gap was escalation). Config-side;
+  artifact-verified via /api/v1/rules per BL-020.
+- **H7** Node-side BL-032 fixes: zkas-node v1.0.6 with file logging ON (the
+  wedge had no node-side witness); `--ram-scale` on kaspad; gRPC firewall
+  rules scoped to the MacBook IP (the 08-24 LAN opening left unauthenticated
+  RPC reachable by seven unaudited-firmware rigs). Upstream wedge report to
+  firecash rides this item (draft exists, 08-26 session).
 
-### P3 · Reconnect/authorize events
-**What:** reporter parses authorize lines from the log it already tails; one
-row per event: `worker_events(occurred_at, worker, wallet_captured, ip)`.
-Feeds BL-029's series-growth model, rig stability trending, and a standing
-cross-check on the BL-007 wallet-capture trap (a row with an unexpected
-wallet is the alarm).
-**Footprint:** near-zero in steady state; that is itself the signal.
-
-### P4 · Latency consumer  «depends on A5 shipping»
-**What:** extend the reporter to parse A5's structured line and attach the
-four deltas to the existing `zkas_blocks` row — as a beat-2 field extension
-if timing allows (the line lands before the T+60s beat), else a third beat
-on the same key. Prefer extension: two beats on one key was the WS7 design;
-don't add a transport tier without need.
-**Schema:** four nullable integer-ms columns on `zkas_blocks`. Nullable
-because 659 historical rows will never have them.
-
-### P-mechanics
-- Schema changes via Bolt with the constraints-first brief format that worked
-  on 08-21, PLUS the banked addendum: **never reinit git history**; Bolt
-  cannot set edge secrets (operator does); no RLS loosening.
-- Reporter update procedure per banked runbook: stop task → overwrite →
-  start → verify RUNNING artifact (reporter.log "metrics listener" line +
-  `:9151/metrics`).
-- Each P item gets its own reconciliation check on first live day (row counts
-  vs source-of-truth query), per the sompi-exact discipline.
-- P1 and P3 have zero Stream-A dependency; P2 needs only a metric-name
-  verification; P4 waits on A5. Ship P1 first as the pattern-prover for
-  "new table + rollup beat."
-
----
-
-## SEQUENCING SUMMARY
+## 5. SEQUENCING
 
 ```
-A0 (query, today-ish, needs ≥3d uptime) ──► A1 in/out decision
-A2.1, A3.1, A4.1, A5.1, A6.1 (all READS — one investigation session, no code)
-        │
+queue-5 READS SITTING (one sitting, no code):
+  A1' source read + A2/A3/A5/A6/A8 reads · A4 query gate (valid ~02:55 08-28)
         ▼
-A-code session(s): only what survived the reads
+  r2 line-edits from read outcomes (this doc, content r3 only if shape changes)
         ▼
-canary 12h ──► deploy ──► post-deploy measurements ──► ledger close-out
+  A-code session(s): only what survived ──► canary 12h ──► deploy ──►
+  post-deploy measurements ──► ledger close-out
 
-P1 ── ships independently, anytime (recommended first)
-P3 ── ships independently, anytime
-P2 ── after metric-name verification
-P4 ── after A5 is in production
+P1 ── ships independently, ANYTIME (recommended before the reads)
+P3 ── independently, anytime · P2 ── after metric-name check · P4 ── after A5
+H2 remainder / H6 / H7 ── operator-scheduled, independent of Stream A
 ```
 
-**Two sessions of reads before one session of code.** Every A-item except A1
-begins with an investigation that can shrink it; A1 begins with a gate that
-can delete it. The honest expectation: v2.0.1.5 could be anywhere from a
-two-item release (A5+A6 instrumentation only) to a six-item release, and the
-reads decide which — not this document.
+The honest expectation stands: v2.0.1.5 is anywhere from a two-item release
+(A5+A6 instrumentation) to a seven-item release, and the reads decide —
+not this document.
 
-## OPEN QUESTIONS PARKED AT SCOPE TIME
-1. Does the RC already log submit/accept timestamps? (A5.1 answers.)
-2. Does a stale-share counter already exist per worker? (A6.1 answers.)
-3. Upstream watch: `firecash/zkas-pool` d79bf68 (merged-mining YAML wiring) —
-   re-diff before porting anything, standing ledger note. Not in scope unless
-   the diff shows something we want.
-4. Where does the KAS-leg difficulty gauge live for P1 — same stats loop?
-   (Verify metric name from `/metrics`, not memory.)
+## 6. OPEN QUESTIONS AT r2
+
+1. Does the RC already log submit/accept timestamps? (A5 read answers.)
+2. Does a per-worker stale-share counter already exist? (A6 read answers.)
+3. What runs hourly per worker to mint ~6 series/hr? (A1-hygiene read.)
+4. What attributes the 01:31/03:33 dips? (Likely falls out of the A1′ read's
+   suspect ranking; otherwise stays open — no harness exists.)
+5. Where does the KAS-leg difficulty gauge live for P1? (Verify from
+   `/metrics`, not memory.)
+6. Upstream watch: `firecash/zkas-pool` d79bf68 merged-mining YAML — re-diff
+   before porting anything; not in scope unless the diff shows something we
+   want.
