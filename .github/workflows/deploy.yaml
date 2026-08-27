@@ -67,7 +67,10 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
+          # target/ DELIBERATELY not cached (BL-047): a restored target/ plus
+          # mtime-based fingerprints let cargo skip rebuilding patched crates,
+          # shipping a stale exe under a fresh tag. Deps stay cached; the
+          # workspace always rebuilds.
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
 
@@ -243,7 +246,10 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
+          # target/ DELIBERATELY not cached (BL-047): a restored target/ plus
+          # mtime-based fingerprints let cargo skip rebuilding patched crates,
+          # shipping a stale exe under a fresh tag. Deps stay cached; the
+          # workspace always rebuilds.
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build WASM32 SDK
