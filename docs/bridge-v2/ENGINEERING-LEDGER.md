@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-044 (2026-08-27)
+### Last entry: BL-049 (2026-08-27)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -810,6 +810,139 @@ counter folded into SCOPE r2 A6.
 one-bit diagnosis — protection and instrument in one. When a ground-truth
 event occurs, calibrate the instruments against it while it is fresh: the
 6008 lag went from argued to measured for free.
+
+**BL-045 · 2026-08-27 · bridge/prom — THE STALL ROOT CAUSE: a serial,
+timeout-less HTTP accept loop; fixed in v2.0.1.5**
+`serve_http_loop` served one connection at a time — no spawn, no read
+timeout. Any slow, idle, or half-open client parked the whole server at
+`read()` and every queued scrape pinned at whatever Prometheus' timeout was
+(12→14→25→55s all observed; the stall outlived four ceilings). True render
+floor measured at ~5ms (min_over_time 3.9ms, ~530 series) — every prior
+"~230ms floor" was curl.exe process-startup cost: instrument overhead, not
+server time. Canonical parker: the operator's own dashboard browser (polls
+plus speculative preconnects that send nothing). Confirmed by a five-event /
+five-activity-window join on 08-27 alone: 03:40 (post-recovery dashboard
+check), 08:29 + 08:39 (pace investigation, 55.0s pins), 08:40 (13.29s
+partial — a parked socket releasing mid-scrape as a tab closed), 09:00
+(1.85s, interactive pulls). Mechanistically closes BL-036's unattributed
+01:31/03:33 pair (an idle-session tab works the door autonomously — no
+session events required) and explains H1's negative (churn shook the
+doorknob; it never parked the door). Deterministic reproduction, both
+directions: a silent TCP parker pins v2.0.1.4 at a measured 8,048ms;
+v2.0.1.5 (spawn-per-connection + 5s read timeout, ~10 lines in one
+function) serves 213–232ms × 8 under the identical parker and then EVICTS
+it with a FIN at the timeout — proven from the parker's own socket. Second
+ledgered case of the investigation instrument feeding the failure it
+investigated (ScreenSketch precedent). Interim mitigation (no :3034
+browser tabs) held from discovery to deploy.
+**Lessons:** instrument overhead is part of every floor measurement — a
+floor measured through curl is curl's floor, not the server's. A serial
+accept loop is a shared-fate contract with your least cooperative client.
+And a duration pinned at the timeout still means the handler never ran —
+BL-033's lesson, now with its mechanism.
+
+**BL-046 · 2026-08-27 · host/reporter — reporter double-death across the
+outage: battery-stop convicted; the page was delivered and slept through**
+Death #1, ~23:52–00:01: wordless — last write a BEAT1 mid-cadence, no
+error, no Scheduler restart attempted → condition-stop-or-clean-exit class,
+OPEN (5.3-day runtime; ExecutionTimeLimit=P3650D excludes limits; pre-UPS
+excludes battery). `RcReporterDown` fired 00:06→10:36 (ALERTS series) and
+the Telegram card was DELIVERED at ~00:01 — the pipeline is exonerated end
+to end; the 10.5h gap was a solo operator asleep. Escalation-channel design
+(page-tier loudness vs accepted overnight latency) → H2, as an explicit
+choice. Death #2, 02:52:24: the logon trigger DID fire at 02:51 (the 02:55
+recovery was seven-of-seven attempted, correcting the earlier six-of-seven
+read); the reporter replayed the pre-outage log, every POST failed — SSL
+trust to Supabase, attributed to WAN-recovery transients while the gateway
+itself rebooted, NOT clock skew: the boot-era time step measured +318ms and
+steady-state w32time discipline is ±1–23ms per 30min → **BL-042/H4 CLOSED
+healthy**; this era's second-exact log joins are validated. Then the UPS's
+USB battery registered and `StopIfGoingOnBatteries=True` stopped the task —
+RestartCount=3 never fires on condition stops. The protection stopped the
+protection. Both battery flags flipped False same day (verified); the H2
+service-migration template inherits the two flags + an at-startup trigger
+(+delay) + top-level exit logging so no death is ever wordless again. Data
+healed same day: the reporter's startup replay posted 6 (its from-byte-0
+newest-log replay is real self-healing — corrects the earlier "starts at
+EOF" claim), and zkas-catchup-r1.ps1 posted the 4 blocks from the
+unreplayed 02:55-era log and corrected the 3 provisional rows
+(Beat2GiveUpSec=3600 had expired them) — 13 rows exact, join dt 0.2–4.3s,
+zero unmatched, upsert-on-hash making every re-POST safe.
+**Lessons:** on a UPS-protected host every scheduled task's battery-stop
+defaults are armed against you. A delivered page is only half an escalation
+design. And the two-beat/upsert idempotency design paid for itself — any
+log the reporter can read is a gap it can close.
+
+**BL-047 · 2026-08-27 · CI/release — a stale-cache build shipped v2.0.1.4
+bytes under a v2.0.1.5 tag**
+canary-eda7090: the tag's tree verified correct by raw read
+(BRIDGE_BUILD=5, new accept loop present) — yet the built exe announced
+v2.0.1.4. Mechanism: actions/cache restored a fully-built `target/` (cache
+key = Cargo.lock hash only, untouched by the patch) and cargo's mtime-based
+fingerprints judged the patched crates up-to-date against the fresh
+checkout; packaging zipped the cached exe. BL-030's banner guard validates
+tag-vs-SOURCE (sed on main.rs) and is structurally blind to a stale
+ARTIFACT. Silver lining: the stale canary furnished BL-045's measured
+positive control (8,048ms) before being retired. Fix: `target/` removed
+from BOTH cache blocks in deploy.yaml (deps stay cached; the workspace
+always rebuilds; ~10–15 min/build bought with correctness), caches purged
+(`gh cache delete --all`), release recreated cold → canary-1b63698, banner
+v2.0.1.5 verified as a HARD GATE before the soak clock started. Also
+banked: GitHub auto-attaches "Source code" zips named `repo-tag` to every
+release — the build asset is `zkas-<tag>-win64.zip`; one wrong download
+burned learning it.
+**Lessons:** the running artifact's self-report (banner) is the only
+version check that sees through the entire build+deploy chain — the CI-era
+corollary of four-way identity, now a gate that precedes any soak. A cache
+key must cover everything that determines the artifact, or the cached layer
+must be rebuilt by construction.
+
+**BL-048 · 2026-08-27 · host — UPS load audit and Defender exclusion
+inventory**
+Post-install audit caught a latent fault: unit 1 at 1.01kW against a
+CP1500's ~1000W inverter — fine on passthrough, trips at the next outage:
+the UPS itself as the would-be eighth power event. Physics forbids
+rebalancing it away: 3 × KS7 ≈ 505W each, so any two on one battery bank
+overload by construction. Resolution: hierarchy over symmetry — rigs are
+ride-through-OPTIONAL (all seven hard-dropped and self-recovered in every
+historical event), custody/network is ride-through-REQUIRED. End split:
+2 × (KS7 + 2 KS0) ≈ 760W/76% on the 1500VA units; the 1000VA carries Kron +
+switch + aux only (~63W → 30–60 min runtime; yesterday's 45-minute outage
+class becomes a non-event for the custody stack); the third KS7 rides
+surge-only. An operator-proposed three-way rig balance (KS7 on the 1000VA
+with Kron, ~570W) was rejected on inverter math (95% of a 600W-class
+inverter) and runtime inversion (Kron's runtime spent in the rig's first
+three minutes). Defender ExclusionPath inventory recorded: C:\Node-v2,
+C:\RKBridge, C:\rusty-kaspa-v2, C:\Users\inmyh\AppData\Local (wholesale —
+exempts browser caches and temp staging on a custody box; narrowing to the
+specific app dirs → H2), C:\Users\inmyh\rusty-kaspa, C:\zkas (added 08-27).
+**Lessons:** a UPS's battery-path wattage is the constraint, not its VA
+badge; order protection by recovery cost, not wattage symmetry; on-line
+load% prices the outage, not the day.
+
+**BL-049 · 2026-08-22→27 · process — command-shipping trap catalog (seven
+exhibits; law minted to conduct tier)**
+(1) `</br>` markup leaked into a fenced command (Kernel-Power decode);
+(2) Select-String's case-insensitive default matched "not found" while
+hunting FOUND; (3) a production grep shipped on a pattern the record
+already held as a dead fossil (`KASPA BLOCK`); (4) `powershell -File` does
+not parse comma-lists into array parameters (-OnlyHashes arrived as one
+string; `-Command` invocation is the fix); (5) zsh commands executed on
+Kron's PowerShell (the `&&` parse error saved the run — wrong machine,
+wrong shell, one keystroke from harmless); (6) the first parker test's
+unguarded curl wedged the console instead of measuring the block it was
+built to measure; (7) `</parameter>` fragments recurring in fenced blocks
+under session fatigue (three further instances, all caught pre-execution).
+Total cost: ~ten minutes and zero damage — every exhibit was caught by an
+expected-output mismatch, which is the point. The consolidated law lives at
+conduct tier (project instructions), not here: fenced commands name their
+target machine and shell; last-token integrity eyeball before ship;
+patterns verified against live excerpts with explicit case handling; array
+parameters via -Command; every probe that can block carries its own
+ceiling.
+**Lesson:** expected-output statements are the safety net that converted
+all seven errors into cheap catches — the discipline that finds the error
+is the same one that bounds its cost.
 
 ---
 
