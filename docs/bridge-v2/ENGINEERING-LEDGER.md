@@ -840,3 +840,23 @@ they cost real time and will recur)
 7. Scope claims precisely; a reconciled counter-report strengthens a bug report.
 8. Production is sacred: +100/canary port offsets, failover-first, control-rig
    holdouts, never bet the fleet on unproven code.
+
+**BL-050 · 2026-08-28 · v2.0.1.5 fleet deploy — CLOSED (pending A1' 7-day
+window)**
+Deploy 01:09:02 EDT · policy: soaked bytes promoted. Old exe 66C27E9E...CC882
+parked `.bak-v2014`; production = canary exe F1484FB5...A3F0 @ commit 1b63698;
+PID 15160→14940. Gates: 4a banner v2.0.1.5 ✓ · 4b 2× MERGED ✓ · 4c three
+listeners one PID ✓ · 4d reporter rotation +0.5s ✓ · 4e parker: 8× flat
+214–266ms + server FIN — BL-045 proven on production; tab-ban lifted. Fleet
+7/7 (incl. w1m) at +4min, 284/0/0, zk=ok. Block 7e106acab547 (w7m) rode the
+kill/relaunch: BEAT1 pre, BEAT2 post, txid d4b18c88bfeb.
+GO evidence: FORENSIC IMPLAUSIBLE=0; canary tail zk=PLAIN 00:34–00:54
+canary-local (production zk=ok verified 01:03 pre-kill); soak/pace/share
+health on operator attestation. Deviations: 3a lock-branch taken, resumed at
+failed link (13c); 3c shipped with cmd `&&` into PS 5.1 — relaunched via
+`Start-Process cmd`; law: lifecycle commands name their shell AND ship in it.
+Record build: release v2.0.1.5-win @ merged-v2.0.1.5, guard OK 05:04:58Z,
+win64 zip f90b3769...cfe1cbe (distribution only, never deployed).
+Open: A8-channel WARN pair 01:13:03 (UTXO fetch, post-restart — watch for
+breaker INFO or self-clear); canary process kill/confirm (step 5b) if not
+yet done.
