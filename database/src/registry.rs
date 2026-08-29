@@ -138,6 +138,13 @@ pub enum DatabaseStorePrefixes {
     /// row undecodable, and a missing key here reads as "not attested", which is exactly the
     /// fail-closed answer for a node that was never given the data.
     ShieldedAnchorSourceScore = 91,
+    /// `bool`, set the first time a shielded-history backfill writes chain-index entries
+    /// below this node's own validated range. Never cleared: it records that part of the
+    /// index came from a peer rather than from this node's own validation.
+    ShieldedHistoryBackfilled = 92,
+    /// `Hash` of the base block a shielded-history replay was VERIFIED against (the
+    /// PoW-anchored frontier it reproduced). Written only in the `Verified` arm.
+    ShieldedHistoryVerifiedBase = 93,
 
     // ---- Separator ----
     /// Reserved as a separator

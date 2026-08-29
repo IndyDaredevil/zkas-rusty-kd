@@ -19,6 +19,8 @@ pub struct PruningMetaStores {
     smt_stable_flag_access: CachedDbItem<bool>,
     shielded_stable_flag_access: CachedDbItem<bool>,
     body_missing_anticone_blocks: CachedDbItem<Vec<Hash>>,
+    shielded_history_backfilled_access: CachedDbItem<bool>,
+    shielded_history_verified_base_access: CachedDbItem<Hash>,
 }
 
 impl PruningMetaStores {
@@ -30,7 +32,32 @@ impl PruningMetaStores {
             smt_stable_flag_access: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::SmtSyncFlag.into()),
             shielded_stable_flag_access: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::ShieldedSyncFlag.into()),
             body_missing_anticone_blocks: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::BodyMissingAnticone.into()),
+            shielded_history_backfilled_access: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::ShieldedHistoryBackfilled.into()),
+            shielded_history_verified_base_access: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::ShieldedHistoryVerifiedBase.into()),
         }
+    }
+
+    /// Record that chain-index entries below this node's own validated range were written
+    /// from a peer's shielded-history backfill. Sticky: once any part of the index is
+    /// peer-supplied, "the index reaches genesis" stops being evidence of anything until a
+    /// replay has verified it (see [`Self::shielded_history_verified_base`]).
+    pub fn set_shielded_history_backfilled(&mut self, batch: &mut WriteBatch) -> StoreResult<()> {
+        self.shielded_history_backfilled_access.write(BatchDbWriter::new(batch), &true)
+    }
+
+    /// Default to false if missing: a node that never backfilled built its whole index itself.
+    pub fn shielded_history_backfilled(&self) -> bool {
+        self.shielded_history_backfilled_access.read().optional().unwrap().unwrap_or(false)
+    }
+
+    /// The base block a history replay reproduced the PoW-anchored frontier of. Only the
+    /// `Verified` verdict writes this; a `Mismatch` purges the range and writes nothing.
+    pub fn set_shielded_history_verified_base(&mut self, batch: &mut WriteBatch, base: Hash) -> StoreResult<()> {
+        self.shielded_history_verified_base_access.write(BatchDbWriter::new(batch), &base)
+    }
+
+    pub fn shielded_history_verified_base(&self) -> Option<Hash> {
+        self.shielded_history_verified_base_access.read().optional().unwrap()
     }
 
     /// Represents the exact point of the current pruning point utxoset. Used in order to safely

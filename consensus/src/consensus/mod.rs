@@ -806,7 +806,17 @@ impl ConsensusApi for Consensus {
             // No index at all: nothing below the pruning point is servable.
             return Ok((0, false));
         };
-        let complete = base == self.config.genesis.hash;
+        // "The index reaches genesis" is only half of `complete`. A backfill writes the index
+        // entries FIRST and verifies the replayed leaves against the PoW-anchored frontier
+        // AFTERWARDS (minutes to an hour on a small box), and a Mismatch then purges the range.
+        // For that whole window the index already reaches genesis while nothing has been
+        // checked — observed live 2026-08-29: `history_complete: true` at 20% of the
+        // verification replay. So a node whose index is even partly peer-supplied must also
+        // hold a verified verdict; a node that built its whole index itself needs nothing more.
+        let meta = self.pruning_meta_stores.read();
+        let verified_or_own = !meta.shielded_history_backfilled() || meta.shielded_history_verified_base().is_some();
+        drop(meta);
+        let complete = base == self.config.genesis.hash && verified_or_own;
         // Read the DAA score from the SCAN RECORD, not the header. A backfilled block below the
         // pruning point has a scan record and no header — reading the header here would fail on
         // exactly the nodes this field exists to describe.
@@ -915,6 +925,13 @@ impl ConsensusApi for Consensus {
                 self.virtual_processor.shielded_state_manager_ref().persist_backfilled_scan(&mut batch, r.hash, data).unwrap();
                 rec_written += 1;
             }
+        }
+        if idx_written > 0 {
+            // Same batch as the entries, so the index can never reach genesis on peer data
+            // without the flag that says so (see `get_shielded_history_status`). No lock-order
+            // hazard with the pruning processor: it needs the pruning lock for WRITE, and IBD —
+            // which this runs inside — holds it for read for its whole duration.
+            self.pruning_meta_stores.write().set_shielded_history_backfilled(&mut batch).unwrap();
         }
         self.db.write(batch).unwrap();
         Ok((idx_written, rec_written))
@@ -1112,6 +1129,11 @@ impl ConsensusApi for Consensus {
                         // Only the ability to ANCHOR someone else's verification is lost.
                         kaspa_core::warn!("shielded history: could not stage frontier checkpoint at {hash}: {e}");
                     }
+                }
+                // The verdict itself is persisted with the checkpoints: `history_complete` on
+                // the wire requires it for any node whose index is partly peer-supplied.
+                if let Err(e) = self.pruning_meta_stores.write().set_shielded_history_verified_base(&mut batch, base) {
+                    kaspa_core::warn!("shielded history: could not stage the verified marker: {e}");
                 }
                 if let Err(e) = self.db.write(batch) {
                     kaspa_core::warn!("shielded history: verified, but frontier checkpoints were not written: {e}");
@@ -2438,6 +2460,28 @@ mod tests {
 
         assert!(complete, "an index rooted at genesis must report complete history");
         assert_eq!(from_daa, 0, "genesis is DAA 0, so there is no floor below which this node cannot answer");
+    }
+
+    /// The index reaching genesis is NOT enough once any of it came from a peer: between the
+    /// backfill writing the entries and the replay verifying them, `complete` must be false —
+    /// that window was reported live as `history_complete: true` at 20% of the replay.
+    #[test]
+    fn history_status_is_incomplete_after_a_backfill_until_verified() {
+        let config = Config::new(MAINNET_PARAMS);
+        let tc = TestConsensus::new(&config);
+        let consensus = tc.consensus_clone();
+
+        let mut batch = rocksdb::WriteBatch::default();
+        consensus.pruning_meta_stores.write().set_shielded_history_backfilled(&mut batch).unwrap();
+        consensus.db.write(batch).unwrap();
+        let (_, complete) = consensus.get_shielded_history_status().unwrap();
+        assert!(!complete, "peer-supplied index entries without a verified verdict must not read as complete");
+
+        let mut batch = rocksdb::WriteBatch::default();
+        consensus.pruning_meta_stores.write().set_shielded_history_verified_base(&mut batch, config.genesis.hash).unwrap();
+        consensus.db.write(batch).unwrap();
+        let (_, complete) = consensus.get_shielded_history_status().unwrap();
+        assert!(complete, "a verified replay restores complete");
     }
 
     /// F-08 regression: the peer-declared `nullifier_count` must never drive an
