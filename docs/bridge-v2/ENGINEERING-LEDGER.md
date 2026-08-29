@@ -993,3 +993,175 @@ win64 zip f90b3769...cfe1cbe (distribution only, never deployed).
 Open: A8-channel WARN pair 01:13:03 (UTXO fetch, post-restart — watch for
 breaker INFO or self-clear); canary process kill/confirm (step 5b) if not
 yet done.
+
+**BL-051 · 2026-08-22→29 · prom/alertmanager — THE BLOCK-CARD LOSS: a
+documented two-file coupling that was always three, broken by a scrape
+change nobody connected to it**
+Symptom, operator-observed: block Telegram cards fell to ~1 in 10 after
+08-22 while hourly cards stayed perfect. Not a rule bug and not a route bug —
+Prometheus collected everything. The span in which Alertmanager can notify is
+`firing span = range window - scrape_interval - for`. At 15s scrapes that was
+180-15-30 = 135s against the info route's 90s group_wait: 45s of margin. The
+08-22 change to 60s scrapes (H5-era, made for the BL-045 stall) cut it to
+180-60-30 = EXACTLY 90s — a dead tie with group_wait, decided by sub-second
+ordering inside Alertmanager, with `send_resolved: false` making every loss
+silent. MEASURED 08-29 11:00-12:00 via ALERTS query_range at 15s step: four
+blocks (11:15 w9m, 11:24 w9m, 11:52 w8m, 11:54 w9m), all doubles, four firing
+spans of EXACTLY 90s, ONE card delivered. Hourly cards corroborate to the
+block: tot K 41→45, Z 45→49, D 40→44. The inhibit rule was working correctly
+throughout — one card per double is the design, so the loss was 1 card per
+event, not 3. Both files carried the coupling in their own comments and both
+named only each other; alert_rules.yml even shipped the arithmetic ("scrape
+<=15s + eval <=15s + for 30s") and the warning "IF YOU SHORTEN THESE WINDOWS,
+SHORTEN group_interval TO MATCH". Nobody shortened a window. FIX:
+`keep_firing_for: 2m` on the three block rules — 210s span, 120s margin,
+INDEPENDENT of scrape_interval (the only lever that is), and under the info
+route's 300s repeat_interval so no duplicate cards. Lowering group_wait was
+unavailable: the inhibit rule needs the 90s hold for the double to catch the
+singles (blue-confirm skew, BL-026 era). Gates: promtool 41 rules · reload 200
+· /api/v1/rules keepFiringFor=120 on all three (BL-020 readback). Deployed
+sha 26DF1660...B45656; repo mirrors synced at commit 96eff28 — and they were
+found stale since 08-22 01:06, eleven hours before the 08-22b revision, with
+alertmanager.yml at 4,591 bytes against 11,511 deployed (the entire 08-18
+inhibition analysis absent from the rail).
+**Lessons:** a documented coupling is only as strong as its enumeration of
+TERMS — scrape_interval was in the equation and on nobody's list. When a
+config comment states arithmetic, the arithmetic's inputs are part of the
+contract and every one of them needs naming. And prefer the lever that is
+independent of the variable that broke you.
+
+**BL-052 · 2026-08-28→29 · process — PROBE TRAP CATALOG: seven instruments
+that reported success while failing (the BL-049 sequel, measurement tier)**
+BL-049 catalogued commands that failed to run. This is the worse class:
+probes that RAN and LIED. (1) `curl -s -o NUL` — `-s` suppressed the error,
+`-o NUL` discarded the empty body, so a connection failure rendered as
+silence and was read as success; exit 7 the whole time. This single probe
+anchored SIX successive wrong mechanisms about a walletd outage (pool
+exhaustion, connection-slot starvation, address family, proxy interception,
+firewall/filter driver, accept-queue backlog) before `-w "%{local_ip}"`
+printed `:-1` and collapsed all of them. (2) `%ERRORLEVEL%` on a cmd line
+joined with `&` expands at PARSE time — printed `exit=0` for a curl that
+returned 28. (3) `max_over_time(...)` unlabeled returns ONE SERIES PER
+TARGET; `$r.data.result[0]` printed prometheus's 2.88s and hid two 55s pins.
+(4) PowerShell here-strings drop the newline before the closing `'@`, welding
+an insert onto its anchor (`## Revision`) — caught by the post-sha gate, but
+only AFTER the write had happened. (5) `Get-Content | Measure-Object -Line`
+skips empty strings: 821 vs the file's real 862 lines. (6) PID
+misattribution — 16096 was read as the reporter's powershell and was CHROME;
+that error poisoned three hypotheses and was never checked with a one-line
+`Get-Process`. (7) `Win32_Battery` returned empty on a box where
+`Get-PnpDevice` shows `HID UPS Battery` Status OK — absence of a WMI class is
+not absence of hardware.
+**Lessons:** an instrument that cannot report its own failure will report
+success instead. Every probe carries a failure channel — exit code, http_code,
+or an enumeration that shows all rows rather than the first. Verify the
+IDENTITY of anything you build a hypothesis on (a PID, a class, a series
+count) before the hypothesis, not after it fails. And compute a post-edit sha
+in memory and gate on it BEFORE writing to disk, not after.
+
+**BL-053 · 2026-08-28→29 · walletd/host — the browser parker class claims a
+second service; and the wedge that outlived it**
+Six Chrome→:8501 connections (treasury page, `file:///` origin) opened
+18:59-19:18 and were still ESTABLISHED seven hours later; walletd never reaps
+them. Same operator behaviour as BL-045's canonical parker, different daemon,
+and walletd's accept path has no timeout either — it is not ours to patch, so
+it rides the firecash report. Killing Chrome released all six and did NOT fix
+the fault: walletd itself was wedged (accepting, never answering; then
+refusing at accept), from 17:05 08-28 until a restart at ~02:35 08-29, ~9.5h.
+Process alive throughout, port LISTENING, CPU flat at 0s/60s, 23.4 MB working
+set (fully trimmed — pages evicted because nothing touched them). Cost: exact
+amounts deferred on every block in the window; two blocks aged past
+`Beat2GiveUpSec=3600` to permanently provisional pending catchup. Root cause
+OPEN — a 270s startup cost (BL-055) does not explain a 9.5h failure that
+began 8 minutes after a successful start. Remediation that DID land: both
+operator-facing surfaces confirmed reachable from the MacBook at
+192.168.1.96 (:9090 Prometheus bound `::`, :3034 bridge bound `0.0.0.0`), so
+the dashboard view leaves the custody box entirely. The treasury page cannot
+follow — walletd is loopback-bound and the page is a local `file:///` — and
+stays an RDP-only, close-when-done surface. STANDING RULE: no browser left
+open on Kron.
+**Lesson:** when a fault class is identified, enumerate every service that
+shares the exposure rather than fixing the one instance that bit — the parker
+class had a second victim for weeks, in the daemon holding custody.
+
+**BL-054 · 2026-08-28 · host — EVENT EIGHT: the first post-UPS power event,
+and the discriminator that could not be read**
+Kernel-Power 41 at 09:44:18 with 6008 claiming shutdown 09:30:20.
+`LastBootUpTime` 09:44:16 confirms wevtutil renders LOCAL time on this box —
+BL-044's calibration stands and needs no correction pass. Better clock per
+BL-040: bridge log `RKStratum_1787894876.log` last write 09:43, successor
+started 10:17:31 → dark ≤76s, and the 6008 lag measures ~13 min here against
+~35 min on 08-27 (lag is a function of System-log quiet, not a constant). The
+sub-minute signature matches the six Kron-local events, not the 45-minute
+premises outage. BUT THE VERDICT IS UNAVAILABLE: BL-044 declared every future
+event a "one-bit diagnosis" via the UPS, and the first one arrived unreadable.
+Event ID 105 (power-source transition) is NOT LOGGED on this host —
+`Get-WinEvent` returns NoMatchingEventsFound over the whole log. The USB link
+is present (`Get-PnpDevice` → `HID UPS Battery`, VID_0764 CyberPower, Status
+OK) but no CyberPower/PowerPanel service is installed, so nothing records
+transfers. Event eight is therefore UNCONVICTED — Kron-local by signature,
+unproven by instrument. ZkasReporter battery flags verified both False
+(BL-046 trap disarmed). RECOVERY COST, measured: dark 09:43 → bridge back
+10:17:31 = ~34 minutes, gated on operator logon at 10:13 — against BL-044's
+~5 min when the operator was already awake at 3 AM. That is the realistic
+H2 service-migration figure.
+**Lesson:** an instrument that is designed but never exercised is not an
+instrument. BL-044 banked "near-proof" on a capability that was never tested
+end-to-end; the test came from the fault, not from us, and failed. Validate a
+diagnostic path against a synthetic event before relying on it.
+
+**BL-055 · 2026-08-29 · walletd — first artifact pin, first log, first
+launcher; and a 269.7s startup cost nobody had ever seen**
+walletd ran for the operation's entire life with NO launcher script and NO
+sha pin — hand-typed command line, varying per session, on a binary with no
+version banner. Closed today. Identity pinned:
+BDCBE0673C800720EF33D73EB68A4C6FBEBB10B3CA472E0822B8FDE08063713C, mtime
+2026-08-02 22:32:34. Version confirmed v1.0.5 behaviourally — `/api/wallet/
+balance` returns `notes` WITHOUT `?notes=1` and carries no `note_count`
+(NODE-CONTRACT §6 delta list, used as a version oracle). The v1.0.6 node
+cutover did NOT touch it (node went to `C:\zkas\node-v106\`, walletd lives in
+`C:\zkas\node\`). THREE DEFECTS FIXED: (a) `--wallet-secret` rode argv,
+readable by any local process via `Win32_Process`/`Get-CimInstance` — now a
+DPAPI CurrentUser blob at `C:\zkas\walletd-secret.dpapi` handed over as
+`ZKAS_WALLET_SECRET`; residual is a same-user PEB read, which needs a binary
+change (upstream candidate). DPAPI chosen over a plaintext file because the
+wallet seeds are encrypted FROM this secret and a plaintext copy one directory
+above them turns disk theft into custody compromise; blob is machine- and
+profile-bound, so the password manager is mandatory. (b) `--proof-threads`
+unset → all 16 logical cores available to Halo2 on a six-service box; now 6.
+(c) walletd HAS NO LOGGING FLAG — stdout IS the log — so every prior wedge was
+witnessless; launcher redirects to `C:\zkas\logs\walletd-<stamp>.out.log`.
+FIRST MEASUREMENT off that log: `subtree cache built in 269.7s (1529415
+leaves, notes=471)`, single-threaded at exactly 1.00 core, during which the
+daemon accepts connections and answers NOTHING. Reporter WARNs stopped 6s
+after that line. This is a per-restart cost that scales with leaf count on a
+1 BPS chain — it gets worse every week, and it ELEVATES the walletd v1.0.6
+cutover, whose §6 claim is exactly this path (656s→~76s). Correctness proven:
+notes=472, synced=True, scanned_blocks=2,953,223, balance 5,946,525,827,141
+sompi (59,465.25827141 ZKAS), served in 0.1s once warm. Also banked:
+auto-consolidate's real cadence is "one merge of up to 38 notes per 60s, only
+while nothing is proving" (log line, more precise than --help); execution
+policy is AllSigned and EVERY script on this box runs via `-ExecutionPolicy
+Bypass` — enforced-but-routed-around, a posture KRON-HARDENING should either
+commit to (signing) or drop. DEVIATIONS, recorded per law 9:
+`set-walletd-secret-r1.ps1` declared VOID — it reported SUCCESS on a
+1-character capture (paste into a masked console field silently dropped all
+but one keystroke) because its only check was that the blob round-tripped,
+which a wrong-but-consistent value passes; r2 adds a GUI credential dialog
+(paste works), an 8-char minimum, and a length echo confirmed BEFORE the
+write. And the cutover changed THREE variables at once — launch host
+(cmd→PowerShell), secret delivery (argv→env), and proof-threads (unset→6) —
+violating meta-principle 5; when the new instance appeared to hang, none of
+the three could be attributed, and the operator's own question about the
+launch shell is what redirected the investigation to the contract's 656s
+figure. Launcher also deviates from house convention (`.ps1`, not
+`run-walletd.cmd` beside `run-zkas-node.cmd`/`run-rc-merged.cmd`) — r2 due.
+**walletd does NOT auto-start on reboot.** The launcher is a prerequisite for
+H2 service migration, not a substitute for it; six of seven production
+processes remain manual and Session-1 bound (BL-039).
+**Lessons:** a round-trip check proves CONSISTENCY, not CORRECTNESS — verify
+against the artifact's real purpose (walletd opening three wallets), not
+against the encoding surviving a decode. A consumed binary with no version
+banner and no launcher has no identity and no reproducible invocation; both
+are cheap and neither existed here for months. And meta-principle 5 applies
+hardest exactly when several improvements are ready at once.
