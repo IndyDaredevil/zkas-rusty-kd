@@ -61,6 +61,9 @@ pub enum PaymentCheckError {
     FeeMismatch { got: i64, want: u64 },
     /// No action pays the intended recipient the intended amount.
     RecipientNotPaid,
+    /// More than one action pays the recipient the intended amount, so the bundle
+    /// pays a multiple of what the user approved.
+    RecipientPaidTwice { times: usize },
     /// The bundle pays someone who is neither the recipient nor this wallet.
     UnexpectedRecipient(usize),
     /// A disclosed field is not a valid Orchard value.
@@ -76,6 +79,9 @@ impl core::fmt::Display for PaymentCheckError {
             Self::ValueImbalance => write!(f, "spends minus outputs does not equal the bundle's value balance"),
             Self::FeeMismatch { got, want } => write!(f, "bundle pays a fee of {got}, not the {want} agreed"),
             Self::RecipientNotPaid => write!(f, "no output pays the intended recipient the intended amount"),
+            Self::RecipientPaidTwice { times } => {
+                write!(f, "the bundle pays the recipient {times} times, moving a multiple of the approved amount")
+            }
             Self::UnexpectedRecipient(i) => write!(f, "action {i} pays an address that is neither the recipient nor this wallet"),
             Self::Malformed(i) => write!(f, "action {i}: disclosed note fields are not valid"),
         }
@@ -168,8 +174,170 @@ pub fn check_prepared_payment(
     if wire.value_balance != fee as i64 {
         return Err(PaymentCheckError::FeeMismatch { got: wire.value_balance, want: fee });
     }
+    // (5) EXACTLY one action pays the recipient.
+    //
+    // Requiring only "at least one" was a way to lose money. Two actions each
+    // paying exactly `amount` to `to` both satisfied check (3), and every other
+    // check still passed: the balance holds because the user own notes cover the
+    // extra, and `value_balance` still equals the fee. So a prover could take a
+    // payment the user approved for X and have the device sign one paying N*X —
+    // to the intended recipient, which is what made it look legitimate, and up to
+    // the wallet whole balance.
+    //
+    // Exactly one is the right bound, not a conservative one: an action creates a
+    // single output note, so a payment of `amount` is one output of `amount`.
+    // Splitting it produces outputs that are not equal to `amount`, which check
+    // (3) already refuses as an unexpected recipient.
     if paid_recipient == 0 {
         return Err(PaymentCheckError::RecipientNotPaid);
     }
+    if paid_recipient > 1 {
+        return Err(PaymentCheckError::RecipientPaidTwice { times: paid_recipient });
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bundle::ActionWire;
+    use orchard::{
+        keys::SpendingKey,
+        note::{RandomSeed, Rho},
+        value::{ValueCommitTrapdoor, ValueCommitment},
+    };
+
+    // This file guards the one thing a device cannot delegate: that the payment it
+    // is about to sign is the payment the user asked for. It had NO tests.
+
+    fn fvk_for(seed: [u8; 32]) -> FullViewingKey {
+        FullViewingKey::from(&SpendingKey::from_bytes(seed).unwrap())
+    }
+
+    /// Build one action plus its disclosure, consistent by construction — the
+    /// same derivation the checker performs, so anything it rejects is rejected
+    /// on the merits rather than because the fixture was malformed.
+    fn action(nullifier: [u8; 32], spend_value: u64, out_value: u64, to: [u8; 43]) -> (ActionWire, ActionDisclosure) {
+        let rho = Option::<Rho>::from(Rho::from_bytes(&nullifier)).unwrap();
+        let rseed_bytes = [7u8; 32];
+        let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(rseed_bytes, &rho)).unwrap();
+        let recipient = Option::<Address>::from(Address::from_raw_address_bytes(&to)).unwrap();
+        let note = Option::<Note>::from(Note::from_parts(recipient, NoteValue::from_raw(out_value), rho, rseed)).unwrap();
+        let cmx = ExtractedNoteCommitment::from(note.commitment()).to_bytes();
+
+        let rcv_bytes = [3u8; 32];
+        let rcv = Option::<ValueCommitTrapdoor>::from(ValueCommitTrapdoor::from_bytes(rcv_bytes)).unwrap();
+        let cv_net =
+            ValueCommitment::derive(NoteValue::from_raw(spend_value) - NoteValue::from_raw(out_value), rcv).to_bytes();
+
+        (
+            ActionWire {
+                nullifier,
+                cmx,
+                cv_net,
+                rk: [0; 32],
+                ephemeral_key: [0; 32],
+                enc_ciphertext: [0; 580],
+                out_ciphertext: [0; 80],
+                spend_auth_sig: [0; 64],
+            },
+            ActionDisclosure { spend_value, out_value, out_recipient: to, out_rseed: rseed_bytes, rcv: rcv_bytes },
+        )
+    }
+
+    fn bundle(parts: Vec<(ActionWire, ActionDisclosure)>, fee: i64) -> (ShieldedBundle, Vec<ActionDisclosure>) {
+        let (actions, disc): (Vec<_>, Vec<_>) = parts.into_iter().unzip();
+        (
+            ShieldedBundle {
+                actions,
+                flags: 3,
+                value_balance: fee,
+                anchor: [0; 32],
+                proof: Vec::new(),
+                binding_sig: [0; 64],
+                burn: None,
+            },
+            disc,
+        )
+    }
+
+    #[test]
+    fn a_payment_of_the_approved_amount_is_accepted() {
+        let fvk = fvk_for([1; 32]);
+        let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let (b, d) = bundle(vec![action([9; 32], 1_100, 1_000, to)], 100);
+        assert_eq!(check_prepared_payment(&b, &d, &fvk, &to, 1_000, 100), Ok(()));
+    }
+
+    #[test]
+    fn paying_the_recipient_twice_is_refused() {
+        // The hole this test exists for. Two actions each paying exactly the
+        // approved amount used to satisfy every check: "at least one pays the
+        // recipient" was true, the balance held because the user's own notes
+        // covered the extra, and value_balance still equalled the fee. The user
+        // approved 1,000 and the device would have signed 2,000.
+        let fvk = fvk_for([1; 32]);
+        let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let (b, d) = bundle(
+            vec![action([9; 32], 1_050, 1_000, to), action([8; 32], 1_050, 1_000, to)],
+            100,
+        );
+        assert_eq!(
+            check_prepared_payment(&b, &d, &fvk, &to, 1_000, 100),
+            Err(PaymentCheckError::RecipientPaidTwice { times: 2 })
+        );
+    }
+
+    #[test]
+    fn paying_a_stranger_is_refused() {
+        let fvk = fvk_for([1; 32]);
+        let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let stranger = fvk_for([3; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let (b, d) = bundle(vec![action([9; 32], 1_100, 1_000, stranger)], 100);
+        assert!(matches!(
+            check_prepared_payment(&b, &d, &fvk, &to, 1_000, 100),
+            Err(PaymentCheckError::UnexpectedRecipient(0))
+        ));
+    }
+
+    #[test]
+    fn a_bundle_that_never_pays_the_recipient_is_refused() {
+        let fvk = fvk_for([1; 32]);
+        let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let mine = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+        let (b, d) = bundle(vec![action([9; 32], 1_100, 1_000, mine)], 100);
+        assert_eq!(check_prepared_payment(&b, &d, &fvk, &to, 1_000, 100), Err(PaymentCheckError::RecipientNotPaid));
+    }
+
+    #[test]
+    fn change_back_to_this_wallet_is_allowed_alongside_the_payment() {
+        let fvk = fvk_for([1; 32]);
+        let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let mine = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+        let (b, d) = bundle(
+            vec![action([9; 32], 1_100, 1_000, to), action([8; 32], 500, 400, mine)],
+            200,
+        );
+        assert_eq!(check_prepared_payment(&b, &d, &fvk, &to, 1_000, 200), Ok(()));
+    }
+
+    #[test]
+    fn a_disclosure_that_does_not_cover_every_action_is_refused() {
+        let fvk = fvk_for([1; 32]);
+        let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let (b, mut d) = bundle(vec![action([9; 32], 1_100, 1_000, to)], 100);
+        d.clear();
+        assert_eq!(check_prepared_payment(&b, &d, &fvk, &to, 1_000, 100), Err(PaymentCheckError::ActionCountMismatch));
+    }
+
+    #[test]
+    fn a_fee_that_is_not_the_one_agreed_is_refused() {
+        let fvk = fvk_for([1; 32]);
+        let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let (b, d) = bundle(vec![action([9; 32], 1_100, 1_000, to)], 100);
+        assert!(matches!(
+            check_prepared_payment(&b, &d, &fvk, &to, 1_000, 50),
+            Err(PaymentCheckError::FeeMismatch { .. })
+        ));
+    }
 }
