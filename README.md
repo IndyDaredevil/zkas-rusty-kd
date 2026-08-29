@@ -78,7 +78,7 @@ Non-custodial signing (the seed never leaves the device):
 
 | Crate | Binary | Role |
 |---|---|---|
-| `kaspad` | `kaspad` | the node (gRPC :16810, p2p :16811) |
+| `kaspad` | `kaspad` | the node (gRPC :16810, p2p :16111) |
 | `miner` | `zkas-miner` | CPU miner (native + `--merged` AuxPoW) |
 | `zkas-walletd` | `zkas-walletd` | shielded wallet daemon |
 | `zkas-api` | `zkas-api` | explorer REST backend |

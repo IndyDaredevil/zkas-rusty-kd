@@ -331,7 +331,7 @@ pub fn cli() -> Command {
                 .value_name("IP[:PORT]")
                 .require_equals(true)
                 .value_parser(clap::value_parser!(ContextualNetAddress))
-                .help("Add an interface:port to listen for connections (default all interfaces port: 16811, testnet: 16821)."),
+                .help("Add an interface:port to listen for connections (default all interfaces port: 16111, testnet: 16821)."),
         )
         .arg(
             Arg::new("outpeers")
@@ -722,7 +722,7 @@ mod tests {
                                             automatically disabled if the --connect or --proxy options are used
                                             without also specifying listen interfaces via --listen
       --listen=                             Add an interface/port to listen for connections (default all interfaces
-                                            port: 16811, testnet: 16821)
+                                            port: 16111, testnet: 16821)
       --outpeers=                           Target number of outbound peers (default: 8)
       --maxinpeers=                         Max number of inbound peers (default: 117)
       --enablebanning                       Enable banning of misbehaving peers

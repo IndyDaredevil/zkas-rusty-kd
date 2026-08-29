@@ -207,7 +207,7 @@ services:
     volumes:
       - /mnt/hdd/kaspa-archive:/app/data
     ports:
-      - "16811:16811"  # P2P
+      - "16111:16111"  # P2P
       - "17810:17810"  # RPC Borsh
       - "18810:18810"  # RPC JSON
     environment:
@@ -237,7 +237,7 @@ docker run -d \
   --name kaspad-archive \
   --restart unless-stopped \
   -v /mnt/hdd/kaspa-archive:/app/data \
-  -p 16811:16811 \
+  -p 16111:16111 \
   -p 17810:17810 \
   -p 18810:18810 \
   kaspanet/kaspad:latest \
