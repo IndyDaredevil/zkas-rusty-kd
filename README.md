@@ -37,14 +37,14 @@ Binaries: [Releases](https://github.com/firecash/zkas-rusty/releases) · to comp
 see **[docs/BUILDING.md](docs/BUILDING.md)**.
 
 ```bash
-./kaspad --appdir=./zkas-node --rpclisten=127.0.0.1:16110 --utxoindex \
-  --connect=185.147.157.125:16111 --connect=160.187.211.153:16111
+./kaspad --appdir=./zkas-node --rpclisten=127.0.0.1:16110 --utxoindex
 ```
 
-It syncs from these seed nodes and follows the tip. Without `--connect` the node resolves the
-mainnet seeder `seed.zkas.info` and dials every address it returns; once connected it discovers the rest of the
-network through gossip. Only outbound access to a peer's p2p **16111** is needed; keep the
-RPC on **16110** bound to loopback.
+No peer list is needed: the node resolves the mainnet seeder `seed.zkas.info`, dials every
+address it returns on p2p port **16111**, and discovers the rest of the network through
+gossip. (`--connect=<ip>:16111` pins it to specific peers instead and skips the seeder.)
+Only outbound access to a peer's p2p **16111** is needed; keep the RPC on **16110** bound to
+loopback. Shielded note history is fetched and verified automatically after the first sync.
 
 **Node types — pruned (default), archival, and shielded-history — and every flag are
 documented in [docs/NODE.md](docs/NODE.md).** Which one you want depends on whether the

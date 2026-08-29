@@ -5,16 +5,17 @@
 [docs/BUILDING.md](BUILDING.md).
 
 ```bash
-./kaspad --appdir=./zkas-node --rpclisten=127.0.0.1:16110 --utxoindex \
-  --connect=185.147.157.125:16111 --connect=160.187.211.153:16111
+./kaspad --appdir=./zkas-node --rpclisten=127.0.0.1:16110 --utxoindex
 ```
 
-The node syncs from the seed nodes you give it and follows the tip. Without `--connect` it
-resolves the mainnet seeder `seed.zkas.info` and dials every address it returns; once connected it discovers
-the rest of the network through gossip. Keep the RPC bound to `127.0.0.1`: it is a control
-interface, not something to expose.
+The node resolves the mainnet DNS seeder `seed.zkas.info`, dials every address it returns on
+p2p port 16111, syncs, and follows the tip; once connected it discovers the rest of the
+network through gossip. `--connect=<ip>:16111` pins it to specific peers instead (this
+skips the seeder); `--addpeer` adds peers on top of it. Keep the RPC bound to `127.0.0.1`:
+it is a control interface, not something to expose.
 
-**Seed nodes (mainnet):** `185.147.157.125:16111` · `160.187.211.153:16111`
+**DNS seeder (mainnet):** `seed.zkas.info` · currently resolves to `185.147.157.125` and
+`160.187.211.153` (p2p `16111`)
 
 ### Ports
 
@@ -80,8 +81,7 @@ genesis→tip to byte-identical state; archival is **not** required for validati
 below its pruning point** from peers during IBD.
 
 ```bash
-./kaspad --appdir=./zkas-node --utxoindex --shielded-history=on \
-  --connect=185.147.157.125:16111
+./kaspad --appdir=./zkas-node --utxoindex --shielded-history=on
 ```
 
 With it on, the scan archive and chain index survive pruning, so this node serves wallets
@@ -95,8 +95,7 @@ run the verification pass over the transferred history.
 ### 3. `--archival` — keep everything (explorers, full history)
 
 ```bash
-./kaspad --appdir=./zkas-node --utxoindex --archival \
-  --rocksdb-preset=hdd --connect=185.147.157.125:16111
+./kaspad --appdir=./zkas-node --utxoindex --archival --rocksdb-preset=hdd
 ```
 
 `--archival` stops the node from deleting **public** block data when the pruning point
@@ -122,7 +121,7 @@ Two caveats worth knowing:
 |---|---|
 | `--appdir=<dir>` (`KASPAD_APPDIR`) | Data directory. |
 | `--rpclisten=<ip:port>` | Bind the gRPC RPC. Keep on `127.0.0.1`. |
-| `--connect=<ip:port>` | Connect **only** to these peers (repeatable). Needed to bootstrap. |
+| `--connect=<ip:port>` | Connect **only** to these peers (repeatable); skips the DNS seeder. Not needed to bootstrap. |
 | `--addpeer=<ip:port>` | Add a persistent peer but still discover others (repeatable). |
 | `--utxoindex` (`KASPAD_UTXOINDEX`) | Build the UTXO index (needed for some RPCs and address queries). |
 | `--archival` (`KASPAD_ARCHIVAL`) | Retain old public block data past the pruning point. Heavy disk. |
