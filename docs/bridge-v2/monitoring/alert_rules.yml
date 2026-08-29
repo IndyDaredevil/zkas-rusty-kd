@@ -4,6 +4,48 @@
 # DEPLOYED COPY sits beside prometheus.yml on the Kron (rule_files: is a
 # bare relative name). This file is a MIRROR for docs/bridge-v2/monitoring/.
 #
+# Revision 2026-08-29: keep_firing_for ADDED to the three block rules.
+#   The info route was swallowing most block cards (operator-observed ~1 in
+#   10 delivered since 08-22). Not a rule bug and not a route bug. The span
+#   in which Alertmanager can notify is
+#       firing span = range window - scrape_interval - for
+#   and prometheus.yml's 08-22 scrape change (30s -> 60s) cut it from 135s
+#   to EXACTLY 90s, against the info route's 90s group_wait. A dead tie;
+#   which side won was sub-second ordering inside Alertmanager. Measured
+#   2026-08-29 11:00-12:00: four blocks, four 90s firing spans, ONE card
+#   delivered (ALERTS query_range, 15s step).
+#   keep_firing_for: 2m holds each alert 120s past resolution -> 210s span
+#   = 120s of margin, and is INDEPENDENT of scrape_interval, so a future
+#   interval change cannot silently re-open this. 210s stays under the info
+#   route's 300s repeat_interval, so no duplicate cards. Derivation at the
+#   WINDOW WIDTH block above the block rules.
+#   THE COUPLING IS THREE FILES: this one, alertmanager.yml, prometheus.yml.
+#
+# Revision 2026-08-22b: CARD NARROWED after first field render — the 08-22
+# table wrapped at ~16-17 monospace chars on the phone (tot column
+# orphaned) and <pre> dragged in Telegram's copy-header chrome.
+#   1. Row labels KAS/ZKAS/DBL/SLV -> K/Z/D/S (existing shorthand); grid
+#      re-cut to a 16-char width budget (see the rule's contract comment).
+#   2. net split to two lines (K / Z), decimal-aligned %5.1f.
+#   3. COUPLED alertmanager.yml 08-22b: <pre> -> <code> (monospace without
+#      the copy bar).
+#
+# Revision 2026-08-22: HOURLY CARD REFORMAT — monospace table, `tot` column.
+#   1. HourlyMergedReport description rebuilt as a fixed-width table:
+#      24h / luck / tot columns per row (KAS, ZKAS, DBL), where `tot` is
+#      the since-restart rc:*_total figure that previously lived on its
+#      own `restart K/Z/D` line. SOLVE -> SLV, DOUBLE -> DBL; net/rig/up
+#      compacted (rig and up split to separate lines).
+#   2. COUPLED alertmanager.yml change: the hourly route now points at a
+#      NEW dedicated receiver 'telegram-html' (parse_mode HTML, <pre>
+#      wrapper) so the columns render monospace. ONLY the hourly route
+#      uses HTML — all other alerts stay on the plain-text receiver so a
+#      stray < > & in an ordinary annotation can never 400-and-drop.
+#      Rules content is unchanged; only this card's template moved.
+#   3. `description: |2` — the explicit indentation indicator is REQUIRED
+#      because the table's header row starts with alignment spaces; see
+#      the comment at the rule.
+#
 # Revision 2026-08-18: LABEL-CHURN FAN-OUT FIX + pin re-derive + two new
 # alerts.
 #   1. THE PHANTOM-ALERT BUG — BIRTH CLAUSE DELETED, not patched.
@@ -535,16 +577,28 @@ groups:
       # than the info route's group_interval, which means a block card could
       # be silently swallowed by a group that flushed after the alert had
       # already resolved (send_resolved: false).
-      #   fires at   ~T+37s   (scrape <=15s + eval <=15s + for 30s)
-      #   resolves at ~T+187s (3m window)
-      #   worst-case flush T+37+90 = T+127s, inside the window with ~60s
-      #   of margin.
+      # 2026-08-29: THE COUPLING IS THREE FILES, NOT TWO. scrape_interval
+      # in prometheus.yml is a term in the same inequality:
+      #     firing span = range window - scrape_interval - for
+      # At 15s scrapes: 180-15-30 = 135s vs a 90s group_wait = 45s margin.
+      # The 08-22 change to 60s scrapes made it 180-60-30 = 90s against a
+      # 90s group_wait -- a DEAD TIE, decided by sub-second ordering inside
+      # Alertmanager. Measured 2026-08-29 11:00-12:00: four blocks, four
+      # firing spans of EXACTLY 90s, one card delivered. Operator-observed
+      # rate ~1 in 10 since 08-22. No rule and no route was edited; the
+      # scrape interval alone did it.
+      # FIX: keep_firing_for: 2m on the three block rules below. That holds
+      # each alert firing 120s past resolution -> 210s span vs 90s
+      # group_wait, and it is INDEPENDENT of scrape_interval, so a future
+      # interval change cannot silently re-open this. 210s stays under the
+      # info route's 300s repeat_interval, so no duplicate cards.
       # IF YOU SHORTEN THESE WINDOWS, SHORTEN group_interval TO MATCH.
       # Cost of 3m: two blocks on the SAME worker inside 3 minutes render
       # as one card. At w9m's ~0.6 blocks/hr that is a ~3% event.
       - alert: RcKasBlockFound
         expr: sum without (ip) (increase(ks_blocks_mined{job="rc_merged_bridge"}[3m])) > 0
         for: 30s
+        keep_firing_for: 2m
         labels:
           severity: info
         annotations:
@@ -554,6 +608,7 @@ groups:
       - alert: RcZkasBlockFound
         expr: sum without (ip) (increase(ks_zkas_blocks_mined{job="rc_merged_bridge"}[3m])) > 0
         for: 30s
+        keep_firing_for: 2m
         labels:
           severity: info
         annotations:
@@ -571,6 +626,7 @@ groups:
       - alert: RcMergedDoubleBlockFound
         expr: sum without (ip) (increase(ks_double_blocks_mined{job="rc_merged_bridge"}[3m])) > 0
         for: 30s
+        keep_firing_for: 2m
         labels:
           severity: info
         annotations:
@@ -692,12 +748,42 @@ groups:
       # Prometheus, Alertmanager or the Telegram bot is down, and no other
       # alert can tell you that.
       #
-      # `description: |` (literal) not `>` (folded). The folded scalar
-      # collapses newlines into spaces — that was the wall-of-text cause.
-      # parse_mode is '' (plain text) in alertmanager.yml, so Telegram
-      # renders in a proportional font: every line is short and
-      # self-labelling rather than column-aligned. See the file footer for
-      # the HTML <pre> variant if you want true monospace alignment.
+      # `description: |2` — BOTH markers are load-bearing:
+      #   |  (literal, not >) — the folded scalar collapses newlines into
+      #      spaces; that was the original wall-of-text cause.
+      #   2  (explicit indentation indicator) — the header row begins with
+      #      alignment spaces, and a bare `|` derives the block's indent
+      #      from its FIRST line, making every later line "under-indented"
+      #      = parse error. promtool catches it, but only if promtool runs.
+      #
+      # MONOSPACE CONTRACT (2026-08-22, revised same day after first field
+      # render): this description renders inside <code> via the
+      # telegram-html receiver in alertmanager.yml — that is what makes
+      # the columns hold; in Telegram's default proportional font the
+      # padding collapses. Consequences:
+      #   - The hourly ROUTE must keep receiver: 'telegram-html'. Falling
+      #     back to 'telegram-bot' (parse_mode '') silently degrades to
+      #     misaligned columns, it does not error.
+      #   - HTML mode: any literal < > & in THIS rule's annotations breaks
+      #     the message with a silent 400-and-drop. Keep them out or
+      #     escape them. Other alerts are unaffected (they stay on the
+      #     plain-text receiver).
+      #   - WIDTH BUDGET: 16 monospace chars per line. Measured, not
+      #     guessed — the first 08-22 render (23-char lines in a <pre>
+      #     block) wrapped at ~16-17 on the operator's phone, orphaning
+      #     the tot column. Single-letter row labels (K/Z/D/S — the
+      #     operation's existing shorthand) buy the room back. Any line
+      #     added here must fit 16 chars at its MAXIMUM field widths or
+      #     it wraps on mobile. Known tolerated edge: the `up` line hits
+      #     17-18 chars only when uptime formats to its longest shape
+      #     (e.g. "12d 23h 59m 59s"); worst case the seconds wrap alone.
+      #   - Column grid: label(1) %4.0f 1sp %3.0f+% 1sp %5.0f = 16.
+      #     Good to 9999 blocks/24h and 99999 since restart; luck cannot
+      #     exceed 999 by construction (clamp_max in rc:*_luck_pct), so
+      #     the table cannot overflow its budget.
+      #   - `tot` column = the rc:*_total recording rules (since-restart
+      #     counters, previously the `restart K/Z/D` line). S has no
+      #     total on purpose: derive K+Z-D if ever needed.
       - alert: HourlyMergedReport
         expr: minute() == 0
         for: 0m
@@ -706,15 +792,17 @@ groups:
           severity: info
         annotations:
           summary: "📊 RC MERGED — 24h"
-          description: |
-            KAS     {{ with query "rc:kas_24h or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }}  ·  luck {{ with query "rc:kas_luck_pct or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }}%
-            ZKAS    {{ with query "rc:zkas_24h or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }}  ·  luck {{ with query "rc:zkas_luck_pct or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }}%
-            DOUBLE  {{ with query "rc:doubles_24h or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }}
-            SOLVE   {{ with query "rc:solves_24h or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }}   (K+Z-D)
+          description: |2
+              24h luck   tot
+            K{{ with query "rc:kas_24h or vector(0)" }}{{ . | first | value | printf "%4.0f" }}{{ end }} {{ with query "rc:kas_luck_pct or vector(0)" }}{{ . | first | value | printf "%3.0f" }}{{ end }}% {{ with query "rc:kas_total or vector(0)" }}{{ . | first | value | printf "%5.0f" }}{{ end }}
+            Z{{ with query "rc:zkas_24h or vector(0)" }}{{ . | first | value | printf "%4.0f" }}{{ end }} {{ with query "rc:zkas_luck_pct or vector(0)" }}{{ . | first | value | printf "%3.0f" }}{{ end }}% {{ with query "rc:zkas_total or vector(0)" }}{{ . | first | value | printf "%5.0f" }}{{ end }}
+            D{{ with query "rc:doubles_24h or vector(0)" }}{{ . | first | value | printf "%4.0f" }}{{ end }}      {{ with query "rc:doubles_total or vector(0)" }}{{ . | first | value | printf "%5.0f" }}{{ end }}
+            S{{ with query "rc:solves_24h or vector(0)" }}{{ . | first | value | printf "%4.0f" }}{{ end }} (K+Z-D)
 
-            restart  K{{ with query "rc:kas_total or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }} / Z{{ with query "rc:zkas_total or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }} / D{{ with query "rc:doubles_total or vector(0)" }}{{ . | first | value | printf "%.0f" }}{{ end }}
-            net      KAS {{ with query "(rc:kas_net_hs / 1e15) or vector(0)" }}{{ . | first | value | printf "%.1f" }}{{ end }}  ·  ZKAS {{ with query "(rc:zkas_net_hs / 1e15) or vector(0)" }}{{ . | first | value | printf "%.1f" }}{{ end }}  PH/s
-            rig      {{ with query "rc:rig_ths or vector(0)" }}{{ . | first | value | printf "%.2f" }}{{ end }} TH/s  ·  up {{ with query "(time() - min(ks_worker_start_time{job='rc_merged_bridge'})) or vector(0)" }}{{ . | first | value | humanizeDuration }}{{ end }}
+            net K {{ with query "(rc:kas_net_hs / 1e15) or vector(0)" }}{{ . | first | value | printf "%5.1f" }}{{ end }} PH/s
+            net Z {{ with query "(rc:zkas_net_hs / 1e15) or vector(0)" }}{{ . | first | value | printf "%5.1f" }}{{ end }} PH/s
+            rig  {{ with query "rc:rig_ths or vector(0)" }}{{ . | first | value | printf "%6.2f" }}{{ end }} TH/s
+            up {{ with query "(time() - min(ks_worker_start_time{job='rc_merged_bridge'})) or vector(0)" }}{{ . | first | value | humanizeDuration }}{{ end }}
 
 # ===========================================================================
 # NOTE: the kaspa_failover group (:3030 / job="kaspa_bridge") was REMOVED

@@ -54,7 +54,7 @@
 # ===========================================================================
 
 global:
-  scrape_interval: 15s
+  scrape_interval: 60s
   evaluation_interval: 15s
   # Punch-list item from the 08-05 overnight soak: the bridge's dashboard
   # port can answer /metrics slowly while it is busy with template work;
@@ -79,7 +79,9 @@ global:
   # 14s is MITIGATION, not the fix, and it is the hard ceiling: scrape_timeout
   # must stay <= scrape_interval. A /metrics handler taking 12 seconds to
   # render ~70 series is the real defect and is bridge-side.
-  scrape_timeout: 14s
+  #
+  # 2026-08-22: RAISED 30s -> 60s, 15s -> 55s
+  scrape_timeout: 55s
 
 alerting:
   alertmanagers:

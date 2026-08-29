@@ -1,5 +1,5 @@
 # ===========================================================================
-# Alertmanager Ã¢â‚¬â€ KDSM mining stack (Kron K1)
+# Alertmanager — KDSM mining stack (Kron K1)
 #
 # *** READ BEFORE DEPLOYING ***
 # This file uses bot_token_file, NOT an inline token. Alertmanager will
@@ -9,7 +9,7 @@
 #   2. Write the NEW token, and nothing else, to telegram_token.txt:
 #        Set-Content -Path .\telegram_token.txt -Value '<TOKEN>' `
 #          -NoNewline -Encoding ascii
-#      NOT Notepad Ã¢â‚¬â€ it writes a UTF-8 BOM and those bytes become part of
+#      NOT Notepad — it writes a UTF-8 BOM and those bytes become part of
 #      the token string, producing a 401 with a config that looks perfect.
 #      Verify: (Get-Item .\telegram_token.txt).Length  ->  46
 #   3. Set the ABSOLUTE path in bot_token_file below. Single quotes are
@@ -20,6 +20,33 @@
 #
 # This is what makes the config committable to a PUBLIC repo. The prior
 # revision carried the live token in cleartext.
+#
+# Revision 2026-08-22b:
+#   - telegram-html message wrapper <pre> -> <code>: the first field render
+#     showed <pre> pulls in Telegram's copy-header chrome, which is client
+#     UI on pre blocks and not disableable. Multi-line <code> = monospace,
+#     newlines preserved, no copy bar. COUPLED to alert_rules.yml 08-22b
+#     (card narrowed to a 16-char budget in the same pass).
+#
+# Revision 2026-08-22:
+#   - NEW receiver 'telegram-html' (parse_mode HTML, <pre>-wrapped message)
+#     and the report_type="hourly" route re-pointed at it. COUPLED to the
+#     alert_rules.yml 2026-08-22 revision: the hourly card is now a
+#     space-padded monospace table and only aligns inside <pre>. All other
+#     routes stay on the plain-text receiver deliberately — see the
+#     telegram-html comment block for the escaping rationale.
+#
+# Revision 2026-08-18:
+#   - INHIBITION NEVER WORKED. Matchers were right; timing was wrong. The
+#     singles fire up to a minute before the double (blue-confirm skew),
+#     and Alertmanager checks inhibition at notification time. info route
+#     group_wait 15s -> 120s AND group_interval 1m -> 120s. The second one
+#     is the fix; group_wait alone only ever covered the first block after
+#     an Alertmanager restart. See the inhibit_rules block.
+#   - Repaired 5 double-encoded em dashes (the "â€”" sequence) in comments.
+#     Cosmetic, but it means this file was written by something that read
+#     UTF-8 as cp1252 and re-encoded. Same family as the BOM trap warned
+#     about above; use UTF8Encoding($false), not [Text.Encoding]::UTF8.
 #
 # Revision 2026-08-09:
 #   - bot_token -> bot_token_file
@@ -34,16 +61,42 @@ global:
   resolve_timeout: 5m
 
 # ---------------------------------------------------------------------------
-# A double is ONE solve with TWO chain-hashes. Without this, a double fired
+# A double is ONE solve with TWO chain-hashes. Without this, a double fires
 # three Telegram messages (RcKasBlockFound + RcZkasBlockFound +
-# RcMergedDoubleBlockFound) Ã¢â‚¬â€ Invariant 8 violated in messaging form.
+# RcMergedDoubleBlockFound) — Invariant 8 violated in messaging form.
 #
-# All three rules live in the same rule group, so they reach Alertmanager in
-# a single POST and inhibition resolves cleanly. The 15s group_wait on the
-# info route below is belt-and-braces for that.
+# *** THE MATCHERS BELOW ARE CORRECT AND HAVE NEVER WORKED. ***  Corrected
+# 2026-08-18 after the operator reported seeing all three cards, singles
+# FIRST, on every double.
+#
+# The prior version of this comment claimed: "All three rules live in the
+# same rule group, so they reach Alertmanager in a single POST and
+# inhibition resolves cleanly." That is FALSE, and it is the whole bug.
+# Same rule group means same EVALUATION cycle, not same firing time — and
+# the three counters do not increment together:
+#
+#   16:23:32.814  ZKAS BLOCK FOUND        -> ks_zkas_blocks_mined++
+#   16:23:32.835  ACCEPTED BY NODE
+#   16:23:38.869  confirmed BLUE          -> ... and the KAS leg separately
+#                                            -> ks_double_blocks_mined++ only
+#                                               once BOTH legs are blue
+#
+# The blue-confirm loop is 30 attempts x 2s = up to 60s per leg, on top of
+# a 15s scrape interval and a 15s evaluation interval. So the singles can
+# become firing a full minute or more before the double does. `for: 30s`
+# applies to all three equally and cancels out; it is not the problem.
+#
+# Alertmanager evaluates inhibition AT NOTIFICATION TIME. If the singles'
+# group flushes before the double is firing, there is nothing to inhibit
+# them with, and Alertmanager cannot recall a message already sent. The
+# rule then correctly suppresses a re-notification nobody was going to get.
+#
+# The fix is therefore TIMING, not matchers: the info route below holds
+# block cards long enough for the double to catch up. See the note there
+# for why group_interval matters more than group_wait.
 #
 # If you would rather see all three, delete this block and set the info
-# route's group_wait back to 0s.
+# route's group_wait/group_interval back to 15s/1m.
 # ---------------------------------------------------------------------------
 inhibit_rules:
   - source_matchers:
@@ -61,22 +114,51 @@ route:
 
   routes:
     # 1. Scheduled reports (hourly cards). Each hour is a FRESH firing, so
-    #    repeat_interval never throttles them Ã¢â‚¬â€ by construction.
+    #    repeat_interval never throttles them — by construction.
+    #    2026-08-22: receiver changed to 'telegram-html' — the card is now
+    #    a monospace table and needs HTML <pre> to align. ONLY this route
+    #    uses the HTML receiver; see the receiver block for why.
     - matchers:
         - report_type="hourly"
-      receiver: 'telegram-bot'
+      receiver: 'telegram-html'
       group_by: ['report_type']
       group_wait: 0s
       group_interval: 10s
       repeat_interval: 23h
 
-    # 2. Blocks: near-immediate. 15s of group_wait buys correct double
-    #    attribution (see inhibit_rules) at a cost nobody will notice on a
-    #    block notification.
+    # 2. Blocks. Held 90s so the double can catch the singles.
+    #
+    #    TWO CONSTRAINTS BOUND THIS NUMBER FROM OPPOSITE SIDES.
+    #
+    #    LOWER BOUND — inhibition. group_interval, not group_wait, governs
+    #    steady state: because group_by is ['alertname'], the
+    #    RcKasBlockFound group is created once and persists for the life of
+    #    the process, so every block after the first joins an EXISTING
+    #    group and flushes on the next tick. The old 1m gave the double a
+    #    0-60s window to arrive, which it frequently lost. Raising
+    #    group_wait alone would have fixed the first block after a restart
+    #    and nothing else.
+    #
+    #    UPPER BOUND — and this one bites silently. These alerts only stay
+    #    FIRING while the increment sits inside the rule's range window.
+    #    With send_resolved: false, a group that flushes AFTER its alerts
+    #    have resolved notifies nothing: the block card vanishes. So
+    #    group_interval must be comfortably less than
+    #    (range window - for:). The rules were widened 1m -> 3m in the
+    #    same change to make room:
+    #      fires  ~T+37s   resolves ~T+187s   worst flush T+127s
+    #    ~60s of margin. At the old 1m window the firing span was only
+    #    ~30s and ANY group_interval above that would have started eating
+    #    block notifications.
+    #
+    #    THESE TWO FILES ARE COUPLED. Changing a block rule's range window
+    #    in alert_rules.yml without revisiting this number can silently
+    #    delete notifications rather than merely delay them.
     - matchers:
         - severity="info"
       receiver: 'telegram-bot'
-      group_wait: 15s
+      group_wait: 90s
+      group_interval: 90s
       repeat_interval: 5m
 
     # 3. Critical: bridge down, rig silent, merged leg off, red block.
@@ -98,13 +180,14 @@ receivers:
   - name: 'telegram-bot'
     telegram_configs:
       # REPLACE THIS PATH. Single quotes, absolute, no trailing slash.
-      - bot_token_file: 'C:\path\to\alertmanager\telegram_token.txt'
+      - bot_token_file: 'C:\Prometheus\alertmanager\telegram_token.txt'
         chat_id: 8180943473
         # Plain text. Do NOT set 'Markdown': legacy Markdown 400s on
         # unbalanced underscores, and the alert descriptions are full of
         # metric names that contain them. A 400 drops the message silently.
-        # For monospace alignment use 'HTML' with the <pre> variant in the
-        # alert_rules.yml appendix Ã¢â‚¬â€ and test it with amtool first.
+        # Monospace lives in the SEPARATE 'telegram-html' receiver below —
+        # do not switch this one to HTML: these descriptions are not
+        # HTML-escaped and any < > & would 400-and-drop.
         parse_mode: ''
         send_resolved: false
         message: |
@@ -112,3 +195,44 @@ receivers:
           {{ .Annotations.summary }}
           {{ .Annotations.description }}
           {{ end }}
+
+  # -------------------------------------------------------------------------
+  # ADDED 2026-08-22 — HTML receiver, used ONLY by the report_type="hourly"
+  # route. Exists so the hourly card's fixed-width table renders in
+  # Telegram's monospace font while every other alert stays on the
+  # plain-text receiver above.
+  #
+  # REVISED 2026-08-22b: <pre> -> <code>. The first field render showed
+  # <pre> drags in Telegram's code-block chrome — the "copy" header bar —
+  # which is client UI attached to pre blocks and cannot be disabled while
+  # using them. Multi-line <code> is the escape: Telegram's HTML mode
+  # preserves newlines verbatim everywhere, and inline code renders
+  # monospace with NO copy bar (tap-to-copy toast only). If a future
+  # client mangles multi-line <code>, the fallback is reverting to <pre>
+  # and living with the chrome.
+  #
+  # WHY A SECOND RECEIVER instead of flipping parse_mode globally: in HTML
+  # mode any un-escaped < > & in an annotation 400s and the message drops
+  # SILENTLY — the same failure shape as legacy Markdown's underscore trap,
+  # which is exactly what the plain-text receiver was adopted to avoid.
+  # Scoping HTML to this one route confines that risk to a single rule
+  # (HourlyMergedReport) whose content is controlled; the rule carries a
+  # matching warning comment in alert_rules.yml.
+  #
+  # COUPLING: alert_rules.yml's HourlyMergedReport table is space-padded
+  # to a 16-char width budget on the assumption it lands inside <code>
+  # here. Re-pointing the hourly route at 'telegram-bot' does not error —
+  # it silently degrades to misaligned columns. These two files move
+  # together (same class of coupling as the info-route / range-window
+  # pair above).
+  # -------------------------------------------------------------------------
+  - name: 'telegram-html'
+    telegram_configs:
+      # Same bot, same chat; path rules from the file header apply here too.
+      - bot_token_file: 'C:\Prometheus\alertmanager\telegram_token.txt'
+        chat_id: 8180943473
+        parse_mode: 'HTML'
+        send_resolved: false
+        message: |
+          {{ range .Alerts }}{{ .Annotations.summary }}
+          <code>{{ .Annotations.description }}</code>{{ end }}
