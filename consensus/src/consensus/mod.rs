@@ -97,6 +97,19 @@ use kaspa_utils::arc::ArcExtensions;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use rocksdb::WriteBatch;
 
+/// Chain-index spacing of the tree-frontier checkpoints reconstructed when backfilled shielded
+/// history is verified (`verify_shielded_history`).
+///
+/// Deliberately keyed on CHAIN INDEX, not DAA score. The pruning processor spaces its own
+/// checkpoints on `daa_score % 1000`, but a DAG block's DAA advances by its whole mergeset and
+/// therefore steps over multiples — which is fine for "keep a usable anchor near here" and wrong
+/// for "give me evenly sized verifiable segments". Index spacing makes every segment the same
+/// number of blocks, which is what a range-verifying requester needs.
+///
+/// Cost: one `FrontierState` (~1 KB: size + leaf + <=32 ommers) per 1,000 blocks, so ~1 MB for a
+/// 1M-block chain — against the ~232 MB the scan archive itself occupies.
+const SHIELDED_REPLAY_CHECKPOINT_INTERVAL: u64 = 1_000;
+
 use self::{services::ConsensusServices, storage::ConsensusStorage};
 use kaspa_consensus_core::api::SeqCommitLaneEntry;
 use std::{
@@ -782,6 +795,30 @@ impl ConsensusApi for Consensus {
         sc.get_by_index(0).unwrap_or_else(|_| self.config.genesis.hash)
     }
 
+    fn get_shielded_history_status(&self) -> ConsensusResult<(u64, bool)> {
+        let _guard = self.pruning_lock.blocking_read();
+        let sc = self.storage.selected_chain_store.read();
+        // Index 0 is the oldest block this node can ENUMERATE, which is the real limit on what
+        // it can serve: a wallet reaches history through `get_shielded_chain_range`, which
+        // resolves its start block through this index. Holding records without index entries
+        // still answers "cannot find header".
+        let Ok(base) = sc.get_by_index(0) else {
+            // No index at all: nothing below the pruning point is servable.
+            return Ok((0, false));
+        };
+        let complete = base == self.config.genesis.hash;
+        // Read the DAA score from the SCAN RECORD, not the header. A backfilled block below the
+        // pruning point has a scan record and no header — reading the header here would fail on
+        // exactly the nodes this field exists to describe.
+        let sm = self.virtual_processor.shielded_state_manager_ref();
+        let daa = match sm.scan_block(base) {
+            Ok(Some(d)) => d.daa_score,
+            // Fall back to the header for a node whose base is its own pruning point.
+            _ => self.headers_store.get_compact_header_data(base).map(|h| h.daa_score).unwrap_or(0),
+        };
+        Ok((daa, complete))
+    }
+
     fn backfill_shielded_history(
         &self,
         anchor: Hash,
@@ -931,33 +968,73 @@ impl ConsensusApi for Consensus {
         // unless the `unstable-voting-circuits` feature is on, so the projective points cannot be
         // collected for a batch inversion from here.)
         const REPLAY_BATCH: usize = 4096;
+        // Leave a core for everything else.
+        //
+        // The per-block coinbase derivations below are embarrassingly parallel and rayon will
+        // otherwise take every core for the whole replay. That was acceptable while this only ran
+        // on an operator's explicit `--verify-shielded-history`; shielded history now defaults ON,
+        // so every node runs it once on its first sync.
+        //
+        // MEASURED, and narrower than it first looked. On a 2-core box, 2026-08-22, two fresh
+        // syncs of the same chain:
+        //
+        //   uncapped (2 threads): replay 11.5 min, 4 inbound handshake timeouts
+        //   capped   (1 thread):  replay 17.4 min, 4 inbound handshake timeouts, load avg 1.00
+        //
+        // The cap did NOT reduce handshake timeouts. In both runs half of them fell OUTSIDE the
+        // replay window, and the same two peers recurred, so those timeouts are peer- or
+        // path-side and were never caused by this code. An earlier version of this comment
+        // claimed the replay starved the handshake path; that claim was wrong and is recorded
+        // here so it does not get re-derived.
+        //
+        // The cap is kept on the narrow ground it can actually support: it holds the box at load
+        // 1.00 instead of pinning every core for ~12 minutes, on a node that is simultaneously
+        // relaying blocks and answering wallets. That is a plausible courtesy, NOT a measured
+        // win — block-relay latency and RPC responsiveness under a saturated replay were not
+        // measured. The cost is real and known: about +50% replay time, once, on first sync.
+        // If someone measures no difference there either, delete this.
+        let replay_threads = std::thread::available_parallelism().map(|n| n.get().saturating_sub(1).max(1)).unwrap_or(1);
+        let replay_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(replay_threads)
+            .thread_name(|i| format!("shielded-replay-{i}"))
+            .build()
+            .map_err(|e| ConsensusError::GeneralOwned(format!("cannot build shielded replay pool: {e}")))?;
+        kaspa_core::info!(
+            "shielded history: verifying with {replay_threads} thread(s), leaving a core for p2p"
+        );
         let indices: Vec<u64> = (0..=base_index).collect();
         let total_blocks = indices.len() as u64;
         let started = std::time::Instant::now();
-        let done = std::cell::Cell::new(0u64);
-        let last_report = std::cell::Cell::new(std::time::Instant::now());
+        // Atomics, not `Cell`: the replay now runs inside a dedicated rayon pool (see below) and
+        // `ThreadPool::install` requires the closure to be `Send`, which a `Cell` is not.
+        let done = std::sync::atomic::AtomicU64::new(0);
+        // Milliseconds since `started`, so the "report at most every 15s" gate needs no `Instant`
+        // in shared state.
+        let last_report_ms = std::sync::atomic::AtomicU64::new(0);
         let stream = indices.chunks(REPLAY_BATCH).flat_map(|chunk| {
             // Progress, because this takes minutes and looks exactly like a hang otherwise: the
             // node logs "0 blocks processed" throughout while one pass re-derives ~1.4M coinbase
             // note commitments. Reported on a time interval rather than every batch so a fast
             // machine does not spam, and with an ETA so an operator can decide to wait.
-            done.set(done.get() + chunk.len() as u64);
-            if last_report.get().elapsed() >= std::time::Duration::from_secs(15) {
-                last_report.set(std::time::Instant::now());
-                let pct = done.get() as f64 * 100.0 / total_blocks as f64;
+            use std::sync::atomic::Ordering::Relaxed;
+            let done_now = done.fetch_add(chunk.len() as u64, Relaxed) + chunk.len() as u64;
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            if elapsed_ms.saturating_sub(last_report_ms.load(Relaxed)) >= 15_000 {
+                last_report_ms.store(elapsed_ms, Relaxed);
+                let pct = done_now as f64 * 100.0 / total_blocks as f64;
                 let elapsed = started.elapsed().as_secs_f64();
-                let eta = if done.get() > 0 { elapsed * (total_blocks - done.get()) as f64 / done.get() as f64 } else { 0.0 };
+                let eta = if done_now > 0 { elapsed * (total_blocks - done_now) as f64 / done_now as f64 } else { 0.0 };
                 kaspa_core::info!(
                     "shielded history: verifying {:.0}% ({}/{} blocks), about {:.0}s left",
                     pct,
-                    done.get(),
+                    done_now,
                     total_blocks,
                     eta
                 );
             }
             // Reads stay sequential: RocksDB point lookups are a small fraction of the cost, and
             // keeping them on one thread avoids contending with the derivation workers.
-            let raw: Vec<Result<Option<(Hash, ShieldedScanBlockData)>, String>> = chunk
+            let raw: Vec<Result<Option<(u64, Hash, ShieldedScanBlockData)>, String>> = chunk
                 .iter()
                 .map(|&index| {
                     let hash = sc.get_by_index(index).map_err(|e| format!("chain index gap at {index}: {e}"))?;
@@ -966,14 +1043,19 @@ impl ConsensusApi for Consensus {
                     // have leaves and the peer withheld its record, skipping it changes the leaf
                     // sequence and the frontier comparison fails, which is what we want.
                     match sm.scan_block(hash).map_err(|e| format!("scan record read failed for {hash}: {e}"))? {
-                        Some(d) => Ok(Some((hash, d))),
+                        Some(d) => Ok(Some((index, hash, d))),
                         None => Ok(None),
                     }
                 })
                 .collect();
+            replay_pool.install(|| {
             raw.into_par_iter()
                 .map(|entry| {
-                    let Some((hash, d)) = entry? else { return Ok((Vec::new(), Vec::new())) };
+                    let Some((index, hash, d)) = entry? else { return Ok((None, Vec::new(), Vec::new())) };
+                    // Label only the blocks that become checkpoints. The interval is in CHAIN
+                    // INDEX, not DAA score: DAA advances by a block's whole mergeset, so spacing
+                    // on it leaves uneven and occasionally huge gaps between anchors.
+                    let label = (index % SHIELDED_REPLAY_CHECKPOINT_INTERVAL == 0).then_some(hash);
                     // Prefer the commitments consensus computed and stored. Deriving is the
                     // fallback for records written before that field existed; it uses the SAME
                     // function validation uses, gated on the same fork activation, so a replay
@@ -989,13 +1071,55 @@ impl ConsensusApi for Consensus {
                             .map(|n| n.commitment.to_bytes())
                             .collect()
                     };
-                    Ok((coinbase, d.accepted.iter().map(|t| t.action_bytes.clone()).collect()))
+                    Ok((label, coinbase, d.accepted.iter().map(|t| t.action_bytes.clone()).collect()))
                 })
                 .collect::<Vec<_>>()
+            })
         });
 
-        match ShieldedStateManager::replay_frontier_streaming(stream) {
+        // Capture the frontier at every checkpoint boundary as the replay passes it, but do NOT
+        // write any of them yet — see `persist_replayed_frontier`'s safety note. ~1 KB each, one
+        // per SHIELDED_REPLAY_CHECKPOINT_INTERVAL blocks, so a 1M-block chain buffers ~1 MB.
+        let mut checkpoints: Vec<(Hash, kaspa_shielded_core::tree::FrontierState)> = Vec::new();
+
+        // The replay itself stays SEQUENTIAL — the frontier depends on leaf order, so the tree
+        // appends cannot be parallelised. Only the per-block coinbase derivations inside the
+        // stream are parallel, and those already run on the bounded `replay_pool` built above.
+        //
+        // Note this cannot be wrapped in `pool.install(..)` as a whole: the stream carries the
+        // progress counters as `Cell`s, which are `!Sync`, so the closure is not `Send`. That is
+        // the right shape anyway — the pool belongs around the parallel part, not the serial one.
+        let replayed = ShieldedStateManager::replay_frontier_streaming_capturing(stream, |hash, frontier| {
+            checkpoints.push((hash, frontier.clone()));
+        });
+
+        match replayed {
             Ok((frontier, leaves)) if frontier == expected => {
+                // Only now. The whole replay reproduced a frontier this node learned from
+                // proof-of-work and never from the peer that supplied the records, so every
+                // intermediate frontier on the way to it is equally proven — they are prefixes of
+                // the same verified leaf sequence.
+                //
+                // This is what lets a backfilled node serve history that a THIRD node can verify
+                // against it, instead of every verification in the network funnelling back to the
+                // few nodes that validated the chain themselves.
+                let written = checkpoints.len();
+                let sm_w = self.virtual_processor.shielded_state_manager_ref();
+                let mut batch = rocksdb::WriteBatch::default();
+                for (hash, f) in checkpoints {
+                    if let Err(e) = sm_w.persist_replayed_frontier(&mut batch, hash, f) {
+                        // Not fatal: the history itself is verified and serving it is unaffected.
+                        // Only the ability to ANCHOR someone else's verification is lost.
+                        kaspa_core::warn!("shielded history: could not stage frontier checkpoint at {hash}: {e}");
+                    }
+                }
+                if let Err(e) = self.db.write(batch) {
+                    kaspa_core::warn!("shielded history: verified, but frontier checkpoints were not written: {e}");
+                } else if written > 0 {
+                    kaspa_core::info!(
+                        "shielded history: wrote {written} tree-frontier checkpoints below the pruning point;                          this node can now anchor another node's history verification"
+                    );
+                }
                 Ok(ShieldedHistoryVerdict::Verified { blocks: base_index + 1, leaves })
             }
             Ok((frontier, leaves)) => Ok(ShieldedHistoryVerdict::Mismatch {
@@ -2296,6 +2420,25 @@ mod tests {
     use crate::consensus::test_consensus::TestConsensus;
     use kaspa_consensus_core::api::{ConsensusApi, ShieldedExportMetadata};
     use kaspa_consensus_core::config::params::MAINNET_PARAMS;
+
+    /// A node whose chain index starts at genesis must report history COMPLETE; the whole point
+    /// of the field is that a wallet can tell the difference, so getting the polarity wrong is
+    /// worse than not publishing it at all.
+    ///
+    /// A fresh `TestConsensus` is exactly the genesis-rooted case: `init_with_pruning_point`
+    /// has not rebased anything, so index 0 IS genesis — the same state a node reaches after a
+    /// successful history backfill.
+    #[test]
+    fn history_status_reports_complete_when_the_index_starts_at_genesis() {
+        let config = Config::new(MAINNET_PARAMS);
+        let tc = TestConsensus::new(&config);
+        let consensus = tc.consensus_clone();
+
+        let (from_daa, complete) = consensus.get_shielded_history_status().expect("status must be readable");
+
+        assert!(complete, "an index rooted at genesis must report complete history");
+        assert_eq!(from_daa, 0, "genesis is DAA 0, so there is no floor below which this node cannot answer");
+    }
 
     /// F-08 regression: the peer-declared `nullifier_count` must never drive an
     /// allocation, an absurd count must be rejected up front by the sanity cap, and

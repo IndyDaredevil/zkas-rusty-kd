@@ -616,6 +616,30 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// How far back this node can actually serve shielded note history, and whether that
+    /// reaches genesis.
+    ///
+    /// Returns `(daa_score_of_oldest_servable_block, complete)`.
+    ///
+    /// # Why a node must publish this
+    ///
+    /// IBD transfers a frontier and a nullifier MuHash — aggregates that cannot yield anyone's
+    /// notes — so a node that has not backfilled holds per-note history only from its pruning
+    /// point forward. Ask it for a wallet's balance and it answers with whatever it can see,
+    /// which is a PARTIAL balance reported as final. There is no symptom: the number is
+    /// plausible, the node says it is synced, and the user has no way to tell.
+    ///
+    /// That is not hypothetical on this chain. A wallet holding four tokens was observed reading
+    /// 2,038,348 / 1,902,767 / 1,902,767 / 0.00 across successive queries, every one of them
+    /// reported as synced. Publishing the floor is what lets a wallet say "this node cannot
+    /// answer for my birthday" instead of inventing a number.
+    ///
+    /// `complete` means the node can enumerate down to genesis. It is derived, not stored: a
+    /// backfill that fails verification is purged, so records that are present were verified.
+    fn get_shielded_history_status(&self) -> ConsensusResult<(u64, bool)> {
+        unimplemented!()
+    }
+
     /// Ingest a backfilled chunk. `anchor` and `anchor_index` are the block the chunk was
     /// requested below and its index in the SERVER's genesis-based numbering — together they are
     /// what aligns the two index spaces, since the chunk itself never contains the anchor.

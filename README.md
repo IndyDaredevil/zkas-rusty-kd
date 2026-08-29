@@ -41,8 +41,8 @@ see **[docs/BUILDING.md](docs/BUILDING.md)**.
   --connect=185.147.157.125:16111 --connect=160.187.211.153:16111
 ```
 
-It syncs from these seed nodes and follows the tip. ZKas mainnet has no DNS seeders yet, so
-a fresh node bootstraps from a known peer; once connected it discovers the rest of the
+It syncs from these seed nodes and follows the tip. Without `--connect` the node resolves the
+mainnet seeder `seed.zkas.info` and dials every address it returns; once connected it discovers the rest of the
 network through gossip. Only outbound access to a peer's p2p **16111** is needed; keep the
 RPC on **16110** bound to loopback.
 

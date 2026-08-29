@@ -230,6 +230,8 @@ from!(item: RpcResult<&kaspa_rpc_core::GetShieldedTreeStateResponse>, protowire:
         size: item.size,
         leaf: item.leaf.to_string(),
         ommers: item.ommers.iter().map(|h| h.to_string()).collect(),
+        history_from_daa_score: item.history_from_daa_score,
+        history_complete: item.history_complete,
         error: None,
     }
 });
@@ -836,6 +838,10 @@ try_from!(item: &protowire::GetShieldedTreeStateResponseMessage, RpcResult<kaspa
         size: item.size,
         leaf: RpcHash::from_str(&item.leaf)?,
         ommers: item.ommers.iter().map(|s| RpcHash::from_str(s)).collect::<Result<Vec<_>, _>>()?,
+        // A peer that predates these fields sends proto defaults (0, false). `false` is the
+        // safe reading: never let an old node's silence pass as a promise of full history.
+        history_from_daa_score: item.history_from_daa_score,
+        history_complete: item.history_complete,
     }
 });
 

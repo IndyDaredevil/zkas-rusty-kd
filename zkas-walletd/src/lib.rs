@@ -3308,7 +3308,13 @@ fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSn
         // `tip > 0` guard: when the pass's dag-info call times out, `chain_len` is 0 and
         // `scanned + margin >= 0` is trivially true — the UI then flashed "synced" on a
         // wallet that was mid-scan (observed live 2026-07-16). No tip info ⇒ not synced.
-        synced: tip > 0 && (e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= tip),
+        // `blind_below == 0` guard: a view rebuilt against a node that could not serve the
+        // wallet's history (see `WalletEntry::blind_below`) is caught up to the tip but
+        // its balance is NOT final - notes minted below the blind point are invisible.
+        // Reporting that as `synced` is the exact lie the 2026-07-30 four-token incident
+        // told; `missing_history` already said why, but nothing consumed it before
+        // presenting the balance as the whole truth.
+        synced: tip > 0 && e.blind_below == 0 && (e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= tip),
         scanned: e.scanned,
         chain_len: tip,
         balance_sompi: total,
@@ -5497,6 +5503,7 @@ struct BalanceResp {
     balance_sompi: String,
     balance_fc: String,
     synced: bool,
+    missing_history: bool,
     scanned_blocks: usize,
     chain_len: u64,
     /// Every owned note, **only when asked for** (`?notes=1`).
@@ -5544,7 +5551,10 @@ async fn wallet_balance(
         // synced. Without it, `scanned + margin >= 0` is trivially true and a wallet that
         // has not yet been swept (or was swept on a pass whose dag-info timed out) reports
         // a partial balance as final — the shape every "my coins vanished" report takes.
-        synced: e.chain_len > 0 && (e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= e.chain_len),
+        synced: e.chain_len > 0 && e.blind_below == 0 && (e.caught_up || (e.scanned as u64) + SYNC_MARGIN >= e.chain_len),
+        // Why `synced` can be false on a caught-up wallet: the serving node could not
+        // provide the wallet's history from its birthday, so this balance is partial.
+        missing_history: e.blind_below > 0,
         scanned_blocks: e.scanned,
         chain_len: e.chain_len,
         notes,

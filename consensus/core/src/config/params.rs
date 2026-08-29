@@ -859,9 +859,14 @@ pub const ZKAS_DEV_FEE_PERMILLE: u64 = 50;
 pub const MAINNET_PARAMS: Params = Params {
     // ZKas is a distinct network with its own genesis; it MUST NOT advertise or
     // dial Kaspa's DNS seeders (doing so would waste connections on genesis-mismatch
-    // rejects and leak our nodes into Kaspa's peer graph). Until ZKas seeders are
-    // deployed (task #28), mainnet bootstraps via explicit --connect/--addpeer.
-    dns_seeders: &[],
+    // rejects and leak our nodes into Kaspa's peer graph).
+    //
+    // `seed.zkas.info` is resolved with a plain A-record lookup (`to_socket_addrs`,
+    // components/connectionmanager/src/lib.rs) and every address it returns is dialled on
+    // the default p2p port, so it works as a static list of A records today and becomes a
+    // crawling seeder the day one is put behind the same name - no node release needed.
+    // Only consulted when no --connect peer is given (kaspad/src/daemon.rs).
+    dns_seeders: &["seed.zkas.info"],
     net: NetworkId::new(NetworkType::Mainnet),
     genesis: GENESIS,
     timestamp_deviation_tolerance: TIMESTAMP_DEVIATION_TOLERANCE,

@@ -13,6 +13,26 @@ use std::sync::Arc;
 /// rather than hundreds of thousands, small enough to stay well inside the message size cap.
 const HISTORY_CHUNK_BLOCKS: usize = 4_000;
 
+/// Minimum wall-clock spacing between history chunks served to ONE peer.
+///
+/// Serving is not free: each chunk is a `HISTORY_CHUNK_BLOCKS`-deep walk of the selected-chain
+/// index plus one scan-archive point lookup per block — a few MB of RocksDB reads — and the
+/// request loop has no other bound, so a peer could previously issue them back to back for as
+/// long as it liked. That was survivable while history serving was rare (it defaulted to
+/// `--archival` only). It stops being survivable now that every node defaults to holding and
+/// serving history, which is exactly the change that makes this path worth attacking.
+///
+/// A whole-chain backfill is ~116 round trips, so at this spacing an honest requester pays about
+/// 12 s of added latency on a transfer that already takes minutes — while a peer trying to pin a
+/// server's disk gets throttled to one walk per interval per connection.
+const HISTORY_CHUNK_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How many chunks one peer may request before it must wait out a full interval regardless.
+///
+/// The spacing above bounds the sustained rate; this bounds the burst, so a peer cannot open with
+/// an unbounded run of free walks before the throttle engages.
+const HISTORY_BURST_CHUNKS: u32 = 8;
+
 /// Server side of shielded-history backfill.
 ///
 /// A node that synced from a headers proof writes scan records only for blocks it validated
@@ -33,6 +53,10 @@ pub struct RequestShieldedHistoryFlow {
     ctx: FlowContext,
     router: Arc<Router>,
     incoming_route: IncomingRoute,
+    /// When this peer last had a chunk served, for [`HISTORY_CHUNK_MIN_INTERVAL`].
+    last_served: Option<std::time::Instant>,
+    /// Chunks served to this peer so far, for the [`HISTORY_BURST_CHUNKS`] allowance.
+    served_count: u32,
 }
 
 #[async_trait::async_trait]
@@ -48,7 +72,7 @@ impl Flow for RequestShieldedHistoryFlow {
 
 impl RequestShieldedHistoryFlow {
     pub fn new(ctx: FlowContext, router: Arc<Router>, incoming_route: IncomingRoute) -> Self {
-        Self { ctx, router, incoming_route }
+        Self { ctx, router, incoming_route, last_served: None, served_count: 0 }
     }
 
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
@@ -61,6 +85,21 @@ impl RequestShieldedHistoryFlow {
             ab.copy_from_slice(&msg.anchor_hash);
             let anchor = kaspa_hashes::Hash::from_bytes(ab);
             let max_blocks = (msg.max_blocks as usize).clamp(1, HISTORY_CHUNK_BLOCKS);
+            // Throttle before doing the work, not after: the cost this guards is the walk itself,
+            // so sleeping afterwards would still let a peer queue the reads back to back.
+            if self.served_count >= HISTORY_BURST_CHUNKS {
+                if let Some(last) = self.last_served {
+                    let since = last.elapsed();
+                    if since < HISTORY_CHUNK_MIN_INTERVAL {
+                        tokio::time::sleep(HISTORY_CHUNK_MIN_INTERVAL - since).await;
+                    }
+                }
+            }
+            self.last_served = Some(std::time::Instant::now());
+            self.served_count = self.served_count.saturating_add(1);
+            if self.served_count == HISTORY_BURST_CHUNKS {
+                debug!("peer {} is now rate-limited on shielded history after {HISTORY_BURST_CHUNKS} chunks", self.router);
+            }
             self.handle_request(anchor, max_blocks).await?;
         }
     }

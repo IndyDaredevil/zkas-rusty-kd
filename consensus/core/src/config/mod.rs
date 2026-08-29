@@ -91,13 +91,29 @@ pub struct Config {
 impl Config {
     /// Whether this node should obtain shielded note history below its pruning point.
     ///
-    /// Defaults to `is_archival`: an archival node that lacks it silently serves wallets a
-    /// partial balance, and a non-archival node should not pay for history it will not serve.
-    /// The explicit setting exists mainly for a PRUNED wallet-serving node, which can hold and
-    /// serve complete history (the scan archive and chain index both survive pruning) without
-    /// being archival.
+    /// **Defaults to ON for every node**, archival or not.
+    ///
+    /// It used to default to `is_archival`, on the reasoning that "a non-archival node should not
+    /// pay for history it will not serve". That reasoning priced the wrong thing. Measured on a
+    /// fresh pruned sync 2026-08-22 at 968,613 chain blocks, the shielded scan archive is
+    /// **499 MiB** (540 B mean per block) against a 1.5 GiB total database — a large SHARE of a
+    /// pruned node, but a small absolute cost, and roughly a twentieth of what `--archival`'s
+    /// block bodies ask for. Tying that decision to the archival one made history rare when it
+    /// needs to be ubiquitous.
+    ///
+    /// (An earlier note here said 232 MB / 2.35%. That was measured on an ARCHIVAL node at
+    /// 861,987 blocks; the archive has since roughly doubled with the chain, and the percentage
+    /// was never the right comparison for a pruned node.)
+    ///
+    /// The failure that default produced is not hypothetical. Every node that fast-syncs with
+    /// defaults holds no history below its own pruning point, so pre-pruning-point note data —
+    /// which is USER FUNDS DATA, and is not recoverable from the network once lost — survives
+    /// only on the handful of machines that happened to be running when those blocks were mined.
+    /// Defaulting on is what makes the network, rather than two servers, the place history lives.
+    ///
+    /// Turn it off explicitly (`--shielded-history=off`) for a node that will never serve wallets.
     pub fn wants_shielded_history(&self) -> bool {
-        self.shielded_history.unwrap_or(self.is_archival)
+        self.shielded_history.unwrap_or(true)
     }
 
     pub fn new(params: Params) -> Self {

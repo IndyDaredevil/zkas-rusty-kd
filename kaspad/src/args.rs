@@ -407,13 +407,13 @@ pub fn cli() -> Command {
                 .value_parser(["on", "off"])
                 .require_equals(true)
                 .help(
-                    "Fetch shielded note history below the pruning point from peers (default: on with \
-                     --archival, off otherwise). IBD transfers a frontier and a nullifier MuHash, which \
-                     are aggregates and cannot yield anyone's notes, so without this a node serves wallets \
-                     history only from its pruning point forward and balances read as silently partial. \
-                     Turn it ON for a pruned wallet-serving node: the scan archive and chain index both \
-                     survive pruning, so such a node can serve complete history. Turn it OFF to skip the \
-                     transfer and its verification pass.",
+                    "Fetch shielded note history below the pruning point from peers (default: ON for \
+                     every node). IBD transfers a frontier and a nullifier MuHash, which are aggregates \
+                     and cannot yield anyone's notes, so without this a node serves wallets history only \
+                     from its pruning point forward and balances read as silently partial. The archive is \
+                     ~500 MB at ~1M blocks and survives pruning, so a pruned node can serve complete \
+                     history — which is why this is no longer tied to --archival. Pass \
+                     --shielded-history=off for a node that will never serve wallets.",
                 ),
         )
         .arg(

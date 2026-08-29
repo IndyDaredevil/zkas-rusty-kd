@@ -287,6 +287,13 @@ impl ConsensusSessionOwned {
         self.clone().spawn_blocking(move |c| c.get_shielded_history_base()).await
     }
 
+    /// `(daa_score_of_oldest_servable_block, complete)` — see
+    /// [`ConsensusApi::get_shielded_history_status`]. Published so a wallet can refuse to
+    /// report a balance this node cannot actually answer for.
+    pub async fn async_get_shielded_history_status(&self) -> ConsensusResult<(u64, bool)> {
+        self.clone().spawn_blocking(move |c| c.get_shielded_history_status()).await
+    }
+
     /// Ingest a backfilled history chunk (index entries + scan records); see
     /// `backfill_shielded_history`.
     pub async fn async_backfill_shielded_history(

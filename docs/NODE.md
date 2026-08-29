@@ -9,8 +9,8 @@
   --connect=185.147.157.125:16111 --connect=160.187.211.153:16111
 ```
 
-The node syncs from the seed nodes you give it and follows the tip. ZKas mainnet ships no
-DNS seeders yet, so a fresh node bootstraps from a known peer; once connected it discovers
+The node syncs from the seed nodes you give it and follows the tip. Without `--connect` it
+resolves the mainnet seeder `seed.zkas.info` and dials every address it returns; once connected it discovers
 the rest of the network through gossip. Keep the RPC bound to `127.0.0.1`: it is a control
 interface, not something to expose.
 

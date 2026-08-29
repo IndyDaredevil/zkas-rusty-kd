@@ -506,29 +506,50 @@ pub struct GetShieldedTreeStateResponse {
     pub size: u64,
     pub leaf: RpcHash,
     pub ommers: Vec<RpcHash>,
+    /// DAA score of the OLDEST block this node can serve shielded history for.
+    ///
+    /// A wallet whose birthday is below this cannot be fully scanned here, and any balance
+    /// this node reports for it is partial. Zero on a node that can serve from genesis.
+    pub history_from_daa_score: u64,
+    /// Whether this node can enumerate shielded history all the way to genesis.
+    ///
+    /// `false` does NOT mean the node is broken — it means it fast-synced and has not
+    /// backfilled, which is the default state of a fresh node. It means a wallet must not
+    /// treat a balance from it as final unless the wallet's birthday is above
+    /// [`Self::history_from_daa_score`].
+    pub history_complete: bool,
 }
 
 impl Serializer for GetShieldedTreeStateResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        // Version 2 adds the history-coverage fields. Bumped rather than appended silently so a
+        // reader can tell "this node did not report coverage" from "coverage is zero".
+        store!(u16, &2, writer)?;
         store!(RpcHash, &self.block_hash, writer)?;
         store!(u64, &self.daa_score, writer)?;
         store!(u64, &self.size, writer)?;
         store!(RpcHash, &self.leaf, writer)?;
         store!(Vec<RpcHash>, &self.ommers, writer)?;
+        store!(u64, &self.history_from_daa_score, writer)?;
+        store!(bool, &self.history_complete, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for GetShieldedTreeStateResponse {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let block_hash = load!(RpcHash, reader)?;
         let daa_score = load!(u64, reader)?;
         let size = load!(u64, reader)?;
         let leaf = load!(RpcHash, reader)?;
         let ommers = load!(Vec<RpcHash>, reader)?;
-        Ok(Self { block_hash, daa_score, size, leaf, ommers })
+        // A v1 peer sends nothing here. Decode as "coverage unknown", and deliberately as
+        // NOT complete: a caller must never read an old node's silence as a promise of full
+        // history — that is the same silent-partial failure these fields exist to end.
+        let (history_from_daa_score, history_complete) =
+            if version >= 2 { (load!(u64, reader)?, load!(bool, reader)?) } else { (0, false) };
+        Ok(Self { block_hash, daa_score, size, leaf, ommers, history_from_daa_score, history_complete })
     }
 }
 

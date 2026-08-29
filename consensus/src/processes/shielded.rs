@@ -598,6 +598,42 @@ impl ShieldedStateManager {
         self.scan_block.delete_batch(batch, block)
     }
 
+    /// Persist a note-commitment tree frontier at `block` as a fast-sync / verification anchor.
+    ///
+    /// Distinct from [`Self::persist`], which writes the frontier a node computed while
+    /// VALIDATING a block. This writes one reconstructed by replaying the compact scan archive,
+    /// for blocks below the pruning point that this node never validated.
+    ///
+    /// # SAFETY — ordering is the whole argument
+    ///
+    /// A replayed frontier is only as trustworthy as the archive it was replayed from, and that
+    /// archive arrived from a peer. Writing one before the replay has been checked end-to-end
+    /// against a PoW-anchored frontier would leave a poisoned anchor behind on exactly the path
+    /// that is supposed to reject bad history — and every later verification, local or served,
+    /// would be measured against it. Callers MUST buffer checkpoints and write them only after a
+    /// `Verified` verdict. `verify_shielded_history` is the only caller and does exactly that.
+    ///
+    /// Idempotent: re-verifying rewrites identical values, since the frontier is a pure function
+    /// of the leaf prefix.
+    ///
+    /// # Interaction with the pruner
+    ///
+    /// [`Self::prune_block_snapshots`] deletes a block's frontier unless the pruner marks it a
+    /// checkpoint, and it decides that from `daa_score % SHIELDED_FRONTIER_CHECKPOINT_INTERVAL`
+    /// — a rule these index-spaced checkpoints do not satisfy, and one that reads a header a
+    /// backfilled block does not have. That does not collide today: the pruner reaches blocks by
+    /// walking REACHABILITY up from `ORIGIN`, and backfill writes only the selected-chain index
+    /// and scan records, so a block whose history was backfilled is not in the reachability tree
+    /// and the traversal never visits it.
+    ///
+    /// If that ever changes, the failure is benign — losing these frontiers returns the node to
+    /// the old behaviour of being unable to anchor a peer's verification, and re-running
+    /// `--verify-shielded-history` restores them. It is not a correctness risk: nothing in
+    /// validation reads them.
+    pub fn persist_replayed_frontier(&self, batch: &mut WriteBatch, block: Hash, frontier: FrontierState) -> StoreResult<()> {
+        self.tree_store.set_batch(batch, block, frontier)
+    }
+
     /// Replay a backfilled history range into an empty tree and return the resulting frontier.
     ///
     /// This is what makes history backfill trustless. `GlobalTree::append` is pure append-only,
@@ -645,6 +681,33 @@ impl ShieldedStateManager {
     pub fn replay_frontier_streaming(
         blocks: impl IntoIterator<Item = Result<(Vec<[u8; 32]>, Vec<Vec<u8>>), String>>,
     ) -> Result<(FrontierState, u64), ReplayError> {
+        Self::replay_frontier_streaming_capturing::<()>(blocks.into_iter().map(|b| b.map(|(c, a)| (None, c, a))), |_, _| {})
+    }
+
+    /// [`Self::replay_frontier_streaming`] that also hands the caller the frontier as it stood
+    /// after each block it labels — the raw material for tree-frontier checkpoints below the
+    /// pruning point.
+    ///
+    /// # Why this exists
+    ///
+    /// Verifying backfilled history already computes every intermediate frontier and then throws
+    /// them away. That is why a backfilled node can never anchor anyone else's verification:
+    /// `verify_shielded_history` needs `frontier_at(base)`, and a node that learned its history
+    /// from a peer holds frontiers only at (and above) its own pruning point. So history could be
+    /// copied endlessly and still only ever be *checkable* against the handful of nodes that
+    /// validated it themselves. Capturing the frontiers this pass already produces is what makes
+    /// a backfilled node a first-class source.
+    ///
+    /// Each stream item may carry an opaque label; `on_checkpoint(label, frontier)` fires after
+    /// that block's leaves are appended, for items whose label is `Some`. The caller chooses the
+    /// spacing (by labelling only the blocks it wants) and — critically — chooses *when to
+    /// persist*: a checkpoint captured here is only as good as the replay that produced it, so
+    /// nothing may be written until the whole replay has been checked against a PoW-anchored
+    /// frontier. See `verify_shielded_history`.
+    pub fn replay_frontier_streaming_capturing<L>(
+        blocks: impl IntoIterator<Item = Result<(Option<L>, Vec<[u8; 32]>, Vec<Vec<u8>>), String>>,
+        mut on_checkpoint: impl FnMut(L, &FrontierState),
+    ) -> Result<(FrontierState, u64), ReplayError> {
         let mut tree = GlobalTree::default();
         let mut leaves = 0u64;
         let append = |tree: &mut GlobalTree, cmx: &[u8; 32], leaves: &mut u64| -> Result<(), ReplayError> {
@@ -657,7 +720,7 @@ impl ShieldedStateManager {
             Ok(())
         };
         for block in blocks {
-            let (coinbase, accepted) = block.map_err(ReplayError::Source)?;
+            let (label, coinbase, accepted) = block.map_err(ReplayError::Source)?;
             // Coinbase mint first, then accepted actions in consensus applied order — the
             // order `compute` appended them in at validation time. Any other order yields a
             // different frontier from identical data.
@@ -670,6 +733,11 @@ impl ShieldedStateManager {
                     cmx.copy_from_slice(&rec[32..64]);
                     append(&mut tree, &cmx, &mut leaves)?;
                 }
+            }
+            // After this block's leaves, never between them: a frontier is only meaningful at a
+            // block boundary, which is the only place `frontier_at` can ever be asked about.
+            if let Some(label) = label {
+                on_checkpoint(label, &tree.to_state());
             }
         }
         Ok((tree.to_state(), leaves))
@@ -2097,6 +2165,76 @@ mod tests {
     /// reject any tampering. Without this the whole history-backfill path would be "trust the
     /// peer", which is precisely what it exists to avoid.
     #[test]
+    /// The capturing replay must emit a frontier for every labelled block, and each captured
+    /// frontier must equal what a replay TRUNCATED at that block produces. That equality is the
+    /// entire reason a checkpoint is trustworthy once the full replay verifies: a checkpoint is a
+    /// prefix of the same verified leaf sequence, not an independent claim.
+    #[test]
+    fn captured_checkpoints_equal_truncated_replays() {
+        // Three blocks, each contributing distinct leaves; label every one.
+        let blocks: Vec<(Vec<[u8; 32]>, Vec<Vec<u8>>)> = (0u32..3)
+            .map(|b| (vec![cmx(b * 10 + 1).to_bytes(), cmx(b * 10 + 2).to_bytes()], Vec::new()))
+            .collect();
+
+        let mut captured: Vec<(usize, FrontierState)> = Vec::new();
+        let (final_frontier, leaves) = ShieldedStateManager::replay_frontier_streaming_capturing(
+            blocks.iter().enumerate().map(|(i, (c, a))| Ok((Some(i), c.clone(), a.clone()))),
+            |i, f| captured.push((i, f.clone())),
+        )
+        .expect("replay of well-formed leaves must succeed");
+
+        assert_eq!(leaves, 6, "two leaves per block over three blocks");
+        assert_eq!(captured.len(), 3, "one checkpoint per labelled block");
+
+        // Each captured frontier must match a replay of just the prefix up to that block.
+        for (i, f) in &captured {
+            let (prefix, _) =
+                ShieldedStateManager::replay_frontier_streaming(blocks[..=*i].iter().map(|(c, a)| Ok((c.clone(), a.clone()))))
+                    .expect("prefix replay must succeed");
+            assert_eq!(&prefix, f, "checkpoint at block {i} must equal the truncated replay");
+        }
+        // And the last checkpoint is the final frontier.
+        assert_eq!(captured.last().unwrap().1, final_frontier);
+    }
+
+    /// Unlabelled blocks must produce NO checkpoint, so the caller controls spacing entirely.
+    #[test]
+    fn unlabelled_blocks_capture_nothing() {
+        let blocks: Vec<(Vec<[u8; 32]>, Vec<Vec<u8>>)> =
+            (0u32..4).map(|b| (vec![cmx(b + 1).to_bytes()], Vec::new())).collect();
+        let mut captured = 0usize;
+        // Label only every 2nd block, mirroring how the verifier spaces checkpoints by index.
+        ShieldedStateManager::replay_frontier_streaming_capturing(
+            blocks.iter().enumerate().map(|(i, (c, a))| Ok(((i % 2 == 0).then_some(i), c.clone(), a.clone()))),
+            |_, _| captured += 1,
+        )
+        .expect("replay must succeed");
+        assert_eq!(captured, 2, "only labelled blocks may emit a checkpoint");
+    }
+
+    /// SAFETY PROPERTY: a replay that FAILS must not leave a usable checkpoint behind.
+    ///
+    /// The capturing replay hands frontiers to the caller as it goes, so it necessarily emits
+    /// some before it discovers the data is bad. What must hold is that it still returns `Err`,
+    /// which is what stops `verify_shielded_history` from reaching its persist branch. If this
+    /// ever returned `Ok` on tampered data, poisoned anchors would be written on exactly the path
+    /// that exists to reject bad history.
+    #[test]
+    fn a_failed_replay_reports_error_so_nothing_is_persisted() {
+        let good = vec![cmx(1).to_bytes()];
+        // A non-canonical Pallas encoding: all-0xff is not a valid base-field element.
+        let bad = vec![[0xffu8; 32]];
+        let mut captured = 0usize;
+        let res = ShieldedStateManager::replay_frontier_streaming_capturing(
+            vec![Ok((Some(0usize), good, Vec::new())), Ok((Some(1usize), bad, Vec::new()))].into_iter(),
+            |_, _| captured += 1,
+        );
+        assert!(matches!(res, Err(ReplayError::Data(_))), "tampered leaves must fail the replay, got {res:?}");
+        // It may have captured the first block's frontier — that is fine and unavoidable. The
+        // guarantee is the Err above: the caller never reaches its write.
+        assert!(captured <= 1, "must not capture past the failure point");
+    }
+
     fn history_replay_reproduces_frontier_and_detects_tampering() {
         use kaspa_consensus_core::api::ShieldedChainBlockData;
 

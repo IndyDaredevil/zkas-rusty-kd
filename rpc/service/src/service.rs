@@ -762,7 +762,11 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let (size, leaf, ommers) = session.async_get_shielded_tree_frontier(block_hash).await?;
         let leaf = RpcHash::from_bytes(leaf.unwrap_or_default());
         let ommers = ommers.into_iter().map(RpcHash::from_bytes).collect();
-        Ok(GetShieldedTreeStateResponse { block_hash, daa_score, size, leaf, ommers })
+        // How far back this node can actually answer. Published on the call wallets already
+        // make to anchor a scan, so a wallet learns the node's floor at the moment it decides
+        // where to start — rather than discovering it as a wrong balance later.
+        let (history_from_daa_score, history_complete) = session.async_get_shielded_history_status().await?;
+        Ok(GetShieldedTreeStateResponse { block_hash, daa_score, size, leaf, ommers, history_from_daa_score, history_complete })
     }
 
     async fn get_shielded_blocks_call(

@@ -253,6 +253,12 @@ message GetShieldedTreeStateResponseMessage {
   uint64 size = 3;                      // leaves summarised by the frontier
   string leaf = 4;                      // last frontier leaf (hex); zero hash when size == 0
   repeated string ommers = 5;           // frontier ommers (hex)
+  // DAA score of the oldest block this node can serve shielded history for. A wallet whose
+  // birthday is below this cannot be fully scanned here and must not treat a balance from
+  // this node as final. Zero when the node serves from genesis.
+  uint64 historyFromDaaScore = 6;
+  // Whether this node can enumerate shielded history to genesis.
+  bool historyComplete = 7;
   RPCError error = 1000;
 }
 
