@@ -2666,7 +2666,7 @@ impl WalletDb {
         // v8: persisted complete-subtree index. It is an optimisation only and is
         // accepted solely when it covers this exact tip and reproduces the independent
         // commitment-tree root; malformed/stale data degrades to an empty cache.
-        if version >= CHECKPOINT_VERSION {
+        if version >= CHECKPOINT_VERSION_V8 {
             if let Some(slen) = r.u64() {
                 if let Some(sbuf) = r.take(slen as usize) {
                     Self::read_subtree_section(&mut db, sbuf);
@@ -3000,6 +3000,11 @@ fn read_witness(r: &mut Cursor<'_>) -> Option<IncrementalWitness<MerkleHashOrcha
 /// mistake their net outflow or placeholder fee for exact payment details.
 const CHECKPOINT_VERSION: u8 = 9;
 const CHECKPOINT_VERSION_V9: u8 = 9;
+/// v8 introduced the persisted complete-subtree index. Gate its section on THIS
+/// constant, never on `CHECKPOINT_VERSION`: when v9 was added the gate silently moved to
+/// 9, every v8 checkpoint was left with 34 unread trailing bytes, `restore` rejected it
+/// as malformed, and every wallet (and the shared chain tree) fell into a full rescan.
+const CHECKPOINT_VERSION_V8: u8 = 8;
 const CHECKPOINT_VERSION_V7: u8 = 7;
 /// v6 appended the history rows. A pure suffix of v5.
 const CHECKPOINT_VERSION_V6: u8 = 6;
