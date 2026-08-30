@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-055 (2026-08-29)
+### Last entry: BL-056 (2026-08-29)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -1165,3 +1165,78 @@ against the encoding surviving a decode. A consumed binary with no version
 banner and no launcher has no identity and no reproducible invocation; both
 are cheap and neither existed here for months. And meta-principle 5 applies
 hardest exactly when several improvements are ready at once.
+
+**BL-056 · 2026-08-27→29 · docs rail — THE RETIRED BRANCH THAT KEPT TAKING
+COMMITS: three documents stranded for two days, and three false absence-calls
+made from single-rail reads**
+At the S11/S12 close (08-27) the laptop clone was resting on
+`merged-v2.0.1.4`. Three documentation artifacts committed there and nowhere
+else: SCOPE-v2.0.1.5 r3 (`6ecfb06`, 302 ln, `1b70e2ba…632e3`),
+FLEET-DEPLOY-v2.0.1.5-r1 (`51f4193`, 115 ln, `5df03ad7…a4e4e`), and
+SESSION-STATE-2026-08-27 (`51f4193`, 99 ln, `a7bdd148…4b02d`). On 08-28
+`merged-v2.0.1.5` became canonical at the fleet deploy. The ledger portion of
+that same close was rescued by the `5da64aa` cherry-pick — because BL-045..049
+were visibly missing and someone went looking. The three docs were not, because
+nobody looked. For two days the production branch's SCOPE was r2, header
+reading `Status: READS PENDING (no code started)`, describing a release that
+had been running seven rigs since 08-28. Surfaced only by a cross-rail sha
+audit run for an unrelated reason (a session-summary request).
+**Root cause: branch retirement has no retirement step.** The lineage law says
+each release branch becomes canonical on release and the line is strictly
+linear — but nothing freezes the predecessor or verifies that everything on it
+reached the successor. A retired branch that still accepts writes is a
+BL-019-class trap: `merged-ws1-port` was the code instance of this, and the
+docs rail just produced its own.
+**Second failure, same sitting, Claude-side: three absence-claims, all false,
+all from single-rail reads.** (a) ENGINEERING-LEDGER declared "mount stale at
+BL-049" — read off the file's OWN header line 5, which had never been bumped
+when BL-050..055 were appended; the file was byte-current at 1167 ln
+`29405554…a450` on both rails and contained all six entries. (b) SCOPE r3
+declared "cut, uploaded, never committed" — it was at `6ecfb06`. (c)
+SESSION-STATE-2026-08-27 declared "does not exist; the new cut is a new
+document" — 99 lines on `.4`, and it already answered three of the four
+questions the audit was reconstructing. Each claim was an inference from one
+rail's working tree to the artifact's existence. The instruments that
+falsified them are cheap and were available throughout: `git log --all
+--diff-filter=A -- <path>`, a content sha, `git branch -a --contains`.
+**The mount was never the wrong rail.** It was a HYBRID with no single git
+anchor — SCOPE and FLEET-DEPLOY faithful to `.4`'s docs tip, ledger and the two
+v1.0.6 node docs faithful to `.5` — which is why it read as simultaneously
+ahead and behind depending on which file was sampled. Law 2f was honored at
+every individual commit; what failed is that a mount synced from two branches
+has no verifiable identity.
+**Fix, `a2d8650` on `merged-v2.0.1.5`:** path-scoped `git checkout
+merged-v2.0.1.4 -- <3 paths>` rather than cherry-pick — `6ecfb06` also carries
+a ledger append already present on `.5` via `5da64aa`, so a pick would have
+conflicted on a file needing no change. Bytes verified by sha at stage, before
+commit; all three matched the `.4` pins exactly. Same commit corrected the
+ledger self-header (BL-049 → BL-055; 1 ins / 1 del) with the post-edit sha
+PREDICTED container-side before the write (`3c73ee05…e656`) and confirmed on
+readback. Commit arithmetic reconciled independently: 295 ins / 25 del, with
+SCOPE's 80+24 = the 104 changed lines the pre-commit `.4`↔`.5` diff had
+forecast. `merged-v2.0.1.4` retired to read-only as of this commit; it now
+holds nothing `.5` lacks.
+**Law 15's line-count identity check failed here and was amended.** The ledger
+read 1167 lines both before AND after the header fix — a single-line
+substitution leaves the count invariant, so only the sha discriminated
+`29405554` from `3c73ee05`. Destructive mount deletes now cite line count AND
+content sha. Law 14 gained an exhibit: a trailing `</parameter>` markup
+fragment rode the commit block and zsh parse-errored it — the last-token
+integrity eyeball exists for exactly this and was not run, on the very commit
+that was reconciling the law into the instructions. Nothing executed; the chain
+resumed at the failed link per 13c. Law 16 minted (rails are independent;
+absence is rail-scoped), generalizing 13d from refs to rails.
+**Deviation recorded per law 9:** mount sync BATCHED at session close rather
+than riding each commit (2f), operator-authorized in-conversation — three
+artifacts land within the hour and two upload passes double the wrong-file
+click exposure that stage-verify-open exists to eliminate. Divergence is named
+here rather than silent, which is the interest 2f protects.
+**Still open from the 08-27 handoff:** the 02:55 08-28 pace gate
+(`rc:solves_24h ≥ 33`) has no recorded result on any rail.
+**Lesson:** a rail is not the record. A file's absence from one branch, one
+mount, or one working tree is evidence about that rail alone — and a
+document's own header is not an instrument for its currency, because headers
+are written by hand and content is written by append. Three cross-rail
+commands would have prevented every false call in this sitting, and a
+retirement step on the outgoing branch would have prevented the incident that
+prompted them.
