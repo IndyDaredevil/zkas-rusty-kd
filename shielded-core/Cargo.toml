@@ -25,7 +25,7 @@ circuit = ["orchard/circuit", "orchard/multicore", "dep:nonempty"]
 # the June-2026 Orchard proof-forgery bug. A caret range would let `cargo update`
 # silently move us onto an unaudited (or regressed) release. Bump deliberately,
 # reading the changelog, never incidentally.
-orchard = { version = "=0.14.0", default-features = false, features = ["std"] }
+orchard = { package = "zakura-orchard", version = "1.0.1", default-features = false, features = ["std", "weighted-merkle"] }
 # Must match the incrementalmerkletree version Orchard links, so that
 # `MerkleHashOrchard: incrementalmerkletree::Hashable` is the same trait.
 # `legacy-api` provides CommitmentTree / IncrementalWitness, the wallet-side
@@ -36,8 +36,8 @@ incrementalmerkletree = { version = "=0.8.2", features = ["legacy-api"] }
 serde = { workspace = true, features = ["derive"] }
 # Curve point handling for the encoding consensus rules (non-identity epk).
 # Versions are pinned to match what Orchard 0.14 links.
-group = "=0.13.0"
-pasta_curves = "=0.5.1"
+group = "0.14"
+pasta_curves = { package = "zakura-pasta-curves", version = "1.0.1" }
 # Shielded-transaction sighash.
 blake2b_simd = { workspace = true }
 chacha20 = "0.9"
@@ -62,7 +62,8 @@ kaspa-seq-commit = { path = "../consensus/seq-commit", default-features = false 
 nonempty = { version = "0.11", default-features = false, optional = true }
 # RNG for RedPallas signing (message signatures + circuit proving). Non-optional:
 # `message` signing is available without the heavy `circuit` feature.
-rand = { workspace = true }
+rand = "0.10"
+rand_core = "0.10"
 # Note decryption for wallet scanning (the receive side). Must match the version
 # Orchard links so the OrchardDomain types agree.
 zcash_note_encryption = "0.4"

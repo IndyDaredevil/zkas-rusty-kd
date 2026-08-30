@@ -7427,7 +7427,7 @@ async fn wallet_sign(
     let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet loaded"))?;
     let seed = { w.lock().await.key.seed()? };
     let tag = state.prefix.to_string();
-    let signed = sign_message(seed, tag.as_bytes(), req.message.as_bytes(), rand::rngs::OsRng)
+    let signed = sign_message(seed, tag.as_bytes(), req.message.as_bytes(), rand10::rng())
         .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "seed is not a valid spending key"))?;
     let address = String::from(&Address::new(state.prefix, Version::ShieldedOrchard, &signed.address));
     let mut blob = Vec::with_capacity(FVK_LEN + SIG_LEN);

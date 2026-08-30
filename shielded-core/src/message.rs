@@ -35,7 +35,7 @@ use orchard::{
     primitives::redpallas::{Signature, SpendAuth, VerificationKey},
 };
 use pasta_curves::pallas;
-use rand::{CryptoRng, RngCore};
+use rand_core::{CryptoRng, RngCore};
 
 /// BLAKE2b personalization for the message-signing digest. The trailing `1` is a
 /// scheme version, so a future change gets a distinct domain.
@@ -154,14 +154,14 @@ pub fn sign_spend_auth_from_seed(seed: [u8; 32], alpha: [u8; 32], sighash: [u8; 
     let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes(seed))?;
     let alpha = Option::<pallas::Scalar>::from(pallas::Scalar::from_repr(alpha))?;
     let ask = SpendAuthorizingKey::from(&sk);
-    let sig = ask.randomize(&alpha).sign(rand::rngs::OsRng, &sighash);
+    let sig = ask.randomize(&alpha).sign(rand::rng(), &sighash);
     Some(<[u8; 64]>::from(&sig))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::OsRng;
+    use rand::rngs::SysRng;
 
     fn seed(b: u8) -> [u8; 32] {
         [b; 32]
@@ -169,13 +169,13 @@ mod tests {
 
     #[test]
     fn sign_then_verify_roundtrips() {
-        let signed = sign_message(seed(7), b"zkas-mainnet", b"i own this address", OsRng).unwrap();
+        let signed = sign_message(seed(7), b"zkas-mainnet", b"i own this address", rand::rng()).unwrap();
         assert_eq!(verify_message(&signed.address, b"zkas-mainnet", b"i own this address", &signed.fvk, &signed.sig), Ok(()));
     }
 
     #[test]
     fn wrong_message_fails() {
-        let signed = sign_message(seed(7), b"zkas-mainnet", b"i own this address", OsRng).unwrap();
+        let signed = sign_message(seed(7), b"zkas-mainnet", b"i own this address", rand::rng()).unwrap();
         assert_eq!(
             verify_message(&signed.address, b"zkas-mainnet", b"a different message", &signed.fvk, &signed.sig),
             Err(VerifyError::BadSignature)
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn wrong_network_fails() {
-        let signed = sign_message(seed(7), b"zkas-mainnet", b"msg", OsRng).unwrap();
+        let signed = sign_message(seed(7), b"zkas-mainnet", b"msg", rand::rng()).unwrap();
         assert_eq!(verify_message(&signed.address, b"zkas-devnet", b"msg", &signed.fvk, &signed.sig), Err(VerifyError::BadSignature));
     }
 
@@ -192,8 +192,8 @@ mod tests {
     fn claiming_another_address_fails() {
         // Attacker signs with their own wallet (seed 9) but swaps in a victim's
         // address (seed 3). The FVK is the attacker's, so the binding check rejects.
-        let attacker = sign_message(seed(9), b"net", b"msg", OsRng).unwrap();
-        let victim = sign_message(seed(3), b"net", b"msg", OsRng).unwrap();
+        let attacker = sign_message(seed(9), b"net", b"msg", rand::rng()).unwrap();
+        let victim = sign_message(seed(3), b"net", b"msg", rand::rng()).unwrap();
         assert_ne!(attacker.address, victim.address);
         assert_eq!(verify_message(&victim.address, b"net", b"msg", &attacker.fvk, &attacker.sig), Err(VerifyError::AddressMismatch));
     }
@@ -202,22 +202,22 @@ mod tests {
     fn forged_fvk_for_victim_address_fails() {
         // Even if an attacker presents the victim's real address AND real FVK (both
         // public), they cannot produce a valid signature without the victim's `ask`.
-        let victim = sign_message(seed(3), b"net", b"msg", OsRng).unwrap();
-        let attacker = sign_message(seed(9), b"net", b"msg", OsRng).unwrap();
+        let victim = sign_message(seed(3), b"net", b"msg", rand::rng()).unwrap();
+        let attacker = sign_message(seed(9), b"net", b"msg", rand::rng()).unwrap();
         // Victim's binding holds, but attacker's signature over it does not verify.
         assert_eq!(verify_message(&victim.address, b"net", b"msg", &victim.fvk, &attacker.sig), Err(VerifyError::BadSignature));
     }
 
     #[test]
     fn tampered_signature_fails() {
-        let mut signed = sign_message(seed(1), b"net", b"msg", OsRng).unwrap();
+        let mut signed = sign_message(seed(1), b"net", b"msg", rand::rng()).unwrap();
         signed.sig[0] ^= 0x01;
         assert!(verify_message(&signed.address, b"net", b"msg", &signed.fvk, &signed.sig).is_err());
     }
 
     #[test]
     fn garbage_fvk_rejected() {
-        let signed = sign_message(seed(1), b"net", b"msg", OsRng).unwrap();
+        let signed = sign_message(seed(1), b"net", b"msg", rand::rng()).unwrap();
         let bad = [0xffu8; FVK_LEN];
         let r = verify_message(&signed.address, b"net", b"msg", &bad, &signed.sig);
         assert!(matches!(r, Err(VerifyError::BadFvk) | Err(VerifyError::AddressMismatch)));

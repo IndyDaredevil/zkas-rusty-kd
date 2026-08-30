@@ -543,14 +543,14 @@ pub mod build {
         value::NoteValue,
     };
     use pasta_curves::pallas;
-    use rand::{CryptoRng, RngCore};
+    use rand_core::{CryptoRng, RngCore};
     use std::sync::OnceLock;
 
     pub use crate::payment_check::{ActionDisclosure, PaymentCheckError, check_prepared_payment};
 
     /// The process-wide Orchard [`ProvingKey`], built once and reused.
     ///
-    /// `ProvingKey::build()` is a multi-minute Halo 2 keygen; rebuilding it per
+    /// `ProvingKey::build(crate::verify::CIRCUIT_VERSION)` is a multi-minute Halo 2 keygen; rebuilding it per
     /// payment (as the wallet builders originally did) dominated every send —
     /// live pool payouts measured ~5 minutes each, almost all of it keygen.
     /// The key is deterministic and read-only, so one shared instance serves
@@ -558,7 +558,7 @@ pub mod build {
     /// one-time cost can invoke this at startup from a background thread.
     pub fn proving_key() -> &'static ProvingKey {
         static PROVING_KEY: OnceLock<ProvingKey> = OnceLock::new();
-        PROVING_KEY.get_or_init(ProvingKey::build)
+        PROVING_KEY.get_or_init(|| ProvingKey::build(crate::verify::CIRCUIT_VERSION))
     }
 
     /// A wallet's Orchard keys, derived from a 32-byte seed.
@@ -621,7 +621,7 @@ pub mod build {
             .collect();
         ShieldedBundle {
             actions,
-            flags: bundle.flags().to_byte(),
+            flags: bundle.flags().to_byte(crate::verify::BUNDLE_VERSION).expect("orchard v2 flags are always encodable"),
             value_balance: *bundle.value_balance(),
             anchor: bundle.anchor().to_bytes(),
             proof,
@@ -644,7 +644,7 @@ pub mod build {
         tx_context: &[u8],
         mut rng: impl RngCore + CryptoRng,
     ) -> Result<ShieldedBundle, BuildError> {
-        let mut builder = Builder::new(BundleType::DEFAULT, Anchor::empty_tree());
+        let mut builder = Builder::new(BundleType::DEFAULT, crate::verify::BUNDLE_VERSION, orchard::bundle::Flags::ENABLED, Anchor::empty_tree()).expect("orchard v2 ENABLED flags are always representable");
         builder
             .add_output(None, recipient, NoteValue::from_raw(value), [0u8; 512])
             .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
@@ -688,7 +688,7 @@ pub mod build {
     ) -> Result<ShieldedBundle, BuildError> {
         // The anchor is the root the supplied path proves the note into.
         let anchor = merkle_path.root(ExtractedNoteCommitment::from(note.commitment()));
-        let mut builder = Builder::new(BundleType::DEFAULT, anchor);
+        let mut builder = Builder::new(BundleType::DEFAULT, crate::verify::BUNDLE_VERSION, orchard::bundle::Flags::ENABLED, anchor).expect("orchard v2 ENABLED flags are always representable");
         builder.add_spend(keys.fvk.clone(), note, merkle_path).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         builder
             .add_output(None, recipient, NoteValue::from_raw(output_value), [0u8; 512])
@@ -740,7 +740,7 @@ pub mod build {
         let change = note.value().inner().checked_sub(amount).and_then(|v| v.checked_sub(fee)).ok_or(BuildError::Empty)?;
 
         let anchor = merkle_path.root(ExtractedNoteCommitment::from(note.commitment()));
-        let mut builder = Builder::new(BundleType::DEFAULT, anchor);
+        let mut builder = Builder::new(BundleType::DEFAULT, crate::verify::BUNDLE_VERSION, orchard::bundle::Flags::ENABLED, anchor).expect("orchard v2 ENABLED flags are always representable");
         builder.add_spend(keys.fvk.clone(), note, merkle_path).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         builder
             .add_output(None, recipient, NoteValue::from_raw(amount), [0u8; 512])
@@ -806,7 +806,7 @@ pub mod build {
         let desc = derive_coinbase_note_desc(keys.address().to_raw_address_bytes(), &seed);
         let rho = Option::<Rho>::from(Rho::from_bytes(&desc.rho)).ok_or(BuildError::Empty)?;
         let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(desc.rseed, &rho)).ok_or(BuildError::Empty)?;
-        let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(note_value), rho, rseed))
+        let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(note_value), rho, rseed, orchard::note::NoteVersion::V2))
             .ok_or(BuildError::Empty)?;
 
         // Single-leaf witness: position 0, siblings are the empty-subtree roots.
@@ -817,7 +817,7 @@ pub mod build {
         let recipient = Option::<Address>::from(Address::from_raw_address_bytes(&recipient_addr)).ok_or(BuildError::Empty)?;
         let pk = proving_key();
         let wire =
-            build_spend_bundle(pk, &keys, note, merkle_path, recipient, output_value, network_domain, tx_context, rand::rngs::OsRng)?;
+            build_spend_bundle(pk, &keys, note, merkle_path, recipient, output_value, network_domain, tx_context, rand::rng())?;
         Ok(wire.to_bytes())
     }
 
@@ -899,7 +899,7 @@ pub mod build {
 
         // The shared anchor: all supplied witnesses were taken at one tree state.
         let anchor = first_path.root(ExtractedNoteCommitment::from(first_note.commitment()));
-        let mut builder = Builder::new(BundleType::DEFAULT, anchor);
+        let mut builder = Builder::new(BundleType::DEFAULT, crate::verify::BUNDLE_VERSION, orchard::bundle::Flags::ENABLED, anchor).expect("orchard v2 ENABLED flags are always representable");
         for (note, merkle_path) in inputs {
             builder.add_spend(keys.fvk.clone(), note, merkle_path).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         }
@@ -913,7 +913,7 @@ pub mod build {
             .map_err(|e| BuildError::Builder(format!("{e:?}")))?;
 
         let pk = proving_key();
-        let mut rng = rand::rngs::OsRng;
+        let mut rng = rand::rng();
         let (unauth, _meta) =
             builder.build::<i64>(&mut rng).map_err(|e| BuildError::Builder(format!("{e:?}")))?.ok_or(BuildError::Empty)?;
         let proven = unauth.create_proof(pk, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
@@ -988,7 +988,7 @@ pub mod build {
         let change = total_in.checked_sub(amount).and_then(|v| v.checked_sub(fee)).ok_or(BuildError::Empty)?;
         let anchor = first_path.root(ExtractedNoteCommitment::from(first_note.commitment()));
 
-        let mut builder = Builder::new(BundleType::DEFAULT, anchor);
+        let mut builder = Builder::new(BundleType::DEFAULT, crate::verify::BUNDLE_VERSION, orchard::bundle::Flags::ENABLED, anchor).expect("orchard v2 ENABLED flags are always representable");
         for (note, merkle_path) in inputs {
             builder.add_spend(fvk.clone(), note, merkle_path).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         }
@@ -1002,7 +1002,7 @@ pub mod build {
         }
 
         let pk = proving_key();
-        let mut rng = rand::rngs::OsRng;
+        let mut rng = rand::rng();
         let (mut pczt, _meta) = builder.build_for_pczt(&mut rng).map_err(|e| BuildError::Builder(format!("{e:?}")))?;
         pczt.create_proof(pk, &mut rng).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
 
@@ -1050,7 +1050,7 @@ pub mod build {
     pub fn sign_spend_auth(ask: &SpendAuthorizingKey, alpha: [u8; 32], sighash: [u8; 32]) -> Option<[u8; 64]> {
         use group::ff::PrimeField;
         let alpha = Option::<pallas::Scalar>::from(pallas::Scalar::from_repr(alpha))?;
-        let mut rng = rand::rngs::OsRng;
+        let mut rng = rand::rng();
         let sig = ask.randomize(&alpha).sign(&mut rng, &sighash);
         Some(<[u8; 64]>::from(&sig))
     }
@@ -1059,7 +1059,7 @@ pub mod build {
     /// verifiable wire bundle. Still never touches the spend key.
     pub fn finalize_payment(mut prepared: PreparedPayment, device_sigs: Vec<(usize, [u8; 64])>) -> Result<ShieldedBundle, BuildError> {
         let sighash = prepared.sighash;
-        let mut rng = rand::rngs::OsRng;
+        let mut rng = rand::rng();
         for (i, sig) in device_sigs {
             let sig = Signature::<SpendAuth>::from(sig);
             prepared.pczt.actions_mut()[i].apply_signature(sighash, sig).map_err(|e| BuildError::Proof(format!("{e:?}")))?;
@@ -1095,14 +1095,14 @@ pub mod build {
         /// 0 of the tree, so its authentication path is the empty-subtree roots.
         #[test]
         fn wallet_spend_bundle_verifies() {
-            let pk = ProvingKey::build();
+            let pk = ProvingKey::build(crate::verify::CIRCUIT_VERSION);
             let keys = ShieldedKeys::from_seed([5u8; 32]).expect("valid seed");
             let ctx = b"zkas-spend";
 
             // A note worth 10_000 owned by the wallet.
             let rho = Option::<Rho>::from(Rho::from_bytes(&canon(1))).unwrap();
             let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(2), &rho)).unwrap();
-            let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed)).unwrap();
+            let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
 
             // Single-leaf tree at position 0: siblings are the empty-subtree roots.
             let auth_path: [MerkleHashOrchard; 32] =
@@ -1112,7 +1112,7 @@ pub mod build {
             let recipient = ShieldedKeys::from_seed([6u8; 32]).unwrap().address();
             let net = [0x11u8; 32];
             let wire =
-                build_spend_bundle(&pk, &keys, note, merkle_path, recipient, 8_000, &net, ctx, rand::rngs::OsRng).expect("build");
+                build_spend_bundle(&pk, &keys, note, merkle_path, recipient, 8_000, &net, ctx, rand::rng()).expect("build");
 
             let msg = sighash(&wire, &net, ctx);
             crate::verify::verify_bundle(&wire, &msg).expect("wallet spend bundle must verify");
@@ -1134,7 +1134,7 @@ pub mod build {
             use orchard::keys::SpendAuthorizingKey;
             use orchard::value::NoteValue;
 
-            let pk = ProvingKey::build();
+            let pk = ProvingKey::build(crate::verify::CIRCUIT_VERSION);
             let keys = ShieldedKeys::from_seed([5u8; 32]).expect("valid seed");
             let ctx = b"zkas-noncustodial";
             let net = [0x44u8; 32];
@@ -1142,7 +1142,7 @@ pub mod build {
             // A note worth 10_000 owned by the wallet, alone at tree position 0.
             let rho = Option::<Rho>::from(Rho::from_bytes(&canon(1))).unwrap();
             let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(2), &rho)).unwrap();
-            let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed)).unwrap();
+            let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
             let auth_path: [MerkleHashOrchard; 32] =
                 core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
             let merkle_path = MerklePath::from_parts(0, auth_path);
@@ -1150,11 +1150,11 @@ pub mod build {
             let recipient = ShieldedKeys::from_seed([6u8; 32]).unwrap().address();
 
             // Spend 10_000, send 8_000 to the recipient, no change → fee = 2_000.
-            let mut builder = Builder::new(BundleType::DEFAULT, anchor);
+            let mut builder = Builder::new(BundleType::DEFAULT, crate::verify::BUNDLE_VERSION, orchard::bundle::Flags::ENABLED, anchor).expect("orchard v2 ENABLED flags are always representable");
             builder.add_spend(keys.fvk.clone(), note, merkle_path).expect("add_spend");
             builder.add_output(None, recipient, NoteValue::from_raw(8_000), [0u8; 512]).expect("out");
 
-            let mut rng = rand::rngs::OsRng;
+            let mut rng = rand::rng();
 
             // === SERVER (viewing key + proving key; NO spend authority) ===
             let (mut pczt, _meta) = builder.build_for_pczt(&mut rng).expect("build_for_pczt");
@@ -1209,7 +1209,7 @@ pub mod build {
 
             let rho = Option::<Rho>::from(Rho::from_bytes(&canon(5))).unwrap();
             let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(6), &rho)).unwrap();
-            let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed)).unwrap();
+            let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
             let auth_path: [MerkleHashOrchard; 32] =
                 core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
             let merkle_path = MerklePath::from_parts(0, auth_path);
@@ -1293,7 +1293,7 @@ pub mod build {
 
             let rho = Option::<Rho>::from(Rho::from_bytes(&canon(3))).unwrap();
             let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(4), &rho)).unwrap();
-            let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed)).unwrap();
+            let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
             let auth_path: [MerkleHashOrchard; 32] =
                 core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
             let merkle_path = MerklePath::from_parts(0, auth_path);
@@ -1335,12 +1335,12 @@ pub mod build {
         /// consensus verifier accepts it under the same sighash.
         #[test]
         fn wallet_built_bundle_verifies() {
-            let pk = ProvingKey::build();
+            let pk = ProvingKey::build(crate::verify::CIRCUIT_VERSION);
             let keys = ShieldedKeys::from_seed([3u8; 32]).expect("valid seed");
             let ctx = b"zkas-wallet-roundtrip";
             let net = [0x22u8; 32];
 
-            let wire = build_output_only_bundle(&pk, keys.address(), 1_000, &net, ctx, rand::rngs::OsRng).expect("build");
+            let wire = build_output_only_bundle(&pk, keys.address(), 1_000, &net, ctx, rand::rng()).expect("build");
 
             let msg = sighash(&wire, &net, ctx);
             crate::verify::verify_bundle(&wire, &msg).expect("wallet-built bundle must verify");
@@ -1359,10 +1359,10 @@ pub mod build {
         /// that recipient's incoming viewing key (and by no one else's).
         #[test]
         fn scan_recovers_sent_note() {
-            let pk = ProvingKey::build();
+            let pk = ProvingKey::build(crate::verify::CIRCUIT_VERSION);
             let recipient = ShieldedKeys::from_seed([2u8; 32]).expect("valid seed");
             let wire =
-                build_output_only_bundle(&pk, recipient.address(), 4242, &[0x33u8; 32], b"ctx", rand::rngs::OsRng).expect("build");
+                build_output_only_bundle(&pk, recipient.address(), 4242, &[0x33u8; 32], b"ctx", rand::rng()).expect("build");
 
             let ivk = crate::wallet::ivk_from_seed([2u8; 32]).unwrap();
             let received = crate::wallet::scan_bundle(&ivk, &wire);
@@ -1381,10 +1381,10 @@ pub mod build {
         #[test]
         fn compact_scan_matches_full_scan() {
             use crate::wallet::CompactActionRecord;
-            let pk = ProvingKey::build();
+            let pk = ProvingKey::build(crate::verify::CIRCUIT_VERSION);
             let recipient = ShieldedKeys::from_seed([2u8; 32]).expect("valid seed");
             let wire =
-                build_output_only_bundle(&pk, recipient.address(), 4242, &[0x33u8; 32], b"ctx", rand::rngs::OsRng).expect("build");
+                build_output_only_bundle(&pk, recipient.address(), 4242, &[0x33u8; 32], b"ctx", rand::rng()).expect("build");
 
             let ivk = crate::wallet::ivk_from_seed([2u8; 32]).unwrap();
 
@@ -1431,10 +1431,10 @@ pub mod build {
         fn gpu_scan_path_finds_exactly_what_orchard_finds() {
             use crate::wallet::CompactActionRecord;
             use group::Curve;
-            let pk = ProvingKey::build();
+            let pk = ProvingKey::build(crate::verify::CIRCUIT_VERSION);
             let recipient = ShieldedKeys::from_seed([2u8; 32]).expect("valid seed");
             let wire =
-                build_output_only_bundle(&pk, recipient.address(), 4242, &[0x33u8; 32], b"ctx", rand::rngs::OsRng).expect("build");
+                build_output_only_bundle(&pk, recipient.address(), 4242, &[0x33u8; 32], b"ctx", rand::rng()).expect("build");
             let compact: Vec<CompactActionRecord> = wire.actions.iter().map(CompactActionRecord::from_wire).collect();
 
             let ivk = crate::wallet::ivk_from_seed([2u8; 32]).unwrap();

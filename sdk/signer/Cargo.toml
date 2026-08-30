@@ -11,7 +11,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+rand = "0.10"
 kaspa-shielded-core.workspace = true
-orchard = { version = "=0.14.0", default-features = false, features = ["std"] }
-rand.workspace = true
+orchard = { package = "zakura-orchard", version = "1.0.1", default-features = false, features = ["std"] }
 zeroize.workspace = true

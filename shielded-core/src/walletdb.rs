@@ -2391,7 +2391,7 @@ impl WalletDb {
         let addr = Option::<Address>::from(Address::from_raw_address_bytes(&desc.recipient))?;
         let rho = Option::<Rho>::from(Rho::from_bytes(&desc.rho))?;
         let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(desc.rseed, &rho))?;
-        Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed))
+        Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))
     }
 
     /// Serialize the wallet's **scanned state** — the fast-sync base frontier, the
@@ -2600,7 +2600,7 @@ impl WalletDb {
             let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
             let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
             let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
-            let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed))?;
+            let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))?;
             db.notes.push(OwnedNote { note, position, nullifier });
         }
         let n_nfs = r.u64()? as usize;
@@ -2757,7 +2757,7 @@ impl WalletDb {
                 let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
                 let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
                 let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
-                let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed))?;
+                let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))?;
                 let txid = r.arr::<32>()?;
                 let submitted_daa = r.u64()?;
                 out.push(PendingSpend { note: OwnedNote { note, position, nullifier }, txid, submitted_daa });
@@ -4543,7 +4543,7 @@ mod circuit_tests {
 
     #[test]
     fn wallet_discovers_and_spends_coinbase_note_at_nonzero_position() {
-        let pk = ProvingKey::build();
+        let pk = ProvingKey::build(crate::verify::CIRCUIT_VERSION);
         let miner = [21u8; 32];
         let net = [0x5au8; 32];
         let ctx = b"zkas-walletdb-e2e";
@@ -4575,7 +4575,7 @@ mod circuit_tests {
         let merkle_path = db.witness_path(owned.position).expect("wallet builds a witness path on demand");
         let recipient = ShieldedKeys::from_seed([42u8; 32]).unwrap().address();
         let output_value = 7_000u64;
-        let wire = build_spend_bundle(&pk, &keys, owned.note, merkle_path, recipient, output_value, &net, ctx, rand::rngs::OsRng)
+        let wire = build_spend_bundle(&pk, &keys, owned.note, merkle_path, recipient, output_value, &net, ctx, rand::rng())
             .expect("wallet builds a real spend from its own witness");
 
         // Consensus accepts it: proof verifies, and it spends against the anchor

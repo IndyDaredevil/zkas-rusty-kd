@@ -159,7 +159,7 @@ impl SoftwareSigner {
     }
 
     pub fn sign_message(&self, domain: &[u8], message: &[u8]) -> SignedMessage {
-        sign_message(*self.seed, domain, message, rand::rngs::OsRng).expect("seed was validated at construction")
+        sign_message(*self.seed, domain, message, rand::rng()).expect("seed was validated at construction")
     }
 
     /// Verify user intent and authorize a prepared payment. `expected_network`

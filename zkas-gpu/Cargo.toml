@@ -6,8 +6,8 @@ publish = false
 description = "Optional CUDA acceleration for Orchard trial decryption; falls back to the CPU"
 
 [dependencies]
-pasta_curves = "0.5"
-group = "0.13"
+pasta_curves = { package = "zakura-pasta-curves", version = "1.0.1" }
+group = "0.14"
 libloading = "0.8"
 log.workspace = true
 

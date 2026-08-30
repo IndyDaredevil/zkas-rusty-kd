@@ -140,7 +140,7 @@ pub fn check_prepared_payment(
         let recipient =
             Option::<Address>::from(Address::from_raw_address_bytes(&d.out_recipient)).ok_or(PaymentCheckError::Malformed(i))?;
         let out_value = NoteValue::from_raw(d.out_value);
-        let note = Option::<Note>::from(Note::from_parts(recipient, out_value, rho, rseed)).ok_or(PaymentCheckError::Malformed(i))?;
+        let note = Option::<Note>::from(Note::from_parts(recipient, out_value, rho, rseed, orchard::note::NoteVersion::V2)).ok_or(PaymentCheckError::Malformed(i))?;
 
         // (1) The note this action really creates is the note the prover disclosed.
         if ExtractedNoteCommitment::from(note.commitment()).to_bytes() != act.cmx {
@@ -222,7 +222,7 @@ mod tests {
         let rseed_bytes = [7u8; 32];
         let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(rseed_bytes, &rho)).unwrap();
         let recipient = Option::<Address>::from(Address::from_raw_address_bytes(&to)).unwrap();
-        let note = Option::<Note>::from(Note::from_parts(recipient, NoteValue::from_raw(out_value), rho, rseed)).unwrap();
+        let note = Option::<Note>::from(Note::from_parts(recipient, NoteValue::from_raw(out_value), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
         let cmx = ExtractedNoteCommitment::from(note.commitment()).to_bytes();
 
         let rcv_bytes = [3u8; 32];

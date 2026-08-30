@@ -120,7 +120,7 @@ mod circuit_verify {
     use nonempty::NonEmpty;
     use orchard::{
         Action, ActionFromPartsError, Bundle, Proof,
-        bundle::{Authorized, BatchValidator, Flags, ProofSizeEnforcement},
+        bundle::{Authorized, BatchValidator, Flags},
         circuit::{Instance, VerifyingKey},
         note::{ExtractedNoteCommitment, Nullifier, TransmittedNoteCiphertext},
         primitives::redpallas::{Binding, Signature, SpendAuth, VerificationKey},
@@ -128,7 +128,7 @@ mod circuit_verify {
         value::ValueCommitment,
     };
     use pasta_curves::pallas;
-    use rand::{CryptoRng, RngCore};
+    use rand_core::{CryptoRng, RngCore};
     use std::sync::OnceLock;
 
     /// The Orchard action-circuit verifying key. Building it is expensive (it
@@ -136,7 +136,7 @@ mod circuit_verify {
     /// Pinned to the audited upstream circuit version (PLAN §5).
     pub fn verifying_key() -> &'static VerifyingKey {
         static VK: OnceLock<VerifyingKey> = OnceLock::new();
-        VK.get_or_init(VerifyingKey::build)
+        VK.get_or_init(|| VerifyingKey::build(crate::verify::CIRCUIT_VERSION))
     }
 
     /// Verify a shielded bundle's full cryptography against `sighash` using the
@@ -159,8 +159,7 @@ mod circuit_verify {
         if bundle.flags & !0b11 != 0 {
             return Err(BundleVerifyError::NonCanonicalFlags);
         }
-        let enable_spend = bundle.flags & 0b01 != 0;
-        let enable_output = bundle.flags & 0b10 != 0;
+        let flags = Flags::from_byte(bundle.flags, crate::verify::BUNDLE_VERSION).ok_or(BundleVerifyError::NonCanonicalFlags)?;
 
         let mut instances = Vec::with_capacity(bundle.actions.len());
         let mut rks = Vec::with_capacity(bundle.actions.len());
@@ -188,7 +187,7 @@ mod circuit_verify {
 
             // `Instance::from_parts` itself returns None on an identity rk — a
             // second, independent line of defence against the same bug class.
-            let instance = Instance::from_parts(anchor, cv_net.clone(), nf, rk.clone(), cmx, enable_spend, enable_output)
+            let instance = Instance::from_parts(anchor, cv_net.clone(), nf, rk.clone(), cmx, flags.clone())
                 .ok_or(BundleVerifyError::IdentityRk)?;
             instances.push(instance);
 
@@ -232,7 +231,7 @@ mod circuit_verify {
     /// `try_from_parts` (Strict) rejects non-canonical proof lengths.
     fn to_orchard_bundle(wire: &ShieldedBundle) -> Result<Bundle<Authorized, i64>, BundleVerifyError> {
         let anchor: Anchor = Option::from(Anchor::from_bytes(wire.anchor)).ok_or(BundleVerifyError::NonCanonicalField("anchor"))?;
-        let flags = Flags::from_byte(wire.flags).ok_or(BundleVerifyError::NonCanonicalFlags)?;
+        let flags = Flags::from_byte(wire.flags, crate::verify::BUNDLE_VERSION).ok_or(BundleVerifyError::NonCanonicalFlags)?;
 
         let mut actions = Vec::with_capacity(wire.actions.len());
         for a in &wire.actions {
@@ -258,7 +257,7 @@ mod circuit_verify {
         let actions = NonEmpty::from_vec(actions).ok_or(BundleVerifyError::NoActions)?;
 
         let auth = Authorized::from_parts(Proof::new(wire.proof.clone()), Signature::<Binding>::from(wire.binding_sig));
-        Bundle::try_from_parts(actions, flags, wire.value_balance, anchor, auth, ProofSizeEnforcement::Strict).map_err(|_| {
+        Bundle::try_from_parts(actions, flags, wire.value_balance, anchor, auth, crate::verify::BUNDLE_VERSION).map_err(|_| {
             BundleVerifyError::BadProofLength { expected: Proof::expected_proof_size(wire.actions.len()), got: wire.proof.len() }
         })
     }
@@ -275,12 +274,12 @@ mod circuit_verify {
         items: &[(&ShieldedBundle, [u8; 32])],
         rng: impl RngCore + CryptoRng,
     ) -> Result<(), BundleVerifyError> {
-        let mut batch = BatchValidator::new();
+        let mut batch = BatchValidator::new(verifying_key());
         for (wire, sighash) in items {
             let bundle = to_orchard_bundle(wire)?;
-            batch.add_bundle(&bundle, *sighash);
+            batch.add_bundle(&bundle, *sighash).map_err(|_| BundleVerifyError::ProofInvalid)?;
         }
-        if batch.validate(verifying_key(), rng) { Ok(()) } else { Err(BundleVerifyError::ProofInvalid) }
+        if batch.validate(rng) { Ok(()) } else { Err(BundleVerifyError::ProofInvalid) }
     }
 }
 
@@ -334,7 +333,7 @@ mod e2e {
             .collect();
         ShieldedBundle {
             actions,
-            flags: bundle.flags().to_byte(),
+            flags: bundle.flags().to_byte(crate::verify::BUNDLE_VERSION).expect("orchard v2 flags are always encodable"),
             value_balance: *bundle.value_balance(),
             anchor: bundle.anchor().to_bytes(),
             proof,
@@ -345,17 +344,17 @@ mod e2e {
 
     #[test]
     fn real_bundle_verifies_and_rejects_tampering() {
-        let mut rng = rand::rngs::OsRng;
+        let mut rng = rand::rng();
         let ctx = b"zkas-e2e-tx-context";
 
         // 1. Keys + an output-only bundle (dummy spends are auto-signed), anchored
         //    at the empty tree (no real spend, so no Merkle path needed).
-        let pk = ProvingKey::build();
+        let pk = ProvingKey::build(crate::verify::CIRCUIT_VERSION);
         let sk: SpendingKey = Option::from(SpendingKey::from_bytes([7u8; 32])).expect("valid spending key");
         let fvk = FullViewingKey::from(&sk);
         let recipient = fvk.address_at(0u32, Scope::External);
 
-        let mut builder = Builder::new(BundleType::DEFAULT, Anchor::empty_tree());
+        let mut builder = Builder::new(BundleType::DEFAULT, crate::verify::BUNDLE_VERSION, orchard::bundle::Flags::ENABLED, Anchor::empty_tree()).expect("orchard v2 ENABLED flags are always representable");
         builder.add_output(None, recipient, NoteValue::from_raw(5000), [0u8; 512]).unwrap();
         let (unauth, _meta) = builder.build::<i64>(&mut rng).unwrap().unwrap();
 
@@ -403,8 +402,8 @@ mod e2e {
 
         // 8. Batch verification (PLAN §2.8): a batch of valid bundles verifies;
         //    a batch containing a tampered bundle fails.
-        super::verify_bundles_batched(&[(&wire, msg), (&wire, msg)], rand::rngs::OsRng).expect("batch of valid bundles verifies");
-        assert!(super::verify_bundles_batched(&[(&wire, msg), (&bad_proof, msg)], rand::rngs::OsRng).is_err());
+        super::verify_bundles_batched(&[(&wire, msg), (&wire, msg)], rand::rng()).expect("batch of valid bundles verifies");
+        assert!(super::verify_bundles_batched(&[(&wire, msg), (&bad_proof, msg)], rand::rng()).is_err());
     }
 }
 
@@ -479,3 +478,15 @@ mod tests {
         assert_eq!(sighash(&b2, &NET_A, b""), s, "sighash must not cover proof/signatures");
     }
 }
+
+/// Wire semantics of the bundle `flags` byte: Orchard pool, v5-style flags — bits 0/1 only,
+/// bit 2 MUST be zero, cross-address transfers always permitted. Exactly what the chain has
+/// always enforced (`flags & !0b11 != 0` is rejected as non-canonical).
+pub const BUNDLE_VERSION: orchard::bundle::BundleVersion = orchard::bundle::BundleVersion::orchard_v2();
+
+/// The Orchard Action circuit the chain's verifying key is built from. `FixedPostNu6_2` is the
+/// anchored-base circuit of halo2_gadgets 0.5.0 / orchard 0.14.0 — the circuit every proof on
+/// the live chain has been verified against. `PostNu6_3` adds a constrained public input and is
+/// a DIFFERENT circuit: changing this constant is a hard fork.
+#[cfg(feature = "circuit")]
+pub const CIRCUIT_VERSION: orchard::circuit::OrchardCircuitVersion = orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2;

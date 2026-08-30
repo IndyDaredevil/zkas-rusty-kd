@@ -783,7 +783,7 @@ mod circuit_e2e {
 
     #[test]
     fn coinbase_note_is_spent_end_to_end() {
-        let pk = ProvingKey::build();
+        let pk = ProvingKey::build(crate::verify::CIRCUIT_VERSION);
         let keys = ShieldedKeys::from_seed([5u8; 32]).unwrap();
         let net = [0x77u8; 32];
 
@@ -791,7 +791,7 @@ mod circuit_e2e {
         let value = 10_000u64;
         let rho = Option::<Rho>::from(Rho::from_bytes(&canon(1))).unwrap();
         let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(2), &rho)).unwrap();
-        let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(value), rho, rseed)).unwrap();
+        let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
 
         // Consensus recomputes the coinbase note commitment from its public
         // description + value, and it must equal the wallet's own note commitment.
@@ -819,7 +819,7 @@ mod circuit_e2e {
         let recipient = ShieldedKeys::from_seed([6u8; 32]).unwrap().address();
         let output_value = 8_000u64;
         let ctx = b"e2e";
-        let wire = build_spend_bundle(&pk, &keys, note, merkle_path, recipient, output_value, &net, ctx, rand::rngs::OsRng).unwrap();
+        let wire = build_spend_bundle(&pk, &keys, note, merkle_path, recipient, output_value, &net, ctx, rand::rng()).unwrap();
 
         // The consensus verifier accepts the real bundle, and it spends against the
         // coinbase anchor with the expected public fee.

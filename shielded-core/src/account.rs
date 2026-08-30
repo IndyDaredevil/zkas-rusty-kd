@@ -147,7 +147,7 @@ impl ShieldedAccount {
         let keys = ShieldedKeys::from_seed(self.seed).ok_or(PaymentError::BadRecipient)?;
         let change_addr = keys.address();
 
-        let pk = ProvingKey::build();
+        let pk = ProvingKey::build(crate::verify::CIRCUIT_VERSION);
         let wire = build_payment_bundle(
             &pk,
             &keys,
@@ -159,7 +159,7 @@ impl ShieldedAccount {
             fee,
             network_domain,
             tx_context,
-            rand::rngs::OsRng,
+            rand::rng(),
         )
         .map_err(|e| PaymentError::Build(format!("{e:?}")))?;
 
