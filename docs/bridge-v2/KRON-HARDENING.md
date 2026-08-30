@@ -1,5 +1,6 @@
 # KRON-HARDENING — Windows 11 Pro as a mining appliance
-### Drafted 2026-08-26 · Host: Kron (ACEMAGICIAN K1, Win 11 Pro 25H2, build 26200.8875)
+### Content r2 · drafted 2026-08-26, revised 2026-08-30 · Host: Kron
+### (ACEMAGICIAN K1, Win 11 Pro 25H2, build 26200.8875)
 ### Origin: the 08-22 stall investigation — 18 scrape failures in 2 days traced to
 ### Windows servicing (a Store retry loop on Microsoft.ScreenSketch) plus unexplained
 ### night dips. Goal: the host interferes with mining and its instruments ONLY inside
@@ -162,6 +163,79 @@ Gate: `w32tm /query /status` shows sync within the last 15 min and sub-second
 offset on later rechecks; Kernel-General 1/24 events stop appearing in pairs
 every half hour.
 
+## 6.5 POWER — UPS LOAD SPLIT, POWERPANEL, AND THE READABLE DISCRIMINATOR
+
+Added at r2. Three CyberPower units installed 08-27 (BL-044). This section is
+the plan of record for the physical rearrangement; it was designed in BL-048
+on 08-27 and lived ONLY in the ledger until r2 — a runbook cannot be followed
+from an entry it does not cite.
+
+**Target load split (BL-048; hierarchy over symmetry).** Rigs are
+ride-through-OPTIONAL (all seven hard-dropped and self-recovered in every
+historical event); custody + network is ride-through-REQUIRED.
+
+- 1500VA #1: KS7 + 2 × KS0  ≈ 760W / 76%
+- 1500VA #2: KS7 + 2 × KS0  ≈ 760W / 76%
+- 1000VA   : Kron + SG116E switch + aux ONLY (~63W)
+- third KS7: surge-only outlet, no battery
+
+Latent fault this corrects: unit 1 measured 1.01kW against a CP1500's ~1000W
+inverter — fine on passthrough, trips at the next outage, i.e. the UPS itself
+as the would-be next power event. Physics forbids balancing it away
+(3 × KS7 ≈ 505W each, so any two on one bank overload by construction). An
+operator-proposed three-way balance putting a KS7 with Kron on the 1000VA was
+REJECTED on inverter math (95% of a 600W-class inverter) and runtime inversion
+(Kron's runtime spent in the rig's first three minutes).
+
+**Artifact gate (post-rebalance):** each unit's PowerPanel load% below 80, and
+the 1000VA's estimated runtime read and recorded.
+
+**PowerPanel Personal — installed 08-30, and where it actually records.**
+BL-044 declared every future power event a "one-bit diagnosis" via the UPS.
+Event eight (08-28) arrived unreadable and BL-054 recorded why. Root cause is
+now known and is NOT host configuration: **PowerPanel does not write to the
+Windows event log at all.** Event ID 105 will never appear on this host; no
+`CyberPower`/`PowerPanel` channel is created.
+
+The real store is the PowerPanel UI's Event Logs view, backed by:
+
+```
+C:\Program Files (x86)\CyberPower PowerPanel Personal\assets\PPPE_Db.db
+```
+
+SQLite. **Every host-event sweep must include this store** alongside System /
+Application / TerminalServices-LSM. Services: `PowerPanel Personal Service`
+and `PowerPanel Personal Service Monitor`, both Running / Automatic.
+
+**The exercise is mandatory, not optional.** A ~12-second deliberate wall-plug
+pull on 08-30 produced four second-precision rows (Utility Power Failed →
+Battery discharging → Utility restored → Battery stopped discharging) and zero
+Windows System-log entries. Kron rode it with no process impact. Repeat this
+after any UPS change, and after the rebalance:
+
+```powershell
+Get-Service | Where-Object { $_.Name -match 'cyber|power.?panel|pwrctl' } | Format-Table Name, Status, StartType -AutoSize
+```
+
+Pass: both services Running / Automatic, AND the plug-pull transfer visible in
+the PowerPanel Event Logs view. An instrument that has never been exercised is
+not an instrument (BL-054); the corollary is that exercising it is also the
+only way to learn where it records (BL-058).
+
+**Runtime, measured.** 11 min at 08-30 with 2 KS0 Ultras still on the 1000VA,
+battery at 97% and still recharging (so understated). Post-rebalance forecast
+~33–40 min — better than 3× by Peukert, but the LOW half of BL-048's 30–60
+band, and still short of the one known 45-minute premises outage (08-27).
+
+**Graceful shutdown: DEFERRED, deliberately.** Any runtime-based threshold set
+now would be calibrated against a load about to change by two thirds. Set it
+only after the rebalance, against a re-measured figure taken at 100% charge.
+The argument for setting it at all: the archival zkas-node's RocksDB store is
+one of a closed, non-regrowable set, and eight uncontrolled power losses have
+been survived so far — which is a record of luck, not of safety.
+
+---
+
 ## 7. OPEN THREADS THIS DOC DOES NOT CLOSE
 
 - **Night dips** (01:58, 01:30-era): no suspect from Defender or servicing yet.
@@ -171,8 +245,9 @@ every half hour.
   host I/O pressure turn a 230ms render into a ≥25s stall rather than a slow one?
   Host hardening reduces the trigger frequency; the bridge fix removes the
   failure class. Both proceed.
-- **UPS install**: power is the last uncontrolled host input. Bundle with the
-  first §8 window.
+- **UPS install**: DONE 08-27 (×3). Superseded by §6.5 below, which carries the
+  load split and the PowerPanel findings. Remaining open thread is the
+  graceful-shutdown threshold, which cannot be set until after the rebalance.
 
 ## 8. THE MAINTENANCE WINDOW (monthly, operator-declared)
 
@@ -204,3 +279,9 @@ tune it away.
 ## CHANGE LOG
 - 2026-08-26 · r1 · initial draft (post-ScreenSketch investigation). Applies to
   Win 11 Pro 25H2; §2/§3 mechanisms are Pro-specific (policy keys).
+- 2026-08-30 · r2 · adds §6.5 POWER: BL-048's UPS load split promoted from the
+  ledger into the plan of record; PowerPanel install, its ACTUAL log store
+  (PPPE_Db.db — the Windows event log carries nothing), the mandatory
+  plug-pull exercise, the measured 11-min runtime, and the deliberate deferral
+  of the graceful-shutdown threshold until after the rebalance. §7's "UPS
+  install" thread retired to a pointer. Ledgered BL-058.

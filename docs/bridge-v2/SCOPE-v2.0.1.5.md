@@ -1,5 +1,5 @@
 # SCOPE — Bridge v2.0.1.5 + Pipeline Stream P + Host Stream H
-### Content r4 · revised 2026-08-29 · Status: SHIPPED — v2.0.1.5 IN PRODUCTION
+### Content r5 · revised 2026-08-30 · Status: SHIPPED — v2.0.1.5 IN PRODUCTION
 ### Code tip merged-v2.0.1.5 @ 1b63698 (running exe); docs tip @ ac4a603.
 ### Stream A is CLOSED except A1′'s seven-day acceptance (D2, 09-04).
 ### Revision chain: r1 (2026-08-22) → r2 (folded 08-27) → r3 (08-27) → r4.
@@ -11,10 +11,13 @@
 ### r4 records the 08-28 fleet deploy, the v1.0.6 node cutover, and the 08-29
 ### alerting/walletd work; it converts every «acceptance pending» marker into
 ### either a closed item or a dated calendar gate.
+### r5 records S14 (08-29→30): P1 SHIPPED end to end (ingest + Kron sampler,
+### all five gates verified against deployed artifacts), PowerPanel installed
+### and EXERCISED, and adds P6 + P7. Ledgered BL-057..BL-062.
 ### Convention: Stream A = bridge release (one exe). Stream P = reporter/schema
 ### (ships independently, WS7 discipline). Stream H = host work.
-### References: ENGINEERING-LEDGER sealed @ BL-056 (1242 ln,
-### 711980fd…b73c, commit ac4a603). FLEET-DEPLOY-v2.0.1.5-r1 (5df03ad7…a4e4e)
+### References: ENGINEERING-LEDGER sealed @ BL-062 (1425 ln,
+### d4c3807e…348e17, commit 4734675). FLEET-DEPLOY-v2.0.1.5-r1 (5df03ad7…a4e4e)
 ### is the executed deploy record. NODE-CONTRACT-v1.0.6 (ce39e49d…2692) and
 ### NODE-CUTOVER-v1.0.6-r1 (78da1589…a36e) govern the node leg.
 ### SESSION-STATE-2026-08-27 (a7bdd148…4b02d) is the deploy-eve handoff.
@@ -187,12 +190,23 @@ INFO confirmed on canary and in production.
 - Docs pass: BRIDGE-SPEC §2 single-process clarification NOT YET DONE —
   carried to the next doc window.
 
-## 3. STREAM P — PIPELINE (not started; unchanged priority)
+## 3. STREAM P — PIPELINE (P1 SHIPPED 2026-08-29; P2/P3/P4 not started)
 
-P1 network_history (D_z/D_k 5-min sampler) — **SHIP FIRST; the curve is
-being lost continuously at 15-day retention.** The Bolt brief is cut and
-sha-pinned (P1-BOLT-BRIEF-r1.md, 86d2b546…a210, `~/zkas-lab/`) and has been
-unpasted since 08-27; every day of delay is curve permanently lost.
+**P1 network_history — SHIPPED 2026-08-29 (BL-057, BL-059).** The curve is
+no longer being lost. Brief P1-BOLT-BRIEF-r1.md (86d2b546…a210) was cut 08-27,
+never landed, and was RECOVERED byte-identical from the conversation rail on
+08-29 after a wrongly-issued VOID (BL-057). Supabase side: table
+`network_history` (9 cols, UNIQUE on `sample_bucket`, RLS on, SELECT-only for
+anon/authenticated) + edge function `network-history-webhook`; all four
+acceptance tests plus the fail-closed check verified against the DEPLOYED
+endpoint. Kron side: `set-nh-secret-r1.ps1` (2CCEFCFB…F0207) writes
+`C:\zkas\nh-secret.dpapi`; `network-history-sampler-r1.ps1` (E4869402…30DA68)
+is ONE-SHOT, cadence from scheduled task `NetworkHistorySampler` (5-min
+repetition, both battery flags disarmed per BL-046). Verified firing
+LastTaskResult 0, NumberOfMissedRuns 0.
+Follow-ons NOT built: (i) Prometheus staleness alert on the sampler — it
+currently fails to a log line nobody reads, the BL-032 detection-vs-escalation
+gap; (ii) the dashboard chart consuming the table (explicit brief non-goal).
 P3 worker_events → P2 worker_stats (metric-name verification first — from
 `/metrics`, not memory) → P4 latency consumer (A5's migrated work).
 - **NEW at r4 — P5 commitment enrichment.** zkas-node v1.0.6 adds
@@ -202,6 +216,45 @@ P3 worker_events → P2 worker_stats (metric-name verification first — from
   for cursor discovery. Both additive and wire-compatible.
   Gate: the running node must be confirmed post-`e49ce61` layout before the
   field is trusted (NODE-CONTRACT §3.2).
+- **NEW at r5 — P6 treasury balance push (Kron → dashboard rail).** One-shot
+  PowerShell on the P1 sampler pattern: read `/api/wallet/balance` from walletd
+  on loopback, POST sompi-exact values to a new edge function, low cadence.
+  Nothing new is exposed — walletd stays loopback-bound and firewall-dropped
+  (VERIFIED 08-29 from the MacBook: exit=28, http=000, no connection
+  established). Retires the treasury `file:///` page as a ROUTINE surface,
+  which is the structural version of the behavioural rule "no browser left
+  open on Kron" (BL-053). Honest limit: BL-053 records that killing the parked
+  browser did NOT clear the 9.5h wedge, so P6 closes an exposure, not a proven
+  root cause.
+  **SEQUENCING: build AFTER H8**, not before — v1.0.6 changes this endpoint
+  (`notes` needs `?notes=1`, `note_count` appears), so building against v1.0.5
+  means touching it again immediately.
+  **Design risk, must be handled:** walletd returns a ZEROED OBJECT rather than
+  401 on bad auth, so the consumer must distinguish "answered zero" from
+  "did not answer" or it writes false zeros into a permanent rail — the
+  BL-052 class, applied to a number the operator might act on.
+- **NEW at r5 — P7 chain-block rate analysis.** Operator hypothesis: the ratio
+  of chain blocks to blue blocks rose after the bridge moved off template
+  polling. Mechanism is sound and specific: GHOSTDAG selects the parent with
+  highest accumulated blue work, so a fresher template means parents closer to
+  the current tips, which wins selected-parent comparisons. In Kaspa the chain
+  block earns the base subsidy PLUS all mergeset transaction fees; the other
+  merge-set miners get subsidy only. Since subsidy decays on a fixed schedule
+  and fees do not, chain-block capture is the long-run incentive.
+  Data EXISTS (operator-built, Supabase + on-use expansion): 3,127 rows,
+  734 chain / 2,393 blue = 23.5%.
+  Open before analysis: (a) the polling→notification commit date pinned from
+  git history, not recollection; (b) whether chain status is PERSISTED or
+  computed on demand — if the latter, historical status must be bulk-resolved
+  and stored before it ages out; (c) mergeset size as a covariate (chain-block
+  probability depends on merge-set width, which moved independently of us);
+  (d) two-proportion test — at 23.5% base rate a few-point shift is
+  detectable, a one-point shift is not.
+  Note the dataset is structurally BLIND to blue-vs-red: only paid blocks
+  appear. If the same change also reduced reds, that gain is invisible here.
+  **Rider on P5:** persist chain/blue status and merge-set size at block time,
+  so the next bridge change is measurable prospectively rather than
+  archaeologically.
 - Bolt briefs: 08-21 constraints-first format + never-reinit-git-history
   addendum; Bolt cannot set edge secrets (operator does); no RLS loosening.
 - Reporter updates per banked runbook: stop task → overwrite → start →
@@ -227,7 +280,14 @@ P3 worker_events → P2 worker_stats (metric-name verification first — from
   (c) **walletd is a migration prerequisite, now satisfied** — it has a
   versioned launcher as of 08-29 (BL-055) but still does NOT auto-start;
   (d) the launcher scripts are load-bearing config (they bake env vars), so
-  migration must carry them, not replace them.
+  migration must carry them, not replace them;
+  (e) **UPS load rebalance to BL-048's designed split** — 2 × (KS7 + 2×KS0)
+  ≈ 760W/76% on the 1500VA units, the 1000VA carrying Kron + switch + aux
+  only, third KS7 surge-only. Designed 08-27, never written into a plan
+  document until r5. Measured 08-30: 11 min runtime with 2 KS0s still on the
+  1000VA (battery at 97%, understated); post-rebalance forecast ~33–40 min,
+  the LOW half of BL-048's 30–60 band. Graceful-shutdown threshold must be set
+  AFTER the rebalance and re-measured, never before (BL-058).
   Measured stake: ~34 min recovery when the operator is asleep vs ~5 min
   awake. Post-window: KRON-HARDENING §8 gates.
 - **H3** Hardening acceptance: KRON-HARDENING §9, 7 quiet days from
