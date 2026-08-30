@@ -119,3 +119,98 @@ first). Not amended: the commit is pushed and this repo does not force-push.
 - Every MacBook git op starts `cd ~/zkas/zkas-rusty-kd &&`; the clone rests
   on `merged-v2.0.1.5`.
 (END)
+
+
+---
+
+## S15 APPEND — 2026-08-30 (v1.0.6 cutover thread: adoption, impostor night, drought arc, 14:22 reset)
+Appended per merge protocol; supersedes nothing above. Deep content: ledger
+BL-063–068, NODE-CONTRACT v1.0.6, NODE-CUTOVER r1, STARTUP-ORDER r1.
+
+### OPEN THE NEXT SESSION WITH
+0. BL-068 hardware forensics: PowerPanel PPPE_Db.db around 14:22 (power
+   event vs silence) · Reliability Monitor · decide thermal/rail
+   instrumentation (HWiNFO logging) before the next uncaptured reset.
+   Pattern review: the wordless-events pile may be TWO mechanisms
+   (instant-reset hardware class vs wedge/memory class).
+1. Walletd degradation verdict: latest BEAT2 `dt` readings + one
+   `/api/wallet/balance` gap read ×2 (scanned must advance). If stalling
+   persists → scan-gap investigation (impostor wrote hours of records;
+   v1.0.6 reads mixed archives, but walletd v1.0.5 paging through the
+   boundary is the suspect surface). BL-067(3) holds the first datapoint.
+2. Session-kill + launcher-truncation forensics: what killed Session 1
+   ~08-29/30 (Event Log 6008/41 vs 1074/6006 on that window; if
+   uncommanded, it joins the BL-040 series) · run-zkas-node.cmd
+   empty-file timestamp already captured.
+3. `--verify-shielded-history` run (NODE-CUTOVER §13a) — now doubly
+   motivated: proves the archive across BOTH the v1.0.6 boundary and the
+   impostor's write era.
+
+### LIVE STATE (deltas from S14 block above)
+- zkas-node v1.0.6 IN PRODUCTION via launcher: exe C:\zkas\node-v106\
+  zkas-node.exe, sha 1B49D1FA…DC97D2, --shielded-history=on. NO banner
+  exists; hash is the version. Rollback set: C:\zkas\backup\
+  node-data-pre-v106 (32.817 GB, 0 failed) + wallets-pre-v106 +
+  zkas-node-758k.toml (95814C89…AD75A) + v105 exe 0E2B5B43…7A24AF.
+- Firewall: gRPC 16810 scoped to MacBook 192.168.1.173 only (old rule
+  {e38b9023…} disabled, kept). H7 CLOSED (already in SCOPE r5).
+- Legacy exes QUARANTINED: C:\zkas\archive\legacy-node-dir\ (impostor
+  66D8296D…B4078E, v0.3.1, stray stratum-bridge.exe et al). C:\zkas\node\
+  holds configs + walletd launcher ONLY.
+- check-kron.ps1 deployed C:\zkas\ (r1 that night, r2 cut this close-out:
+  reporter check = :9151 + log-age 90m; launcher-integrity check added).
+  One live catch banked (BL-065).
+- STARTUP-ORDER-r1.md is now the sole startup reference; personal notes
+  retired (the impostor factory).
+- NetworkHistorySampler: DISABLED 08-30 ~08:15 during the drought
+  experiment, EXONERATED (BL-066) — re-enable is one command and is OWED
+  (every hour off = permanent P1 curve gap):
+  `Enable-ScheduledTask -TaskName NetworkHistorySampler`.
+- Drought escalated same morning per its own 3σ clause; tail-histogram
+  hunt localized the deficit to genuine extreme-tail scarcity, bar
+  acquitted (BL-066 amended). Per-rig decomposition armed, day-2.
+- 14:22:41 INSTANT RESET, uncaptured, hardware-class (BL-068). ~10 min
+  gap; STARTUP-ORDER-r1 first live cold start; reporter proved it
+  AUTO-STARTS at boot. Give-up trio at provisional amounts: 7da0660e,
+  5740a96b, fb952a95 (exact-amount backfill owed).
+- Reporter dark window 08:27–11:01 recovered by replay+dedup (5 blocks
+  in 6s); reconciliation alert's first live catches (BL-067 amended).
+
+### QUEUE ADDITIONS / CHANGES
+- NODE-CONTRACT r2 DEFERRED deliberately: two line-edits (perf-metrics
+  "armed, emission path unverified" — zero counter lines at INFO since
+  launch; §7 note that check-kron/step-10 style log reads must target
+  zkas-mainnet\logs, never the datadir WAL *.log files). Batch with the
+  walletd-cutover r3 to avoid double mount churn. The RECORD of both
+  corrections is this append + BL-063/065.
+- perf-metrics emission-path source read (before wiring any consumer).
+- Launcher mints owed: run-kaspad.cmd + monitoring pair (cwd-baking) —
+  H2 prerequisites; H2 itself re-argued by the impostor night.
+- Close-out grabs STILL OWED (never run): datadir decomposition (or
+  zkas-db-usage.exe), fresh RSS baselines (note restarts 08-30 ~03:30
+  reset uptime clocks), rollback-set manifest.
+- Prometheus rule sketch: cumulative expected-vs-observed solve drift
+  (100:1 law) alerting at ~3σ with flat near-misses.
+- Sampler S4U principal fix (script read DONE, :3034-only confirmed) +
+  the args-discrepancy oddity (BL-067(2)).
+- Upstream report batch grew: wedge (class-level) · config-key drop +
+  dead externalip · consolidate-as-coinbase · .dmg signature.
+- Fork rebase: dry-run merge CLEAN (tree ed9acea4 vs origin 30b0700 +
+  zkas-v1.0.6); re-run locally at execution (laws 4/13d).
+- Archival stewardship (NEW): Kron holds true-archival depth from genesis
+  — closed, non-regrowable set, network-recovery asset (BL-002
+  precedent). Implies off-box periodic snapshot + recurring verify runs +
+  size-at-height slope (32.8 GB @ ~2.878M chain, 08-30; firecash fresh-
+  sync figures NOT comparable — 4 confounds recorded in-thread).
+
+### KEY VALUES (this thread)
+- v1.0.6 zip 8B63C491…B2D830 · exe 1B49D1FA…DC97D2 · launch 08-28
+  16:46:20, tip-follow ~16:50, zk=ok 0.1s @ 16:55 · downtime ~14 min,
+  27,495/0/0 shares, zero bridge restarts.
+- Treasury balance read 08-28: 5,783,683,057,813 sompi (57,836.83057813
+  ZKAS), 3 keys/3 wallets.
+- Drought window 08-30 00:00–08:27: ~4 events vs ~16 expected; near-miss
+  stream flat 155–234/hr for 48h; d= 1.62e16→1.64e16.
+- STARTUP-ORDER-r1 + check-kron-r2 shas: pinned at this close-out's cut
+  (see commit).
+(S15 END)

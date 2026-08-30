@@ -1423,3 +1423,170 @@ reasoning from five points.
 **Lesson:** compute Poisson σ from the measured rate, never from the
 threshold being tested. And do not infer a recovery MECHANISM from a
 recovery's SHAPE — the operator knows what was done; the curve does not.
+**BL-063 · 2026-08-28 · node — v1.0.6 adoption: four findings that outlive
+the cutover**
+Cutover record lives in NODE-CUTOVER-r1 + SCOPE r5 H7. The findings:
+(1) **Config-key drop trap.** kaspad/zkas args assembly takes CLI-only for
+five fields — `shielded-history`, `verify-shielded-history`,
+`consensus-diag`, `shielded-anchor-overrides`, `externalip` — TOML values
+parse then are SILENTLY DISCARDED (no `.or(defaults)`). Verified in source
+at both tags; pre-existing. Corollary: `externalip` in zkas-node-758k.toml
+(and plausibly kaspad's config) was dead the operation's whole life;
+inbound peering works regardless. Consequence: those flags ride LAUNCHERS,
+which are therefore load-bearing config (H2 must carry them verbatim).
+(2) **No version banner.** `kaspad_env::version()` = workspace 2.0.1 on
+every zkas release; no git hash. Sha-256 at download is the ONLY node
+identity; BL-030's engine-prefix alarm is structurally blind to
+zkas-version drift — the §3 contract re-review is the sole rail.
+(3) **Forward-only boundaries live at COMMITS, not tags.** `e49ce61`
+(08-06) changed the bincode scan-record layout mid-struct; only v1.0.6
+(`5d94f7f`) reads a mixed archive. Our pre-cutover binary probed
+pre-boundary (`ShieldedHistoryChunk` string absent). Cold-copy-before-
+first-launch is now a STANDING upgrade step.
+(4) **Release assets are re-clobbered post-tag** (v1.0.5 precedent; manual
+`--clobber` recipe in upstream deploy.yaml). HEAD-probe + pin at download.
+**Lesson:** a config file that parses clean can still be lying about five
+of its keys; verify flag paths in source before trusting any config rail.
+
+**BL-064 · 2026-08-28 · BL-032 addendum — deadlock candidate raised and
+RETRACTED on reachability; class-level finding stands**
+Upstream `6467cb3` documents an ingest deadlock (pruning-lock
+blocking_write under the IBD flow's held read) whose symptom set matches
+the 08-26 wedge exactly. Retracted as a BL-032 mechanism: the four defects
+were each hidden behind the previous — in every SHIPPED build, defect #1
+(missing chunk subscription) closes the connection before the deadlocking
+acquisition is reachable; the only tagged builds where it is reachable
+also contain the fix. Doubly confirmed: the code was absent from our
+running binary entirely. What stands, class-level, for the upstream
+report: RPC sessions starve behind the fair session RwLock with no fault
+raised — a pending writer blocks all subsequent readers while p2p keeps
+running. BL-032 root cause remains OPEN; memory pressure leads; H6 is the
+only instrumentation path.
+**Lesson:** reachability analysis before mechanism attribution — a
+documented bug is not a candidate unless a shipped artifact could execute
+it.
+
+**BL-065 · 2026-08-30 · host/ops — the impostor night: a stale notes line
+resurrected a legacy binary twice; the state-check button caught round two**
+Sequence: a Session-1 disruption (~08-29/30, origin UNRESOLVED — forensics
+open) killed the stack; the operator's CURRENT-STARTUP notes carried
+`C:\zKAS\node\zkas-node.exe --configfile ...v106.toml` — a legacy-dir exe
+(66D8296D…B4078E, era unknown), no launcher, no flag. Executed twice: the
+impostor served production for hours (round 1), was killed and corrected,
+then returned at 03:28 when the notes were re-run for the bridge relaunch
+(round 2). check-kron.ps1 — minted that night, identity-pinning path +
+sha + flag — caught round 2 on its first live run. Compounding find:
+run-zkas-node.cmd was EMPTY on disk (truncation mystery open, timestamp
+captured); rebuilt byte-identical from the CONVERSATION RAIL (law 16's
+fourth rail, second recovery this month). Closure: legacy node exes
+quarantined to C:\zkas\archive\legacy-node-dir\ so the wrong line now
+fails loud; notes corrected; STARTUP-ORDER-r1 minted as the sole reference.
+Cost: hours of unpinned-binary service (walletd scan-degradation watch
+opened, BL-067), an evening of whack-a-mole.
+**Lessons:** port-listening is not identity — state checks must pin path +
+sha + flags; a start command living in personal notes is a defect (docs or
+launchers only); an empty launcher is invisible until launch — integrity-
+check launchers, not just processes (button r2).
+
+**BL-066 · 2026-08-30 · analysis — the drought arc: no fault found, five
+instruments minted**
+00:00–08:27 EDT: ~4 solve events vs ~16 expected (event-luck ≈25%, ~10⁻³
+for the window, ~2–4% of appearing somewhere in 34 days) immediately after
+a 127% day. Pipeline exonerated by convergent instruments: near-misses
+FLAT ~190/hr for 48h through onset, drought, rebuild, and sampler removal;
+min-ratio table at the 1.000x% print threshold in every 6h bucket (no
+classification floor); zero rejects; scrapes 12/12; difficulty/net-hash
+flat (d 1.62e16→1.64e16). NetworkHistorySampler EXONERATED by data (flat
+stream across its entire lifetime AND its removal) after being the
+operator's suspect; disable ran as a controlled experiment.
+Minted: (a) **the 100:1 law** — near-misses/hr ÷ 100 = expected solves/hr
+(190/hr ⇒ 1.9/hr ⇒ 46/day; independently 15.3T/29.0P × 86400 = 45.6 —
+two derivations, one number); (b) the 15-min boundary-bucket test — the
+generic "did my change touch the pipeline" discriminator; (c) the
+min-ratio classification check; (d) trailing-24h luck is LAGGING by
+construction — since-midnight expected-vs-observed is the drought
+instrument (the ~100% cards during the drought were arithmetically
+correct); (e) the legs are ONE correlated solve process (72/74 doubles) —
+per-leg Poisson intuition overstates events ~2×.
+Standing trap documented with two live exhibits: **interventions self-
+certify** (droughts end after anything) — the total rebuild did NOT end
+the drought; the sampler disable "did" only in the way regression always
+does. Dashboard's restart threshold (18 outcomes, 16 "effective") is this
+trap wearing a UI. Verdict: cold window at the edge of plausible;
+discriminators armed; a future 3σ cumulative drift WITH flat near-misses
+is the escalation trigger (Prometheus rule queued).
+**Lesson:** exonerate with mechanisms and proxies, never with the block
+count — and apply the same standard to recoveries as to failures.
+**Amended 08-30 ~10:15:** the 3σ trigger FIRED the same morning (~5 obs vs
+~19 exp at 10h). Tail-histogram hunt ran per the escalation clause:
+control window Pareto-perfect at every rung; drought window Pareto-perfect
+through z≥30 (625/620 · 184/186 · 61/62), thin only in the extreme tail
+(z≥60: 24 vs 31; z≥100: 9 vs 18.6, ~1.6% conditional); z≥100 == clears ==
+submissions in BOTH windows — the evaluation bar is ACQUITTED share-by-
+share. Deficit localized to genuine extreme-tail scarcity; no mechanism on
+our side can thin above 30% while leaving below perfect. Per-rig tail
+decomposition armed as the day-2 escalation; not fired (9 events too few
+to decompose).
+
+**BL-067 · 2026-08-30 · monitoring — task liveness, sampler census gap,
+walletd degradation watch**
+(1) `task=Running` is NOT liveness — Task Scheduler tracks the instance,
+not the work; reporter truth = :9151 listening + log moving (button r2
+rewrites check 7 accordingly; r1's 10-min log-age threshold also
+miscalibrated for an event-paced log). (2) NetworkHistorySampler was
+absent from the BL-039 census (created after, S14) — census-freshness is
+a revision trigger; its console blink is structural (`-WindowStyle
+Hidden` cannot suppress the console-host allocation frame for a task in
+the interactive session; S4U principal is the fix, gated on a script read
+that IS now done — sampler verified :3034-only, 2s lifetime, wedge-proof
+by design). Oddity pinned: the census read its args WITHOUT the Hidden
+flag at ~04:00; a direct read at ~04:30 showed the flag present — same
+API, different answers, unresolved. (3) Walletd degradation watch OPEN:
+post-impostor, `/api/wallet/history` polls timing out (07:58 WARN) and a
+BEAT2 landed 38 min after its BEAT1 on a T+60s protocol — reporter
+self-healed as designed (exact sompi delivered). First datapoint for the
+scan-gap investigation; next block's dt is the probe.
+**Amended 08-30 midday:** the watch ESCALATED live. Reporter went dark
+~08:27 (no BEAT2/give-up for fb952a; :9151 False at ~10:5x) while the
+bridge counted three doubles — the reconciliation alert's FIRST LIVE
+CATCHES (09:02/10:04/10:52 cards), working exactly as designed. Recovery:
+startup-replay-from-byte-0 + state-file dedup backfilled FIVE missed
+blocks in six seconds (BEAT1+BEAT2, dt 0.3–3.7s, real txids) — the
+timestamps show the wedged instance revived and fired the backfill just
+before the task-tier restart cycled it: wedge-then-recover, not clean
+death; cause unopened. Walletd measured healthy after (41/213/12 ms
+balance; history sub-4s in the backfill). THREE give-up blocks stand at
+provisional 45.24092998 pending exact-amount backfill: 7da0660e,
+5740a96b, fb952a95. New PS5.1 trap banked: `-o $null` in an external
+command expands to a bare `-o` — use `-o NUL`.
+**Lesson:** read liveness off the work, not the wrapper — the same
+principle that separated blocked-from-busy (BL-033) applies to tasks.
+
+**BL-068 · 2026-08-30 · host — instant hard reset at 14:22:41, uncaptured;
+hardware-class; operator's click coincident as trigger, not cause**
+Timeline pinned by three independent clocks: block card 14:17 (full alert
+path alive) · bridge log last write 14:22:41 MID-TABLE, uptime column
+self-consistent to the second (03:30:31 + 10:52:10) · boot records
+14:22:57/14:23:06 — a 16-SECOND death-to-boot turnaround. The 6008's
+"previous shutdown 13:44:26" is DEBUNKED as the last-System-event floor
+(bridge wrote 38 min past it) — that field is an estimate, never a death
+time. Capture sweep EMPTY: no MEMORY.DMP, no minidump, no WHEA, no 1001
+bugcheck, no 1074 command. An instantaneous reset Windows never saw
+coming = hardware-class (DC brick/VRM transient under sustained all-core
+load is the lead on a consumer mini-PC; window-activation iGPU spike as
+the plausible last-straw — the operator's click on a red console at
+~14:22:4x is trigger-coincident, not causal in any software sense; the
+red console itself died unidentified with the session). Honest hypothesis
+update: instant reset WEAKENS commit-exhaustion for THIS event (OOM is
+sluggish, not instantaneous) while the reporter wedge keeps it alive —
+two distinct fault classes may be in play. Gap only ~10 min (bridge back
+14:32:03) — STARTUP-ORDER-r1's first live cold start. Banked property:
+ZkasReporter AUTO-STARTS at boot (task fired itself; button showed its
+log 18m fresh by 14:50). Forensics queue: PowerPanel PPPE_Db.db power-
+event check for 14:22 · Reliability Monitor sweep · thermal/rail
+instrumentation decision · the four-wordless-events pattern review
+(session kill, launcher truncation, reporter wedge, this reset) now reads
+as possibly TWO mechanisms, not one.
+**Lesson:** date a death by the victim's own last write, never by the
+event log's estimate — and an uncaptured instant reset is a hardware
+conversation, not a software one.
