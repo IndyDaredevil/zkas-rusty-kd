@@ -1,5 +1,7 @@
 # SCOPE — Bridge v2.0.1.5 + Pipeline Stream P + Host Stream H
-### Content r2 · folded 2026-08-27 · Status: READS PENDING (no code started)
+### Content r3 · revised 2026-08-27 (same day as r2) · Status: A1'+A8 ON
+### BRANCH merged-v2.0.1.5 @ 1b63698; canary PASSED banner+parker gates,
+### soaking since 14:21 ET. All reads COMPLETE; A2/A3/A4 closed by reads.
 ### r1 (2026-08-22) superseded in-place per the naming law: same filename,
 ### header carries the content revision. r2 absorbs KICKOFF-v2.0.1.5-r5 §2–§5
 ### (the 08-22..26 investigation layer that superseded r1's Stream A) plus the
@@ -10,8 +12,8 @@
 ### (ships independently, WS7 discipline). Stream H = host work.
 ### References: ENGINEERING-LEDGER sealed @ BL-043 (commit 5179e65); BL-044
 ### banked in the S11/S12 thread, appends with this document's commit.
-### Read-gated items are marked «READ-GATED»: their shape is decided by the
-### queue-5 reads sitting; post-read amendments are line edits to this doc.
+### r3 records the read outcomes and implementation state; «READ-GATED»
+### markers are retired — every gate has answered. BL-045..049 ledgered.
 
 ---
 
@@ -79,7 +81,16 @@
 
 ## 2. STREAM A — BRIDGE v2.0.1.5
 
-### A1′ · HEADLINE: make /metrics unstallable  «READ-GATED»
+### A1′ · HEADLINE — ROOT CAUSE FOUND & FIX IMPLEMENTED (BL-045)
+**Read outcome:** `serve_http_loop` was serial, spawn-less and timeout-less;
+any idle/half-open client (canonically the operator's own dashboard browser)
+parked the whole server at read(). True render floor 5ms. Fix (on branch):
+spawn-per-connection + 5s read timeout. Deterministic acceptance PASSED on
+canary 1b63698: silent-parker stimulus that pins v2.0.1.4 at a measured
+8,048ms yields 213–232ms × 8 on v2.0.1.5, parker evicted by FIN at 5s.
+**Remaining acceptance:** soak clean + zero timeout-kills across one week
+of production post-deploy.
+<historical r2 text follows for the record>
 **Read first:** trace the render path for anything that can block ≥ seconds
 (locks shared with RPC work, sync I/O, pool starvation — the blue-confirm
 loop is the named pool-starvation suspect). Anchors: BRIDGE-SPEC §5 (metrics
@@ -92,7 +103,17 @@ snapshot render nothing the bridge does can starve.
 "declared host-pressure windows" clause is retired — H1 showed we cannot
 declare such windows on demand; the week must stand on its own.)
 
-### A1-hygiene · Series lifecycle  «READ-GATED»
+### A1-hygiene · Series lifecycle — MECHANISM SOLVED, work DEFERRED to
+### v2.0.1.6
+**Read outcome:** the ~6/hr smooth mint is the block-event gauges
+(set_block_event_gauge: nonce/bluescore/timestamp/hash as label values —
+one immortal series per block event across K/Z/D gauges, ~5.4/hr at era
+block rates); the ghost twin is the pre-app-parse miner="" mint — and the
+ghosts are LOAD-BEARING (block-accept counters record onto them). Retention
+must be bounded-keep-last-N per gauge (the event gauges are the dashboard's
+lossless block-history store), never blanket retirement. With the true
+floor at 5ms this is scrape-size hygiene only — deferred.
+<historical r2 text follows for the record>
 Explain the ~6/hr smooth mint (what runs hourly per worker?), then retire
 idle series with BL-025-aware design: grace ≥10m; full-labelset key (wallet
 label is a second churn vector); re-verify all five block rules +
@@ -101,7 +122,14 @@ RcReporterStarved against the new coexistence behavior BEFORE deploy
 **Acceptance (canary):** churn w1c; series count returns to baseline within
 grace; zero phantom cards; scrape duration flat across churn.
 
-### A2 · `full_clear` semantics pin  «READ-GATED»
+### A2 · `full_clear` semantics — CLOSED by read, outcome (c): zero code
+**Read outcome:** full_clear prints meets_network_target (pow ≤ KASPA
+network target) on a line that only prints inside clears_zkas — it
+literally means "double". The ~91% rate is physics: P(double|zKAS block) =
+d_z/d_k ≈ 87% at current regime, matching both the 566/646 log rate and the
+six-day table (284/348). The "~25 real doubles" baseline was an
+incompatible early-era cohort. Field correct, correctly named; ledger note
+only.
 Unchanged from r1: trace the write site; outcome (a) rename / (b) fix with
 unit test / (c) ledger note only. ~91% of DOUBLE lines carry it against ~25
 real doubles. Reporter does not consume it today (verify with grep before
@@ -109,13 +137,24 @@ claiming, per the negative-claims rule).
 **Acceptance:** next real double logs a value consistent with the pinned
 definition; definition written into the scope-close ledger entry.
 
-### A3 · Hashrate estimator drift  «READ-GATED»
+### A3 · Hashrate estimator — CLOSED by read: documented, zero code
+**Read outcome:** both legs call the node's
+estimate_network_hashes_per_second RPC with a 1000-block observed window
+anchored at tip; the bridge computes nothing. Ratio wobble is 1000-block
+luck (σ≈3.2%); observations 2.11 (+5.5%) and 1.956 (−2.2%) both inside 2σ.
+BL-028's minor-open tail closes.
 Unchanged from r1: confirm which window the estimator uses (observed vs
 target blockrate); smallest change wins — cosmetic; a wrong "fix" touching
 the 30s stats loop is worse than the drift. Closes BL-028's minor-open tail
 either way.
 
-### A4 · K/Z/D "24h" card bug — discriminator first  «READ-GATED»
+### A4 · K/Z/D "24h" card — CLOSED: rules faithful; EXITS Stream A
+**Discriminator run 08-27 (restart-rich window = ideal stressor):** rule ≡
+raw exactly on all three pairs (32/35/27; solves 40), and raw reconciles
+with log-truth within reset-compensation noise (±1 across three restarts —
+tolerable). Not the stats loop, not rule evaluation. Residual: one eyeball
+of the HourlyMergedReport card vs live values; any remaining discrepancy is
+the Alertmanager template leg (config-side).
 Unchanged from r1: run the recording-rule expr and raw `increase(...[24h])`
 side by side after ≥24h bridge uptime. Monitoring at fault → exits Stream A
 (config fix, artifact-verified via /api/v1/rules). Bridge stats loop at
@@ -124,14 +163,27 @@ fault → in-scope code fix.
 02:55:25 08-27; discriminator valid from ~02:55 08-28. (Third arming: 08-26
 16:00 restart re-armed it once already; any future restart re-arms again.)
 
-### A5 · Instrumentation: submit latency + time-to-blue  «READ-GATED»
+### A5 · Submit latency + time-to-blue — MIGRATED to Stream P (near-zero
+### bridge code)
+**Read outcome:** submit processing latency already exists (merged_obs #4,
+µs, surfaced as sub=avg/max), and FOUND → ACCEPTED → confirmed-BLUE are
+already timestamped info lines — the reporter can compute the deltas from
+lines it already tails. Only submit-SENT lives at debug. Collect
+reporter-side first; a structured bridge line only if per-block submit-send
+granularity proves necessary.
 Unchanged from r1: grep for existing timestamps first (may shrink to a log
 FORMAT change); one structured line per block, four deltas (ms), keyed by
 H_zk; Prometheus histograms only if free — the log line is the mandatory
 artifact. No alert rules this release; collect first.
 
-### A6 · Instrumentation: stale-share rate + job delivery latency + worker
-### disconnect counter  «READ-GATED»
+### A6 · Stale-share / job latency / disconnect counter — SHRUNK to job
+### latency only; DEFERRED to v2.0.1.6
+**Read outcome:** ks_invalid_share_counter (per-worker, reason-labeled) and
+ks_worker_disconnect_counter both already exist — the W9 watch item is
+queryable today. Genuine remainder: job-delivery latency gauge; its
+dispatch site is not a single obvious location (notification_hub → mining
+state → per-client sends), so it rides the next release rather than this
+one half-read.
 r1 items unchanged (inventory existing share-outcome metrics first; counters
 as metrics; job latency as rolling gauge/summary, not per-job logs; kill
 criterion: stale ≈0% fleet-wide for a week closes it as "measured healthy").
@@ -140,16 +192,20 @@ spontaneous self-reboot (~8/25) was invisible to all current alerting
 (~2-min stratum gap, under every threshold). Cheap counter now; threshold
 only if W9 repeats.
 
-### A8 · Log/alert hygiene from BL-032 (bridge side)
-Retire the structurally-dead balance WARN (2,872/day against a shielded
-treasury that has no UTXOs — a call that cannot succeed firing every 30s
-trains WARN-blindness). Verify at the write site whether the call itself
-should be conditional or only the log level demoted; smallest change wins.
+### A8 · Balance-WARN circuit breaker — IMPLEMENTED (on branch)
+Site: client_handler.rs periodic fetch. Breaker: 10 consecutive failures →
+one INFO, scheduling stops for process lifetime; any success resets. Live
+volume confirmation: the dead WARN was ~120–130/h of the entire WARN
+channel (501/4.2h, 557/4.3h measured 08-27) — the breaker restores WARN
+visibility wholesale. Canary console shows the single INFO in-soak.
 
 ### A7 · Release mechanics + close-out
-- Branch `merged-v2.0.1.5` from `merged-v2.0.1.4` (code identity 336b7a5
-  four-way verified 08-20, unchanged; docs commits since do not touch code).
-- `BRIDGE_BUILD` → 5. Banner guard verifies at release time (BL-030).
+- Branch `merged-v2.0.1.5` LIVE @ 1b63698 (eda7090 = A1'+A8+build-bump;
+  1b63698 = BL-047 CI cache fix). Canary binary
+  F1484FB5DCC7631CB29BCED90F2B8E89F8A5B7EACF5432CFF3603642B3E7A3F0.
+- `BRIDGE_BUILD` = 5 (done). Banner guard verifies v-tags at release time
+  (BL-030) — and per BL-047 the guard is source-side only: the BANNER GATE
+  on the running artifact precedes any soak, as executed for canary-1b63698.
 - Canary `:5775`/w1c: minimum 12h soak; acceptance = all item-level criteria
   + clean share flow + zero FORENSIC IMPLAUSIBLE.
 - Deploy: park/copy/hash-verify/kill/launch; four-way identity check. Single
@@ -196,9 +252,9 @@ schemas/footprints; constraints refreshed here:
   cover). Post-window: KRON-HARDENING §8 gates.
 - **H3** Hardening acceptance: KRON-HARDENING §9, 7 quiet days from
   application.
-- **H4** Clock discipline: w32tm status read (BL-042 OPEN); fix if the ~30-min
-  steps are seconds-scale — correlation precision of every host-event join
-  rides on it.
+- **H4** Clock discipline: **CLOSED HEALTHY 08-27** (BL-046) — steady-state
+  steps ±1–23ms per ~30min, boot-era correction +318ms after a 45-min dark
+  RTC. Second-exact joins validated; BL-042 closed.
 - **H5** Revisit global-vs-per-job scrape config (reporter back to 15s) once
   the bridge render is trusted again (post-A1′).
 - **H6** BL-032 instrumentation & escalation package: windows_exporter +
@@ -234,8 +290,8 @@ not this document.
 
 ## 6. OPEN QUESTIONS AT r2
 
-1. Does the RC already log submit/accept timestamps? (A5 read answers.)
-2. Does a per-worker stale-share counter already exist? (A6 read answers.)
+1. ANSWERED yes (A5): found/accepted/blue all timestamped at info.
+2. ANSWERED yes (A6): stale AND disconnect counters both pre-exist.
 3. What runs hourly per worker to mint ~6 series/hr? (A1-hygiene read.)
 4. What attributes the 01:31/03:33 dips? (Likely falls out of the A1′ read's
    suspect ranking; otherwise stays open — no harness exists.)
