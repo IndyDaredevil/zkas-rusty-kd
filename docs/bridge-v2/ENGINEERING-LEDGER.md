@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-056 (2026-08-29)
+### Last entry: BL-062 (2026-08-30)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -1240,3 +1240,186 @@ are written by hand and content is written by append. Three cross-rail
 commands would have prevented every false call in this sitting, and a
 retirement step on the outgoing branch would have prevented the incident that
 prompted them.
+
+## 2026-08-29→30 — S14: P1 shipped, PowerPanel exercised, rail-enumeration laws
+
+**BL-057 · 2026-08-27→30 · process — a deliverable shipped with a correct
+move-and-verify one-liner that was never run, and an absence-claim built on
+an incomplete rail list**
+`P1-BOLT-BRIEF-r1.md` was cut, sha-pinned `86d2b546…a210`, presented, and
+shipped 08-27 with a correct `mv`-and-`shasum` one-liner. It never reached
+`~/zkas-lab/`. SESSION-STATE tracked it as "cut and pinned… unpasted" — which
+monitors the DOWNSTREAM USE while silently assuming the landing. Cost: two
+days of D_z/D_k curve, permanently, at 15-day retention.
+Compounding error, Claude's: three rails were checked (mount absent; laptop
+absent by name AND by content grep; repo `--diff-filter=A` across all fetched
+branches empty) and the artifact was declared **VOID** — omitting the
+CONVERSATION rail, the one rail that is append-only and guaranteed to have
+held it, since every deliverable is authored there. Recovery took one
+`conversation_search` + one `read_conversation`; reconstruction from the
+transcript hashed to `86d2b546…a210` **byte-identical**, proving it was
+r1 RECOVERED, not a re-cut. No renumber, no VOID. Note the sha pin is what
+made recovery verifiable: a pin converts "gone" into a testable claim, and it
+was equally available before the VOID was written.
+**Lessons:** the rails are mount · repo (per branch) · working tree ·
+CONVERSATION, and the conversation rail is the rail of first resort for any
+deliverable. A VOID declaration destroys an artifact's identity in the record
+and carries law 15's evidentiary bar, not law 16's — never issued from
+absence alone when a sha pin exists. And law 1b's one-liner is only half a
+protocol: a deliverable that gates other work needs its landing CONFIRMED,
+not assumed.
+
+**BL-058 · 2026-08-30 · host/UPS — PowerPanel installed and EXERCISED;
+BL-044's assumed channel REFUTED, real channel found, runtime measured**
+BL-054 recorded that event eight was unreadable because Event ID 105 is not
+logged on this host. Root cause now known and it is not host configuration:
+**PowerPanel Personal does not write to the Windows event log at all.** No
+`CyberPower`/`PowerPanel` log channel is created (`Get-WinEvent -ListLog`
+empty); a deliberate 12-second wall-plug pull produced ZERO System-log
+entries. BL-044's "one-bit diagnosis" was banked on a channel that was never
+going to carry the signal.
+The instrument DOES exist, one layer over: the PowerPanel UI's Event Logs
+view, backed by `C:\Program Files (x86)\CyberPower PowerPanel Personal\
+assets\PPPE_Db.db` (SQLite; snapshot pinned `0586A64C…F56B3`). The exercise
+produced four second-precision rows: `00:16:45 Utility Power Failed,
+transferred backup mode` · `00:16:45 Battery is discharging` · `00:16:54
+Utility Power restored` · `00:16:57 Battery stopped discharging`. Every
+future host-event sweep must include this store alongside System /
+Application / TerminalServices-LSM.
+Services `PowerPanel Personal Service` + `…Service Monitor`, both Running /
+Automatic. Kron rode the transfer with zero process impact.
+**Estimated runtime measured at 11 min** with 2 KS0 Ultras still on the
+1000VA unit (battery at 97%, still recharging — so 11 is understated).
+Corroborates BL-048 independently: if the KS0s are ~2/3 of the load, the
+remainder is ~63W, which is exactly BL-048's derived figure for Kron +
+switch + aux. Post-rebalance forecast narrows from BL-048's 30–60 min band
+to **~33–40 min** (better than 3× by Peukert), i.e. the LOW half — still
+short of the one known 45-minute premises outage, so graceful-shutdown
+configuration stays on the table. Threshold must NOT be set until after the
+rebalance, then re-measured by the same plug pull at 100% charge.
+PROCESS NOTE: the step-5 read was first run WITHOUT the plug pull. Empty
+output was correctly treated as ambiguous and disambiguated by asking, not
+inferred — had it been read as "PowerPanel doesn't log," it would have been
+a false conviction on an unexercised probe, i.e. BL-054's own error one
+layer up.
+**Lesson:** BL-054 said an instrument never exercised is not an instrument.
+The corollary: exercising it is also the only way to learn WHERE it records.
+Both the channel and the runtime figure came from twelve seconds of
+deliberate fault injection with nothing at stake.
+
+**BL-059 · 2026-08-29 · P1 — ingest + sampler SHIPPED end to end, every gate
+verified against the deployed artifact rather than the vendor's report**
+Bolt reported both artifacts live. Treated as a claim, not evidence. Verified:
+constraint 4 (fail-closed) tested BEFORE the secret was set — the one path
+observable exactly once — returning 401 `{"error":"Unauthorized"}`, an
+APPLICATION-tier body proving our handler ran rather than Supabase's platform
+JWT check. Then T1 `inserted` 200 · T2 `duplicate` 200 (the UNIQUE index
+genuinely arbitrating — constraint 5 is structural, not application logic) ·
+T3 401 · T4 400 naming the missing field. Float round-trip exact through
+JSON (`d_z` 1.45e16, `est_hashrate_k` 3.09e17). RLS: SELECT only for
+anon/authenticated, no write path outside the service role.
+Kron side: `set-nh-secret-r1.ps1` (`2CCEFCFB…F0207`) inheriting all three
+BL-055 guards — GUI credential dialog for paste-safety, 8-char minimum,
+length ECHOED and confirmed before write; 15 chars captured, cross-checked
+against an independent count taken on the MacBook. `network-history-sampler
+-r1.ps1` (`E4869402…30DA68`), ONE-SHOT by design — cadence from the task's
+5-minute repetition trigger, not an internal loop, because a resident loop is
+a thing that can wedge, be battery-stopped (BL-046), or die wordlessly, and
+all three have bitten this operation. Task `NetworkHistorySampler` registered
+with both battery flags disarmed; verified firing at `00:00:03` and
+`00:05:03` into buckets no hand-run produced, `LastTaskResult 0`,
+`NumberOfMissedRuns 0`.
+File transfer to Kron: browser download, sha-verified both ends. Clipboard
+paste into an editor is NOT an acceptable transfer for sha-gated files —
+Windows editors save CRLF, LF becomes CRLF, and the identity check dies while
+the script still runs.
+**Lesson:** a vendor's "both artifacts are live" is a claim about intent; the
+acceptance tests are the artifact. And test the fail-closed path FIRST — it
+is destroyed by the very configuration that makes everything else work.
+
+**BL-060 · 2026-08-29 · reporter/prom — `Serve-Metrics` is coupled to the
+beat loop; and a 26-hour "gap" that never existed**
+Six-day capture (08-20→08-27, step 60s, archived — see BL-061) shows
+`zkas_reporter` scrape duration max **55.011s @ 08-23 00:34**, 8 samples >5s,
+4 >10s of 8,522. NOT the BL-045 parker class: `Serve-Metrics` uses
+`BeginGetContext`/`IsCompleted`, so a connection that sends nothing never
+completes a context and is skipped — structurally immune to the silent
+parker that took the bridge and walletd. The actual mechanism is loop shape:
+`Serve-Metrics` is called ONCE per main-loop iteration, LAST, after
+`Run-Beats`. Per-call timeouts are correct individually (`Post-Block` 15s,
+`Get-WalletHistory` 10s) but one iteration makes MANY — a POST per pending
+block plus a history poll. Four pending blocks against a slow webhook is 60s
+in one iteration with the endpoint unserved throughout. Metrics availability
+is coupled to beat-processing latency, and the coupling is unbounded in
+pending-block count. Cheap fix: serve metrics before beats, or between POSTs.
+Same capture raised an apparent 26h data gap (8,522 samples vs 10,080 on the
+other two targets, with only 10 `up==0`) — the BL-024 shape, where `up` is
+synthesized per ATTEMPT and absence of attempts reads as neither up nor down.
+One query killed it: `first=2026-08-21 01:59`, ZERO gaps >5min, and
+10,080−8,522 = 1,558 exactly matches the 1,559 minutes from window start to
+first scrape. The reporter job simply began being scraped that day.
+Coverage is unbroken. Claim RETRACTED.
+**Lessons:** a per-call timeout bounds a call, not an iteration — audit the
+loop, not the call. And a missing-sample count is a hypothesis, not a
+finding, until the gap's POSITION is read.
+
+**BL-061 · 2026-08-29 · monitoring — the six-day pre-fix window archived
+before expiry; D2 now has a positive control**
+Retention read from the running artifact (`/api/v1/status/flags`):
+`retention.time 15d`, `retention.size 0B` — the ~09-04 horizon carried across
+four documents as an assumption is now MEASURED. Captured 08-20 00:00 →
+08-27 00:00 EDT at step 60s (1:1 with the scrape interval; coarser steps hid
+15 of 18 failures once already), three series × 3 targets, to
+`~/zkas-lab/perishable-2026-08-20_26/`: `scrape_duration_seconds`
+(`eb76a51b…c0bf0`), `scrape_samples_scraped` (`9065bc26…15b3df`), `up`
+(`7fab0b01…e5be3c`).
+Content verified, not merely fetched — the failure mode being HTTP 200 with
+`series=0`, i.e. the retention wall wearing a success code. `rc_merged_bridge`
+max **55.005s @ 08-26 01:31**, 56 of 10,080 over 5s (0.556%). Decisive
+detail: **56 over 5s and 56 over 10s — zero samples in between.** The
+distribution is bimodal with nothing in the middle; a render degrading
+gracefully produces a tail, this produces a step. BL-033's blocked-vs-busy
+thesis confirmed at population scale rather than by one probe. The single
+worst sample in six days is 08-26 01:31 — one of the two dips BL-036 left
+unattributed and BL-045 later closed as the parker.
+**Lesson:** capture a phenomenon's baseline while it still exists; an
+acceptance gate without a positive control is an assertion.
+
+**BL-062 · 2026-08-28→30 · monitoring/analysis — the pace gate read, and a
+variance error corrected mid-session**
+`rc:solves_24h` at 08-28 02:55:00 EDT = **32** against threshold 33. FAILED
+by one, and the gate was CORRECTLY calibrated: Claude first dismissed it as
+non-diagnostic by computing σ = √33 — anchoring Poisson variance on the
+THRESHOLD — when variance is set by the expected RATE. The 237-point curve
+gives mean 53.6, so σ ≈ 7.3 and the threshold sits **2.8σ** below baseline,
+firing by chance well under 1% of the time. Same error class as BL-028: a
+constant treated as an expectation instead of reading the expectation off the
+data.
+Cause decomposed against difficulty, which was still in retention: D_k flat
+(1.55e16→1.65e16, +6%) while D_z rose ~45% (9.6e15→1.45e16), ratio 0.62→0.87.
+Difficulty explains roughly 58→45 of the decline. The trough is NOT
+difficulty — 08-25 07:00 had D_z at its series MAXIMUM (1.653e16) with pace
+healthy at 57, while 08-28 01:00 had LOWER D_z (1.502e16) at pace 32. A
+variable cannot explain an effect it moves opposite to. Remaining ~45→32
+(~29%) is capture-side, coincident with the outage + node-cutover + deploy
+era, and was RESOLVED BY THAT WORK — not self-limiting (operator correction
+to Claude's "self-recovered" inference, which was drawn from curve shape
+alone). 08-29 20:00 = 51, inside the 51–60 baseline band, fully post-deploy
+and post-cutover.
+Also banked: the D_z/D_k ratio spans **0.62–1.106** over 225 hours,
+including a period where zKAS difficulty EXCEEDED KAS. BL-028 called the
+ratio unpinnable on four measurements; this is the same finding much louder,
+and any Luck denominator reading a constant is wrong by up to 78%.
+WATCH ITEM opened: `est_hashrate_z` appears BIMODAL ~18× apart — five
+samples inside 28 minutes read 2.883e16, 3.014e16, 3.031e16, 3.041e16, then
+**1.677e15**, with `d_z` flat at 1.468–1.491e16 and `hk` steady. A genuine
+18× hashrate collapse at flat difficulty is not physical. The 1.677e15 value
+matches a 08-27 reading, so it oscillates between regimes rather than
+drifting. Sampler is reporting faithfully; the gauge is suspect. This is A3's
+file, and A3 was scoped on a few-percent drift — 18× is a different
+phenomenon under the same label. Ratio columns unaffected (difficulty-
+derived). Read the distribution after a few hours of samples rather than
+reasoning from five points.
+**Lesson:** compute Poisson σ from the measured rate, never from the
+threshold being tested. And do not infer a recovery MECHANISM from a
+recovery's SHAPE — the operator knows what was done; the curve does not.
