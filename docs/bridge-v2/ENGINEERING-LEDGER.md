@@ -1590,3 +1590,131 @@ as possibly TWO mechanisms, not one.
 **Lesson:** date a death by the victim's own last write, never by the
 event log's estimate — and an uncaptured instant reset is a hardware
 conversation, not a software one.
+
+**BL-069 · 2026-08-31 · zKAS chain-level — the reorg-resistance ladder is
+three-tiered; 12 h is the irreversibility bar, NOT the 10-minute anchor**
+Source-verified container-side against firecash/zkas-rusty tag `25be83a`
+(the v1.0.6 pin), tarball read, not a GitHub UI read.
+THE CONSTANT: `constants.rs:70` `FINALITY_DURATION = 43_200` (seconds);
+`bps.rs:92` `finality_depth() = BPS * FINALITY_DURATION`. At `Bps::<1>` =
+**43,200 blocks = 12 h**.
+ENFORCEMENT, already-synced node: `virtual_processor/processor.rs:1703`,
+`sink_search_algorithm` accepts a candidate sink ONLY if `finality_point`
+is its chain ancestor; else the `warn!` at :1722 — "Finality Violation
+Detected. Block … violates finality and is ignored from Virtual chain."
+The node KEEPS ITS OWN CHAIN and does not follow. A reorg deeper than
+finality_depth cannot move an already-synced node.
+ENFORCEMENT, IBD: `protocol/flows/src/ibd/flow.rs:594` calls
+`are_pruning_points_violating_finality` → peer disconnect on violation.
+But that function's own comment (`processor.rs:2331`) states it detects
+violations only at depth `2*finality_depth` and gives FALSE NEGATIVES
+below that; and it tests against the node's OWN virtual finality point,
+which a genesis-only node does not have. **A fresh sync inherits its
+peer's view.** Same seam as BL-001/BL-002, approached from the hostile
+direction rather than the benign one.
+SECOND GATE, not predicted before the read: `post_pow_validation.rs:80`
+`check_bounded_merge_depth` → `RuleError::ViolatingBoundedMergeDepth`.
+`MERGE_DEPTH_DURATION = 3600` → merge_depth 3,600 blocks = 1 h at 1 BPS.
+Its comment states the value is sized to roughly the DAA window duration
+specifically to block low-difficulty side-chain merges. This is the
+SHALLOWER gate and it decides whether a hidden chain can be reintroduced
+at all — read it alongside finality, never instead of it.
+
+THE LADDER at `Bps::<1>`:
+  · < 1 h hidden — merge rules permit it; this is where a double-spend
+    actually lives.
+  · 1–12 h — reds can't be sneaked in, but a genuinely heavier chain can
+    still take the sink. The real exposure window; costs sustained
+    majority hashrate for hours and is visible in the difficulty gauges.
+  · > 12 h — refused by every already-synced node. Only fresh-syncing
+    nodes are takeable.
+
+DEPTH TABLE (blocks / wall clock at `Bps::<1>`; every constant is
+`BPS × duration-in-seconds`, so all wall-clock windows are RATE-INVARIANT):
+  shielded_anchor_depth      600      / 10 min   (`600 * BPS`)
+  merge_depth              3,600      / 1 h
+  max_shielded_anchor_age 27,000      / 7.5 h    (`pruning_depth / 4`)
+  finality_depth          43,200      / 12 h
+  pruning_depth          108,000      / 30 h     (PRUNING_DURATION
+    dominates; computed lower bound 63,398 at k=18, mergeset_limit 180)
+
+OPERATIONAL LAW: `shielded_anchor_depth` is a SPENDABILITY gate — when a
+note becomes provable — NOT a finality gate. Anything irreversible
+against a counterparty, OTC settlement included, gates on 43,200 blocks
+/ 12 h. Conflating the two numbers is expensive in exactly one direction.
+
+THREAT CONTEXT (2026-08-31): zKAS ~30 PH/s. Kaspa live ~267 PH/s
+(2Miners, ONE rail, unverified — other aggregators return garbage) vs
+~1500 PH/s peak, so the threat surface is ~1200 PH/s of IDLE kHeavyHash
+inventory, not diverted Kaspa hashrate. Merged mining drives an
+attacker's MARGINAL cost to ~zero: keep full KAS revenue, redirect the
+ZKMM commitment. Precedent: Coiledcoin, killed 2012 by a merged-mining
+51% at no marginal cost. What 51% CANNOT do: mint. The turnstile
+invariant, the per-bundle binding signature and the Halo 2 proofs are
+not hashrate-defeatable — hashrate rewrites ORDER, never VALUE. The
+live defense is economic, not cryptographic: no trading venue found for
+firecash's ZKAS (search contaminated by the ZKasino ticker collision —
+absence NOT established), and the actors capable of the attack are the
+~73% of headers already earning ZKAS at zero marginal cost. That
+alignment expires the day a liquid listing exists.
+**Lesson:** a chain's irreversibility bar is a consensus constant, not a
+block time — and the merge-depth rule, not the finality rule, is what
+decides whether a hidden chain can come back at all.
+
+**BL-070 · 2026-08-31 · docs/upstream — firecash's stated 1-BPS rationale
+located; three of our nine rate arguments falsified against their source**
+RAILS: `x.com/ZKas_X` → ROBOTS_DISALLOWED, zero coverage.
+`discord.gg/3kp6SmPrD` → OG metadata only (title ZKas, 522 members);
+message rail needs auth, zero coverage. Note zkas.info advertises a
+DIFFERENT invite (`jysMS4XNFT`) and the launch announcement deep-links
+guild `1521797800952729612`. The rationale was found on an unnamed
+fourth rail: `zkas.info/whitepaper.html` §9. Rail-of-first-resort
+discipline (law 16 amendment) applies to research targets too — the
+named rails were the wrong ones.
+STATED RATIONALE — shielded proof VERIFICATION is the gate. §9: a
+shielded proof costs on the order of 100–700× a signature check, and at
+one block per second naive per-Action verification would already
+overwhelm a node under load. Named unlock: recursive per-chain-block
+Halo 2 aggregation — one accumulator proof per chain block instead of
+one per Action — described as the throughput lever that lets a private
+ledger sustain higher block rates and as the primary post-launch
+engineering objective. §15 Roadmap is BLANKED ("being revised"): there
+is NO published plan to raise the rate. Absence of the commitment is
+itself the datapoint.
+POSITIONING: the whitepaper never benchmarks against Kaspa's 10 BPS
+anywhere. The peer set is deliberately Zcash ~75 s and Monero ~120 s,
+claimed at ~750× and ~1,200×. Their implicit reply to the critique is
+that the critic chose the wrong comparison class.
+OUR ARGUMENTS, FALSIFIED against their own source:
+  (a) "emission is denominated at 1 BPS" — WRONG. The schedule is
+      defined per second and divided by the block rate; per-second
+      issuance is rate-invariant. Same construction Kaspa used at
+      Crescendo. Rate is not economically load-bearing.
+  (b) "time-based safety constants are expressed in blocks and scale
+      wrong" — WRONG. Every depth is `BPS × duration-in-seconds`
+      (`shielded_anchor_depth: 600 * BPS`); all wall-clock windows are
+      rate-invariant by construction. Only memory/storage scales.
+  (c) "per-block shielded state cost" — MOSTLY WRONG. §6.3 asserts no
+      per-transaction cost depends on block rate: bundle subtrees built
+      offline, chain-block subtrees in parallel with zero contention,
+      one serialized append over a ~32-node frontier. The rate-invariance
+      claim covers the TREE; the cost that does not scale away is
+      per-Action proof verification (§9).
+  (d) "1 BPS = 10× work per block = security" — arithmetically true but
+      NOT their argument and in tension with it. §10: zKAS sets its own
+      difficulty, its target is typically far easier than Kaspa's; §7:
+      finality via a matured canonical anchor is the decisive reorg
+      protection, not raw hashrate. DO NOT argue this publicly.
+SURVIVING arguments: verification throughput (theirs, strongest) ·
+unprunable nullifier-set growth, rate-bounded by a KIP-9 storage-mass
+extension — our measured ~1.35 GB/day archival on Kron is the
+operator-side reading of exactly this · node topology/count (ours,
+unstated by them) · rate is the cheapest knob to hardfork later.
+NEW LEAD: `params.rs:198`/`:230` cite "security audit F-04/F-05" as the
+origin of `max_shielded_anchor_age`. We have no record that zKAS has
+been audited and no report on any rail. Chase with firecash.
+FOSSIL: the whitepaper appendix reads "Ticker: FC" — firecash lineage,
+same family as the `h_fc`/FCMM fossils (repo map).
+**Lesson:** test our own arguments against upstream's design document
+before deploying them — four of nine died on contact, and the one that
+survived was theirs, stated plainly in a section we had never read.
