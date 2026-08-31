@@ -7850,6 +7850,12 @@ async fn warm_sweep_loop(state: Arc<AppState>) {
             {
                 done.insert(token.clone());
                 None
+            } else if !e.caught_up {
+                // Still syncing: the stream WILL move under a build (observed 3/3 failed
+                // installs on a wallet catching up ~40 leaves/s). Touching it above already
+                // made it active, so the sync loop is bringing it to the tip right now —
+                // build on a later tick, once the stream is still.
+                None
             } else if e.build_in_flight {
                 // The sync loop is already building it; check back next tick.
                 None
