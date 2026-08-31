@@ -25,7 +25,7 @@ circuit = ["orchard/circuit", "orchard/multicore", "dep:nonempty"]
 # the June-2026 Orchard proof-forgery bug. A caret range would let `cargo update`
 # silently move us onto an unaudited (or regressed) release. Bump deliberately,
 # reading the changelog, never incidentally.
-orchard = { package = "zakura-orchard", version = "1.0.1", default-features = false, features = ["std", "weighted-merkle"] }
+orchard = { package = "zakura-orchard", version = "=1.0.1", default-features = false, features = ["std", "weighted-merkle"] }
 # Must match the incrementalmerkletree version Orchard links, so that
 # `MerkleHashOrchard: incrementalmerkletree::Hashable` is the same trait.
 # `legacy-api` provides CommitmentTree / IncrementalWitness, the wallet-side
@@ -37,7 +37,7 @@ serde = { workspace = true, features = ["derive"] }
 # Curve point handling for the encoding consensus rules (non-identity epk).
 # Versions are pinned to match what Orchard 0.14 links.
 group = "0.14"
-pasta_curves = { package = "zakura-pasta-curves", version = "1.0.1" }
+pasta_curves = { package = "zakura-pasta-curves", version = "=1.0.1" }
 # Shielded-transaction sighash.
 blake2b_simd = { workspace = true }
 chacha20 = "0.9"

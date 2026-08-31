@@ -1050,19 +1050,6 @@ const SUBTREE_CACHE_MIN_SPAN: u64 = 20_000;
 /// action-keyed trigger would essentially never fire.
 const SCAN_COST_REPORT_LEAVES: u64 = 20_000;
 
-/// How long one background subtree-cache slice may hold the wallet lock.
-///
-/// This is a direct trade against how long a build takes in WALL-CLOCK. A slice runs
-/// once per sync pass under a `--warm-wallets` permit, so a 2 M-leaf build (~295 s of
-/// Sinsemilla) needs `295s / slice` passes. At the original 250 ms that was ~1,180
-/// passes shared with every other resident wallet — measured live on 2026-08-07 as
-/// **7 completed builds in 9.5 hours**, i.e. effectively never, which is why users hit
-/// the ~280 s cold-send replay on wallets the UI already called "synced".
-///
-/// 2 s cuts that to ~148 passes. The lock is held for at most one slice, so the worst
-/// case a status poll can queue behind is 2 s — against the 280 s cold send this
-/// prevents.
-const SUBTREE_BUILD_SLICE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Free memory the daemon refuses to build a subtree cache below.
 ///
@@ -1341,9 +1328,6 @@ const MEMPOOL_POLL: std::time::Duration = std::time::Duration::from_millis(700);
 // 150→50 ms: with the bounded-parallel loop another scan task overlaps this sleep, so
 // its only job is guaranteeing the HTTP runtime a scheduling gap — 50 ms is plenty.
 const SYNC_WALLET_THROTTLE_MS: u64 = 50;
-/// Sleep after each ingested page inside a wallet's chunk, same reason (a single page
-/// is ~200 blocks of pure-CPU trial decryption with no natural await).
-const SYNC_PAGE_THROTTLE_MS: u64 = 5;
 
 /// Idle wallets are evicted from RAM after this long without a request. The on-disk
 /// checkpoint IS the wallet; memory is only a cache of it, and reloading on the next

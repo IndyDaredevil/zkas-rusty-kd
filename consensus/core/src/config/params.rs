@@ -988,14 +988,11 @@ pub const MAINNET_PARAMS: Params = Params {
 };
 
 pub const TESTNET_PARAMS: Params = Params {
-    dns_seeders: &[
-        // This DNS seeder is run by Tiram
-        "seeder1-tn.kaspad.net",
-        // This DNS seeder is run by -gerri-
-        "dnsseeder-kaspa-testnet.x-con.at",
-        // This DNS seeder is run by supertypo
-        "n-testnet-10.kaspa.ws",
-    ],
+    // No ZKas testnet seeders exist yet. These MUST NOT be Kaspa's testnet seeders
+    // (inherited here until 2026-08-31): since 64beca1 the connection manager actually
+    // dials every address a seeder returns, so a ZKas testnet node would spam Kaspa's
+    // testnet with genesis-mismatch handshakes and leak itself into their peer graph.
+    dns_seeders: &[],
     net: NetworkId::with_suffix(NetworkType::Testnet, 10),
     genesis: TESTNET_GENESIS,
     timestamp_deviation_tolerance: TIMESTAMP_DEVIATION_TOLERANCE,
