@@ -7720,6 +7720,196 @@ async fn warm_wallet(
     })))
 }
 
+/// Make this wallet fast to interact with, without making the caller wait for anything.
+///
+/// Token-scoped and idempotent: loading the wallet (the call itself does that) marks it
+/// active, so the sync loop keeps it current; if its complete-subtree cache is missing we
+/// arm the same off-lock build the sync pass would eventually request, but NOW — so by the
+/// time the user reaches the send button the O(depth) witness path is (or is becoming)
+/// ready. Returns the readiness picture so a client can even show "optimizing…" honestly.
+async fn wallet_warm(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let token = token_from(&headers, state.allow_default_token)?;
+    let w = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no wallet for this token"))?;
+    let mut e = w.lock().await;
+    let matured = e.matured_leaves().unwrap_or(0);
+    let notes = e.db.notes().len();
+    let ready = e.db.subtree_cache_ready(matured);
+    let span = e.db.size().saturating_sub(e.db.base_size());
+    let mut armed = false;
+    if !ready && !e.db.subtree_cache_failed() && !e.build_in_flight && notes > 0 && span >= SUBTREE_CACHE_MIN_SPAN {
+        // Same memory floor the sync pass applies: warming must never squeeze a scan out.
+        match mem_available_mb() {
+            Some(free) if free < state.resources.subtree_free_floor_mb => {}
+            _ => {
+                e.wants_cache_build = true;
+                armed = true;
+            }
+        }
+    }
+    let building = e.build_in_flight || e.wants_cache_build;
+    let witnesses_warm = e.witnesses_warm;
+    drop(e);
+    Ok(Json(serde_json::json!({
+        "notes": notes,
+        "subtree_cache_ready": ready,
+        "witnesses_warm": witnesses_warm,
+        "building": building,
+        "armed": armed,
+    })))
+}
+
+/// How often the warm sweep looks for something to do. Cheap when idle-gated out.
+const WARM_SWEEP_TICK_SECS: u64 = 30;
+/// Rest after a full pass over every wallet before rescanning for new wallets and
+/// previously failed installs.
+const WARM_SWEEP_REST: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+/// Give up on a wallet whose build keeps failing to install (the stream moved under it
+/// every time) after this many attempts in one pass; the next pass tries again.
+const WARM_SWEEP_MAX_ATTEMPTS: u32 = 3;
+
+/// Wallet tokens eligible for the warm sweep: every `<token>.scan` in the wallet dir,
+/// excluding the shared chain tree and any quarantine/backup artifacts
+/// (`*.scan.divergent-*`, `*.scan.stale-*`, `*.scan.bak` — none of which end in `.scan`
+/// after the strip, or carry a dot inside the token and are skipped).
+fn sweep_candidates(dir: &str) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| {
+                let name = e.ok()?.file_name().into_string().ok()?;
+                let token = name.strip_suffix(".scan")?;
+                if token == CHAIN_TREE_TOKEN || token.contains('.') || token.is_empty() {
+                    return None;
+                }
+                Some(token.to_string())
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Background auto-warm: while the daemon is otherwise idle, bring every known wallet's
+/// complete-subtree cache to ready — ONE wallet at a time — so a user's first interaction
+/// finds the O(depth) witness path already in place instead of paying the one-time
+/// O(chain) build inline (the "first transaction takes longer" reports).
+///
+/// Why this exists when the sync pass already arms builds: the sync pass only ever sees
+/// ACTIVE wallets (touched in the last few minutes). A wallet nobody has opened since the
+/// last restart never gets a cache until its owner shows up — and then pays the build at
+/// exactly the moment they are watching. The sweep does that work up front, in idle time,
+/// and the result is persisted (v8 checkpoint section) and rolls forward on append, so it
+/// is paid once per wallet, ever — not once per restart.
+///
+/// Careful by construction:
+///  - runs only when nothing is proving, no consolidation is in flight, memory is above
+///    the same floor the sync pass honors, and fewer than half the residency slots are in
+///    use (loading a parked wallet must never evict someone's live session);
+///  - loads through `get_wallet`, so the ordinary sync/checkpoint/eviction machinery owns
+///    the wallet afterwards — the sweep adds no second persistence path;
+///  - one build at a time, inline-awaited: the sweep can never pile up background folds.
+async fn warm_sweep_loop(state: Arc<AppState>) {
+    let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut attempts: HashMap<String, u32> = HashMap::new();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(WARM_SWEEP_TICK_SECS)).await;
+        if proving_now() || CONSOLIDATING.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            continue;
+        }
+        if let Some(free) = mem_available_mb() {
+            if free < state.resources.subtree_free_floor_mb {
+                continue;
+            }
+        }
+        if state.wallets.lock().await.len() >= state.resources.max_resident_wallets / 2 {
+            continue;
+        }
+        let Some(token) = sweep_candidates(&state.wallet_dir).into_iter().find(|t| !done.contains(t)) else {
+            log::info!("warm sweep: pass complete ({} wallets checked); resting", done.len());
+            done.clear();
+            attempts.clear();
+            tokio::time::sleep(WARM_SWEEP_REST).await;
+            continue;
+        };
+        let Some(w) = state.get_wallet(&token).await else {
+            done.insert(token);
+            continue;
+        };
+        let job = {
+            let mut e = w.lock().await;
+            let matured = e.matured_leaves().unwrap_or(0);
+            let span = e.db.size().saturating_sub(e.db.base_size());
+            if e.db.notes().is_empty()
+                || e.db.subtree_cache_ready(matured)
+                || e.db.subtree_cache_failed()
+                || span < SUBTREE_CACHE_MIN_SPAN
+            {
+                done.insert(token.clone());
+                None
+            } else if e.build_in_flight {
+                // The sync loop is already building it; check back next tick.
+                None
+            } else {
+                e.build_in_flight = true;
+                Some(e.db.subtree_build_job())
+            }
+        };
+        let Some(job) = job else { continue };
+        let leaves = job.leaves();
+        let t = std::time::Instant::now();
+        log::info!("warm sweep: building subtree cache for {token} ({leaves} leaves)");
+        let built = tokio::task::spawn_blocking(move || job.run()).await.ok().flatten();
+        let mut e = w.lock().await;
+        e.build_in_flight = false;
+        let installed = built.is_some_and(|b| e.db.install_subtree_cache(b));
+        if installed {
+            // Expensive and durable: persist so a restart reloads it warm.
+            e.force_checkpoint = true;
+        }
+        drop(e);
+        if installed {
+            log::info!("warm sweep: {token} spend-ready in {:.1?} ({leaves} leaves, persisted)", t.elapsed());
+            done.insert(token);
+        } else {
+            let n = attempts.entry(token.clone()).or_insert(0);
+            *n += 1;
+            log::warn!("warm sweep: {token} cache did not install (attempt {n}) — the stream moved under it; will retry");
+            if *n >= WARM_SWEEP_MAX_ATTEMPTS {
+                done.insert(token);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod warm_sweep_tests {
+    use super::sweep_candidates;
+
+    #[test]
+    fn sweep_skips_chain_tree_and_quarantine_artifacts() {
+        let dir = std::env::temp_dir().join(format!("sweep-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in [
+            "aabb.scan",
+            "ccdd.scan",
+            "__chain.tree__.scan",
+            "aabb.scan.divergent-1788080871",
+            "ccdd.scan.stale-1788080871",
+            "aabb.scan.bak",
+            "eeff.wallet",
+        ] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let got = sweep_candidates(dir.to_str().unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(got, vec!["aabb".to_string(), "ccdd".to_string()]);
+    }
+}
+
 /// Run the daemon until `shutdown` resolves (hold the sender forever to run
 /// forever). Returns once the HTTP server has stopped and the background loops are
 /// aborted, so an embedding process (the desktop app) can call `serve` again with a
@@ -7922,6 +8112,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     let mempool_task = tokio::spawn(mempool_loop(state.clone()));
     // No-op unless --auto-consolidate is set; returns immediately when it is not.
     let consolidate_task = tokio::spawn(consolidate_loop(state.clone()));
+    let warm_sweep_task = tokio::spawn(warm_sweep_loop(state.clone()));
 
     // Keep the cached node tip fresh independently of loaded wallets, so `status` can
     // report node connectivity + chain height without ever calling the node on the
@@ -8025,6 +8216,9 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         // restart's catch-up window can be closed by hand instead of waited out.
         .route("/api/admin/warm_chain_tree", post(warm_chain_tree))
         .route("/api/admin/warm_wallet", post(warm_wallet))
+        // Public, token-scoped warm: the app calls it when a wallet is opened so the
+        // send path is already fast by the time the user reaches it.
+        .route("/api/wallet/warm", post(wallet_warm))
         .with_state(state.clone());
 
     // Transport auth: gate every route behind the bearer token when one is configured
@@ -8167,6 +8361,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     tip_task.abort();
     connector_task.abort();
     consolidate_task.abort();
+    warm_sweep_task.abort();
     flush_checkpoints_on_exit(&state).await;
     result
 }
