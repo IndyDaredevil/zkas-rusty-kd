@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-062 (2026-08-30)
+### Last entry: BL-077 (2026-08-31)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -1718,3 +1718,204 @@ same family as the `h_fc`/FCMM fossils (repo map).
 **Lesson:** test our own arguments against upstream's design document
 before deploying them — four of nine died on contact, and the one that
 survived was theirs, stated plainly in a section we had never read.
+
+## 2026-08-31 — S16: reporter r3 on the money rail, the red solved, host verdicts
+
+**BL-071 · 2026-08-31 · reporter — r1→r3 deployed (r2 VOID, never ran):
+the provisional-zero defect closed fail-closed, walletd made visible,
+BL-060's coupling fixed, and the error stream captured**
+Defect found by reading the 08-30 boot in r1's own log: the reporter's
+boot-start (proven 27s after power-on) races walletd's ~270s cold start;
+`Update-ProvisionalAmount` on a failed poll leaves `ProvisionalAmt=0`, and
+`Run-Beats` posts it — `14:23:26 provisional amount source: 0 zKAS` armed a
+window where any found block ships amt(prov)=0 to the accounting rail (the
+BL-052 zeroed-object class, on money). Corollary caught on the full source
+read: the surplus guard is `-gt 0`-gated, so BEAT2 matching while provisional
+is unknown runs WITHOUT the third-party-income filter and can cross-claim a
+treasury row. r3 therefore gates ALL beats at the top of Run-Beats:
+provisional <=0 → no BEAT1, no BEAT2, throttled defer warning (300s), blocks
+queue losslessly; give-up clock only runs on b1-sent blocks, so a walletd
+outage defers rather than degrades. Non-positive poll answers never arm the
+value; the main loop polls walletd while provisional is unknown even with
+zero pending beats, so a boot ahead of walletd converges in <=30s of it
+waking.
+Visibility (replacing the accidental walletd signal that r3's pump removes):
+`zkas_reporter_walletd_poll_failures_total`,
+`walletd_last_success_timestamp_seconds`, `provisional_known` — plus
+Pump-Metrics at four beat-path sites so stalled polls can no longer starve
+:9151 (BL-060's loop coupling, fixed). Alert-rule note pre-filed: naive
+age-on-last_success is wrong (quiet nights age legitimately); gate on
+failures increasing or age-while-pending.
+ERRSTREAM (the r2→r3 delta, forced by an operator observation between cut
+and deploy — sustained vs flash red): PowerShell's error stream is red on
+console and invisible to Log() by construction; r3 flushes $Error to the log
+per iteration (cap 5 + suppressed count). Proved itself pre-deploy on a live
+exception (the DryRun port-9151 collision surfaced as an ERRSTREAM line
+unprompted).
+Deploy per house gates: source-identity F48D66D6…51DA4D matched mount and
+Kron; r2 af977851…89dc4 VOID never deployed; r3
+eb2b813d1c49bad11f46d077539c72cbbdaf78477541057245b99de80094753e (412 ln)
+DryRun-accepted, swapped (.bak-pre-r3 = r1 bytes), verified at the RUNNING
+artifact: r3 banner, six series, first two production blocks BEAT1→BEAT2
+complete (78216a…, 10d7cb…, dt=0.9s both), Prometheus ingestion confirmed
+against a known event to the second (last_success 1788165379 = the 04:36:19
+BEAT2). Mount carries r3 only.
+**Lessons:** a value only Michael's walletd can supply must never default to
+a postable number — unknown is a state, zero is a claim. And an observation
+arriving between cut and deploy is cheap to honor (r2→r3 was four anchored
+edits) and expensive to ignore.
+
+**BL-072 · 2026-08-31 · host/UI — the red console SOLVED: Windows Terminal
+ignores -WindowStyle Hidden; red = focus-denial attention tint; crash-day
+red and the click both exonerated; windowless goal STRUCK**
+Identified at the command line: PID 1456, created 04:24:25 (the task start
+to the second), running `-WindowStyle Hidden -File C:\zkas\zkas-reporter.ps1`
+— WITH a visible tab. WT hosts task consoles as tabs regardless of the flag
+(it targets classic conhost); both stack tasks carry the flag and both
+surface anyway. All six stack consoles are tabs of ONE WindowsTerminal PID
+(9220) — why window enumeration shows a single title.
+The red: background-launched tabs are denied focus and tinted red-orange
+UNTIL ACTIVATED. Sustained red = the reporter's long-lived tab (tonight
+04:24→activation; crash day 11:02 wedge-recovery restart → the 14:20 click —
+three hours of tint over a log clean 13:16→14:18). Flash red = the sampler's
+transient tab every 5 min. Confirmed by operator test, not inference:
+activation cleared the tint, content was nominal r3 startup + two blocks,
+and — the control experiment 08-30 never had — clicking the red console on a
+healthy machine caused NOTHING. Crash-day red carries zero diagnostic
+weight; the click is double-exonerated (bridge-pen timeline + direct
+repetition).
+Theories retracted en route, all mine: ANSI escape bleed; active error-spew
+(refuted by the clean log the instant it was read); stale scrollback;
+"sampler flashing unsuppressed" (flag was already present); "hidden flag
+means no console exists." The WINDOWLESS GOAL IS STRUCK from the plan: its
+premise (console as crash trigger surface) died with the evidence, the
+window is the operator's beats view, and r3's ERRSTREAM keeps its value
+independently. Flags left in place, noted DORMANT: if the default terminal
+ever reverts to conhost, both consoles silently vanish — pre-filed answer to
+a future "where did the reporter window go."
+**Lessons:** goals inherit the mortality of their premises — audit the task
+list when a hypothesis dies, not just the verdicts. H2 service migration
+gains its fourth motivation (tasks off the interactive desktop ends the
+tint, the tabs, and the dormant-flag trap at once).
+
+**BL-073 · 2026-08-31 · host — commit exhaustion ACQUITTED by continuous
+curve; PowerPanel's first NEGATIVE verdict; two lookback misreads corrected;
+BL-068 stands with zero pre-death observables**
+The S15 unifying hypothesis (one resource curve crossing its ceiling
+explains reporter wedge → red console → hang → reset) is DEAD on the
+instrument installed 13 hours before the event: commit ratio 01:00→15:00
+08-30 shows max 60.6% at 01:10 (pre-restart), then a POST-RESTART plateau
+41.0–41.2% flat into the cutoff — 21 GB against a 50.9 GB limit, no ramp,
+no stumble. Classic mimalloc step-plateau (BL-047-era MemLog shape),
+nowhere near a ceiling. windows_exporter's first major verdict, 13h after
+install. Independent corroboration of instrument accuracy: 60.6% @ 01:10 vs
+60.5% measured by hand at 01:15.
+PowerPanel, same event: Event Logs 08-29→31 contain ONLY the four rows of
+the deliberate 00:16 plug-pull test — NO transfer at 14:2x. Premises power
+ELIMINATED for the 08-30 event, by an instrument proven watching the right
+unit (the test rows are the proof). BL-044's one-bit promise delivered on
+the first post-install event — as a negative.
+Corrections, mine: two Prometheus reads (a "6-min gap 14:27→14:33" and
+"serving metrics at 14:25") were 5-minute-lookback smear over coarse steps —
+carried-forward samples, not live ones. The bridge log's pen (14:22:41
+mid-table, 16s to boot records) is authoritative and BL-068 already carried
+it; container-timezone labels compounded the first read. Range-query gap
+edges at step>=60s are ESTIMATES; the log pen is the clock.
+Net: BL-068 unchanged and now fully fenced — instantaneous, uncaptured,
+hardware-class, premises power out, commit out, thermal untestable (BL-075),
+zero pre-death observables. The DC-path transient lead is strengthened by
+elimination and by BL-076's headroom finding.
+**Lesson:** an acquittal is worth as much as a conviction — this one killed
+the only hypothesis that explained four events, and it cost one query
+against data that existed BECAUSE the instrument went in the same night.
+
+**BL-074 · 2026-08-31 · monitoring — KronHeartbeat deadman built and
+DRILLED both directions; host death now has an off-box clock**
+`C:\zkas\heartbeat-r1.ps1` (3F5CB4EC…5E2C7, 54 ln): one-shot on the sampler
+pattern, pings healthchecks.io check `kron-deadman` (Period 5m / Grace 5m),
+URL from `C:\zkas\heartbeat-url.txt`. PURE HOST LIVENESS by design — no
+stack checks, so a bridge fault cannot page a false host-death; Prometheus
+owns stack health and this exists precisely because Prometheus dies with the
+host (BL-054's ~34-min asleep discovery cost). Failure-only logging: the
+log's absence means the ping has never failed. Task 5-min repetition,
+battery flags disarmed (BL-046), ExecutionTimeLimit 2m.
+Verified at every layer: manual run exit=0 with the dashboard ping carrying
+the WindowsPowerShell UA (ping #1's Chrome UA had proven only the receive
+side); four unattended grid fires; then the DRILL — task disabled 09:33 UTC,
+DOWN detected 09:40:02 (prediction ±2s), email DELIVERED to inbox (~05:40
+EDT), re-enable → UP 09:45:02 with recovery email. Downtime 5:00 exact.
+Both directions witnessed with nothing at stake — the BL-054/058 standard,
+met before the instrument was a day old.
+Recorded decision: the ping URL sits on the conversation rail — accepted for
+its sensitivity class (possession enables fake pings, nothing else); the
+same judgment that keeps wallet secrets off this rail absolutely.
+**Lesson:** the drill IS the install. An alarm whose delivery has never been
+witnessed is BL-044 with a subscription.
+
+**BL-075 · 2026-08-31 · host — thermal is UNTESTABLE-BY-INSTRUMENT on this
+board (scoped negative), not tested**
+The thermalzone collector path resolved as: enable never applied (ImagePath
+verified unchanged — six collectors + process filter intact throughout; the
+step-2 probe queried an unmodified exporter), and then made moot one layer
+down: `MSAcpi_ThermalZoneTemperature` answers **"Not supported"** at the WMI
+layer itself — the exact class the collector reads. Board-scoped,
+authoritative: the ACEMAGICIAN's ACPI exposes no thermal zones. Continuous
+temperature trending is unavailable on this host; HWiNFO-under-load remains
+the only open thermal path; the crash-series thermal hypothesis stays
+UNTESTED, which BL-068's file must carry as distinct from ruled out.
+**Lesson:** scope a negative before recording it — "collector found
+nothing" and "board exposes nothing" are different claims, and one WMI read
+promoted the first to the second.
+
+**BL-076 · 2026-08-31 · host/power — brick label read: 65W, not 90W; the
+box has run at ~87% of nameplate for months; replacement ordered; swap =
+experiment start**
+Label (AS0651-193402F): 19V / 3.42A / **64.98W** — the transcribed "9.0V"
+falsified by the label's own arithmetic (64.98/3.42 = 19.0 exactly) and the
+model string (…19**34**02 = 19V/3.4A). Every prior analysis assumed a
+~90W-class unit loafing; reality: Kron+switch ~63W at the wall (BL-048,
+UPS-corroborated) ≈ 55–57W DC against a 65W ceiling — **~85–88% sustained,
+continuous, with essentially zero transient headroom**. A 5825U boost or
+iGPU redraw spike atop that is exactly BL-068's "DC transient under
+sustained load"; ceiling-limitation now joins degradation as the mechanism
+(no capacitor aging required). DC barrel jack inspected by operator: no
+play, no discoloration, no strain — CHECKED, narrowing the class to brick
+(and residual board VRM only the swap can separate).
+Replacement ordered: PERFEIDY 19V/6.3A/120W (B0GK119W8T) — fixed voltage,
+5.5×2.5mm, center-positive STATED on listing, protection functions stated;
+~2.1× headroom. SHNITPWR adjustable (incl. Pro) evaluated and REJECTED for
+the permanent role: stepless 4–24V knob with an off-gear is a settable
+power fault on a custody box (my tip-kit disqualifier was CORRECTED — the
+native cable end is 5.5×2.5 center-positive; the knob argument stood alone
+and sufficed). Install protocol: seat + wiggle-test any tip joint; DATE THE
+SWAP — it starts the controlled experiment BL-040 prescribed, now running
+unattended under PowerPanel + deadman + exporter. Resets stop → old brick
+convicted (retained, labeled, as evidence and rollback). Reset on the 120W
+unit → board-side fault, different conversation. Old-chat sequencing
+("hold the order until discriminators run") is satisfied: they ran.
+**Lesson:** read the label before sizing the theory — one worn digit hid a
+25W assumption error that reframes the whole fault class.
+
+**BL-077 · 2026-08-31 · process — the prior-work-sweep law minted; the
+sitting's retraction set on the record**
+Exhibits: the 19V brick was convicted, retracted, re-convicted, and refuted
+across one sitting while BL-068's better synthesis sat committed; the 08-30
+"instability" question was answered from live instruments before the S15
+investigation of the SAME EVENT was read; two operator redirects ("we
+already did this — go read it") were required. Same failure class as BL-057
+one level up: closed-world conclusions from incomplete rail enumeration,
+applied to FINDINGS instead of artifacts. Law filed to project instructions
+(conduct tier, law 10): causal verdicts require a prior-work sweep —
+conversation rail, ledger, then live instruments, in that order — and state
+their evidence base; a verdict from a partial base is labeled provisional.
+Sitting's full retraction set, for calibration: three red-console content
+theories (BL-072); two Prometheus lookback misreads (BL-073); the
+no-1001-means-no-bugcheck challenge (withdrawn when CrashDumpEnabled=3 was
+read — S15's inference was sound); the SHNITPWR tip-kit claim (BL-076); the
+windowless goal carried past its premise (BL-072); a drill-timing
+prediction (09:18 down-call made before checking that ping #2 had reset the
+window). Every reversal came from reading a rail nobody had read yet — the
+lesson is the order of operations, not the humility.
+**Lesson:** the model races to verdicts that lag the operation's own record
+unless retrieval is forced FIRST; the operator's redirects are part of the
+system, and the law exists to make them rarer.
