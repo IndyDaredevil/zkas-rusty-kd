@@ -2165,8 +2165,9 @@ impl WalletEntry {
         cache: &Mutex<PageCache>,
         warm_gate: &std::sync::Arc<tokio::sync::Semaphore>,
         // Published to mid-pass so a long scan reports progress instead of silence; see
-        // [`SNAPSHOT_PUBLISH_EVERY`].
-        state: &AppState,
+        // [`SNAPSHOT_PUBLISH_EVERY`]. Arc so the page prefetch below can hold the
+        // shared page cache across an await without borrowing from this frame.
+        state: &std::sync::Arc<AppState>,
         token: &str,
         // Whether this wallet was caught up BEFORE this pass reset the flag. Mid-pass
         // progress is only published for a wallet that is genuinely scanning; see below.
@@ -2317,6 +2318,37 @@ impl WalletEntry {
             }
             self.reorged_strikes = 0;
             self.sink_blue = resp.sink_blue_score;
+            // PREFETCH the next page while this one is being ingested below. The next
+            // cursor is this page's LAST block hash - known right now, before any
+            // ingest - and the result lands in the shared page cache, so this loop's
+            // next iteration (and every other wallet walking the same stream) hits it
+            // warm instead of paying the fetch serially. The wall-clock profile that
+            // motivates this: a page is ~136 ms of fetch against ~38 ms of ingest, so
+            // the fetch is the loop's critical path and overlapping it is worth more
+            // than any decrypt-side work (see the `scan cost so far` comment above).
+            //
+            // Restore-shaped pages only (`page_limit == SHIELDED_PAGE` and the page
+            // came back full): a caught-up wallet's next page does not exist yet, and
+            // caching a premature partial tip page would pin it for PAGE_CACHE_TTL.
+            // The in-flight gate inside `fetch_shielded_page` dedupes this against
+            // other wallets' prefetches of the same cursor, so a cohort spawns one
+            // fetch, not one per wallet. Deliberately NOT the node-max 2000-block
+            // page: that was tried and measured slower end to end (892 vs 2,219
+            // blocks/s) because the page is also the unit of work held under the
+            // wallet lock - overlap attacks the fetch without touching that trade.
+            if page_limit == SHIELDED_PAGE && resp.blocks.len() as u64 == page_limit {
+                if let Some(next_cursor) = resp.blocks.last().map(|b| b.hash) {
+                    let st = state.clone();
+                    let cl = client.clone();
+                    tokio::spawn(async move {
+                        let _ = tokio::time::timeout(
+                            SYNC_RPC_TIMEOUT,
+                            fetch_shielded_page(&cl, &st.page_cache, next_cursor, SHIELDED_PAGE),
+                        )
+                        .await;
+                    });
+                }
+            }
             let settled = resp.sink_blue_score.saturating_sub(SYNC_TIP_MARGIN);
             // This section is synchronous trial-decryption/tree work. Mark it as
             // blocking so Tokio starts replacement workers for HTTP and RPC tasks
