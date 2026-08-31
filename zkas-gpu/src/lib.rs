@@ -262,7 +262,7 @@ mod tests {
             eprintln!("no GPU available — CPU path only, which is a valid configuration");
             return;
         };
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let ivk = pallas::Scalar::random(&mut rng);
         let mut epks: Vec<Option<pallas::Point>> = (0..1024).map(|_| Some(pallas::Point::random(&mut rng))).collect();
         // Planted edge cases: an absent key, and the generator (whose ladder hits the

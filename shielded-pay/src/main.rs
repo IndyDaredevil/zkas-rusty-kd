@@ -384,7 +384,7 @@ mod tests {
 fn sign(seed: [u8; 32], network: String, message: String) {
     let prefix = prefix_from(&network);
     let tag = prefix.to_string();
-    let signed = sign_message(seed, tag.as_bytes(), message.as_bytes(), rand::rngs::OsRng)
+    let signed = sign_message(seed, tag.as_bytes(), message.as_bytes(), rand10::rng())
         .unwrap_or_else(|| fatal("seed is not a valid Orchard spending key".into()));
 
     let addr = String::from(&Address::new(prefix, Version::ShieldedOrchard, &signed.address));
@@ -725,7 +725,7 @@ async fn main() {
             // A random seed that is a valid Orchard spending key (retry the rare miss).
             let mut seed = [0u8; 32];
             let address = loop {
-                rand::rngs::OsRng.fill_bytes(&mut seed);
+                { use rand10::Rng as _; rand10::rng().fill_bytes(&mut seed); }
                 if let Some(raw) = address_bytes_from_seed(seed) {
                     break String::from(&Address::new(prefix, Version::ShieldedOrchard, &raw));
                 }

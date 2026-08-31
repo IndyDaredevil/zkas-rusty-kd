@@ -48,7 +48,7 @@ fn main() {
 }
 
 fn gen(path: &str, n: usize) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let scalar = pallas::Scalar::random(&mut rng);
 
     let mut pts: Vec<pallas::Point> = (0..n).map(|_| pallas::Point::random(&mut rng)).collect();

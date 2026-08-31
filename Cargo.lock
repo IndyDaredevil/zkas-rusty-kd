@@ -4331,6 +4331,7 @@ dependencies = [
  "kaspa-shielded-core",
  "kaspa-shielded-wallet",
  "log",
+ "rand 0.10.1",
  "rand 0.8.6",
  "tokio",
 ]
@@ -9924,6 +9925,7 @@ dependencies = [
  "axum 0.7.9",
  "borsh",
  "clap",
+ "hex",
  "kaspa-addresses",
  "kaspa-consensus",
  "kaspa-consensus-core",
@@ -9964,7 +9966,7 @@ dependencies = [
  "group",
  "libloading",
  "log",
- "rand 0.8.6",
+ "rand 0.10.1",
  "zakura-pasta-curves",
 ]
 

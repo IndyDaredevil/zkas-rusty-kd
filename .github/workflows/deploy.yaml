@@ -59,11 +59,11 @@ jobs:
           cd $GITHUB_WORKSPACE
           
           # Build non-bridge binaries first (ZKas node + shielded wallet + miner + explorer API)
-          cargo --verbose build --bin kaspad --bin zkas-miner --bin zkas-walletd --bin zkas-api --bin shielded-pay --release --target x86_64-unknown-linux-musl
+          cargo --verbose build --locked --bin kaspad --bin zkas-miner --bin zkas-walletd --bin zkas-api --bin shielded-pay --release --target x86_64-unknown-linux-musl
           # Build bridge with allow-multiple-definition to resolve mimalloc/libstdc++ symbol collisions.
           # musl-toolchain/build.sh sets RUSTFLAGS directly, so we append this flag here explicitly.
           export RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,--allow-multiple-definition"
-          cargo --verbose build --bin stratum-bridge --release --target x86_64-unknown-linux-musl
+          cargo --verbose build --locked --bin stratum-bridge --release --target x86_64-unknown-linux-musl
           mkdir bin || true
           cp target/x86_64-unknown-linux-musl/release/kaspad bin/
           cp target/x86_64-unknown-linux-musl/release/zkas-miner bin/
@@ -110,12 +110,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          cargo build --bin kaspad --release
-          cargo build --bin zkas-miner --release
-          cargo build --bin zkas-walletd --release
-          cargo build --bin zkas-api --release
-          cargo build --bin shielded-pay --release
-          cargo build --bin stratum-bridge --release
+          cargo build --locked --bin kaspad --release
+          cargo build --locked --bin zkas-miner --release
+          cargo build --locked --bin zkas-walletd --release
+          cargo build --locked --bin zkas-api --release
+          cargo build --locked --bin shielded-pay --release
+          cargo build --locked --bin stratum-bridge --release
           mkdir bin || true
           cp target/release/kaspad.exe bin/
           cp target/release/zkas-miner.exe bin/
@@ -145,12 +145,12 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.os == 'macos-15-intel' && '10.13' || '11.0' }}
         run: |
           echo "building with MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET on $(uname -m)"
-          cargo build --bin kaspad --release
-          cargo build --bin zkas-miner --release
-          cargo build --bin zkas-walletd --release
-          cargo build --bin zkas-api --release
-          cargo build --bin shielded-pay --release
-          cargo build --bin stratum-bridge --release
+          cargo build --locked --bin kaspad --release
+          cargo build --locked --bin zkas-miner --release
+          cargo build --locked --bin zkas-walletd --release
+          cargo build --locked --bin zkas-api --release
+          cargo build --locked --bin shielded-pay --release
+          cargo build --locked --bin stratum-bridge --release
           mkdir bin || true
           cp target/release/kaspad bin/
           cp target/release/zkas-miner bin/
@@ -171,84 +171,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  build-wasm:
-    runs-on: ubuntu-latest
-    name: Building WASM32 SDK
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v3
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install llvm
-        id: install_llvm
-        continue-on-error: true
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          sudo apt-get install -y clang-15 lldb-15 lld-15 clangd-15 clang-tidy-15 clang-format-15 clang-tools-15 llvm-15-dev lld-15 lldb-15 llvm-15-tools libomp-15-dev libc++-15-dev libc++abi-15-dev libclang-common-15-dev libclang-15-dev libclang-cpp15-dev libunwind-15-dev
-          # Make Clang 15 default
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/lib/llvm-15/bin/clang++ 100
-          sudo update-alternatives --install /usr/bin/clang clang /usr/lib/llvm-15/bin/clang 100
-          sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/lib/llvm-15/bin/clang-format 100
-          sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/lib/llvm-15/bin/clang-tidy 100
-          sudo update-alternatives --install /usr/bin/run-clang-tidy run-clang-tidy /usr/lib/llvm-15/bin/run-clang-tidy 100
-          # Alias cc to clang
-          sudo update-alternatives --install /usr/bin/cc cc /usr/lib/llvm-15/bin/clang 0
-          sudo update-alternatives --install /usr/bin/c++ c++ /usr/lib/llvm-15/bin/clang++ 0
-
-      - name: Install gcc-multilib
-        # gcc-multilib allows clang to find gnu libraries properly
-        run: |
-          sudo apt-get update
-          sudo apt install -y gcc-multilib
-
-      - name: Install stable toolchain
-        if: steps.install_llvm.outcome == 'success' && steps.install_llvm.conclusion == 'success'
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install wasm-pack
-        run: cargo install wasm-pack
-
-      - name: Add wasm32 target
-        run: rustup target add wasm32-unknown-unknown
-
-      - name: Install NodeJS
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install NodeJS dependencies
-        run: npm install --global typedoc typescript
-
-      - name: Cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build WASM32 SDK
-        run: |
-          cd wasm
-          bash build-release
-          cd release
-          zip -q -r kaspa-wasm32-sdk-${{ github.event.release.tag_name }}.zip kaspa-wasm32-sdk
-          archive="wasm/release/kaspa-wasm32-sdk-${{ github.event.release.tag_name }}.zip"
-          echo "archive=${archive}" >> $GITHUB_ENV
-
-      - name: Upload release asset
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ./${{ env.archive }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # build-wasm job removed 2026-08-31: it shipped upstream Kaspa's JS SDK, which nothing
+  # in the ZKas ecosystem consumes (the wallet has its own signer wasm), and the
+  # getrandom-0.3 wasm_js migration broke it. Restore from git history if the JS SDK is wanted.
