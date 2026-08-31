@@ -43,3 +43,4 @@ kaspa-p2p-lib.workspace = true
 kaspa-utils.workspace = true
 tonic.workspace = true
 uuid.workspace = true
+hex = "0.4"
