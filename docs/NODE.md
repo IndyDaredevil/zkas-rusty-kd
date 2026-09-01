@@ -30,18 +30,19 @@ Only outbound access to a peer's **p2p** port (`16111`) is required to sync; inb
 optional (it lets others sync from you).
 
 **Running ZKas and Kaspa on one host.** The RPC ports differ (ZKas `16810` vs Kaspa
-`16110`), so those never clash. The **p2p ports do not**: ZKas mainnet p2p is `16111`, the
-same as Kaspa mainnet p2p — both the seed nodes and `seed.zkas.info` are on `16111`, and the
-DNS seeder appends `16111` to each address it returns, so the default cannot be moved without
-splitting the network (it was `16811` until 2026-08-29, and that broke bootstrapping). On a
-host already running Kaspa on `16111`, bind ZKas's p2p to a free port instead:
+`16110`), so those never clash. For p2p, ZKas separates the two things `16111` used to mean:
+the node **listens on and advertises `16811`** by default (the free "8" block, no Kaspa
+clash), while the port it **dials seed/peer addresses on stays `16111`** — that is where the
+seed nodes and `seed.zkas.info` are, and the DNS seeder appends it to each bootstrap IP.
+So a current-release node coexists with a Kaspa parent out of the box and still bootstraps.
+
+Older binaries (≤ v1.0.7) defaulted p2p to `16111` for both, which collided with Kaspa. On
+those, bind ZKas's p2p to a free port yourself — this changes only inbound; outbound
+discovery still dials `16111`, so the node syncs normally:
 
 ```bash
 ./kaspad --appdir=./zkas-node --rpclisten=127.0.0.1:16810 --listen=0.0.0.0:16811 --utxoindex
 ```
-
-This changes only **your inbound** p2p port; outbound discovery still dials the seeder and
-peers on `16111`, so the node syncs normally. Pick any free port (`16811`, `26811`, …).
 
 ---
 
