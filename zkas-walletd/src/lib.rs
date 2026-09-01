@@ -1105,6 +1105,17 @@ fn mem_available_mb() -> Option<u64> {
 /// So background builds check this and stand down while a payment is proving.
 static PROVING_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Unix-seconds of the last shared-chain-tree reset-to-genesis, so a node that
+/// keeps a cursor off its selected chain (pruned/non-archival, or unstable and
+/// constantly reorging) cannot drive a genesis rebuild every ~1s lap forever —
+/// the livelock an operator reported 2026-08-24 (`resetting it to genesis and
+/// rebuilding` on a tight loop). 0 = never reset.
+static CHAIN_TREE_LAST_RESET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Minimum seconds between shared-chain-tree genesis resets. A genuine reorg is
+/// handled by the first reset; anything re-striking within this window is a node
+/// that cannot serve the shielded history, so back off instead of spinning.
+const CHAIN_TREE_RESET_MIN_INTERVAL: u64 = 120;
+
 /// Marks a payment proof as in flight for as long as it is held — including on an
 /// early return or a panic, which a bare increment/decrement pair would leak.
 struct ProvingGuard;
@@ -5022,8 +5033,30 @@ async fn sync_loop(state: Arc<AppState>) {
             // (same `Arc`, so `state.chain_tree` follows) and let it rescan; its
             // checkpoint has already been retired to .bak by the retire path.
             if reorged_tokens.iter().any(|t| t == CHAIN_TREE_TOKEN) {
-                log::warn!("shared chain tree hit a reorg it could not follow — resetting it to genesis and rebuilding");
-                *state.chain_tree.lock().await = chain_tree_from_genesis(state.genesis);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let last = CHAIN_TREE_LAST_RESET.load(std::sync::atomic::Ordering::Relaxed);
+                if now.saturating_sub(last) >= CHAIN_TREE_RESET_MIN_INTERVAL {
+                    // First reset (or the first after the back-off window): a real reorg
+                    // is absorbed here and the tree rebuilds cleanly.
+                    log::warn!("shared chain tree hit a reorg it could not follow — resetting it to genesis and rebuilding");
+                    CHAIN_TREE_LAST_RESET.store(now, std::sync::atomic::Ordering::Relaxed);
+                    *state.chain_tree.lock().await = chain_tree_from_genesis(state.genesis);
+                } else if last != 0 {
+                    // Re-striking within the window: this is not a passing reorg, it is a
+                    // node that cannot serve the shielded history from genesis (pruned /
+                    // non-archival, or unsynced and constantly reselecting its chain). Do
+                    // NOT rebuild every lap — that is the 1 Hz genesis-reset livelock. Leave
+                    // the tree as it is (parked, serving stale roots) until the window
+                    // elapses, and say why, once.
+                    if now.saturating_sub(last) <= 2 {
+                        log::error!(
+                            "shared chain tree cannot follow this node's chain and a genesis rebuild keeps failing                              — the node cannot serve the shielded history from genesis. Point walletd at an ARCHIVAL,                              fully-synced node (or run the node with --shielded-history=on / --archival). Backing off                              for {CHAIN_TREE_RESET_MIN_INTERVAL}s instead of rescanning every pass."
+                        );
+                    }
+                }
             }
             let mut map = state.wallets.lock().await;
             let mut snaps = state.snapshots.lock().await;
