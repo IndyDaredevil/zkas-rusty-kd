@@ -256,6 +256,37 @@ impl PruningProcessor {
         }
     }
 
+    /// Drop body tips that virtual can never merge again (not in the future of the
+    /// pruning point). The same rule the non-archival prune path applies inline; kept
+    /// as a separate step so archival nodes - which skip data pruning entirely - still
+    /// perform this piece of bookkeeping. Takes the pruning write lock briefly, exactly
+    /// like the inline version, so it cannot race a concurrent virtual advance.
+    fn prune_unmergeable_tips(&self, new_pruning_point: Hash) {
+        let _prune_guard = self.pruning_lock.blocking_write();
+        let reachability_read = self.reachability_store.read();
+        let mut batch = WriteBatch::default();
+        let mut tips_write = self.body_tips_store.write();
+        let pruned_tips = tips_write
+            .get()
+            .unwrap()
+            .read()
+            .iter()
+            .copied()
+            .filter(|&h| !reachability_read.try_is_dag_ancestor_of(new_pruning_point, h).unwrap())
+            .collect_vec();
+        if pruned_tips.is_empty() {
+            return;
+        }
+        tips_write.prune_tips_with_writer(BatchDbWriter::new(&mut batch), &pruned_tips).unwrap();
+        self.db.write(batch).unwrap();
+        info!(
+            "Archival tip cleanup: pruned {} unmergeable side-branch tips: {}...{}",
+            pruned_tips.len(),
+            pruned_tips.iter().take(5.min(pruned_tips.len().div_ceil(2))).reusable_format(", "),
+            pruned_tips.iter().rev().take(5.min(pruned_tips.len() / 2)).reusable_format(", ")
+        );
+    }
+
     fn advance_pruning_utxoset(&self, utxoset_position: Hash, new_pruning_point: Hash) -> bool {
         // If the latest pruning point is the result of an IBD catchup, it is guaranteed that the headers selected tip
         // is pruning_depth on top of it
@@ -307,6 +338,17 @@ impl PruningProcessor {
 
     fn prune(&self, new_pruning_point: Hash, retention_period_root: Hash) {
         if self.config.is_archival {
+            // An archival node keeps all DATA, but the body-tips set is live consensus
+            // bookkeeping, not history: by the prunality argument below, a tip outside
+            // future(pruning_point) can never be merged by virtual again, on any node
+            // type. Skipping this cleanup along with data pruning (the inherited
+            // behaviour: this early return sits above the tip-pruning step) left such
+            // tips in the set FOREVER on archival nodes. Observed live (issue #6): a
+            // disqualified 2026-07-31 side-branch tip, ~2.7M blocks behind virtual, was
+            // still tipHashes[0] a month later on every archival node - polluting
+            // getBlockDagInfo for every wallet/explorer and pinning anchored
+            // estimateNetworkHashesPerSecond calls to a difficulty era from July.
+            self.prune_unmergeable_tips(new_pruning_point);
             warn!("The node is configured as an archival node -- avoiding data pruning. Note this might lead to heavy disk usage.");
             return;
         }
