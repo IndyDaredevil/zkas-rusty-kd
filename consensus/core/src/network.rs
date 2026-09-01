@@ -268,6 +268,27 @@ impl NetworkId {
         }
     }
 
+    /// The port a node LISTENS on and ADVERTISES by default — distinct from
+    /// [`default_p2p_port`], which is the port ASSUMED for a remote peer given
+    /// without one (DNS-seeded IPs, bare `--connect`/`--addpeer`/`--externalip`).
+    ///
+    /// On mainnet the two differ on purpose. The assumed-remote port must stay
+    /// `16111` — that is where `seed.zkas.info` and the seed nodes are, and the DNS
+    /// seeder appends it to every bootstrap IP; moving it broke bootstrapping in
+    /// 2026-08. But `16111` is also Kaspa mainnet p2p, so a node that also *binds*
+    /// it cannot coexist with a Kaspa parent on one host. Listening on `16811`
+    /// (`rpc + 1`, the free "8" block) fixes that without touching bootstrap: the
+    /// node still dials the seeds on `16111`, and a peer learns this node's real
+    /// `16811` from the handshake/gossip, so inbound still works. On testnet/
+    /// simnet/devnet the p2p port is already in the 8-block with no Kaspa clash,
+    /// so listen == assumed there.
+    pub fn default_listen_p2p_port(&self) -> u16 {
+        match self.network_type {
+            NetworkType::Mainnet => 16811,
+            _ => self.default_p2p_port(),
+        }
+    }
+
     pub fn iter() -> impl Iterator<Item = Self> {
         static NETWORK_IDS: [NetworkId; 4] = [
             NetworkId::new(NetworkType::Mainnet),
