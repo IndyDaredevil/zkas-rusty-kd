@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-077 (2026-08-31)
+### Last entry: BL-080 (2026-09-01)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -1919,3 +1919,111 @@ lesson is the order of operations, not the humility.
 **Lesson:** the model races to verdicts that lag the operation's own record
 unless retrieval is forced FIRST; the operator's redirects are part of the
 system, and the law exists to make them rarer.
+
+## 2026-08-31→09-01 — S17: the accounting rail interrogated, A3 solved, first public filing
+
+**BL-078 · 2026-08-31 · analysis — the Supabase rail answers six standing
+questions in one sitting; the two-beat timestamps were an unread instrument**
+Schema anchored from the webhook doc before any query (the mount's
+"ZKAS_WEBHOOK_INTEGRATION_md.pdf" is actually a zip of markdown — noted;
+readable either way). Key realization: upsert-on-hash means `created_at` is
+BEAT1 and `updated_at` is BEAT2 — every row carries its own confirmation-
+latency measurement, recorded since 08-21 and never read.
+(1) BEAT2 LATENCY IS A WALLETD HEALTH INSTRUMENT, retroactively validated:
+p50 sits 200–208s on every healthy day (found → chain index → next 30s poll);
+the daily max reproduces the documented incident set EXACTLY — 08-27 883s
+(premises outage), 08-28 929s (event eight), 08-29 3,132s (walletd wedge),
+08-30 2,323s (reboot) — with five clean days 08-22→26 maxing ≤267s. Four
+events, four spikes, zero false positives.
+(2) 28 GIVE-UPS (amount frozen at provisional), ALL incident-era (7/4/9/8
+across 08-27→30), zero in steady state. Per BL-069, chain blocks earn
+mergeset fees atop subsidy, so any chain block among the 28 is UNDERCOUNTED
+on the accounting rail. One-time reconciliation vs walletd history queued
+POST-H8. Metric correction: gate on age>1h (a fresh block awaiting its
+normal ~200s beat2 is not a give-up) and exclude 08-21.
+(3) DROUGHT PERCENTILES, permanent calibration from 1,184 blocks: mean
+0.503h · p50 0.34 · p90 1.16 · p99 2.50 · max 5.19h; gaps ≥3h occur ~7/1183
+≈ twice a week. S16's opening anxiety (3.3h, 2 blocks) was a p99 event that
+recurs every few days. Replaces per-incident Poisson arithmetic.
+(4) FLEET ATTRIBUTION CLEAN over 25 days: KS7s ~352 blocks each vs KS0s
+~32.5 each = 10.8:1 per-unit, matching the measured share-rate ratio;
+within-class spreads inside ±1.7σ. No degraded-rig signal.
+(5) Artifacts to read around: the 08-21 row (n=707, "latency" 4.10 days,
+spread 187s) is the backfill's bulk insert + one bulk update pass — exclude
+from latency stats; row-count drift between queries = live inserts, the rail
+proving it's alive.
+**Lesson:** Supabase is the operation's ONLY long-horizon series store
+(Prometheus forgets at 15d; the ledger holds findings, not series). Interro-
+gate stored side-effects before building new instruments — the best walletd
+monitor of the month was two timestamp columns nobody had subtracted.
+
+**BL-079 · 2026-08-31 · A3 CLOSED — the frozen hashrate gauge, end to end:
+a stranded tip, a faithful estimator, and our own anchor choice**
+Chain of custody, each link a read: 520-sample statistics (95.4% bit-
+identical 1676882337221918, mid-band EMPTY between 5e15 and 2e16, distinct-
+low-values = 1) → sampler EXONERATED (single series under the metric name —
+no ghost to mis-select) → bridge source read at the running commit 1b63698:
+ONE writer (`record_zkas_network_stats`), both arguments from the same
+30s-tick response, error path skips both gauges — caller cannot mix stale
+with live → node probed LIVE via gRPC (protos extracted from our own clone,
+protowire-protos.zip 3f2d2531…62a76): UNANCHORED estimate = 3.101e16 then
+3.118e16, distinct, ≈2×d_z as 1 BPS demands → ANCHORED on tipHashes[0]
+reproduces the constant ON DEMAND → tipHashes[0] IDENTICAL across rounds
+while virtualDaaScore advances and every other tip churns.
+The anchor, dated: block e8dc1a034c0cfd99…555c12e, header 2026-07-31
+11:26:54.799 UTC, daaScore 418,627, blueScore 415,031 — ~2.74M blocks behind
+virtual; DAA-depth age (31.7d @ 1 BPS) matches header age (31.4d): a branch
+that stranded at birth, blew past merge depth within half a day, and on an
+ARCHIVAL node (no pruning) will never leave the tip set. Persistence
+re-confirmed 4.6h later, still index 0.
+Micro-mystery closed: Supabase's uniform …920 vs live …918 is the /metrics
+text render truncating to 15 significant digits; gauge exact, text lossy.
+THE DEFECT IS OURS: kaspaapi.rs:543 anchors the zkas estimate on
+`tip_hashes.first()` — an unspecified-order list with a permanent squatter
+at [0]; the same latent choice sits at :511 on the KAS leg, masked only by
+10-BPS merge speed. Fix: `Some(tip_hash) → None` (virtual anchor) both legs.
+**v2.0.1.6 SEED** via the standard CI + canary path — the gauge feeds
+nothing load-bearing meanwhile; P2 sources from
+rc:fleet_hashrate_delivered_hps regardless (measured 15.23 TH/s — the
+dashboard's 14.2 nameplate understates Expected by ~7%).
+Four intermediate verdicts reversed en route, each by the next rail in:
+two-bridge-writers theory (killed by prom.rs), sampler-selection theory
+(killed by the single-series read), a premature sampler exoneration, and a
+node-side conviction (killed by the unanchored probe). The provisional-
+verdict clause, exercised the day it was minted.
+**Lesson:** an anchored estimator answers a question about its ANCHOR's era,
+faithfully; the bug class is anchoring on unstable-ordered collections. And
+the investigation cost one evening BECAUSE every prior layer (sampler
+stats, source pins, gRPC access, proto extraction) already existed.
+
+**BL-080 · 2026-09-01 · upstream — the batch cross-checked against venue
+norms, cut 4→3, and the operation's first public filing landed**
+Exemplar standard derived from kaspanet/silverscript's 20 open issues
+(fingerprinted R/E/A/V/M/F + three full bodies): ONE defect per issue;
+declarative first line; version pins; minimal paste-ready repro; observed vs
+expected at the artifact level; measured numbers with METHOD credibility
+(#218: "confirmed three independent ways… prediction matched a recompile to
+the byte"); explicitly FENCED non-claims (#226: "no incorrect result or
+covenant bypass has been demonstrated"); acceptance criteria; offer of
+labor (#139). The two accepted outsider reports are written in this
+operation's native dialect — the bar is form, not depth.
+Batch re-formed 4→3: A3 SPLIT (bridge bug is OURS — fixed our side, never
+filed upstream; observation + spec question UP; anchor-semantics docs note
+queued) · finality ladder → docs PR, not an issue · 1-BPS material DELETED
+from the batch on our own record's evidence (BL-070: four of nine arguments
+died against upstream's design doc; the survivor was already theirs) ·
+surplus/third-party-miner note → docs-gap report, pending txid data.
+FILED: **firecash/zkas-rusty#6** (2026-09-01 UTC), body =
+ISSUE-DRAFT-stranded-tip-r2.md (19bffbc3…3c941a, 94 ln), committed alongside
+this entry; rendering verified by fetch at the far end — title, table,
+three repro blocks, non-claims, questions, all byte-faithful. The
+operation's first public artifact.
+Corrections, mine: `open_issues: 0` misread as "empty tracker" — the issue
+landing as #6 proves five CLOSED predecessors (a tracker that gets worked,
+the better signal); and the first digest script shipped with a SyntaxError
+from an unvetted f-string edit — law 5's dry-run discipline applies to
+one-off analysis scripts exactly as much as to deliverables.
+**Lesson:** grade the batch against the venue before filing — form-fit
+first, and owning your own bug inside someone else's tracker ("that was our
+bug, fixed on our side") is what separates a report that gets worked from
+one that gets closed.
