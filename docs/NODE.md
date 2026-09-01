@@ -5,7 +5,7 @@
 [docs/BUILDING.md](BUILDING.md).
 
 ```bash
-./kaspad --appdir=./zkas-node --rpclisten=127.0.0.1:16110 --utxoindex
+./kaspad --appdir=./zkas-node --rpclisten=127.0.0.1:16810 --utxoindex
 ```
 
 The node resolves the mainnet DNS seeder `seed.zkas.info`, dials every address it returns on
@@ -23,12 +23,25 @@ The current mainnet runs on the `161xx` block:
 
 | Purpose | Port |
 |---|---|
-| RPC (gRPC) | **16110** (bind to loopback) |
+| RPC (gRPC) | **16810** (bind to loopback) |
 | p2p | **16111** |
 
 Only outbound access to a peer's **p2p** port (`16111`) is required to sync; inbound p2p is
-optional (it lets others sync from you). A ZKas node and a merged-mining Kaspa parent are
-kept on separate port blocks so both run on one host with no overrides.
+optional (it lets others sync from you).
+
+**Running ZKas and Kaspa on one host.** The RPC ports differ (ZKas `16810` vs Kaspa
+`16110`), so those never clash. The **p2p ports do not**: ZKas mainnet p2p is `16111`, the
+same as Kaspa mainnet p2p — both the seed nodes and `seed.zkas.info` are on `16111`, and the
+DNS seeder appends `16111` to each address it returns, so the default cannot be moved without
+splitting the network (it was `16811` until 2026-08-29, and that broke bootstrapping). On a
+host already running Kaspa on `16111`, bind ZKas's p2p to a free port instead:
+
+```bash
+./kaspad --appdir=./zkas-node --rpclisten=127.0.0.1:16810 --listen=0.0.0.0:16811 --utxoindex
+```
+
+This changes only **your inbound** p2p port; outbound discovery still dials the seeder and
+peers on `16111`, so the node syncs normally. Pick any free port (`16811`, `26811`, …).
 
 ---
 
