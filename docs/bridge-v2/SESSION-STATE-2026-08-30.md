@@ -214,3 +214,116 @@ BL-063–068, NODE-CONTRACT v1.0.6, NODE-CUTOVER r1, STARTUP-ORDER r1.
 - STARTUP-ORDER-r1 + check-kron-r2 shas: pinned at this close-out's cut
   (see commit).
 (S15 END)
+
+---
+
+## S18 APPEND — 2026-09-01 (memory posture closed; zkas-node found undiscoverable)
+Appended per merge protocol; supersedes nothing above. Deep content: ledger
+BL-081–085. NOTE: the S16/S17 threads (ledger BL-071–080) never received a
+session-state append — this doc is behind by two threads on that rail, and
+this append does not cover them.
+
+### OPEN THE NEXT SESSION WITH
+0. **zkas-node restart — the only pending action from S18.** The launcher is
+   ARMED, NOT ACTIVE: `--externalip=108.95.94.128:16811` is on the exe line
+   (verified by read, no BOM), but PID 14824's argv lacks it. Ctrl+C in the
+   node console (NODE-CUTOVER §7a) then
+   `C:\zkas\node-v106\run-zkas-node.cmd` from Kron/cmd. Bridge auto-
+   reconnects; walletd untouched so no 270s cache rebuild.
+   Gate: `External address is publicly routable 108.95.94.128:16811` at INFO
+   in `C:\zkas\node-data\zkas-mainnet\logs\rusty-kaspa.log`. Inbound peers
+   in HOURS not minutes — zero at 30 min is not yet a failure.
+   Two riders, free once stopping anyway: (a) decide `perf-metrics` — it is
+   honoured but its output dies at the INFO filter (BL-083), so either add
+   `--loglevel=info,kaspad_lib=debug` or set the key false; the present state
+   is misleading either way. (b) The restart releases zkas-node's 5.34 GB and
+   starts a fresh instrumented ramp while kaspad's 55h ramp continues
+   undisturbed — that DECOMPOSES the host curve rather than destroying it.
+   Read per-process at +12h.
+1. **H7 asymmetry — NOT EXECUTED, no rail carries a result.** kaspad's 16110
+   still allows `192.168.1.0/24`. Census showed zero LAN clients, one
+   loopback (the bridge). One command, no restart:
+   `Set-NetFirewallRule -DisplayName 'Kaspa gRPC LAN only' -NewDisplayName
+   'Kaspa gRPC MacBook only' -RemoteAddress 192.168.1.173` + address-filter
+   readback. Loopback is unfiltered, so the bridge is unaffected.
+2. **D2 gate** — `max_over_time(scrape_duration_seconds[7d]) < 5s` on/after
+   2026-09-04 ~01:09 EDT. Pass closes SCOPE r4. **D1** (`.bak-v2014`
+   retirement) is COUPLED to D2, never executed standalone — the
+   SESSION-STATE-2026-08-29 handoff defect that prompts otherwise is still
+   uncorrected.
+3. **Doc corrections owed** (§QUEUE below): the `zkas-node-v106.toml` header
+   states FIVE drop-trap fields and there are six.
+
+### LIVE STATE (deltas from the blocks above)
+- **Memory: CLOSED, no configuration change on either node.** The 79% RAM
+  reading is a configured equilibrium, not drift (BL-081). Memory pressure
+  ELIMINATED on the swap read/write split. `ram-scale` stays 2.0 — a prior
+  1.25–1.5 recommendation is WITHDRAWN. `rocksdb-cache-size = 8192` proven
+  INERT under the default preset and has never been read.
+- **zkas-node p2p: 0 inbound, 10 outbound against `outpeers = 16`.** The node
+  advertises no address and is undiscoverable by construction (BL-082). All
+  local causes exonerated: listener `0.0.0.0`, firewall rule present, gateway
+  forward present, port confirmed open externally with 16111 as positive
+  control. zKAS mainnet is SEEDERLESS (`dns_seeders = &[]`). `outpeers` was
+  never the lever here — the node fills only 10 of 16.
+- **kaspad p2p: 42/42 outbound, 11 inbound.** `outpeers = 42` is achievable
+  and evidenced; a recommendation to cut it to 16 was WITHDRAWN on the
+  operator's July blocks-found data.
+- **Config files: only `run-zkas-node.cmd` changed this session**, by the
+  operator, manually, before any script ran. Both TOMLs untouched. No node
+  restarted; the box has held one boot since 08-30 14:22:41.
+- **windows_exporter `process` collector** was already installed, running,
+  and scoped by include regex to six stack binaries since ~01:00 08-30 —
+  H6's per-process leg was never open (BL-084(5a)).
+
+### QUEUE ADDITIONS / CHANGES
+- **kaspad `nologfiles = false` + a versioned launcher — highest-value
+  remaining change on the box, and neither is a tuning knob.** The largest
+  process (10.89 GB, 39% of commit) has no log at all, and runs from a bare
+  exe path with BL-018 and BL-019 both live. H2 window.
+- **Delete the inert `rocksdb-cache-size = 8192` line** from
+  `C:\Node-v2\config.toml` — documentation, not behaviour. H2 window.
+- **H6 RESCOPED: instrument and collector are present; RULES ONLY remain.**
+  Alert on `windows_memory_swap_pages_written_total` (near-zero baseline; a
+  sustained climb is genuine eviction). A RAM-percentage rule is WRONG — it
+  fires at 79% today and means nothing.
+- **NODE-CUTOVER r2 must fix `-AsByteStream` → `-Encoding Byte`** in its BOM
+  verification line; PS7-only, and Kron is 5.1, so that step has evidently
+  never been executed on this host.
+- **`zkas-node-v106.toml` header: five → six drop-trap fields** (add
+  `override-params-file`); and once the launcher flag is live, the
+  `externalip` comment should gain a "now live via launcher" pointer so the
+  next reader does not re-derive it.
+- **BL-073 pin resolution** — one query over 08-30 01:00–14:22 decides
+  whether the ratio (41.2%) or the absolute (21 GB) was the sound figure.
+  Verdict unaffected either way.
+- Unchanged and carried: H2 window (five riders, UPS rebalance), H8 walletd
+  v1.0.6 cutover, P6/P7, reporter `Serve-Metrics` loop-coupling, fork rebase,
+  cold-storage sweep, A4 residual eyeball, `est_hashrate_z` bimodality
+  (see BL-079 if S17 closed it).
+
+### KEY VALUES (this thread)
+- Ledger PRE **2029 ln · 779a77cc…24db8 · last entry BL-080**;
+  append **276 ln · 397cb2a5…71b5ee** → POST expected **2305 ln**, sha
+  recorded at merge.
+- Session-state PRE **216 ln · 4f91fb16…57ae3**; append **113 ln**, sha
+  recorded at merge (self-reference cannot be pinned inside the file).
+- `run-zkas-node.cmd` (operator-edited, current) **5 ln ·
+  5FE330BBC2EC4AC987DC90E56F8FD5816973A475D80AC60AC7D32DB61F2DE2D7**,
+  first byte 64 (no BOM). Backup `.bak-pre-externalip` NOT created — the
+  guard aborted before writing.
+- Source pin for every code claim in BL-081/082/083: `firecash/zkas-rusty`
+  **25be83a** (the v1.0.6 pin), tarball read container-side.
+- **Commit limit 47.42 GB, FLAT, 806/806 samples** 08-30 02:00 → 09-01 21:10.
+  Pagefile `C:\pagefile.sys` **16,384 MB fixed**, `AutomaticManagedPagefile
+  = False`, `PeakUsage` 300 MB (1.8%).
+- Per-process at 55h: kaspad **10.89 GB private / 9.33 WS**, zkas-node
+  **5.34 / 3.95**, bridge 0.60, walletd 0.38. Decay-fit equilibrium ~28 GB
+  commit, ~6.5 GB available, ~79% RAM.
+- Swap pages: reads 100–300/s flat while available fell 24.1 → 8.1 GB;
+  writes ZERO in 33 of 56 hours, max 18.6/s.
+- Public IP **108.95.94.128** re-confirmed 09-01 (api.ipify.org).
+- zKAS mainnet `default_p2p_port` = **16811** (`network.rs:246`).
+- Firewall rules on p2p: `zKAS Node` (16811) and `Kaspa P2P Inbound` (16111),
+  both Enabled/Inbound/Allow/Any profile. Both ports externally reachable.
+(END S18)

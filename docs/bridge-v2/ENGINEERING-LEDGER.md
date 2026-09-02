@@ -2027,3 +2027,279 @@ one-off analysis scripts exactly as much as to deliverables.
 first, and owning your own bug inside someone else's tracker ("that was our
 bug, fixed on our side") is what separates a report that gets worked from
 one that gets closed.
+
+## 2026-09-01 — S18: the memory posture closed, and zkas-node found invisible
+
+**BL-081 · 2026-09-01 · host/nodes — the 79% RAM reading is a CONFIGURED
+EQUILIBRIUM, not drift; memory pressure ELIMINATED on the read/write split;
+no config change on either node**
+Opened on a Task Manager frame (21:02:26 EDT, pinned by the bridge log's own
+console line): 24.8/31.4 GB in use (79%), commit 27.9/47.4, compression store
+1.0 GB. The 79% sits one point under BL-032's ">80% RAM" wedge marker, on the
+same instrument.
+Uptime CONFIRMED not inferred: every stack process reads 54.6–54.7h,
+`explorer`/`WindowsTerminal` at 54.7 bracketing the stack at 54.6 — one boot,
+the 08-30 14:22:41 reset, nothing restarted since.
+PER-PROCESS CURVES (windows_exporter `process` collector, scoped by include
+regex to six stack binaries, running since ~01:00 08-30 — see BL-084(5)).
+Two mechanisms, not one:
+· **kaspad = step-plateau.** 1.43 → 10.89 GB. Twelve consecutive hourly
+  samples at 9.51–9.54, then twelve at 10.13–10.16 — ±0.02 GB over half a
+  day. Three step-ups, DECREASING: +1.17, +0.64, +0.21, then a creep. A
+  bounded allocator on shelves.
+· **zkas-node = smooth, shelf-free.** 0.44 → 5.34 GB, rate decaying by 12h
+  block: 0.124 → 0.089 → 0.068 → 0.046 GB/h (ratio ≈0.72). Different
+  mechanism; no `rocksdb-cache-size`, archival, defaults.
+Attribution CLEAN: over the last 12h the two nodes grew +0.82 GB against
++0.72 GB of host growth. No third contributor. Growth leadership has FLIPPED
+— zkas-node adds memory ~2× kaspad's rate at half the size.
+Decay-fit equilibrium (a fit on four points of a derived quantity, treat
+loosely): kaspad ~11 GB, zkas-node ~6.5–6.8, host commit ~28 GB, available
+~6.5 GB, RAM ~79%. **The box is not drifting toward BL-032's marker; its
+designed steady state IS the marker.** Reframes BL-032 rather than closing
+it: not a leak crossing a line, a configuration whose equilibrium is the line.
+**`rocksdb-cache-size = 8192` IS INERT.** `daemon.rs:243` computes a cache
+budget only `if matches!(preset, RocksDbPreset::Hdd)`, `else { None }`;
+`rocksdb_preset.rs:60-61` — `apply_default(opts, parallelism, mem_budget)`
+never receives `cache_budget`. Under `rocksdb-preset = "default"` the value
+is never read and the `info!("Custom RocksDB cache size…")` line never
+prints. kaspad's 10.89 GB is `ram-scale = 2.0` alone, acting on the
+consensus cache policies (`storage.rs:84`). Deleting the line changes no
+behaviour; it is documentation.
+`ram-scale` is therefore the SOLE memory lever on kaspad. Valid range
+0.1–10.0 (`daemon.rs:107-111`). Help text targets 3.0–4.0 for a DEDICATED
+64 GB node; Kron shares 31.4 GB across two nodes plus bridge, walletd,
+Prometheus, Grafana.
+PRESSURE TEST — the verdict. An initial read of
+`rate(windows_memory_swap_page_operations_total[1h])` returned max 1221/s,
+mean 252/s and was WRONGLY called non-zero-therefore-pressure: that counter
+is perfmon `Memory\Pages/sec`, which counts hard faults of ANY kind
+including file-backed I/O. The split is decisive:
+· reads 100–300/s throughout, spikes at both ends of the range
+· writes ZERO in 33 of 56 hours, max 18.6/s
+· available memory fell 24.1 → 8.1 GB across the same window with the read
+  rate FLAT — no correlation, therefore not eviction
+· pagefile `PeakUsage` 300 MB of 16,384 (1.8%) corroborates independently
+**VERDICT: no memory pressure exists. `ram-scale` stays at 2.0. No
+configuration change on either node.** A prior "1.25–1.5" recommendation is
+WITHDRAWN — it bought headroom the machine has no use for at a certain cost
+in RPC latency, which is template freshness, which is revenue.
+Banked for H6: `windows_memory_swap_pages_written_total` is the correct
+pressure alert (near-zero baseline, a sustained climb is genuine eviction).
+A RAM-percentage threshold is the WRONG rule — it would fire at 79% today
+and mean nothing.
+Also observed, no action: read spikes recur near 05:35/17:35, the same hours
+as kaspad's allocation step-ups (compaction doing both at once); and the
+final sample shows available jumping 8.12 → 11.55 GB with reads flat,
+~3.4 GB released in an hour.
+**Lesson:** occupancy is not pressure — on Windows the number that indicates
+stress is paging, not how full RAM is. And a counter's AGGREGATE can be
+uninformative where its component split is decisive: the same metric that
+looked like a conviction at 252/s was an acquittal once read as reads-vs-
+writes. Know what a counter counts before setting a threshold on it.
+
+**BL-082 · 2026-09-01 · zkas-node/p2p — the node is STRUCTURALLY
+UNDISCOVERABLE: zero inbound peers for the operation's life, open port and
+all; BL-063's "inbound peering works regardless" falsified for this leg**
+Measured: zkas-node **0 inbound, 10 outbound** against `outpeers = 16`.
+kaspad on the same box, same gateway: **42/42 outbound plus 11 inbound**.
+Everything local exonerated in sequence — both listeners bound `0.0.0.0`
+(16811/PID 14824, 16111/PID 12904); both ports carry enabled inbound Allow
+rules on Any profile (`zKAS Node`, `Kaspa P2P Inbound`); AT&T gateway
+NAT/Gaming forwards 16811 → 192.168.1.96; and BOTH ports confirmed open from
+outside via canyouseeme.org with **16111 as the positive control** (it must
+be open — kaspad has 11 live inbound — which validates the instrument).
+The port is reachable and nobody dials it.
+MECHANISM, source-verified at the v1.0.6 pin:
+(1) `flow_context.rs:907-917` — a peer's address enters an address manager
+    in exactly two cases: `router.is_outbound()` (you dialled them), or
+    `peer_version.address` (they SELF-REPORTED in the version message).
+    **There is no path that records an inbound connection's source IP.**
+(2) `addressmanager/src/lib.rs:116-128` — `local_addresses()` advertises
+    `externalip` if publicly routable; otherwise falls back to enumerating
+    local interfaces FILTERED to publicly routable. Kron has only
+    192.168.1.96. The fallback yields nothing.
+(3) `externalip` is a drop-trap field (BL-063) — parsed from the TOML then
+    discarded.
+Therefore the node advertises no address, and nothing on the network can
+ever learn it exists. Compounding it: **zKAS mainnet is SEEDERLESS** —
+`MAINNET_PARAMS.dns_seeders = &[]` (`params.rs:864`); only TESTNET carries
+seeders. There is no crawler to find an unadvertised node, and peer
+discovery is hardcoded `addpeer` plus gossip from there. (Gossip IS working:
+8 of 10 outbound peers came from exchange, not the three bootstrap entries.)
+kaspad is exempt not by configuration — its `externalip` is equally dead —
+but because its address is already in the network's collective address books
+from earlier in its life, where it propagates by gossip and persists across
+restarts regardless of whether the node keeps advertising.
+CONSEQUENCE for the 38-public-node figure: this operation is a member of the
+population that figure cannot see. On a seederless network the reachable set
+any crawler finds is bounded by what its bootstrap peers happened to know,
+so two crawlers from different starting points can converge on different
+totals. A DEFINITIVE public+private count is not obtainable — non-listening
+nodes are unobservable by construction; the private population is estimable
+only by capture-recapture across multiple listening observers, never counted.
+CONSEQUENCE for `outpeers`: the setting was NEVER the lever on zKAS. The
+node fills only 10 of 16 — the reachable pool binds first. Raising it is
+inert. (The 32–42 diminishing-returns finding from July stands on its own
+network: kaspad fills 42 of 42, so 42 is both achievable and evidenced there.
+A recommendation to cut it to 16 was withdrawn on the operator's blocks-found
+data.) `maxinpeers = 8` likewise exonerated as a constraint — nowhere near
+binding at 0 inbound.
+FIX, applied to the launcher by the operator and VERIFIED by direct read:
+`--externalip=108.95.94.128:16811` on the `zkas-node.exe` line of
+`C:\zkas\node-v106\run-zkas-node.cmd` (`require_equals(true)`, args.rs:477 —
+the `=` is mandatory; `cd /d %~dp0` and `--shielded-history=on` both intact;
+first byte 64, no BOM). Public IP re-confirmed unchanged at 108.95.94.128.
+**STATE: ARMED, NOT ACTIVE.** PID 14824's argv carries only `--configfile`
+and `--shielded-history=on`; the flag lands at the next node restart.
+Acceptance gate: `External address is publicly routable 108.95.94.128:16811`
+at INFO in the node log ("not publicly routable" = value rejected; no line =
+flag never reached the binary). Then inbound peers in HOURS not minutes —
+the address must enter a peer's addrman, propagate through the addresses
+gossip flow, and be selected for a dial.
+Standing fragility: a residential WAN IP change silently un-advertises the
+node again, with no alert and no symptom but inbound quietly returning to
+zero. `KASPAD_EXTERNALIP` exists as an alternative injection point if that
+ever wants automating.
+**Lesson:** a reachable port proves nothing about discoverability. On a
+seederless network self-advertisement is the ONLY discovery path, which
+makes `externalip` load-bearing for this leg in a way it is not for kaspad —
+and a corollary proven on one node ("inbound peering works regardless") was
+generalised one node too far.
+
+**BL-083 · 2026-09-01 · kaspad/zkas args — config-surface audit at the
+v1.0.6 pin: the drop trap is SIX fields, `perf-metrics` is honoured but
+FILTERED, and one field is TOML-only**
+Source-verified container-side against `firecash/zkas-rusty` at `25be83a`,
+tarball read (BL-069's method), not a GitHub UI read.
+(1) **The drop trap is SIX, not five.** BL-063 lists `shielded-history`,
+`verify-shielded-history`, `consensus-diag`, `shielded-anchor-overrides`,
+`externalip`. **`override-params-file` (`args.rs:655`) has the identical
+shape** — `m.get_one::<String>(…).cloned()` with no `.or(defaults)`. The
+header comment block inside `zkas-node-v106.toml` states five and needs
+correcting.
+(2) **`perf-metrics` is NOT in the trap.** `args.rs:635` uses
+`arg_match_unwrap_or`, and `args.rs:673` guards it:
+`.filter(|_| m.value_source(arg_id) != Some(DefaultValue))` falls through to
+the TOML value when the flag is absent from the CLI. The key is honoured and
+the monitor IS constructed and ticking. **Its output is discarded at the log
+filter** — the callback at `daemon.rs:739-741` logs at `debug!`, compile-time
+target `kaspad_lib` (the `[lib] name` of the kaspad crate, since the closure
+lives in daemon.rs not in `kaspa-perf-monitor`), and the log runs at INFO.
+Confirmed empirically: `matches=0` for `memory|resident|virtual|cpu usage`
+across the whole 54h log. ~19,000 metric lines generated and thrown away this
+boot. Fix if ever wanted: `--loglevel=info,kaspad_lib=debug` on the launcher.
+Moot in practice — windows_exporter answers the same question with better
+fidelity and no restart.
+(3) **`block-template-cache-lifetime` is the INVERSE trap**: TOML-settable,
+NOT CLI-exposed (`args.rs:638`, "currently used programmatically by
+benchmarks and not exposed to CLI users"). Default 1000 ms. It looks like the
+obvious mining knob and is NOT one: `cache.rs:62-67` clears the cache
+whenever `VirtualStateApproxId` changes, so a stale template is never served
+across a virtual-state change. Setting it to 0 buys nothing and costs
+template rebuilds.
+(4) **`deny_unknown_fields`** on the Args struct (`rename_all = "kebab-case"`)
+means a misspelled TOML key is a HARD startup failure, not a silent ignore.
+Both production TOMLs parse, so every key in them is a real key. This is the
+opposite hazard to the drop trap and worth holding separately: unknown keys
+fail loudly; known-but-CLI-only keys fail silently.
+(5) Defaults banked: `outpeers` 8 · `maxinpeers` 128 · `rpcmaxclients` 128 ·
+`async_threads` = num_cpus (16 on the 5825U, per node) · `ram_scale` 1.0 ·
+`rocksdb_cache_size` None · `perf_metrics_interval_sec` 10 · zKAS mainnet
+`default_p2p_port` = **16811** (`network.rs:246`; RPC+1 in the distinct "8"
+block).
+**Lesson:** read the arg-assembly line AND the consumer. A key can be
+correctly named, correctly parsed, correctly plumbed all the way into the
+running config, and still produce nothing — and the config file gives no hint
+that its output dies two layers downstream.
+
+**BL-084 · 2026-09-01 · process — command-shipping and reconstruction trap
+catalog, second edition (five exhibits; all mine)**
+(1) **PromQL label selectors do not survive `curl.exe` invoked from
+PowerShell.** The Win32 command-line parser strips the inner double quotes,
+so `{process=~"kaspad|zkas-node"}` arrived as `{process=~kaspad|zkas-node}`
+→ `bad_data`, `parse error: unexpected identifier "kaspad" in label
+matching, expected string`. Cost: four failed queries. Fix: omit the selector
+and filter client-side (a scoped include regex caps the series count anyway),
+or escape as `\"`. Sibling of BL-049(5).
+(2) **A guard that gates on EQUALITY passes when both sides are absent.**
+`if ($a.Count -eq $b.Count)` is true at 0/0, so a `status=error` response
+flowed straight into the parse and crashed on null arrays. That crash was
+then MISATTRIBUTED to a label-name guess, sending the diagnosis sideways for
+two turns — the error text had been sitting in the response the whole time.
+Gate on `status` FIRST, then on non-zero count.
+(3) **`LastWriteTime` is not a liveness instrument on this box.** Measured
+**41 hours stale** on `rusty-kaspa.log` while the owning process wrote to it
+continuously (NTFS defers metadata updates for files held open with buffered
+writes). It very nearly manufactured an incident: the stale timestamp
+(08-31 04:28) sat inside the only anomaly in the 54h memory curve (the
+04:35–05:35 excursion). Voids any "the log stopped at X" claim taken from a
+directory listing — read the content's own timestamps. Applies equally to
+the reporter, bridge and sampler logs.
+(4) **`-AsByteStream` is PowerShell 7+**; Kron runs Windows PowerShell 5.1,
+where the parameter does not exist. Use `-Encoding Byte`. **NODE-CUTOVER-r1
+carries the same defect in its BOM-verification line**, which means that
+verification has evidently never been executed on this host.
+(5) **Four absence-or-state claims made from RECONSTRUCTIONS rather than
+reads** — the expensive class:
+   (a) "H6's per-process-RSS leg is open" — asserted from a metric-name query
+       I had deliberately narrowed to `^windows_(memory|os)_`, which excluded
+       the process collector BY CONSTRUCTION. The collector had been running,
+       scoped to six binaries, since the exporter went in on 08-30. Several
+       turns were then spent designing node-restart paths to obtain data
+       already on disk.
+   (b) The pagefile reboot-effectuation story — refuted by one query:
+       `windows_memory_commit_limit` flat at 47.42 GB across 806/806 samples.
+   (c) `externalip` as the cause of zero inbound — kaspad has the identical
+       dead key and 11 inbound peers.
+   (d) The launcher's contents reconstructed from NODE-CUTOVER-r1 and an edit
+       proposed against the reconstruction. The operator had already applied
+       the change manually. **The assert-count guard is the only reason that
+       edit survived** — the script would have overwritten it.
+**Lesson:** law 16 governs my own instruments and the runbooks, not only the
+repo rails. A narrowed read establishes NOTHING about what it excluded, and a
+runbook's description of an artifact is evidence about the runbook. Read the
+file before proposing an edit to it — and keep the assert-count guard, which
+paid for itself here by refusing to run.
+
+**BL-085 · 2026-09-01 · corrections and housekeeping (four items)**
+(1) **BL-073's commit-limit pin is FALSIFIED.** That entry cites "21 GB
+against a 50.9 GB limit". Measured: `windows_memory_commit_limit` = **47.42
+GB, flat, 806/806 samples**, 08-30 02:00 → 09-01 21:10. The two BL-073
+figures are self-consistent with each other (21/50.9 = 41.3%) and both
+inconsistent with the instrument: 41.2% of 47.42 is **19.5 GB**, and 21 GB
+against 47.42 is 44.3%. The ratio is the likelier survivor (it presumably
+came from a ratio query) but that is a guess; one query over 08-30
+01:00–14:22 settles it. **BL-073's VERDICT IS UNAFFECTED** — 41% against a
+47.42 GB ceiling is still nowhere near exhaustion, and commit exhaustion
+stays acquitted for the 08-30 event. Only the pins are wrong.
+(2) **Pagefile posture, first record on any rail.** `C:\pagefile.sys`,
+`AllocatedBaseSize` 16,384 MB **fixed**, `AutomaticManagedPagefile = False`,
+`PeakUsage` 300 MB. Reconciles the limit exactly: 31.4 GB usable + 16 GB =
+47.42. Configured with Claude assistance at some earlier date and never
+documented — a load-bearing host setting that existed on the conversation
+rail alone until this entry.
+(3) **H7's gRPC scoping was applied to ONE LEG OF A PAIR.** zkas-node's 16810
+was scoped to the MacBook IP on 08-28 and the exposure recorded closed.
+kaspad's 16110 still carries `RemoteAddress 192.168.1.0/255.255.255.0` under
+a rule named `Kaspa gRPC LAN only` — the full subnet, i.e. the seven
+unaudited-firmware rigs, against unauthenticated kaspad gRPC (which includes
+`shutdown`, `ban`, `addPeer`). Losing the KAS leg takes merged mining with it,
+since the AuxPoW parent comes from that node. Connection census: one Listen,
+one loopback ESTABLISHED (the bridge), **zero LAN clients** — narrowing to
+192.168.1.173 mirrors H7 with nothing at risk, and loopback is not filtered by
+Windows Firewall so the bridge is unaffected. **NOT YET EXECUTED — no rail
+carries a result.** BL-053's enumerate-the-whole-class lesson, recurring.
+(4) **kaspad has no launcher and no witness rail.** It runs from a bare exe
+path, `C:\rusty-kaspa-v2\target\release\kaspad.exe --configfile
+"C:\Node-v2\config.toml"`, so BL-018 (PATH collision) and BL-019 (the next
+local `cargo build` silently overwrites the production binary) are both live
+simultaneously. And `nologfiles = true` means the largest process on the box
+— 10.89 GB, 39% of commit — has NO log at all; its block-processing timing,
+the line zkas-node prints every 10s, is invisible. This is why BL-032 was
+unresolvable, and the fix went to the smaller node. **`nologfiles = false`
+plus a versioned launcher is the highest-value remaining kaspad change**, and
+neither is a tuning knob.
+**Lesson:** a scoping fix applied to one member of a pair leaves the other at
+its original scope while the record reads "closed" — enumerate the pair, and
+verify the fix landed on both before writing the entry.
