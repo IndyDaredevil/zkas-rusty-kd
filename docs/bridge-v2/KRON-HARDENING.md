@@ -1,5 +1,5 @@
 # KRON-HARDENING — Windows 11 Pro as a mining appliance
-### Content r2 · drafted 2026-08-26, revised 2026-08-30 · Host: Kron
+### Content r3 · drafted 2026-08-26, revised 2026-09-02 · Host: Kron
 ### (ACEMAGICIAN K1, Win 11 Pro 25H2, build 26200.8875)
 ### Origin: the 08-22 stall investigation — 18 scrape failures in 2 days traced to
 ### Windows servicing (a Store retry loop on Microsoft.ScreenSketch) plus unexplained
@@ -163,91 +163,145 @@ Gate: `w32tm /query /status` shows sync within the last 15 min and sub-second
 offset on later rechecks; Kernel-General 1/24 events stop appearing in pairs
 every half hour.
 
-## 6.5 POWER — UPS LOAD SPLIT, POWERPANEL, AND THE READABLE DISCRIMINATOR
+## 6.5 POWER — EXECUTED SPLIT, THE CANARY, AND WHAT EACH INSTRUMENT CAN SEE
 
-Added at r2. Three CyberPower units installed 08-27 (BL-044). This section is
-the plan of record for the physical rearrangement; it was designed in BL-048
-on 08-27 and lived ONLY in the ledger until r2 — a runbook cannot be followed
-from an entry it does not cite.
+Rewritten at r3: the rebalance is EXECUTED and measured (09-02, BL-088), the
+brick is replaced (BL-087), and this section now records reality, not plan.
+House terminology, fixed here: **battery-backed** vs **surge-only** outlet
+banks (CyberPower's own labels). "Pass-through" is retired — it collides
+with UPS bypass-mode, a different thing.
 
-**Target load split (BL-048; hierarchy over symmetry).** Rigs are
-ride-through-OPTIONAL (all seven hard-dropped and self-recovered in every
-historical event); custody + network is ride-through-REQUIRED.
+**Executed map (measured loads):**
 
-- 1500VA #1: KS7 + 2 × KS0  ≈ 760W / 76%
-- 1500VA #2: KS7 + 2 × KS0  ≈ 760W / 76%
-- 1000VA   : Kron + SG116E switch + aux ONLY (~63W)
-- third KS7: surge-only outlet, no battery
+- 1500VA #1: KS7 + 2×KS0 battery-backed, **742W** · **w8m (KS7) surge-only
+  ← DESIGNATED PREMISES CANARY**
+- 1500VA #2: KS7 + 2×KS0 battery-backed, **752W**
+- 1000VA   : Kron + SG116E + aux, **52W**, battery-backed (~11W below
+  BL-048's ~63W baseline — arrived with the 120W brick; unexplained, benign,
+  recorded)
 
-Latent fault this corrects: unit 1 measured 1.01kW against a CP1500's ~1000W
-inverter — fine on passthrough, trips at the next outage, i.e. the UPS itself
-as the would-be next power event. Physics forbids balancing it away
-(3 × KS7 ≈ 505W each, so any two on one bank overload by construction). An
-operator-proposed three-way balance putting a KS7 with Kron on the 1000VA was
-REJECTED on inverter math (95% of a 600W-class inverter) and runtime inversion
-(Kron's runtime spent in the rig's first three minutes).
+The 80% artifact gate reads honestly: both 1500VAs run **82–84%** of their
+900W-class inverters — inside spec for their role (bridging sags and short
+cuts), NOT long-runtime protection, and nobody should later mistake them
+for it. Canary trade stated deliberately: w8m is the fleet's top producer
+(31.1% attribution); correct as instrumentation (a reboot you notice),
+priced as a premises event costing its uptime + ramp.
 
-**Artifact gate (post-rebalance):** each unit's PowerPanel load% below 80, and
-the 1000VA's estimated runtime read and recorded.
+**What each instrument can actually see (scoping, BL-088):** PowerPanel
+watches the **1000VA ONLY** — the 1500VAs retain no onboard history and
+have no PC attached; they are DARK instruments until NUT lands. Every
+"zero PowerPanel rows" verdict in the series is so scoped. A rig-side-only
+premises sag is visible ONLY in rig uptime counters — the canary's real
+coverage.
 
-**PowerPanel Personal — installed 08-30, and where it actually records.**
-BL-044 declared every future power event a "one-bit diagnosis" via the UPS.
-Event eight (08-28) arrived unreadable and BL-054 recorded why. Root cause is
-now known and is NOT host configuration: **PowerPanel does not write to the
-Windows event log at all.** Event ID 105 will never appear on this host; no
-`CyberPower`/`PowerPanel` channel is created.
+**Brick (BL-087):** PERFEIDY 19V/6.3A/120W in service since 14:12:49 09-02;
+wiggle-tested; old AS0651 (65W, ran ~87% sustained) labeled and RETAINED as
+evidence. **Experiment armed with its falsifier: another 41/6008 with zero
+PowerPanel rows convicts barrel-or-board and acquits the brick.** Quiet is
+weak evidence — the series has shown 10+ quiet days before.
 
-The real store is the PowerPanel UI's Event Logs view, backed by:
+**Decided architecture (BL-088), delivery-gated:**
 
-```
-C:\Program Files (x86)\CyberPower PowerPanel Personal\assets\PPPE_Db.db
-```
+1. **Gateway → 1000VA** (fate-sharing with Kron is the architecture — a
+   separate gateway UPS would create alive-but-blind mismatch windows).
+   Gated on a 1st-floor→basement cable drop; executes in the UPS-expansion
+   window. Interim exposure known and playbooked: premises loss = both
+   nodes peerless (frozen templates) + deadman path dead (host-down page
+   for a healthy host); decode via PowerPanel row + port census.
+2. **End-state: each KS7 on its own 1500VA** with 1–2 KS0s (one unit
+   carries KS7+2×KS0 ~83% — four KS0s do not divide by three). All seven
+   battery-backed; **the canary role RETIRES**, succeeded by NUT + the
+   gateway move. Third 1500VA ORDERED.
+3. **NUT witness node** (Pi 4 kit + high-endurance SD, ORDERED): all three
+   UPSs over USB → NUT (`usbhid-ups`) → nut_exporter → the existing
+   Prometheus/Telegram rail. Monitoring-only, no shutdown authority.
+   Identical-unit discrimination: serial-match in ups.conf, udev port-path
+   fallback if serials are blank. **DRILL REQUIRED before it counts
+   (BL-054): three input-pulls, three witnessed Telegram alerts.** Charter
+   beyond NUT, one item at a time: off-host deadman leg (immune to §6.7's
+   session semantics), rig-canary exporter (the seven UIs below, polled),
+   WAN-continuity probe, off-Kron backup landing. Firm NOs: nothing
+   mining-critical, no node, no LAN-critical service, nothing
+   inbound-exposed — the box's value IS its independence.
 
-SQLite. **Every host-event sweep must include this store** alongside System /
-Application / TerminalServices-LSM. Services: `PowerPanel Personal Service`
-and `PowerPanel Personal Service Monitor`, both Running / Automatic.
-
-**The exercise is mandatory, not optional.** A ~12-second deliberate wall-plug
-pull on 08-30 produced four second-precision rows (Utility Power Failed →
-Battery discharging → Utility restored → Battery stopped discharging) and zero
-Windows System-log entries. Kron rode it with no process impact. Repeat this
-after any UPS change, and after the rebalance:
+**PowerPanel Personal — where it actually records (unchanged from r2).**
+No Windows event log presence; the store is the UI's Event Logs view backed
+by `C:\Program Files (x86)\CyberPower PowerPanel Personal\assets\PPPE_Db.db`
+(SQLite). Every host-event sweep includes it. Exercise after any UPS
+change: plug-pull → four second-precision rows → services check:
 
 ```powershell
 Get-Service | Where-Object { $_.Name -match 'cyber|power.?panel|pwrctl' } | Format-Table Name, Status, StartType -AutoSize
 ```
 
-Pass: both services Running / Automatic, AND the plug-pull transfer visible in
-the PowerPanel Event Logs view. An instrument that has never been exercised is
-not an instrument (BL-054); the corollary is that exercising it is also the
-only way to learn where it records (BL-058).
+**Graceful shutdown: the r2 deferral has EXPIRED** — its condition ("after
+the rebalance, re-measured at 100%") is met. Now an open ACTION (§7): at
+100% charge, read the 1000VA's estimated runtime in PowerPanel, then set
+the threshold against the measured figure. The argument stands: the
+archival RocksDB store is non-regrowable, and NINE uncontrolled losses
+survived is a record of luck.
 
-**Runtime, measured.** 11 min at 08-30 with 2 KS0 Ultras still on the 1000VA,
-battery at 97% and still recharging (so understated). Post-rebalance forecast
-~33–40 min — better than 3× by Peukert, but the LOW half of BL-048's 30–60
-band, and still short of the one known 45-minute premises outage (08-27).
+## 6.6 HOST MEMORY POSTURE (first railed at BL-085(2))
 
-**Graceful shutdown: DEFERRED, deliberately.** Any runtime-based threshold set
-now would be calibrated against a load about to change by two thirds. Set it
-only after the rebalance, against a re-measured figure taken at 100% charge.
-The argument for setting it at all: the archival zkas-node's RocksDB store is
-one of a closed, non-regrowable set, and eight uncontrolled power losses have
-been survived so far — which is a record of luck, not of safety.
+`C:\pagefile.sys` **fixed 16,384 MB**, `AutomaticManagedPagefile = False` —
+set with Claude assistance at an earlier date, documented nowhere until
+09-01. Commit limit = 31.4 GB usable + 16 GB = **47.42 GB** (measured flat,
+806/806 samples). Steady state: ~79% RAM is the CONFIGURED EQUILIBRIUM
+(BL-081), not drift — occupancy is not pressure; paging is (pagefile peak
+1.8% over 55h). Alerting rule of record: `windows_memory_swap_pages_written_total`
+sustained climb = genuine eviction; a RAM-percentage rule fires at 79%
+today and means nothing.
+
+## 6.7 DEADMAN SEMANTICS (corrected by event #9, BL-087)
+
+`KronHeartbeat` (healthchecks.io, 5m/5m) measures **INTERACTIVE-SESSION
+liveness, not host liveness**: principal `LogonType: Interactive`, no boot
+trigger — a host at the logon screen is booted, healthy, and silent to it
+(19 min measured, 09-02). Failure-only log at `C:\zkas\logs\heartbeat.log`
+(absence = never fired). Fix rides H2 with the sampler's: boot trigger +
+non-interactive principal, one principal decision covers both tasks. Until
+then, a deadman page decodes via: PowerPanel row · port census · Supabase
+`network_history` rows (the second off-box 5-min clock).
+
+## 6.8 FLEET + FIREWALL INVENTORY (first railed at r3)
+
+**Rig web UIs (uptime = the premises instrument of record):**
+w1m 192.168.1.21 · w2m 192.168.1.22 · w5m 192.168.1.25 · w6m 192.168.1.26 ·
+w7m 192.168.1.27 · **w8m 192.168.1.28 (surge-only canary)** ·
+w9m 192.168.1.29. (Worker number = final octet.)
+
+**gRPC scoping — BOTH legs closed (09-02):** zkas 16810 →
+`zkas gRPC 16810 - MacBook only (H7)` @ 192.168.1.173 · kaspad 16110 →
+`Kaspa gRPC MacBook only` @ 192.168.1.173 (BL-085(3)'s gap, found already
+executed under this name; the entry's recorded pre-fix name is obsolete).
+Dead disabled `ZKas gRPC LAN only` /24 rule removed 09-02.
+
+**OPEN FINDING — program-scoped Allow rules undermine port scoping:** eight
+first-run rules (`kaspad.exe` ×4, `kaspad` ×2, `zkas-node` ×2) allow
+**Any port / Any remote**. Windows allows are additive, so if these share
+the active profile, the port-scoped MacBook-only rules above are
+NON-AUTHORITATIVE — 16110/16810 effectively open to the LAN through the
+program rules. `Kaspa-Borsh-Laptop Only` (17110) likewise scoped Any
+despite its name. Needs a profile-aware audit + deliberate rationalization
+(explicit port rules authoritative, program rules disabled) at the RULES
+SITTING — not a drive-by; a blind disable could cut a port the explicit
+rules do not cover.
 
 ---
 
 ## 7. OPEN THREADS THIS DOC DOES NOT CLOSE
 
-- **Night dips** (01:58, 01:30-era): no suspect from Defender or servicing yet.
-  Instruments: the fixed step-3 event sweep on those windows + the 2s probe loop
-  overnight. If they survive §2–§6, they get their own investigation.
-- **Bridge robustness question** (v2.0.1.5 A-item, sharpened 08-22): why does
-  host I/O pressure turn a 230ms render into a ≥25s stall rather than a slow one?
-  Host hardening reduces the trigger frequency; the bridge fix removes the
-  failure class. Both proceed.
-- **UPS install**: DONE 08-27 (×3). Superseded by §6.5 below, which carries the
-  load split and the PowerPanel findings. Remaining open thread is the
-  graceful-shutdown threshold, which cannot be set until after the rebalance.
+- **Night dips** (01:58, 01:30-era): no suspect yet; instruments as at r1.
+- **Bridge robustness question** (v2.0.1.5 A-item): unchanged; both tracks
+  proceed.
+- **Graceful-shutdown threshold — NOW SETTABLE** (r2's deferral expired):
+  measure the 1000VA runtime at 100% charge post-rebalance, set against the
+  measured figure. Owner: next Kron sitting.
+- **Firewall rationalization** (§6.8 finding): program-scoped Any/Any
+  allows vs. port-scoped restrictions — rules sitting.
+- **Gateway cable drop** (§6.5.1) — UPS-expansion window.
+- **NUT build + drill** (§6.5.3) — on Pi arrival; the doc's §6.5 scoping
+  paragraph is amended when the 1500VAs stop being dark.
 
 ## 8. THE MAINTENANCE WINDOW (monthly, operator-declared)
 
@@ -285,3 +339,10 @@ tune it away.
   plug-pull exercise, the measured 11-min runtime, and the deliberate deferral
   of the graceful-shutdown threshold until after the rebalance. §7's "UPS
   install" thread retired to a pointer. Ledgered BL-058.
+- 2026-09-02 · r3 · §6.5 rewritten to executed reality (measured loads,
+  battery-backed/surge-only terminology, w8m canary, brick swap + armed
+  experiment, PowerPanel/1500VA scoping, gateway fate-sharing decision,
+  KS7-per-unit end-state, NUT witness node + charter). NEW §6.6 pagefile
+  posture · §6.7 deadman semantics · §6.8 fleet IPs + gRPC closure + the
+  program-rule finding. §7: shutdown-threshold deferral expired → open
+  action; new gates. Ledgered BL-087/BL-088; sources BL-081/085/086.
