@@ -966,7 +966,8 @@ pub const MAINNET_PARAMS: Params = Params {
     // feature, not a future fork. Keeping it `always()` also exercises the aux path
     // from genesis and needs no activation DAA. (Earlier revisions carried a
     // "REVERT to day-14" note from when this was a demo value — that no longer
-    // applies; the fresh-genesis reset makes always() the intended, correct value.)
+    // applies; since the July 2026 mainnet launch (fresh genesis), always() is the
+    // intended, correct value. This is historical context, not a planned change.)
     merged_mining_activation: ForkActivation::always(),
 
     // ZKas launch difficulty: the low-difficulty bootstrap schedule is DISABLED on mainnet

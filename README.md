@@ -37,7 +37,9 @@ explorer API.
   959,713 (`zkas-mainnet btc#959713` in the genesis coinbase) — see the
   [no-premine proof](https://zkas.info). Earlier public **test chains were wound down
   before this genesis was cut**; the anchored genesis is the final one and there is no
-  planned reset.
+  planned reset. (This README carried a TESTNET banner until 2026-07-27, during the
+  pre-launch test phase — if a copy you are reading still shows one, it is a stale
+  snapshot; check this file on `main`.)
 - **No external audit yet.** The novel piece — Orchard shielded state (nullifier set,
   note-commitment tree, turnstile supply invariant) kept consistent under GHOSTDAG's
   out-of-order block acceptance — is specified in the
