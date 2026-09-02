@@ -873,6 +873,35 @@ impl ConsensusApi for Consensus {
             )));
         };
         let shift = anchor_index.saturating_sub(local_anchor_index);
+        // BOUND THE PEER'S CLAIM before letting it re-number our index. `anchor_index` is
+        // whatever the serving peer put in the message; without a bound, a first chunk
+        // claiming an absurd index (say u64::MAX/2) re-bases our entries sky-high and then
+        // wedges this node for good: both the verification enumeration and the Mismatch
+        // purge walk `0..anchor_index` densely. The invariant that caps it needs no trust:
+        // a selected-chain block's genesis-based index can never exceed its DAA score
+        // (every chain step advances DAA by at least its own mergeset, i.e. >= 1). And a
+        // rebase only ever happens on the FIRST chunk, whose anchor is our own pruning
+        // point - a block whose header we hold - so the DAA bound comes from local data,
+        // not from the peer. Later chunks anchor at blocks we already numbered (shift 0)
+        // and never hit this path.
+        if shift > 0 {
+            let anchor_daa = self
+                .headers_store
+                .get_compact_header_data(anchor)
+                .optional()
+                .unwrap()
+                .map(|h| h.daa_score)
+                .ok_or_else(|| {
+                    ConsensusError::GeneralOwned(format!(
+                        "shielded history anchor {anchor} needs a re-base but its header is not available to sanity-check the peer's index claim"
+                    ))
+                })?;
+            if anchor_index > anchor_daa {
+                return Err(ConsensusError::GeneralOwned(format!(
+                    "peer claims chain index {anchor_index} for anchor {anchor}, but its DAA score is {anchor_daa} - a chain index can never exceed the DAA score; rejecting the backfill chunk"
+                )));
+            }
+        }
         // At or above the anchor is our own validated range; ours is authoritative.
         let ours_from = anchor_index;
 
@@ -2466,6 +2495,39 @@ mod tests {
     /// backfill writing the entries and the replay verifying them, `complete` must be false —
     /// that window was reported live as `history_complete: true` at 20% of the replay.
     #[test]
+    /// A malicious backfill peer must not be able to re-number our chain index with an
+    /// absurd claimed anchor index: the wedge is that verification and the purge both walk
+    /// 0..anchor_index densely. The bound is trustless - a chain index can never exceed
+    /// the anchor blocks DAA score, read from our own header store.
+    #[test]
+    fn backfill_rejects_impossible_peer_anchor_index() {
+        let config = Config::new(MAINNET_PARAMS);
+        let tc = TestConsensus::new(&config);
+        let consensus = tc.consensus_clone();
+        let genesis = config.genesis.hash;
+
+        let record = (
+            0u64,
+            kaspa_consensus_core::api::ShieldedChainBlockData {
+                hash: genesis,
+                blue_score: 0,
+                daa_score: 0,
+                coinbase_txid: genesis,
+                coinbase_outputs: Vec::new(),
+                coinbase_commitments: Vec::new(),
+                accepted_actions: Vec::new(),
+                accepted_txids: Vec::new(),
+                timestamp: 0,
+            },
+        );
+        // Genesis sits at local index 0 with DAA score 0; a peer claiming index 10^15 for it
+        // demands a 10^15-entry re-base - rejected on the DAA invariant before any write.
+        let err = consensus.backfill_shielded_history(genesis, 1_000_000_000_000_000, std::slice::from_ref(&record));
+        assert!(err.is_err(), "an impossible peer index claim must be rejected");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("can never exceed the DAA score"), "rejected for the right reason: {msg}");
+    }
+
     fn history_status_is_incomplete_after_a_backfill_until_verified() {
         let config = Config::new(MAINNET_PARAMS);
         let tc = TestConsensus::new(&config);
