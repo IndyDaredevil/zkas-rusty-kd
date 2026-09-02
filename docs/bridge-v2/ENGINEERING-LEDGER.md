@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-080 (2026-09-01)
+### Last entry: BL-085 (2026-09-01)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
