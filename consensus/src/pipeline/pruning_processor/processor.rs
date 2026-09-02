@@ -467,6 +467,17 @@ impl PruningProcessor {
                 .copied()
                 .filter(|&h| !reachability_read.try_is_dag_ancestor_of(new_pruning_point, h).unwrap())
                 .collect_vec();
+            // Drain the anchor GC queue while we hold the pruning lock anyway. Entries
+            // are only deleted once 2x max_shielded_anchor_age below the new pruning
+            // point - outside every window a spend or the IBD anchor export can name.
+            let pp_blue = self.headers_store.get_compact_header_data(new_pruning_point).unwrap().blue_score;
+            let gc = self
+                .shielded_state_manager
+                .gc_aged_anchors(&mut batch, pp_blue, self.config.params.max_shielded_anchor_age, 50_000)
+                .unwrap();
+            if gc > 0 {
+                info!("Anchor index GC: dropped {gc} aged anchor rows (bounded by the pruning window)");
+            }
             tips_write.prune_tips_with_writer(BatchDbWriter::new(&mut batch), &pruned_tips).unwrap();
             if !pruned_tips.is_empty() {
                 info!(
@@ -570,14 +581,15 @@ impl PruningProcessor {
                 // A sparse frontier checkpoint is kept so `GetShieldedTreeState` still has
                 // fast-sync anchors down here, and past pruning points always keep theirs.
                 // The compact scan archive and the global nullifier set are never touched.
+                let compact_header = self.headers_store.get_compact_header_data(current).optional().unwrap();
                 let keep_checkpoint = keep_headers.contains(&current)
-                    || self
-                        .headers_store
-                        .get_compact_header_data(current)
-                        .optional()
-                        .unwrap()
-                        .is_some_and(|h| h.daa_score % SHIELDED_FRONTIER_CHECKPOINT_INTERVAL == 0);
-                self.shielded_state_manager.prune_block_snapshots(&mut batch, current, keep_checkpoint).unwrap();
+                    || compact_header.is_some_and(|h| h.daa_score % SHIELDED_FRONTIER_CHECKPOINT_INTERVAL == 0);
+                // The blue score is snapshotted into the anchor GC queue here because the
+                // header is about to be pruned and the age of this block's anchor rows
+                // would otherwise be unrecoverable (see `gc_aged_anchors`).
+                self.shielded_state_manager
+                    .prune_block_snapshots(&mut batch, current, keep_checkpoint, compact_header.map(|h| h.blue_score))
+                    .unwrap();
 
                 if let Some(&affiliated_proof_level) = keep_relations.get(&current) {
                     if statuses_write.get(current).optional().unwrap().is_some_and(|s| s.is_valid()) {

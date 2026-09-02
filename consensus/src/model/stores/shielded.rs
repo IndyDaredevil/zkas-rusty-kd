@@ -525,6 +525,92 @@ impl fmt::Display for AnchorKey {
     }
 }
 
+/// Key of the anchor GC queue: big-endian blue score first so the natural RocksDB
+/// iteration order is oldest-first, then the anchor and its producing block so
+/// sibling producers of one root age out independently.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AnchorGcKey(pub [u8; 72]);
+
+impl AnchorGcKey {
+    pub fn new(blue_score: u64, anchor: [u8; 32], block: Hash) -> Self {
+        let mut k = [0u8; 72];
+        k[..8].copy_from_slice(&blue_score.to_be_bytes());
+        k[8..40].copy_from_slice(&anchor);
+        k[40..].copy_from_slice(&block.as_bytes());
+        Self(k)
+    }
+
+    pub fn parts(&self) -> (u64, [u8; 32], Hash) {
+        let blue = u64::from_be_bytes(self.0[..8].try_into().unwrap());
+        let mut anchor = [0u8; 32];
+        anchor.copy_from_slice(&self.0[8..40]);
+        let mut block = [0u8; 32];
+        block.copy_from_slice(&self.0[40..]);
+        (blue, anchor, Hash::from_bytes(block))
+    }
+}
+
+impl AsRef<[u8]> for AnchorGcKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Display for AnchorGcKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for b in self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Deferred GC queue for the anchor indexes (see [`DatabaseStorePrefixes::ShieldedAnchorGcQueue`]).
+#[derive(Clone)]
+pub struct DbAnchorGcQueueStore {
+    db: Arc<DB>,
+    access: CachedDbAccess<AnchorGcKey, Hash>,
+}
+
+impl DbAnchorGcQueueStore {
+    pub fn new(db: Arc<DB>, cache_policy: CachePolicy) -> Self {
+        Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::ShieldedAnchorGcQueue.into()) }
+    }
+
+    pub fn clone_with_new_cache(&self, cache_policy: CachePolicy) -> Self {
+        Self::new(Arc::clone(&self.db), cache_policy)
+    }
+
+    pub fn enqueue_batch(&self, batch: &mut WriteBatch, blue_score: u64, anchor: [u8; 32], block: Hash) -> StoreResult<()> {
+        self.access.write(BatchDbWriter::new(batch), AnchorGcKey::new(blue_score, anchor, block), block)
+    }
+
+    /// Oldest-first entries whose blue score is `<= blue_limit`, capped at `cap`.
+    /// Keys iterate in byte order and the blue score is the big-endian prefix, so this
+    /// stops at the first too-young entry.
+    pub fn peek_upto(&self, blue_limit: u64, cap: usize) -> Vec<(u64, [u8; 32], Hash)> {
+        let mut out = Vec::new();
+        for r in self.access.iterator() {
+            let Ok((key, _)) = r else { break };
+            if key.len() != 72 {
+                continue;
+            }
+            let mut raw = [0u8; 72];
+            raw.copy_from_slice(&key);
+            let (blue, anchor, block) = AnchorGcKey(raw).parts();
+            if blue > blue_limit || out.len() >= cap {
+                break;
+            }
+            out.push((blue, anchor, block));
+        }
+        out
+    }
+
+    pub fn delete_batch(&self, batch: &mut WriteBatch, blue_score: u64, anchor: [u8; 32], block: Hash) -> StoreResult<()> {
+        self.access.delete(BatchDbWriter::new(batch), AnchorGcKey::new(blue_score, anchor, block))
+    }
+}
+
 pub trait AnchorBlockStoreReader {
     /// The chain block whose shielded tree root equals `anchor`, if any block ever
     /// produced it. `None` means no block did (the anchor is not a real tree root).
@@ -589,6 +675,22 @@ impl DbAnchorProducersStore {
         self.access.write(BatchDbWriter::new(batch), AnchorKey(anchor), producers)
     }
 
+    /// Remove one producer of `anchor`; drops the row entirely when it was the last.
+    /// Only the age-based GC calls this.
+    pub fn remove_producer_batch(&self, batch: &mut WriteBatch, anchor: [u8; 32], block: Hash) -> StoreResult<()> {
+        let mut producers = self.get_producers(&anchor)?;
+        let before = producers.len();
+        producers.retain(|p| *p != block);
+        if producers.len() == before {
+            return Ok(());
+        }
+        if producers.is_empty() {
+            self.access.delete(BatchDbWriter::new(batch), AnchorKey(anchor))
+        } else {
+            self.access.write(BatchDbWriter::new(batch), AnchorKey(anchor), producers)
+        }
+    }
+
     /// Every `(anchor, producer)` pair in the index, one row per producer.
     ///
     /// The pruning-point export needs this rather than `DbAnchorBlockStore::iter_all`: that index
@@ -647,6 +749,12 @@ impl DbAnchorBlockStore {
 
     pub fn set_batch(&self, batch: &mut WriteBatch, anchor: [u8; 32], block: Hash) -> StoreResult<()> {
         self.access.write(BatchDbWriter::new(batch), AnchorKey(anchor), block)
+    }
+
+    /// Remove an anchor mapping. Only the age-based GC calls this, for anchors provably
+    /// outside every window a spend or the IBD export can name.
+    pub fn delete_batch(&self, batch: &mut WriteBatch, anchor: [u8; 32]) -> StoreResult<()> {
+        self.access.delete(BatchDbWriter::new(batch), AnchorKey(anchor))
     }
 
     /// Every `(anchor, source block)` pair this node has indexed.

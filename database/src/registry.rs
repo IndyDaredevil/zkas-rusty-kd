@@ -145,6 +145,12 @@ pub enum DatabaseStorePrefixes {
     /// `Hash` of the base block a shielded-history replay was VERIFIED against (the
     /// PoW-anchored frontier it reproduced). Written only in the `Verified` arm.
     ShieldedHistoryVerifiedBase = 93,
+    /// Deferred GC queue for the anchor indexes: `blue_score(BE) || anchor || block`
+    /// keys enqueued when a block's snapshots are pruned, drained once the entry is
+    /// provably outside both the spend window and the IBD anchor export
+    /// (see `gc_aged_anchors`). Without it the anchor indexes grow one row per chain
+    /// block forever.
+    ShieldedAnchorGcQueue = 94,
 
     // ---- Separator ----
     /// Reserved as a separator

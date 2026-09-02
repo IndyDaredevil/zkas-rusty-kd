@@ -33,6 +33,7 @@ use rocksdb::WriteBatch;
 
 use kaspa_muhash::MuHash;
 
+use crate::model::stores::shielded::DbAnchorGcQueueStore;
 use crate::model::stores::shielded::{
     AnchorBlockStoreReader, AnchorProducersStoreReader, BurnReceipts, DbAnchorBlockStore, DbAnchorProducersStore,
     DbNullifierDiffStore, DbNullifierSetStore, DbShieldedAnchorSourceScoreStore, DbShieldedBurnStore, DbShieldedDevAccruedStore,
@@ -537,6 +538,8 @@ pub struct ShieldedStateManager {
     dev_accrued_store: DbShieldedDevAccruedStore,
     nullifier_muhash: DbShieldedNullifierMuHashStore,
     anchor_block: DbAnchorBlockStore,
+    /// Deferred age-based GC queue for the two anchor indexes; see [`Self::gc_aged_anchors`].
+    anchor_gc: DbAnchorGcQueueStore,
     /// Every producer of each root — the reorg-safe replacement for `anchor_block`.
     anchor_producers: DbAnchorProducersStore,
     scan_block: DbShieldedScanBlockStore,
@@ -559,6 +562,7 @@ impl ShieldedStateManager {
             dev_accrued_store: DbShieldedDevAccruedStore::new(Arc::clone(&db), cache_policy),
             nullifier_muhash: DbShieldedNullifierMuHashStore::new(Arc::clone(&db), cache_policy),
             anchor_block: DbAnchorBlockStore::new(Arc::clone(&db), cache_policy),
+            anchor_gc: DbAnchorGcQueueStore::new(Arc::clone(&db), cache_policy),
             anchor_producers: DbAnchorProducersStore::new(Arc::clone(&db), cache_policy),
             scan_block: DbShieldedScanBlockStore::new(Arc::clone(&db), cache_policy),
             burn_store: DbShieldedBurnStore::new(Arc::clone(&db), cache_policy),
@@ -873,7 +877,32 @@ impl ShieldedStateManager {
     /// `keep_checkpoint` marks blocks whose frontier survives as a fast-sync anchor for
     /// `GetShieldedTreeState`; pass `true` for pruning points and for the sparse
     /// checkpoints, `false` otherwise.
-    pub fn prune_block_snapshots(&self, batch: &mut WriteBatch, block: Hash, keep_checkpoint: bool) -> StoreResult<()> {
+    pub fn prune_block_snapshots(
+        &self,
+        batch: &mut WriteBatch,
+        block: Hash,
+        keep_checkpoint: bool,
+        blue_score: Option<u64>,
+    ) -> StoreResult<()> {
+        // Queue this block's anchor-index rows for age-based GC. The rows themselves must
+        // NOT be deleted here: a block being pruned sits just below the pruning point,
+        // which is still inside the window the shielded IBD export serves
+        // (`anchors_for_blocks`) and inside `max_shielded_anchor_age` of blocks near the
+        // pruning point — deleting now would break both. The root is read from the
+        // frontier before it is (possibly) dropped below; once the block's header is
+        // pruned its blue score is unrecoverable, which is exactly why it is snapshotted
+        // into the queue key now.
+        if let Some(blue) = blue_score {
+            match self.tree_store.get(block) {
+                Ok(state) => {
+                    if let Ok(tree) = GlobalTree::from_state(&state) {
+                        self.anchor_gc.enqueue_batch(batch, blue, tree.anchor().to_bytes(), block)?;
+                    }
+                }
+                Err(kaspa_database::prelude::StoreError::KeyNotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
         self.supply_store.delete_batch(batch, block)?;
         self.nullifier_muhash.delete_batch(batch, block)?;
         self.burn_store.delete_batch(batch, block)?;
@@ -885,6 +914,33 @@ impl ShieldedStateManager {
             self.tree_store.delete_batch(batch, block)?;
         }
         Ok(())
+    }
+
+    /// Drain the anchor GC queue: delete anchor-index rows whose source block's blue
+    /// score is more than `2 * max_age` below the pruning point's — provably outside
+    /// the spend window (`max_shielded_anchor_age`, fail-closed on a missing entry
+    /// anyway) and outside anything `anchors_for_blocks` can export. The 2x margin is
+    /// deliberate slack over both. `anchor_block` is last-write-wins, so its row is
+    /// only removed when it still points at the aged block — a younger producer of the
+    /// same root keeps the mapping. Returns how many queue entries were processed.
+    ///
+    /// Without this the two anchor indexes grow one row per chain block for the life
+    /// of the chain (~3.1M rows at 36 days old), and the IBD export pays a full-index
+    /// scan per syncing peer. With it they stay bounded by the pruning window.
+    pub fn gc_aged_anchors(&self, batch: &mut WriteBatch, pp_blue_score: u64, max_age: u64, cap: usize) -> StoreResult<usize> {
+        let limit = pp_blue_score.saturating_sub(max_age.saturating_mul(2));
+        if limit == 0 {
+            return Ok(0);
+        }
+        let aged = self.anchor_gc.peek_upto(limit, cap);
+        for &(blue, anchor, block) in &aged {
+            if self.anchor_block.get(&anchor)? == Some(block) {
+                self.anchor_block.delete_batch(batch, anchor)?;
+            }
+            self.anchor_producers.remove_producer_batch(batch, anchor, block)?;
+            self.anchor_gc.delete_batch(batch, blue, anchor, block)?;
+        }
+        Ok(aged.len())
     }
 
     /// Dev fee accrued but unpaid as of a chain block. `0` for every block mined
@@ -1484,7 +1540,7 @@ mod tests {
 
         let mut batch = WriteBatch::default();
         for b in [pruned, checkpoint] {
-            mgr.tree_store.set_batch(&mut batch, b, FrontierState { size: 5, leaf: Some([9u8; 32]), ommers: vec![] }).unwrap();
+            mgr.tree_store.set_batch(&mut batch, b, FrontierState { size: 1, leaf: Some(cmx(9).to_bytes()), ommers: vec![] }).unwrap();
             mgr.supply_store.set_batch(&mut batch, b, SupplyTotals { cumulative_coinbase: 10, cumulative_fees: 1 }).unwrap();
             mgr.dev_accrued_store.set_batch(&mut batch, b, 77).unwrap();
             mgr.scan_block
@@ -1507,8 +1563,8 @@ mod tests {
         db.write(batch).unwrap();
 
         let mut batch = WriteBatch::default();
-        mgr.prune_block_snapshots(&mut batch, pruned, false).unwrap();
-        mgr.prune_block_snapshots(&mut batch, checkpoint, true).unwrap();
+        mgr.prune_block_snapshots(&mut batch, pruned, false, Some(5)).unwrap();
+        mgr.prune_block_snapshots(&mut batch, checkpoint, true, Some(6)).unwrap();
         db.write(batch).unwrap();
 
         // Recomputation snapshots are gone for both; zero/default is what a missing key reads as.
@@ -1517,13 +1573,58 @@ mod tests {
         assert_eq!(mgr.frontier_at(pruned).unwrap().size, 0, "a non-checkpoint frontier is dropped");
 
         // The checkpoint keeps its frontier so fast-sync still has an anchor down here.
-        assert_eq!(mgr.frontier_at(checkpoint).unwrap().size, 5, "a checkpoint frontier survives");
+        assert_eq!(mgr.frontier_at(checkpoint).unwrap().size, 1, "a checkpoint frontier survives");
 
         // Never dropped: the wallet's scan archive and the global nullifier set.
         for b in [pruned, checkpoint] {
             assert!(mgr.scan_block(b).unwrap().is_some(), "the compact scan archive must survive pruning");
         }
         assert!(mgr.nullifiers.contains(&[5u8; 32]).unwrap(), "a spent nullifier must outlive its block");
+
+        // Pruning ENQUEUED both blocks' anchor rows for age-based GC but deleted nothing:
+        // a just-pruned block is still inside the window the IBD export serves.
+        assert_eq!(mgr.anchor_gc.peek_upto(u64::MAX, 100).len(), 2, "both pruned blocks queue their anchor rows");
+    }
+
+    /// The anchor GC deletes only rows aged 2x `max_age` below the pruning point, and
+    /// never breaks a last-write-wins mapping that a younger block still owns.
+    #[test]
+    fn anchor_gc_drops_only_aged_rows_and_respects_last_write_wins() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = ShieldedStateManager::new(db.clone(), CachePolicy::Empty);
+        let (old_block, young_block) = (Hash::from_bytes([41u8; 32]), Hash::from_bytes([42u8; 32]));
+        let root = [7u8; 32];
+
+        let mut batch = WriteBatch::default();
+        // Both blocks produced the same root (e.g. the younger carried no shielded txs);
+        // the single-valued index points at the YOUNGER writer.
+        mgr.anchor_block.set_batch(&mut batch, root, old_block).unwrap();
+        mgr.anchor_block.set_batch(&mut batch, root, young_block).unwrap();
+        mgr.anchor_producers.add_producer_batch(&mut batch, root, old_block).unwrap();
+        mgr.anchor_producers.add_producer_batch(&mut batch, root, young_block).unwrap();
+        mgr.anchor_gc.enqueue_batch(&mut batch, 100, root, old_block).unwrap();
+        mgr.anchor_gc.enqueue_batch(&mut batch, 500, root, young_block).unwrap();
+        db.write(batch).unwrap();
+
+        // pp_blue 130, max_age 10: limit = 110 -> only the blue-100 entry qualifies.
+        let mut batch = WriteBatch::default();
+        let processed = mgr.gc_aged_anchors(&mut batch, 130, 10, 1000).unwrap();
+        db.write(batch).unwrap();
+        assert_eq!(processed, 1, "only the aged entry is drained");
+
+        // The mapping survives - it points at the younger producer, not the aged one.
+        assert_eq!(mgr.anchor_block.get(&root).unwrap(), Some(young_block), "last-write-wins mapping owned by a younger block survives");
+        assert_eq!(mgr.anchor_producer_blocks(&root).unwrap(), vec![young_block], "only the aged producer row is removed");
+        assert_eq!(mgr.anchor_gc.peek_upto(u64::MAX, 100).len(), 1, "the young queue entry stays");
+
+        // Age the young entry out too: now the mapping itself goes.
+        let mut batch = WriteBatch::default();
+        let processed = mgr.gc_aged_anchors(&mut batch, 100_000, 10, 1000).unwrap();
+        db.write(batch).unwrap();
+        assert_eq!(processed, 1);
+        assert_eq!(mgr.anchor_block.get(&root).unwrap(), None, "an anchor with no live producer is fully dropped");
+        assert!(mgr.anchor_producer_blocks(&root).unwrap().is_empty());
+        assert!(mgr.anchor_gc.peek_upto(u64::MAX, 100).is_empty(), "queue fully drained");
     }
 
     fn cmx(n: u32) -> ExtractedNoteCommitment {
