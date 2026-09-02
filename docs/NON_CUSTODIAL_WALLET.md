@@ -1,9 +1,15 @@
 # Non-custodial ZKas web wallet — design
 
+> **Status: IMPLEMENTED and live on mainnet.** The hosted wallet at `wallet.zkas.info`
+> is non-custodial today: the seed is generated in the browser, the daemon receives the
+> **viewing key only**, and signing happens on the user's device (web/desktop/mobile —
+> see the wallet repo's custody table). What follows is the original design document,
+> kept as the record of how and why.
+
 **Goal:** a web wallet at `wallet.zkas.info` where **the server cannot spend user
-coins.** Today's hosted `zkas-walletd` is *custodial* — it generates and stores each
-user's seed (plaintext), so a server compromise drains everyone. This document is the
-plan to remove that.
+coins.** The hosted `zkas-walletd` of the time was *custodial* — it generated and stored
+each user's seed (plaintext), so a server compromise would drain everyone. This document
+was the plan to remove that.
 
 ## The enabling fact (why this is even possible on a shielded chain)
 

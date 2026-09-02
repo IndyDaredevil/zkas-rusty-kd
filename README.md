@@ -31,6 +31,24 @@ explorer API.
   0.6 ZKAS/block floor (~18.9M ZKAS/year, ~2.2% at onset decaying toward ~1%). No fixed
   supply cap.
 
+## Status & security
+
+- **Mainnet is live** (since late July 2026). The genesis is anchored to Bitcoin block
+  959,713 (`zkas-mainnet btc#959713` in the genesis coinbase) — see the
+  [no-premine proof](https://zkas.info). Earlier public **test chains were wound down
+  before this genesis was cut**; the anchored genesis is the final one and there is no
+  planned reset.
+- **No external audit yet.** The novel piece — Orchard shielded state (nullifier set,
+  note-commitment tree, turnstile supply invariant) kept consistent under GHOSTDAG's
+  out-of-order block acceptance — is specified in the
+  [whitepaper](https://zkas.info/whitepaper.html) and exercised by the consensus test
+  suite, but has not had an independent security review. Treat the software accordingly,
+  and if you break an invariant we want to hear about it.
+- **Custody:** end-user wallets (web, desktop, mobile, paper) are **non-custodial** —
+  the seed stays on the user's device and the daemon receives a viewing key only
+  (`docs/NON_CUSTODIAL_WALLET.md`). `zkas-walletd`'s custodial mode exists for
+  operators (pools, payout services) that must sign server-side.
+
 ## Run a node
 
 Binaries: [Releases](https://github.com/firecash/zkas-rusty/releases) · to compile instead,
