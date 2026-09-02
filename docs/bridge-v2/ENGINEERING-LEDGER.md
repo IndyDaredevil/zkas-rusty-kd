@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-086 (2026-09-02)
+### Last entry: BL-091 (2026-09-02)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -2370,3 +2370,219 @@ a public issue all sat downstream of a single JSON body that contained its
 own disambiguator two fields below the one we parsed — and the cheapest
 instrument in the entire A3 chain was the one nobody ran: print the response
 and look at it.
+
+## 2026-09-02 — S19: event #9 fully witnessed, the power architecture decided, H8 rehearsed
+
+**BL-087 · 2026-09-02 · host/power — series event #9: the first FULLY
+WITNESSED event; premises acquitted twice over; money rail undamaged; brick
+swapped and the experiment armed**
+Timeline, all measured: last deadman ping ~13:50 EDT · death 13:53:17
+(41+6008, **34s dark** — host self-recovered to the logon screen) · DOWN
+email 14:00:02 (period+grace exact, instrument nominal) · operator home
+~14:12, ATTESTED hard-off for the brick swap (its 14:12:51 41/6008 decodes
+identically to the series — the attestation fence is the ONLY discriminator,
+now demonstrated; without this line it becomes phantom event #10) · boot #2
+on the 120W brick 14:12:49 · stack restart 14:14:35 · ping #677 ~14:15.
+IPv6 interface-identifier flip corroborates the reboot boundary.
+Both 41s decode BugcheckCode=0 / PowerButtonTimestamp=0 — seven decodable
+events now, seven at 0/0.
+PREMISES ACQUITTED TWICE: PowerPanel (proven watching the 1000VA by the
+08-30 plug-pull rows) shows ZERO transfers; and the four rigs NOT moved in
+the operator's UPS rebalance all read **~6d12h uptime — continuous through
+13:53**, dating their last boot to the 08-27 premises-recovery, a
+self-corroborating cross-check. (The three short uptimes are the attested
+moves: w2m 35m, w5m 38m, w7m 21m.) Fault LOCALIZED downstream of the UPS
+outlet: brick, barrel, or board.
+DEADMAN SEMANTICS CORRECTED BY ITS FIRST LIVE EVENT: the host sat booted
+and healthy at the logon screen for ~19 minutes, silent. Mechanism read,
+not inferred: principal `LogonType: Interactive`, single time-trigger, NO
+boot trigger; no heartbeat failure log exists → the task NEVER RAN (vs.
+ran-and-failed). The instrument measures INTERACTIVE-SESSION liveness.
+BL-074 amended accordingly; fix (boot trigger + non-interactive principal)
+rides H2 with the sampler's.
+H2's cost side, measured: host back in 34 seconds; PRODUCTION back in 24
+minutes — and only because the operator happened to come home. That number
+moves H2's service migration from hygiene to front-of-queue.
+MONEY RAIL: ZERO DAMAGE — first incident in the series' history. Last
+pre-death block (7628d0…, 17:16 UTC) fully settled before death; 20/20
+blocks today refined, beat2 178–235s (max 210.6s post-recovery), pending 0,
+post_failures 0. Contrast: the 08-29/30 incidents printed 3132s/2323s maxes
+and 17 give-ups on the same instrument. r3's defer-gate fired IN PRODUCTION
+for the first time (`provisional amount UNKNOWN … beats deferred` — r1
+would have armed a zero), with ERRSTREAM capturing the walletd
+connection-refused burst live.
+Two chain observations rode the recovery window: a SUBSIDY STEP occurred
+between 09-01 and 09-02 (45.24092998 → 42.70175169 — stepped emission,
+fresh edge; all expected-value figures must roll) and the first OBSERVED
+mergeset-fee delta: BEAT1 prov 42.70175169 → BEAT2 exact 42.94753769
+(+0.24578600, a chain block earning fees — BL-069's mechanism, live, the
+two-beat architecture visibly correcting money).
+BRICK SWAP: PERFEIDY 19V/6.3A/120W in at 14:12:49 (operator attests ~14:15;
+the boot pen is the measured edge). Wiggle-test done; old AS0651 labeled
+and RETAINED as evidence. **Experiment armed with its falsifier stated:
+quiet under the 120W brick is weak evidence (this series has shown 10+
+quiet days); another 41/6008 with zero PowerPanel rows CONVICTS
+barrel-or-board and acquits the brick.** Old-brick era closes at 8 prior
+events plus #9 (~87% sustained loading, headroom-exhaustion mechanism per
+BL-076).
+**Lesson:** every instrument installed on 08-30/31 fired correctly at its
+first live event — and the one that fired WRONG (the deadman's silence)
+failed in a readable way that corrected its own spec. Nothing in this entry
+is inferred; that is what the weekend bought.
+
+**BL-088 · 2026-09-02 · power architecture — outlet map final, canary
+designated, the router gap found, and the end-state decided and funded**
+FINAL MAP (operator-executed rebalance; retires the H2 rider): 1000VA =
+Kron + auxiliary, 52W, battery-backed (an ~11W drop from BL-048's ~63W
+arrived with the new brick — unexplained, benign, noted). 1500VA-1 = KS7 +
+2×KS0 battery-backed, 742W + **w8m (KS7) on SURGE-ONLY ← designated
+premises canary**. 1500VA-2 = KS7 + 2×KS0 battery-backed, 752W. House
+terminology fixed: **battery-backed** vs **surge-only** (CyberPower's own
+labels); "pass-through" collides with UPS bypass-mode and is retired.
+Canary trade stated deliberately: w8m is the fleet's top producer (31.1%
+attribution) — correct as instrumentation (a reboot you'd notice), priced
+as a real premises event costing its uptime + ramp.
+SCOPING CORRECTION to every "zero PowerPanel rows" claim in the series:
+PowerPanel watches the 1000VA ONLY; the 1500VAs retain no onboard history
+and have no PC attached — they are DARK instruments. Correct scope (Kron is
+the patient), but a rig-side-only premises sag is invisible everywhere
+except rig uptime counters — the canary's real coverage.
+ROUTER GAP, found by the operator: on premises loss the AT&T gateway (no
+UPS) drops — both nodes lose all peers (templates freeze; the fleet hashes
+a dead DAG) and the deadman's path dies, paging host-down for a healthy
+host. FIX DECIDED: gateway → the 1000VA — fate-sharing with Kron is the
+architecture (a separate upstairs UPS would create alive-but-blind mismatch
+windows); ~15W on 52W is trivial. Gated on a first-floor→basement cable
+drop; executes in the UPS-expansion physical window. Interim exposure:
+known, detectable (PowerPanel row + port-census playbook), accepted.
+END-STATE DECIDED: each KS7 on its own 1500VA with 1–2 KS0s (A: KS7+2×KS0
+~83% — the one hot unit, four KS0s don't divide by three; B/C: KS7+1×KS0
+~72%). All seven battery-backed; canary role RETIRES — succeeded by
+NUT/witness-node detection + the gateway move (which becomes prerequisite,
+not nicety). Third 1500VA **ORDERED**.
+WITNESS NODE DECIDED AND ORDERED (~$100: Pi 4 2GB kit w/ case+PSU,
+high-endurance SD bought separately, wired ethernet, powered from the
+1000VA battery side): NUT multi-UPS monitoring (PowerPanel is structurally
+one-UPS-per-PC; the 1500VAs get their first observer) → nut_exporter → the
+existing Prometheus/Telegram rail, monitoring-only, drilled per BL-054
+(three input-pulls, three witnessed alerts) before it counts. Identical
+tri-unit discrimination risk flagged: serial-match in ups.conf, udev
+port-path fallback if serials are blank. CHARTER beyond NUT, in order, one
+at a time: (1) deadman successor/second-leg off-host (immune to the session
+semantics BL-087 exposed), (2) rig-canary exporter (seven IceRiver UIs
+polled to Prometheus — retires browser-tab forensics), then WAN-continuity
+probe and an off-Kron backup landing zone. Firm NOs recorded: nothing
+mining-critical, no node, no LAN-critical service, nothing inbound-exposed
+— the box's value IS its independence, and drift surface is its rent.
+Rig IPs still on no rail — KRON-HARDENING r3 carries them (twice now the
+decisive test stalled on "where do I read rig uptime").
+**Lesson:** the operator found the coverage gap the instruments could not —
+the gateway sat outside every UPS while everything it enables sat inside.
+Enumerate the DEPENDENCIES of protection, not only the protected.
+
+**BL-089 · 2026-09-02 · upstream/H8 — BL-086's release gate is ALREADY
+SATISFIED: v1.0.8 contains 9a464d51 (compare-verified); H8 re-briefed to
+v1.0.8 with three corrections; the cutover class REHEARSED on the MacBook**
+Reconciliation of BL-086's forward-looking gate: `gh api compare/
+zkas-v1.0.8...9a464d51` → `status: behind, ahead_by: 0` — the fix is an
+ANCESTOR of the tag. "Next tagged release" was v1.0.8 itself (tagged 09-01
+10:07, hours after the fix landed). H8's acceptance inherits BL-086's clean
+check: post-cutover, the six-strand class leaves `tipHashes` within one
+finality interval (~12h), no resync. Maintainer's close also endorsed our
+`None` anchor (index 0 "is not a semantic position") — the v2.0.1.6 fix is
+now maintainer-recommended, and BL-086's `sink`/`virtualParentHashes`
+discriminator goes in the patch comment.
+v1.0.7 READ (the skipped version), three corrections banked: (1) the
+v1.0.8 "shared chain tree reset" fix targets code our v1.0.5 walletd
+PREDATES — the wedge class stays formally undiagnosed; the honest statement
+is that walletd is TWO overhauls behind, and v1.0.6's "wallet lock no
+longer held while serializing balance polls (10,507,750 → 185 bytes)" is
+the plausible mechanism for our 10s-timeout bursts (acceptance metric:
+poll_failures flatlines post-cutover). (2) Stranded-tip provenance =
+the v1.0.2–1.0.4 disqualification-storm era — "known early-chain incident
+window" decoded by release archaeology. (3) Skipping v1.0.7 was LUCKY:
+v1.0.8's "v8 checkpoints load again" implies 1.0.7 broke checkpoint
+loading; v1.0.5→v1.0.8 jumps the pothole.
+v1.0.7 also brings: DNS seeder seed.zkas.info (peer pins droppable),
+complete-history-on-every-node w/ frontier checkpoints (Kron's archival
+stewardship stops being systemically load-bearing), and
+`missing_history`/`history_complete` wire semantics — a NEW walletd refusal
+state the reporter's fail-closed logic must recognize on the canary
+(plausibly REPLACES the zeroed-object trap with an honest signal). p2p
+default moved 16111 (1.0.7) → 16811 (1.0.8): launcher port audit rides the
+cutover. Release binary naming changed (node ships as `kaspad`; new
+`zkas-api`, `shielded-pay` binaries) — exporter include-regex and launchers
+audit with it.
+H8 DRESS REHEARSAL PASSED (MacBook, 09-01): the wallet app's bundled node —
+a 13-era 2.8 GB datadir — upgraded IN PLACE to v1.0.8 and caught up at
+~41k daa/minute to Kron's tip ±1 block, zero intervention. Same operation
+class as Kron's cutover, executed first on the low-stakes machine.
+**Lesson:** a gate written as "watch for X" must be re-checked against
+evidence ALREADY HELD — this chat had verified containment fourteen hours
+before BL-086 restated the gate as open. Cross-session merges reconcile
+forward-looking claims, not just facts.
+
+**BL-090 · 2026-09-02 · custody — zkas-wallet 13→29 on the MacBook: the
+/reveal-era surface retired, the dead embedded engine explained, balance
+re-derived sompi-exact, and the app joins the recorded stack**
+The desktop wallet (self-custody + Covenants++ REST harness,
+`info.zkas.wallet`, zkas-api :8500 loopback) was found SIXTEEN releases
+behind — on no rail, watched by nothing; that it took a review prompt to
+discover is itself the finding. 99-commit delta read
+(~/zkas-lab/zkas-wallet-13-29-delta.txt): v1.0.13 carried the CUSTODIAL-ERA
+surface removed at 1.0.19 (`/api/wallet/create`, `/import`, **`/reveal`**,
+and a silent seed-fetch fallback in resolveDeviceSeed) plus plaintext key
+fallbacks sealed at 1.0.27; the desktop connection chooser LIED until
+1.0.19–21 (unlock silently reverted to the embedded daemon while the UI
+showed the remote choice — `25d608d`). That commit EXPLAINS the operator's
+observed history verbatim: a local node went offline, and every unlock
+re-pointed at the dead backend regardless of selection. LIVE CONFIRMATION
+pre-upgrade: zkas-api running with `--rpc-server=127.0.0.1:16810` and
+NOTHING listening there — 1.0.27's "dead embedded engine" report observed
+on this machine. Consequence recorded: pre-upgrade Covenants++ test
+provenance (which node validated) is uncertain; balance figures of that era
+were cache-or-remote, indeterminate by construction.
+Upgrade per custody protocol: hex-key backup CONFIRMED offline first →
+clean quit (sidecar killed by PID) → cold copy
+`wallet-backup-pre-1.0.29-20260901-165823` (454 files / 3.5 GB, manifest
+454, includes the node datadir — a full state snapshot) → DMG
+`ed98e2dd6a2370280195d909ce42bcd303a7109117bc38e4d8e635cd3846e14f` (13 MB,
+authenticated gh download; no published checksums — our sha at download is
+the identity) → install → About **1.0.29** ("New in 1.0.17" popup = unseen
+backlog, benign) → both wallets AUTO-REGISTERED (44d1f34's audit path; also
+evidence the 13-era at-rest storage was readable unsealed — App Lock then
+enabled, sealing into the 1.0.27 path) → embedded node updated in-app to
+v1.0.8, synced (BL-089's rehearsal) → **balance gate PASSED sompi-exact:
+200,451,802,596,746 sompi / 7 notes**, first trustworthy derivation since
+the engine died — retroactively validating the dead-engine-era readings.
+App Lock scope characterized: ONE challenge spans both wallets — no
+per-wallet isolation; app-scoped seal. Correct per design; strengthens the
+cold-storage-sweep case (with "custody component aged 16 releases
+unwatched" as the second strengthener this week). New habit filed: wallet
+releases are CI-stamped with no notes — the commit range is the changelog;
+a release check joins session-open hygiene.
+**Lesson:** custody components age silently — nothing in the monitoring
+universe watches an app version. Put every key-touching binary on a rail
+with a version pin, or it drifts sixteen releases with `/reveal` exposed.
+
+**BL-091 · 2026-09-02 · process — cross-session merging PROVEN on the
+rails; the header trap's third occurrence fixed; two laws minted; and the
+sweep catching a live BL-collision**
+The PRF0 session (memory posture, p2p discoverability — BL-081..085) ran
+parallel to this one; merge executed by READING THE RAILS, not the chats:
+mount ledger → full S18 ingest → boards reconciled → this session's content
+renumbered around it. Defect found live: S18's merge shipped with the
+self-header still reading BL-080 — THIRD header incident — fixed at
+`3270a7c` (count invariant 2305, sha the only discriminator: law 15's own
+exhibit). Two laws minted and filed to project instructions: **17
+(prior-work sweep before verdicts, evidence base stated, partial-base
+verdicts provisional)** and **2g (a merge is complete only when the merged
+file's self-header reads back equal to the append's final BL id, before
+commit)**. Both earned same-day: the pre-cut re-pin for THIS append found
+the base moved 2305→2372 with BL-086 freshly banked by yet another session
+— a blind cut would have collided at BL-086; the sweep renumbered S19 to
+BL-087+ and dovetailed BL-086's open gate (BL-089) instead of duplicating
+it. Three sessions, one record, zero bytes lost.
+**Lesson:** the rails ARE the merge instrument — and they only work if
+every session re-pins the base at cut time and reads what landed since.
+The two new laws are the mechanization of exactly that.
