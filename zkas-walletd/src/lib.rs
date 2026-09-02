@@ -337,6 +337,12 @@ pub struct ResourceLimits {
     pub idle_evict_secs: u64,
     pub max_resident_wallets: usize,
     pub subtree_free_floor_mb: u64,
+    /// Full pages to fetch CONCURRENTLY ahead of the ingest cursor during a
+    /// deep (restore/catch-up) scan. 1 keeps the single cross-wallet prefetch
+    /// the hosted daemon relies on; a fetch-bound client (a phone hitting a
+    /// remote node) raises it so the loop stops fetching pages one-at-a-time
+    /// with the cores idle between round-trips. See `deep_prefetch`.
+    pub prefetch_depth: usize,
 }
 
 impl Default for ResourceLimits {
@@ -358,6 +364,7 @@ impl Default for ResourceLimits {
             idle_evict_secs: 30 * 60,
             max_resident_wallets,
             subtree_free_floor_mb: 1_200,
+            prefetch_depth: 1,
         }
     }
 }
@@ -1811,6 +1818,72 @@ impl PageCache {
 /// fetch+decode here serves the whole cohort for `PAGE_CACHE_TTL`. The cache key
 /// includes the page limit: a 16-block tip page and a 1000-block catch-up page
 /// from the same cursor are different answers.
+/// Concurrent read-ahead for a deep (restore/catch-up) scan.
+///
+/// The per-page prefetch in `sync_chunk` only ever warms ONE page ahead, because a
+/// full page reveals exactly one future cursor (its last block hash). On a
+/// fetch-bound client - a phone hitting a remote node, where a page is round-trip
+/// latency and not CPU - that leaves the loop fetching pages strictly one at a time
+/// with the cores idle in between. This discovers the next `depth` page boundaries
+/// with cheap `metadata_only` scouts (header-only, no archive read; the node returns
+/// up to 2000 hashes per call = two page boundaries) and fires the full-page fetches
+/// CONCURRENTLY into the shared page cache, so the ingest loop finds them warm.
+///
+/// Fire-and-forget and cache-only: it never advances a cursor or touches the tree, so
+/// a failed or reorged scout can only waste a fetch, never a note. `depth` includes
+/// the page at `start` itself.
+async fn deep_prefetch(state: std::sync::Arc<AppState>, client: GrpcClient, start: RpcHash, depth: usize) {
+    let page = SHIELDED_PAGE as usize;
+    let warm = |cur: RpcHash| {
+        let st = state.clone();
+        let cl = client.clone();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(
+                SYNC_RPC_TIMEOUT,
+                fetch_shielded_page(&cl, &st.page_cache, cur, SHIELDED_PAGE),
+            )
+            .await;
+        });
+    };
+    // Page 1: the very next page the loop will ask for (deduped against the loop's
+    // own fetch and the per-page prefetch by the in-flight gate).
+    warm(start);
+    let mut warmed = 1usize;
+    let mut anchor = start; // exclusive cursor of the page we scout past
+    while warmed < depth {
+        let meta = match tokio::time::timeout(
+            SYNC_RPC_TIMEOUT,
+            client.get_shielded_block_metadata(anchor, 2 * SHIELDED_PAGE),
+        )
+        .await
+        {
+            Ok(Ok(m)) if !m.reorged => m,
+            // Scout failed / reorged / node busy: stop. The loop's own fetch still
+            // covers `start`; the next chunk retries the read-ahead.
+            _ => break,
+        };
+        // The 1000th and 2000th block after `anchor` are the exclusive cursors of the
+        // next two full pages.
+        for boundary in [page - 1, 2 * page - 1] {
+            if warmed >= depth {
+                break;
+            }
+            match meta.blocks.get(boundary) {
+                Some(b) => {
+                    warm(b.hash);
+                    warmed += 1;
+                }
+                // Short page: reached the tip, nothing further to warm.
+                None => return,
+            }
+        }
+        if (meta.blocks.len() as u64) < 2 * SHIELDED_PAGE {
+            break; // reached the tip
+        }
+        anchor = meta.blocks[2 * page - 1].hash;
+    }
+}
+
 async fn fetch_shielded_page(
     client: &GrpcClient,
     cache: &Mutex<PageCache>,
@@ -2243,6 +2316,14 @@ impl WalletEntry {
         // carried arrived, so the next iteration must take a full page to catch
         // up in one go (otherwise a stalled wallet would crawl at CAUGHT_UP_PAGE
         // blocks per pass).
+        // Concurrent read-ahead for the deep-sync regime. `preview_roll` empty means
+        // this wallet is not caught up, so `page_limit` below is a full SHIELDED_PAGE
+        // and the loop is fetch-bound; warm `prefetch_depth` pages at once so the
+        // cores are not idle between round-trips. Fire-and-forget and cache-only.
+        if state.resources.prefetch_depth > 1 && self.preview_roll.is_empty() {
+            let depth = state.resources.prefetch_depth;
+            tokio::spawn(deep_prefetch(state.clone(), client.clone(), self.low, depth));
+        }
         let mut need_full_page = false;
         for _ in 0..PAGES_PER_CHUNK {
             // HARD TIMEOUT. There is ONE sync loop for every wallet, and it advances them
