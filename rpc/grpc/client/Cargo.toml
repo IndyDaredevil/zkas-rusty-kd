@@ -31,6 +31,9 @@ prost.workspace = true
 rand.workspace = true
 regex.workspace = true
 thiserror.workspace = true
+tower = { workspace = true }
+tokio-socks = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",

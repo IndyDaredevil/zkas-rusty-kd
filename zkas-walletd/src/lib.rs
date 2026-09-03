@@ -328,6 +328,8 @@ pub struct Config {
     /// property of the deployment. `/health` deliberately does not count as use:
     /// an uptime monitor polling it would otherwise hold the door open forever.
     pub idle_timeout: Option<std::time::Duration>,
+    /// SOCKS5 proxy (host:port) for the node gRPC connection (Tor on-device). None = direct.
+    pub node_socks_proxy: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -8070,6 +8072,13 @@ mod warm_sweep_tests {
 /// new config — e.g. after the user switches nodes.
 pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>) -> Result<(), String> {
     let listen = cfg.listen;
+    // Route node gRPC through Tor/SOCKS when the embedder asked for it. Process-wide
+    // and first-set-wins, so it must happen before the first connect below.
+    if let Some(proxy) = cfg.node_socks_proxy.clone() {
+        if !proxy.is_empty() {
+            kaspa_grpc_client::set_node_socks_proxy(proxy);
+        }
+    }
     let wallet_dir = cfg.wallet_dir;
     let _ = std::fs::create_dir_all(&wallet_dir);
 

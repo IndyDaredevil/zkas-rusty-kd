@@ -192,6 +192,7 @@ pub async fn run_selfhost(cfg: SelfHostConfig, shutdown: tokio::sync::oneshot::R
         // like a treasury, and the ceiling leaves an ordinary wallet untouched.
         auto_consolidate: Some(crate::AUTO_CONSOLIDATE_DEFAULT),
         build_shared_tree: true,
+        node_socks_proxy: None,
         // A self-host is the owner's own daemon: custodial endpoints stay enabled.
         allow_custodial: true,
         max_concurrent_proves: crate::default_max_concurrent_proves(),

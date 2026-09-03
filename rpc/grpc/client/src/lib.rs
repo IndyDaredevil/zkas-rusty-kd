@@ -51,6 +51,46 @@ use std::{
 use tokio::sync::Mutex;
 use tonic::Streaming;
 use tonic::codec::CompressionEncoding;
+use std::sync::OnceLock;
+
+/// A SOCKS5 proxy (host:port) to reach the gRPC server through, set ONCE per process.
+/// The on-device wallet engine sets this to Orbot for Tor mode; the node and hosted
+/// daemon never set it, so their connection path stays byte-identical.
+pub static NODE_SOCKS_PROXY: OnceLock<String> = OnceLock::new();
+
+/// Set the process-wide SOCKS5 proxy for gRPC node connections (first set wins).
+pub fn set_node_socks_proxy(addr: String) {
+    let _ = NODE_SOCKS_PROXY.set(addr);
+}
+
+/// Build a tonic channel to `url`, dialing through [`NODE_SOCKS_PROXY`] when set.
+async fn connect_channel(url: &str, request_timeout: u64) -> Result<tonic::transport::Channel> {
+    let uri = url.parse::<tonic::transport::Uri>().map_err(|e| Error::String(e.to_string()))?;
+    let endpoint = tonic::transport::Channel::builder(uri.clone())
+        .timeout(tokio::time::Duration::from_millis(request_timeout))
+        .connect_timeout(tokio::time::Duration::from_millis(CONNECT_TIMEOUT_DURATION));
+    match NODE_SOCKS_PROXY.get() {
+        Some(proxy) => {
+            let proxy = proxy.clone();
+            let host = uri.host().unwrap_or_default().to_string();
+            let port = uri.port_u16().unwrap_or(16110);
+            let channel = endpoint
+                .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
+                    let proxy = proxy.clone();
+                    let host = host.clone();
+                    async move {
+                        let stream = tokio_socks::tcp::Socks5Stream::connect(proxy.as_str(), (host.as_str(), port))
+                            .await
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                        Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream.into_inner()))
+                    }
+                }))
+                .await?;
+            Ok(channel)
+        }
+        None => Ok(endpoint.connect().await?),
+    }
+}
 
 mod connection_event;
 pub mod error;
@@ -533,19 +573,9 @@ impl Inner {
         counters: Arc<TowerConnectionCounters>,
     ) -> Result<(Streaming<KaspadResponse>, ServerFeatures)> {
         // gRPC endpoint
-        #[cfg(not(feature = "heap"))]
-        let channel =
-            tonic::transport::Channel::builder(url.parse::<tonic::transport::Uri>().map_err(|e| Error::String(e.to_string()))?)
-                .timeout(tokio::time::Duration::from_millis(request_timeout))
-                .connect_timeout(tokio::time::Duration::from_millis(CONNECT_TIMEOUT_DURATION))
-                .connect()
-                .await?;
-
-        #[cfg(feature = "heap")]
-        let channel =
-            tonic::transport::Channel::builder(url.parse::<tonic::transport::Uri>().map_err(|e| Error::String(e.to_string()))?)
-                .connect()
-                .await?;
+        // Route through a SOCKS5 proxy when this process set one (Tor on-device);
+        // otherwise a direct connect. See `connect_channel`.
+        let channel = connect_channel(&url, request_timeout).await?;
 
         let bytes_rx = &counters.bytes_rx;
         let bytes_tx = &counters.bytes_tx;
