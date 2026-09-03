@@ -191,6 +191,7 @@ pub async fn run_selfhost(cfg: SelfHostConfig, shutdown: tokio::sync::oneshot::R
         // Same default as the CLI: a self-hosted wallet that mines fragments exactly
         // like a treasury, and the ceiling leaves an ordinary wallet untouched.
         auto_consolidate: Some(crate::AUTO_CONSOLIDATE_DEFAULT),
+        build_shared_tree: true,
         // A self-host is the owner's own daemon: custodial endpoints stay enabled.
         allow_custodial: true,
         max_concurrent_proves: crate::default_max_concurrent_proves(),

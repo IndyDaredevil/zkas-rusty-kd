@@ -374,6 +374,7 @@ async fn run(cli: Cli) {
         tls: None,
         require_bearer: None,
         auto_consolidate: (!cli.no_auto_consolidate).then_some(cli.auto_consolidate),
+        build_shared_tree: true,
         allow_custodial: !cli.no_custodial,
         // 0 makes no sense (every prepare would 503); fall back to the default.
         max_concurrent_proves: cli

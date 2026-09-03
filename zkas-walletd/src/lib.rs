@@ -309,6 +309,12 @@ pub struct Config {
     /// Run continuously the cost is paid a few seconds at a time in the background,
     /// off the interactive path, and the note count never runs away in the first place.
     pub auto_consolidate: Option<usize>,
+    /// Build and advance the daemon-wide SHARED chain tree. True on a server, where
+    /// many wallets borrow one keyless copy of the public commitment stream. FALSE on
+    /// a single-wallet on-device engine: there is nobody to share it with, the wallet's
+    /// own frontier-seeded tree already witnesses its notes, and building the shared
+    /// copy from genesis is a multi-minute grind that only delays the first send.
+    pub build_shared_tree: bool,
     /// Runtime resource policy. Defaults are hardware-derived and suitable for a
     /// single-user daemon; hosted operators can override every bound from the CLI.
     pub resources: ResourceLimits,
@@ -2067,6 +2073,10 @@ struct WalletEntry {
     /// cache is ever rejected or invalidated, without mistaking a genuinely warm wallet
     /// for one that only looked warm.
     warm_via_subtree_cache: bool,
+    /// The wallet can witness a spend WITHOUT an O(chain) climb right now (its own
+    /// subtree cache is ready, or a shared tree covers it). Mirrors `cache_serves` in
+    /// the sync loop; surfaced to `/api/status` so the app can say "preparing" honestly.
+    spend_fast_ready: bool,
     /// The `--warm-wallets` slot this wallet is holding **for the duration of its
     /// subtree-cache build**, not just for one slice.
     ///
@@ -2191,6 +2201,7 @@ impl WalletEntry {
             last_witness_advance: None,
             witnesses_warm: false,
             warm_via_subtree_cache: false,
+            spend_fast_ready: false,
             build_permit: None,
             wants_cache_build: false,
             build_in_flight: false,
@@ -2792,6 +2803,8 @@ impl WalletEntry {
                 // The question was never "do I have a cache", it is "can somebody
                 // witness for me".
                 let cache_serves = (self.db.subtree_cache_ready(matured) || shared_serves) && matured > self.db.base_size();
+                // Surface the true "can I pay without climbing?" answer to status.
+                self.spend_fast_ready = cache_serves;
                 // A wallet whose cache is still building must not ALSO run the warm. Both
                 // are one-time heavy work aiming at the same outcome — a fast spend — and
                 // the cache is the one that achieves it, in a fraction of the work. Left
@@ -3374,6 +3387,8 @@ struct AppState {
     fvk_index: Mutex<HashMap<[u8; 96], HashSet<String>>>,
     /// Note-count ceiling for background consolidation; see [`Config::auto_consolidate`].
     auto_consolidate: Option<usize>,
+    /// See [`Config::build_shared_tree`].
+    build_shared_tree: bool,
     /// Whether custodial (seed-holding) endpoints are enabled; see
     /// [`Config::allow_custodial`] and [`require_custodial`].
     allow_custodial: bool,
@@ -3440,7 +3455,7 @@ fn snap_from_entry(address: String, e: &WalletEntry, daa_score: u64) -> StatusSn
         // spend paths) — sends work but the first one is slow until this finishes. Lets the
         // UI show "Preparing wallet for fast sends…" instead of a confusing "syncing 100%".
         // Note-heavy wallets skip the eager warm, so they are never reported as warming.
-        warming: e.caught_up && !e.witnesses_warm && (e.db.notes().len() as u64) <= EAGER_WARM_MAX_NOTES,
+        warming: e.caught_up && !e.spend_fast_ready,
         missing_history: e.blind_below > 0,
         // Whether a spend would be ACCEPTED right now, which is not the same question as
         // `synced` and must not be inferred from it. `ensure_canonical_checkpoint` also
@@ -5053,6 +5068,9 @@ async fn sync_loop(state: Arc<AppState>) {
                     continue; // parked: nobody is looking at this wallet right now
                 }
                 // Still being swept by an earlier lap that outran its budget — leave it be.
+                if token == CHAIN_TREE_TOKEN && !state.build_shared_tree {
+                    continue; // on-device: no shared tree to build; the wallet serves itself
+                }
                 let Some(guard) = InPassGuard::claim(&state, &token) else { continue };
                 let Ok(Ok(permit)) =
                     tokio::time::timeout(PERMIT_WAIT, sem.clone().acquire_owned()).await
@@ -8179,6 +8197,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         in_pass: std::sync::Mutex::new(HashSet::new()),
         fvk_index: Mutex::new(HashMap::new()),
         auto_consolidate: cfg.auto_consolidate,
+        build_shared_tree: cfg.build_shared_tree,
         allow_custodial: cfg.allow_custodial,
         resources,
     });
