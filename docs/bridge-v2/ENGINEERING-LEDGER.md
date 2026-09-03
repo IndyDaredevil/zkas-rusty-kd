@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-093 (2026-09-03)
+### Last entry: BL-096 (2026-09-03)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -2774,3 +2774,118 @@ was a known 16 minutes instead of an unknown one. And the checker's IMPOSTOR
 line was the highest-value output of the night: an instrument that pins identity
 will, by construction, call a correct upgrade an intruder — which is exactly
 when you want it to speak, and exactly when you must not obey it.
+
+## 2026-09-03 — S20 (this rail): H8's tail closed, the calendar cleared, the registry born
+
+**BL-094 · 2026-09-03 · H8 §13 tail CLOSED (stranded tip gone ≤13h) and the
+Button's impostor arc — dovetails BL-093's firsthand execution record**
+BL-093 (the executing session) closed with H8 OPEN on its §13 tail: pruning
+point unmoved, stranded tip still present at 04:27. CLOSED HERE: probe
+09-03 ~14:45 EDT — **e8dc1a034c… ABSENT from tipHashes at daa 3,377,490**,
+tips=3, all live/churning. First pruning-point advancement landed between
+04:27 and 14:45 (~13h post-cutover, inside BL-086's one-finality-interval
+gate); BL-092's detector pass condition (difference set {e8dc1a03…} 20/20
+pre-cutover → empty) satisfied from our vantage. **The A3/#6 arc is CLOSED
+end-to-end: gauge anomaly → 520-sample statistics → #6 filed → root-caused
+→ fixed 9a464d51 → shipped v1.0.8 → cut over → healed on Kron. ~66 hours
+discovery-to-cure.**
+THE BUTTON, midday arc: `C:\zkas\check-kron.ps1` run ~12:30 EDT FAILed the
+v1.0.8 node as IMPOSTOR — its contract pinned v106 path+sha+flag, so a
+legitimate upgrade MUST fail it; that is the feature. Remedy NOT followed
+blind (law 17): the process read (cmdline, node-v108 layout, launcher
+provenance comment) showed a deliberate house-pattern cutover, so the
+CONTRACT was updated instead: anchored patch v106→v108 (anchors 4/1/1;
+backup `check-kron.ps1.bak-v106-pin`; binary pin 45687E24E925C4ED777290C5
+8B3A74B68339C8FA6C84F4E303533FC04652236D; script now 7C477761365CA88AB8DC
+E023D3865B5C4F7C216DBF9C14C56BE091BB76C6D3A6) → **8/8 PASS, "v1.0.8
+pinned, flag on."**
+RECONCILE OPEN (one ls settles it): BL-093 records "check-kron-r3 ALL 8 UP
+04:27" — if r3 shipped as a separate file, TWO checkers now exist
+(the patched original + r3); law 1d wants one live copy. Owed: enumerate
+`C:\zkas\check-kron*`, consolidate, and fold R-6's walletd version pin
+into the survivor (walletd passed its own 1.0.5→1.0.8 swap silently —
+liveness-only check).
+H8 residual watches (first days): beat2-latency p50 ~200s · poll-failures
+flat · give-ups 0 · externalip "publicly routable" log line.
+**Lesson:** FAIL → read the process → recognize deliberate change → update
+the contract → re-arm is the impostor detector's whole lifecycle, executed
+correctly on its first live trigger — and two sessions closing each
+other's tails (their execution, our acceptance) is the rails working.
+
+**BL-095 · 2026-09-03 · D2 PASSED (early call, exact-scoped) · SCOPE
+retired · D1 executed — the calendar's coupled pair closes**
+D2: `max_over_time(scrape_duration_seconds{job="rc_merged_bridge"}[135h])`
+= **0.0491s** vs the 5s gate, **8,031 samples**, window exact-scoped
+post-deploy and INCLUDING event #9's death-and-restart. Called at 5.65/7
+days by operator decision, recorded as such (55s pin aged out 09-02; the
+restart stress-sample outweighs two quiet remainder days). Cadence
+correction en route: 8,031/135h = the bridge job scrapes at ~60s, not the
+5-min assumption — prediction wrong, verdict 4× stronger. BL-050 CLOSED;
+**v2.0.1.6 formally OPEN** (changelist in the registry).
+SCOPE-v2.0.1.5 retired at 0715e6d (archive- rename; mount copy removed; r5
+375 ln 864f9956… verified at the gate). Side-finding, unreproducible now:
+the file was TRACKED but sparse-unmaterialized — absent from ls, clean
+status, materialized by a cone re-apply; plus the rail-spelling exhibit
+(panel normalizes dots→underscores; one artifact, two names — BL-092
+cluster-I, second instance).
+D1: five .bak-v2014 artifacts (4 source + the 15.2 MB rollback exe)
+discovered by full-drive recurse, sha'd per file (identity record on this
+rail), deleted; `remaining: 0`. Command defect owned en route: a stateful
+$bak pair split across two fences nulled on standalone execution — III.6's
+class; re-shipped self-contained. Coupling rule proven: D1 rode D2's
+sitting, never standalone.
+**Lesson:** an early gate call is legitimate when it is MORE rigorous than
+waiting — exact-scoping beat the calendar's lazy [7d], and the stress event
+inside the window was worth more than the quiet days outside it.
+
+**BL-096 · 2026-09-03 · registry born · wallet 29→31 evaluated (BATCH) ·
+corrections, one live collision caught, and archaeology**
+ITEM-REGISTRY-r1 (129 ln 629ce4d4…, commit 4126f28, mounted): SCOPE's
+retirement orphaned the D/H/P definitions — referenced 24× in the ledger,
+defined nowhere living. The registry extracts them into a doc that does
+NOT retire with a version; adds R-1..R-6 and T-1..T-5 as first-class
+items; codes never reused. "What is H2" is now a mount read.
+WALLET 29→31: notes era resumed AT v1.0.31 (the on-device "Run on this
+phone" line); v1.0.30 is a CI stamp, content read via the 22-commit range.
+VERDICT per the pre-committed rule: **BATCH — zero desktop custody/key/
+money-display commits.** Desktop-adjacent: 9f55c10 (desktop gains
+Config.build_shared_tree + node_socks_proxy) and bb5390e (macOS ad-hoc
+signing — next DMG won't read "damaged"). UI: Consolidate renamed
+**"Manage notes"** + split mode (1.0.30). P6 gains: view-key polish + a
+phone-native watch-only option maturing. The release-check habit's first
+full cycle: both releases evaluated within hours, against a rule fixed in
+advance — the 16-release drift class is structurally dead.
+INSTRUMENT LESSON (V.3/II.1): the logged-out GitHub releases INDEX served
+a ~4-week-stale CDN render (v1.0.1 as "Latest") — presented as current it
+would have "disappeared" 17 releases. Authenticated `gh` is the instrument
+of record for release state; refetching the same surface is not a second
+instrument.
+ARCHAEOLOGY (three primary sources banked from that stale render's early
+notes): (1) `<wallet>.scan.bak` + **`zkas-walletd --graft`** is the
+documented restore for a broken rescan — "never rescan twice" now has its
+vendor text AND recovery command railed; (2) the pre-1.0.6 poisoned-node
+mechanism verbatim ("disqualifies every chain block above its pruning
+point… while still looking alive"); (3) force-quit app-managed nodes →
+RocksDB lock restart loop, handled since 1.0.2-pre4 — relevant to the
+kill-the-sidecar upgrade step.
+LIVE COLLISION CAUGHT (this train): step 2's base gate read 2776/11f285ad
+with BL-093 present (the executor's entry, landed between sweep and merge)
+against an expected 2684 — the instruction said stop; the merge ran
+anyway; grep=2 exposed the duplicate BL-093 pre-commit; `git checkout --`
+reverted; this append is the r2 renumbered around the firsthand record.
+Nothing reached commit or push. Two notes: II.2's "any session's tip
+memory is wrong the moment another commits" now has a same-DAY exhibit;
+and the executor's push had not yet mount-synced (2f's ride pending on
+that rail) — this train's sync brings the mount current for both.
+CORRECTIONS (IV.8): BL-085(3)'s kaspad-gRPC gap was found ALREADY EXECUTED
+(rule 'Kaspa gRPC MacBook only' @ .173; recorded pre-fix name obsolete;
+executing session unidentified); dead disabled 'ZKas gRPC LAN only' /24
+rule removed 09-02; program-scoped Any/Any finding railed at
+KRON-HARDENING §6.8 / R-4. Hygiene: an r2-era KRON-HARDENING copy in
+~/Downloads rode a mv into the r3 train, caught by the sha gate
+(repo/mount untouched); norm: Downloads cleared of operation artifacts at
+each landing.
+**Lesson:** the registry and the release-check habit are the same repair
+to the same wound — definitions and versions drifting on rails nobody
+reads. Both now have a reader. And the gates only protect a train that
+stops when they fire.
