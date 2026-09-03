@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-092 (2026-09-03)
+### Last entry: BL-093 (2026-09-03)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -2682,3 +2682,95 @@ clean dedup, verified header — because the defect was a universal quantifier
 over n=1, and no law asked for n. A claim's sample count is a value like any
 other; written into the sentence, it lets an outside reader find the weak
 joint without reconstructing the frame that produced it.
+
+**BL-093 · 2026-09-03 · H8 EXECUTED — node + walletd to v1.0.8 in one window,
+every gate passed, money rail verified against a canary; H8 stays OPEN on the
+§13 tail (pruning point unmoved at close)**
+**Timeline (Kron local, EDT):** walletd v1.0.5 stopped 01:24 · wallet dir cold
+copies 01:25 (rollback + canary, 138.75 MB, 0 differing hashes across three dirs)
+· node v1.0.6 stopped ~01:27 · datadir robocopy 01:27→01:34:11 (7m07s, 6554
+files, 38.480 GiB) · v1.0.8 node launched 01:38:39, stopped, relaunched
+**01:42:52** (PID 9448) after the 9b gate was re-read · node accepted via relay
+by 01:39, tip-following through the window · canary walletd 03:35:21→~04:05 (PID
+8460, port 8502, `--no-auto-consolidate --no-custodial`) · money-rail walletd
+**04:09:32** (PID 17348), cache complete 04:25:24 · check-kron-r3 ALL 8 UP 04:27.
+**Identities (all container-side pins matched on Kron, two independent downloads):**
+zip `334cec3c31754318bca3832aab86fbcd75b9ae341cdcf2df825c2c9c9c7ebf40` 66,954,365 B
+· node `45687E24E925C4ED777290C58B3A74B68339C8FA6C84F4E303533FC04652236D` (kaspad.exe
+= zkas-node.exe copy) · walletd `B5B1DDA9093D1FB55A92A76D4D7CFE1ECDC67D57BCFCB0701FBFBAC7EF8C932C`.
+Rollback identities: node v1.0.6 `1B49D1FA5416130A6CB82A166E5941E778EE1266E8BD5ACB23EA810B01DC97D2`
+(pinned in check-kron r2 on 08-30 — **corrects NODE-CUTOVER-v1.0.8-r1's "never
+pinned on any rail": rail-scoped absence stated as absolute**), walletd v1.0.5
+`BDCBE0673C800720EF33D73EB68A4C6FBEBB10B3CA472E0822B8FDE08063713C` (launcher guard).
+Config-key trap re-verified at `args.rs @ zkas-v1.0.8` (793 ln): same five
+CLI-only keys; TOML copied verbatim (Compare-Object = 2 header lines);
+`listen 0.0.0.0:16811` was already the v1.0.8 default → port move no-op;
+`--externalip=108.95.94.128:16811` carried; node logged it publicly routable.
+`perf-metrics=false` confirmed DECIDED (PRF0 09-01 Human turn; BL-081), header
+comment was the stale line, not the key.
+**Money-rail gate (§12), like-for-like on `/api/wallet/balance`:** baseline
+(v1.0.5, live, 01:2x) `balance_sompi=6795485797267 note_count=481
+scanned=3338868 history_total=1279 last_txid=17d8df16…`. Canary (v1.0.8, copy):
+`6812566497943 / 485 / scanned 3348843 / missing_history=False` = base + 4
+coinbases × 4,270,175,169 exactly, notes 481+4. Money rail (v1.0.8, real dir):
+`6812566497943 / 485 / scanned 3349163 / missing_history=False` — **byte-identical
+to the canary**. Two independent full rescans of the same file agreeing is the
+strongest identity the wallet can give. Reporter `provisional_known 1`; the
+window's deferred BEAT2s (c690635e4081, d7193e20a2d3, 5ef12d29976e, …) sent
+with txids. v1.0.5 has no `/status`; v1.0.8 has none either — `note_count` and
+`missing_history` ride the balance body. `notes[]` array (v1.0.5) is gone.
+**Measurements (n=2, canary + money rail):** first v1.0.8 start on a v1.0.5
+wallet dir is a **mandatory full rescan** — v1.0.5 checkpoints are not loaded;
+"v8 checkpoints load again" applies to v8-written ones. Scan ~6.64M tree leaves
+at 24.6–27.8 µs/leaf single-threaded, 99% of cost in tree build; subtree cache
+**141.3 s / 147.5 s** (v1.0.5: ~270 s). Launch→warm **~14 min / 15m52s**.
+**API SERVES HISTORY DURING THE RESCAN** ("off the wallet lock"): reporter's poll
+succeeded 6 s after launch and cleared deferred beats; v1.0.5 answered nothing
+for ~270 s. NODE-CONTRACT-v1.0.8 §6 owes this. Node: IBD of a 10-min gap in <60 s;
+`Querying DNS seeder seed.zkas.info` (first use, peer pins droppable); `Network
+mismatch` WARN from a 16111 Kaspa peer, benign; `shielded history … +0 records …
+reached genesis after 1 rounds` — **benign**, settled by canary `missing_history=False`.
+Banner reads `kaspad v2.0.1`; sha is the only identity, as NODE-CONTRACT §2 says.
+**Detector, II.4 scope widened:** v1.0.8 pre-advancement 20/20 `diff=e8dc1a03`
+(`stranded-detector-zkas-v108-pre-pp.log` 20 ln
+`0df68368e3baec4b988a2448264cf0e4a139a645713d9835926e10c9fce72c4b`, DAA
+3,350,191→3,350,393), including one frame `tips=8 vpar=7` — **parent bound ≥7
+observed, difference still exactly one**. Cumulative: 40/40 across two binaries,
+tip count 2–8, no counterexample. Stranded tip survives the binary upgrade;
+pruning point `f864b7a2…` unmoved at close → §13 not yet readable.
+**Rollback degraded to UNTESTED (node half):** 9a gated on "listeners = 0",
+which proves ports closed, not process exited; RocksDB was still flushing when
+robocopy ran. Backup 6554 files / 41,318,036,812 B vs source at read 6550 /
+41,324,344,541 — four SSTs copied then compacted away, log grew after copy.
+Source has since been written by v1.0.8; the copy cannot be retaken. RocksDB
+WAL/MANIFEST recovery should open it; "should" is the word. **Rehearsal queued:**
+v1.0.6 (`1B49D1FA…`) on a copy of the backup in a separate appdir/ports.
+Walletd half clean (hash-verified triple copy, quiescent).
+**Consumer found in-window:** `check-kron.ps1` r2 pinned v106 path + `1B49D1FA`
+and would have remedied the cutover as an IMPOSTOR — its printed fix was the
+forbidden v1.0.6-on-v1.0.8-data path. **r3 minted** (`C:\zkas\check-kron-r3.ps1`,
+5535 B): node pins → v1.0.8, walletd remedy → v1.0.8-r1 launcher, **walletd
+gains the same path+sha impostor check the node has**. ALL 8 UP at close.
+**Runbook r2 owes (IV.7, one shape each):** token entry — `Read-Host` echoes,
+`-AsSecureString` refuses paste, clipboard held a command (102 chars); guard
+`$tok.Length -eq 17` on every block that uses it · 9a gates on `Get-Process`
+absent · 9b identity read of the source AFTER the copy · poll exits on
+`balance_sompi` present, not on a non-null body (a 400 satisfied the loop) ·
+`-Filter *.log -Recurse` under node-data matched a RocksDB WAL (PRF0 trap #2) →
+fixed log path · kill and launch from the same integrity level (canary launched
+elevated, `Stop-Process` from non-elevated = Access denied; `taskkill` elevated) ·
+canary dir was removed while the daemon still ran (non-terminating error let
+the block continue; outcome correct) · check-kron listed as a cutover consumer.
+**Artifacts on Kron only, owed to the docs rail:** `check-kron-r3.ps1`,
+`start-walletd-v1.0.8-r1.ps1`, `start-walletd-v1.0.8-canary-r1.ps1`,
+`zkas-node-v108.toml`, `node-v108\run-zkas-node.cmd`. Transfer path unrecorded.
+Forward correction: `cc186c8` says "Mount ADD rides" for the laws doc — no mount
+copy exists by design (governing tier = project instructions; repo = archive).
+**H8 status: OPEN on §13 only.** Close = pruning point ≠ `f864b7a2…` → 20 frames
+`diff=-` → node log `pruned N unmergeable side-branch tips`.
+**Lesson:** the canary earned its cost twice — once as the gate it was designed
+to be, and once as the thing that measured the rescan so the money-rail outage
+was a known 16 minutes instead of an unknown one. And the checker's IMPOSTOR
+line was the highest-value output of the night: an instrument that pins identity
+will, by construction, call a correct upgrade an intruder — which is exactly
+when you want it to speak, and exactly when you must not obey it.
