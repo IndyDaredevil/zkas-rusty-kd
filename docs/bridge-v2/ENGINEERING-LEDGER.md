@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-091 (2026-09-02)
+### Last entry: BL-092 (2026-09-03)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -2586,3 +2586,99 @@ it. Three sessions, one record, zero bytes lost.
 **Lesson:** the rails ARE the merge instrument — and they only work if
 every session re-pins the base at cut time and reads what landed since.
 The two new laws are the mechanization of exactly that.
+
+**BL-092 · 2026-09-03 · upstream/process — BL-086's detector claim TESTED
+(n=20, holds within stated scope); #6 addendum FILED and API-verified;
+detector promoted to H8 acceptance instrument; three forward corrections;
+laws evaluated 17→5**
+**II.4 strengthening of BL-086** (amends BL-086 §(2), which asserted
+`tipHashes − virtualParentHashes = the unmergeable set` flatly from a single
+frame). Tested 2026-09-03 on Kron (v1.0.6, un-upgraded): 20 frames at 15 s
+cadence, span 274 DAA (3,334,551→3,334,825), tip count 2–5. Difference set
+was exactly `{e8dc1a03…}` in **20/20**; every non-stranded tip was in
+`virtualParentHashes` on every read, including three frames at 5 tips / 4
+parents (parent bound ≥4 observed). Log: `stranded-detector-zkas-2026-09-03.log`
+20 ln `7191ddafd5ce4b51484b61a1f564247979c23eb10d01f8e74596962dfef72cdf`
+(committed 49390b9). **Scope stated, not glossed:** untested at tip counts
+above the virtual parent bound (never exceeded 5 here — 1 BPS zKAS will not
+produce it), blind to transients shorter than the 15 s interval (bridge's
+30 s tick is blinder), untested on the 10-BPS KAS leg where both modes
+should show if they exist. The metric as defined: a tip persisting in the
+difference across K consecutive `getBlockDagInfo` reads is stranded; K=10 on
+the 30 s tick costs five minutes and is robust to anything the sampler could
+have missed. "Zero new probes" in BL-086 was also overclaimed — persistence
+needs no extra RPC, but *depth* (the discriminator that actually did the
+work in A3) is a `getBlock` per member. Depth now 2,916,198 behind virtual.
+**#6 addendum FILED** 2026-09-03T04:30:38Z as
+`firecash/zkas-rusty#6#issuecomment-5520371274`. Published text pinned as
+`ISSUE-6-ADDENDUM-r3.md` 72 ln
+`348bb708e8febdb75dc736de4d14b5ed544471dc608b533613b0dace1873e2ca` (pulled
+from the API body); r2 (73 ln 67fee2d9…, committed 49390b9) is the DRAFT —
+two operator edits at post time (`not`→`NOT a reopen`; `Happy to`→`I can`);
+r1 (44 ln 5a451740…) VOID, never posted, never committed. Rendering
+verified via `GET /repos/.../issues/comments/5520371274`, not the HTML: the
+logged-out issue page renders NO timeline (not even the 09-01 close) and
+shows the issue as Open — a fetch-scoped absence that would have read as
+"comment missing" under a single-rail read. `<details>` intact, 20 log lines
+intact, JSON fence intact, host-leak grep 0. Adversary pass (named: a
+maintainer who knows rusty-kaspa parent selection) surfaced four objections;
+r2 answered three inline and DELETED the fourth — a counterfactual about
+their six pruned tips, n=0 — rather than defending it. Issue open/closed
+state unresolved from this rail (API rate-limited unauthenticated).
+**Detector promoted to H8 acceptance instrument** (dovetails BL-089, which
+found the release gate already satisfied by v1.0.8). The 20/20 log is the
+pre-cutover baseline; the pass condition after v1.0.8 cutover is `diff=-`
+on the identical sampler within one finality interval (~12 h, first
+pruning-point advancement). Same command, no new tooling. Kron NOT cut over
+as of this entry — operator-confirmed after a misread of "the fix has
+fired" (upstream's 09-01 event, not ours); a run2 was shipped and correctly
+withdrawn once the referent was resolved.
+**Three forward corrections (IV.8):** (a) commit 49390b9 says "BL-087 owes
+the II.4 strengthening" — BL-087..BL-091 landed from S19 (c01a095, evening
+09-02) between this session's e4b518d and 49390b9; correct id is THIS entry.
+Not amended: a forward id reference is corrected forward, not force-pushed.
+(b) This session's recollection of the ledger tip was stale by exactly five
+entries TWICE (BL-080 vs rail BL-085 at open; BL-086 vs rail BL-091 at the
+addendum commit), both times because a parallel session advanced the repo.
+Mechanism, not accident: the conversation rail is per-session, so any
+session's memory of the tip is wrong the moment another session commits.
+Id minted only from a rail read at cut time. (c) d288da5 was amended via
+`--force-with-lease` from 7eba684 to replace a literal `<sha from step 3>`
+that reached the pushed message — the IN pin of a 2f statement was a
+placeholder; the remedy was `$(shasum …)` substitution, which the original
+step should have used.
+**Incident line (law 9), one shape, three instances:** constructions that
+stay syntactically valid while losing their meaning. `dirname ""`→`.` ran
+grpcurl from the wrong cwd instead of failing (empty substitution guard
+absent); an angle-bracket token survived into a pushed commit because the
+token lived in a fence and the fill-in lived in prose; a commit-message
+excerpt shipped in a fence was executed as a command (parse error, no
+state change) because under law 11 a fence IS the instruction signal. Laws
+candidates: substitution over operator fill-in; fences deliver, backticks
+name, quoted artifacts never fenced; empty substitutions fail loud.
+**Skeleton sweep** (e4b518d): 8 lab-side ledger-append skeletons removed
+after `missing=0` on 37 BL ids (SWEEP-MANIFEST-2026-09-02.txt, 8 ln);
+BL-086's repo-committed skeleton removed (this session had introduced it —
+every prior append lived lab-side). II.5 caveat stated with the gate:
+`missing=0` proved header presence, NOT content identity; the manifest shas
+are now unverifiable against anything. Norm: skeletons are not committed;
+the append's cut sha rides the commit message beside OUT/IN. This entry's
+skeleton follows that norm.
+**Laws evaluation** (in-conversation, cut as SESSION-CONDUCT-LAWS-v2 queued):
+17 laws + 5 floating amendments → 5 clusters (identity is content · claims
+carry instrument, scope, and count · commands are deliverables · record is
+append-only, synchronized, corrected forward · external artifacts pass an
+adversary). Full 30-row disposition, nothing dropped; law 8 and the compiler
+half of law 4 move to Part E per law 10's own tiering. Tested against this
+sitting's 14 incidents: old set governed 3 (all compliance, not coverage);
+new set governs 13 — the one it cannot govern is the trigger, which is
+structural (a complete-feeling frame emits no signal). Highest-value new
+provision: general or causal claims carry N and span inline. Rail-spelling
+finding from 0715e6d (panel normalizes dots to underscores) belongs in
+cluster I: filename equality across rails is not guaranteed; sha is the
+only identity.
+**Lesson:** the value-verification laws all passed on BL-086 — correct shas,
+clean dedup, verified header — because the defect was a universal quantifier
+over n=1, and no law asked for n. A claim's sample count is a value like any
+other; written into the sentence, it lets an outside reader find the weak
+joint without reconstructing the frame that produced it.
