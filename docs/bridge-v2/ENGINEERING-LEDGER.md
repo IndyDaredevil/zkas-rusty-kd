@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-098 (2026-09-03)
+### Last entry: BL-099 (2026-09-04)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -2985,3 +2985,62 @@ missing_history-aware semantics.
 **Lesson:** behavioral gates beat declarative ones — a log line would have
 said "I believe I am routable"; three strangers holding connections says
 the internet agrees. Prefer the read that cannot be sincere-but-wrong.
+
+## 2026-09-04 — S21: Telegram block cards shipped (r4→r5), the dashboard sitting closed
+
+**BL-099 · 2026-09-04 · reporter r4→r5 — Telegram block cards live via the
+08-25 architecture; the fail-open law passed its first live test; two wire
+findings; dashboard work order 5/5 with cross-check**
+DESIGN (the 08-25 record's own plan executed): the reporter — holder of
+hash, worker, exact amount, txid — sends the block cards; the Alertmanager
+card demotes to independent backstop. One card per block: born at BEAT1
+(~T+5s, provisional amount, faster than the alert path's structural
+T+37–127s), EDITED IN PLACE at BEAT2 (exact amount + explorer
+/transactions/<txid> link; editMessageText keyed by message_id **persisted
+on the block state**, so edits survive restarts; give-up edits the card to
+"provisional stands"). Alert-path alternative (hash-labeled gauges, 08-11)
+REJECTED: series-per-block is BL-024's churn class and BL-025 says never
+reapply the birth idiom. LAW stated at design time: the TG leg is strictly
+FAIL-OPEN — any Telegram failure logs and drops; beats, queue, money rail
+untouched. Token = Alertmanager's own file (BL-014 lane); chat 8180943473.
+r4 (1DF8C061…) deployed 00:00:49 by operator. FIRST LIVE BLOCK
+(4c2233d675f6, 00:01:50) = the fail-open law's FIRST LIVE PASS and a
+finding: both beats clean, money rail untouched, ERRSTREAM caught TG 400
+"text must be encoded in UTF-8" — **PS 5.1 re-encodes STRING request
+bodies as Latin-1**; the ASCII smoke test passed while the card glyphs
+died. (The script-side twin was caught pre-ship: PS 5.1 reads BOM-less
+scripts as ANSI — r4 shipped with UTF-8 BOM.) r5 (9B4628AB…, 479 ln) fixes
+the wire: body as UTF-8 BYTES + charset in Content-Type. Second finding at
+swap: r5 lost the :9151 bind RACE to r4's HttpListener teardown
+(Stop-ScheduledTask returned before the port freed) — dedup'd
+kill-and-restart; single instance PID-verified, metrics rebound. r5 LIVE
+00:16:04, all pre-block gates green; **first-card witness OPEN** (next
+block is the test).
+DASHBOARD SITTING CLOSED (KDSM/Netlify, Bolt lane, display-only): work
+order 5/5 — (1) projection verified NO-OP: card is pace extrapolation
+(count/hours×24), no hashrate denominator — immune to the endpoint error,
+noisy-at-small-N by construction; future card noted: "Expected (network)"
+from network_history avg × fleet = BL-066's 100:1 law in UI, pace-vs-
+expected as the drought instrument; (2) BOTH hashrate cards re-derived
+from network_history (now + 24h avg), old kaspaApi path REMOVED —
+**cross-checked: dashboard 28.4 vs Prometheus avg_over_time 28.9 PH/s,
+1.7%, two samplers one quantity — the 08-25 mis-derivation class closed**;
+(3) interval mixed-window labeled (lifetime avg + 24h line); (4)
+restart-efficacy machinery DELETED (BL-066's self-certification trap
+un-wore its UI); (5) nameplate 14.2 labeled "capture-efficiency KPI"
+(BL-016(b) by design) + code comment pointing delivered at the reporter
+feed. P2 RESOLVED HONESTLY: a hardcoded 15.23 would violate BL-028
+(constant = measurement minus timestamp); Netlify-remote means no LAN
+Prometheus fetch ever; delivered arrives when the r-series posts the
+gauge — r5 is now the natural vehicle (r6 candidate with the difficulty
+feed). Dashboard's role railed: the ORIGINAL remote deadman ("are we
+okay?" from anywhere), zero-inbound by architecture; four instruments,
+four silences (dashboard=money flowing · TG=events · deadman=host ·
+Button=exactly right).
+PROCESS: two IV.2 violations called by the operator (instructions
+referencing fences in scrollback instead of carrying them) — the clause's
+cost mode is exactly this week's r2-in-Downloads ride; correction: every
+execution request carries its fence verbatim, including closings.
+**Lesson:** ASCII smoke tests certify the pipe, not the payload — test
+with the bytes production will send. And a port is not free just because
+its owner was told to stop.

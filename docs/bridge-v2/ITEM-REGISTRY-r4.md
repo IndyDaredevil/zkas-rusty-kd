@@ -1,5 +1,5 @@
 # ITEM REGISTRY — the operation's project-management list
-### Content r3 · created 2026-09-03, revised 2026-09-03 (r2: H2 rewritten from BL-097; r3: H8 CLOSED at BL-098) · Successor to the registry role of SCOPE-v2.0.1.5 (retired at D2)
+### Content r4 · created 2026-09-03, revised 2026-09-04 (r4: TG cards live, dashboard sitting closed, P2 resolved — BL-099) · Successor to the registry role of SCOPE-v2.0.1.5 (retired at D2)
 
 **Why this doc exists:** SCOPE carried the item definitions and retired with
 its version (D2 pass, 09-03) — leaving codes referenced everywhere and
@@ -60,10 +60,13 @@ evidence; this is the map.
 - **P1 · network-history curve (D_z/D_k) — OPERATIONAL.** 5-min sampler →
   Supabase. Known gaps annotated in-ledger (S15 forensics window; event #9
   ~5 buckets). Consumers must not read gaps as anomalies.
-- **P2 · dashboard hashrate pointer — OPEN, quick win.** "Your Hashrate"
-  14.2 constant → `rc:fleet_hashrate_delivered_hps` (measured 15.23 TH/s);
-  un-flatters Luck ~7%. NEVER source from the zkas estimator gauge until
-  v2.0.1.6's anchor fix ships.
+- **P2 · dashboard delivered-hashrate — RESOLVED at BL-099.** Nameplate
+  14.2 stays BY DESIGN (BL-016(b) capture-efficiency KPI, now labeled);
+  a new constant would violate BL-028; Netlify-remote rules out LAN
+  Prometheus reads. Delivered figure ships when the reporter posts the
+  gauge to Supabase — r6 candidate (with the difficulty feed). Dashboard
+  sitting otherwise CLOSED 5/5 w/ 28.4-vs-28.9 cross-check; future card
+  noted: "Expected (network)" beside pace = drought instrument in UI.
 - **P5 · block-detail expansion — OPEN, gated.** Gate: confirm
   post-e49ce61 layout on the running node. Mergeset-persist rider folded
   in.
@@ -100,6 +103,10 @@ evidence; this is the map.
 - **T-2** Third 1500VA (arrival→physical window): KS7-per-unit end-state,
   w8m to battery, canary role retires, gateway cable drop rides.
 - **T-3** ERRSTREAM soak: next console flash → one Select-String names it.
+  (Two live catches banked: TG 400 UTF-8 at BL-099; walletd refusals at
+  BL-087 — the instrument earns its keep.)
+- **T-6** Reporter r5 first-card witness: next block → card ~T+5s,
+  self-edits at BEAT2. Open until seen; then TG cards are DONE.
 - **T-4** Brick experiment (running since 09-02 14:12): falsifier =
   another 41/6008 + zero PowerPanel rows → convicts barrel/board.
 - **T-5** Upstream watch: firecash seed-side tip-drop note on #6 (ours
