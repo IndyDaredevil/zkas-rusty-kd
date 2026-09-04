@@ -1,5 +1,5 @@
 # ITEM REGISTRY — the operation's project-management list
-### Content r1 · created 2026-09-03 · Successor to the registry role of SCOPE-v2.0.1.5 (retired at D2)
+### Content r2 · created 2026-09-03, revised 2026-09-03 (H2 rewritten from BL-097 post-mortem) · Successor to the registry role of SCOPE-v2.0.1.5 (retired at D2)
 
 **Why this doc exists:** SCOPE carried the item definitions and retired with
 its version (D2 pass, 09-03) — leaving codes referenced everywhere and
@@ -25,13 +25,22 @@ evidence; this is the map.
 
 ## H — HOST STREAM
 
-- **H2 · service-migration window — OPEN, front of queue.** The stack's
-  seven manual processes → Windows services / run-whether-logged-on.
-  Measured argument (event #9): host recovered in 34s, PRODUCTION in 24
-  min, only because the operator came home. Riders: (1) all STARTUP-ORDER
-  processes as services; (2) deadman + sampler principals fixed (boot
-  trigger, non-interactive — kills the §6.7 blind window); (3) retires WT
-  tabs/tint/dormant -WindowStyle flags. Owner: next multi-hour Kron window.
+- **H2 · auto-start + runtime-visibility program — OPEN, front of queue,
+  RESHAPED at BL-097** (the August StartKron orchestrator: SYSTEM-context
+  task, never completed a boot 4/4, killed 08-17 — post-mortem findings
+  F1–F5 govern this item; "run as services" is retired language). Staged:
+  **(a) Visibility contract per process** — log file + Prometheus metric +
+  Button line + viewer command for all seven (kaspad nologfiles=false and
+  a versioned kaspad launcher are the open pieces); consoles become
+  optional. **(b) Boot-start v2** — inmyh principal (never SYSTEM),
+  network-readiness pre-gate, v1's validated internals (tiers, port
+  gates, idempotency, env-baking, logging) wrapped try/finally, **with
+  its own deadman** (end-of-run healthcheck ping — a truncated run pages
+  in minutes, not days); deadman+sampler principal fixes ride here;
+  proven across a deliberate reboot before it counts. **(c) Supervision**
+  — separate later decision, not conflated (F3). Measured argument
+  unchanged: event #9 = host 34s, production 24 min. Owner: next
+  multi-hour Kron window.
 - **H6 · memory alerting — RESHAPED to rules-only.** No config change;
   the rule is `windows_memory_swap_pages_written_total` sustained climb.
   RAM% rules are wrong by construction (79% = configured equilibrium,

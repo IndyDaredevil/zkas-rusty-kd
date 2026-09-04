@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-096 (2026-09-03)
+### Last entry: BL-097 (2026-09-03)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -2889,3 +2889,65 @@ each landing.
 to the same wound — definitions and versions drifting on rails nobody
 reads. Both now have a reader. And the gates only protect a train that
 stops when they fire.
+
+**BL-097 · 2026-09-03 · post-mortem — the August orchestrator (StartKron):
+never ledgered, never completed a boot, killed in the act; H2 reshaped from
+its five findings**
+Prior-work sweep (law 17) on "we tried run-as-a-service and it didn't work":
+the record corrects the memory — NO service was ever installed (the
+mystery-kaspad-era census found zero services touching our binaries). What
+was built 08-11 and killed 08-17 was a SYSTEM-context scheduled-task
+orchestrator: `\StartKron` (BootTrigger, UserId S-1-5-18, HighestAvailable)
+running `C:\Prometheus\tools\start-kron.ps1` — tiered startup, port gates,
+env-baking via run-rc-merged.cmd, idempotent, self-logging. Its v2
+(principal→inmyh, logon trigger) was designed and never shipped.
+THE EVIDENCE IS ITS OWN LOG (start-kron.log, 2,732 B, read 09-03):
+**v1 never completed a real boot — 4 for 4 truncated.** The only clean
+end-to-end run was the 16:00 08-11 dry run (all SKIPs). Every actual boot
+(08-11 16:04; the reset-era boots 08-15 10:53, 08-16 08:34, 08-17 00:51)
+traces identically: `begin → START kaspad → START zkas-node →` SILENCE —
+no gate line, no FATAL, no end banner. The script died seconds in, before
+walletd/bridge/monitoring: after each reset the fleet pointed at a dead
+stratum while two SYSTEM-owned, console-less nodes ran invisibly. The
+"mystery kaspad" was not a side effect — it was the orchestrator's
+half-finished work, four times. Death timeline now exact: the 08-17
+00:51:00 truncated run spawned the final mystery kaspad; the task XML's
+LastWriteTime (StartKron-task-ARCHIVED.xml, 01:01:35) shows it archived
+TEN MINUTES LATER — caught in the act, killed same sitting.
+WHY it died mid-run is unknowable from the record, because it could not
+say: no try/catch, no finally, no exit capture — the log has no vocabulary
+for its own death. Best mechanical suspect (hypothesis, labeled): the
+Test-NetConnection gate throwing unhandled at T+~40s post-boot before the
+network stack answers — consistent with dry-run-passes / real-boot-dies.
+The evidence's verdict is only: died unobserved, four consecutive times
+over six days, failures sitting unread in its own log.
+FIVE FINDINGS → v2 REQUIREMENTS:
+F1 SYSTEM principal made children invisible and console-less → principal
+   is inmyh, never SYSTEM.
+F2 The boot mechanism had no observer (survived its own presumed death;
+   failed 4× silently) → **the orchestrator gets a deadman**: ping a
+   healthcheck at successful END; a truncated run pages in minutes.
+F3 Boot-start and crash-supervision were conflated, then abandoned
+   together → separate items; prove boot-start first, supervision later.
+F4 Consoles were the only runtime view; SYSTEM deleted them with no
+   replacement → **visibility contract per process BEFORE migration**:
+   log file + Prometheus metric + Button line + viewer command; consoles
+   become optional, not load-bearing (the September groundwork —
+   reporter/ERRSTREAM pattern, versioned launchers, identity-pinned
+   Button, kaspad nologfiles=false queued — is most of this already).
+F5 The tool itself was un-instrumented → lifecycle scripts wrap
+   try/finally with failure WRITTEN; LastTaskResult is a checked value.
+FINDING #0: none of this was ever ledgered — the failure lived on
+conversation rails only, and ITEM-REGISTRY r1's H2 ("→ Windows services")
+was written in ignorance of a three-week-old failure in the same
+neighborhood. This entry is the repair; registry r2 rewrites H2 to the
+staged shape (visibility contract → inmyh boot-start with its own deadman,
+proven across a deliberate reboot → supervision as its own later item).
+WHAT SURVIVES, validated: tiered order · port-gates-not-sleeps (plus a
+network-readiness pre-gate) · idempotency-by-name · env-baking via
+run-rc-merged.cmd · file logging. v1's architecture was right; its
+principal, error handling, and observability were wrong — the three
+things the operation now does well.
+**Lesson:** a failure that is not banked is a failure the operation is
+condemned to redesign toward. The sweep cost one search and rewrote H2's
+premise; the log had been holding the whole answer, unread, since August.
