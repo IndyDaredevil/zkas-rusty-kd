@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-097 (2026-09-03)
+### Last entry: BL-098 (2026-09-03)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -2951,3 +2951,37 @@ things the operation now does well.
 **Lesson:** a failure that is not banked is a failure the operation is
 condemned to redesign toward. The sweep cost one search and rewrote H2's
 premise; the log had been holding the whole answer, unread, since August.
+
+**BL-098 · 2026-09-03 · H8 CLOSED — five acceptance gates, five passes; the
+walletd hypothesis confirmed by its own counter; the deferred queue proven
+lossless at scale**
+Gates (read ~19h post-cutover): (1) beat2-latency p50 **198.9s** across 39
+blocks — dead-center of the healthy band. (2) ERRSTREAM quiet since the
+cutover's own walletd start-window (last hits 04:09:09–28, walletd up
+04:09:32). (3) walletd poll-failures **FLAT — increase()=0.0 over 6h**;
+lifetime 1,501 is cutover archaeology in full (~2¾h of connection-refused
+at retry pace, 01:24–04:09) — **BL-089's mechanism hypothesis CONFIRMED:
+the v1.0.5 wallet-lock serialization was the timeout source; v1.0.8's
+185-byte polls ended it.** (4) Discoverability proven BEHAVIORALLY,
+exceeding the planned log-line gate: **three non-LAN peers established on
+16811** (138.88.31.204, 169.155.235.243, 85.215.243.87) — the node that
+was structurally undiscoverable ten days ago (BL-082) now found and held
+by the open internet. (5) Give-ups **0 since steady state**; two in-window
+rows (found 06:02/06:46 UTC, walletd down) identified by the
+insert-default signature `updated_at ≤ created_at` = BEAT1-only, never
+BEAT2-updated — same class as the standing 28 give-up rows; ANNEXED to
+that queued reconciliation (now 30 rows, all incident/outage-era).
+The beat2 max (2,049.9s) resolves as the flip side of gate 5: a block
+found deep in the outage, refined the instant the subtree cache completed
+— **r3's deferred queue proven lossless across a 2¾-hour walletd outage**,
+its strongest exercise to date.
+NEW FINDING → H2(a) broadened: the node writes NO log file (`nologfiles`
+rides zkas-node's config too, not only kaspad's) — the externalip
+activation line went to a console nobody kept, which is why gate 4 needed
+the behavioral read. The visibility-contract rider now names BOTH nodes.
+Registry r3 flips H8 to CLOSED alongside this entry. Post-H8 unblocks are
+live: the (now 30-row) give-up reconciliation · P6 · R-1's
+missing_history-aware semantics.
+**Lesson:** behavioral gates beat declarative ones — a log line would have
+said "I believe I am routable"; three strangers holding connections says
+the internet agrees. Prefer the read that cannot be sincere-but-wrong.

@@ -1,5 +1,5 @@
 # ITEM REGISTRY — the operation's project-management list
-### Content r2 · created 2026-09-03, revised 2026-09-03 (H2 rewritten from BL-097 post-mortem) · Successor to the registry role of SCOPE-v2.0.1.5 (retired at D2)
+### Content r3 · created 2026-09-03, revised 2026-09-03 (r2: H2 rewritten from BL-097; r3: H8 CLOSED at BL-098) · Successor to the registry role of SCOPE-v2.0.1.5 (retired at D2)
 
 **Why this doc exists:** SCOPE carried the item definitions and retired with
 its version (D2 pass, 09-03) — leaving codes referenced everywhere and
@@ -48,14 +48,12 @@ evidence; this is the map.
 - **H7 · gRPC scoping — CLOSED both legs.** zkas 16810 (08-31) + kaspad
   16110 (found executed 09-02, rule 'Kaspa gRPC MacBook only') both
   MacBook-only. Successor concern: see Rules Sitting item R-4.
-- **H8 · v1.0.8 cutover — EXECUTED overnight 09-03** (node v1.0.6→1.0.8 +
-  walletd v1.0.5→1.0.8; parallel session, its NODE-CUTOVER-v1_0_8-r1 on
-  the mount). Acceptance: stranded-tip drop CONFIRMED (daa 3,377,490,
-  ~13h post-cutover, #6 healed end-to-end); still watching: beat2 p50
-  ~200s, poll-failures flatline, give-ups 0 over the first days.
-  UNBLOCKED BY H8, now live: 28-row give-up reconciliation (money;
-  era-correct subsidy values — a step to 42.70175169 occurred 09-02),
-  P6, walletd alert semantics (R-1).
+- **H8 · v1.0.8 cutover — CLOSED at BL-098** (executed overnight 09-03,
+  BL-093; five acceptance gates passed 09-03 evening: beat2 p50 198.9s ·
+  ERRSTREAM quiet · poll-failures flat, BL-089 hypothesis confirmed ·
+  3 non-LAN peers on 16811 · give-ups 0 steady-state, 2 outage-window
+  rows annexed to the give-up reconciliation, now 30 rows). Unblocked and
+  live: the reconciliation · P6 · R-1's missing_history semantics.
 
 ## P — PIPELINE STREAM
 
