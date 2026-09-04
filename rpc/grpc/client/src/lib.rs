@@ -51,16 +51,21 @@ use std::{
 use tokio::sync::Mutex;
 use tonic::Streaming;
 use tonic::codec::CompressionEncoding;
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
-/// A SOCKS5 proxy (host:port) to reach the gRPC server through, set ONCE per process.
-/// The on-device wallet engine sets this to Orbot for Tor mode; the node and hosted
-/// daemon never set it, so their connection path stays byte-identical.
-pub static NODE_SOCKS_PROXY: OnceLock<String> = OnceLock::new();
+/// A SOCKS5 proxy (host:port) to reach the gRPC server through. The on-device wallet
+/// engine sets this to Orbot for Tor mode; the node and hosted daemon leave it None,
+/// so their connection path stays byte-identical. SETTABLE and CLEARABLE, not a
+/// OnceLock: the engine calls this on every start, so toggling Tor OFF (None) actually
+/// stops routing through a proxy that may no longer be there -- otherwise a session that
+/// ever enabled Tor could never reach the node again without Orbot running.
+pub static NODE_SOCKS_PROXY: RwLock<Option<String>> = RwLock::new(None);
 
-/// Set the process-wide SOCKS5 proxy for gRPC node connections (first set wins).
-pub fn set_node_socks_proxy(addr: String) {
-    let _ = NODE_SOCKS_PROXY.set(addr);
+/// Set (Some) or clear (None/empty) the process-wide SOCKS5 proxy for gRPC node connections.
+pub fn set_node_socks_proxy(addr: Option<String>) {
+    if let Ok(mut g) = NODE_SOCKS_PROXY.write() {
+        *g = addr.filter(|a| !a.is_empty());
+    }
 }
 
 /// Build a tonic channel to `url`, dialing through [`NODE_SOCKS_PROXY`] when set.
@@ -69,9 +74,9 @@ async fn connect_channel(url: &str, request_timeout: u64) -> Result<tonic::trans
     let endpoint = tonic::transport::Channel::builder(uri.clone())
         .timeout(tokio::time::Duration::from_millis(request_timeout))
         .connect_timeout(tokio::time::Duration::from_millis(CONNECT_TIMEOUT_DURATION));
-    match NODE_SOCKS_PROXY.get() {
+    let proxy = NODE_SOCKS_PROXY.read().ok().and_then(|g| g.clone());
+    match proxy {
         Some(proxy) => {
-            let proxy = proxy.clone();
             let host = uri.host().unwrap_or_default().to_string();
             let port = uri.port_u16().unwrap_or(16110);
             let channel = endpoint

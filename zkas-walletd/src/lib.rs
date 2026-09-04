@@ -4192,7 +4192,20 @@ impl AppState {
         // (pruned cursor, RPC hiccup), we simply restore the old way.
         let mut abandoned_checkpoint = false;
         let tip = match checkpoint_cursor(&self.wallet_dir, token, &genesis) {
-            Some(cursor) => match self.request_client().await?.get_shielded_tree_state(Some(cursor)).await {
+            Some(cursor) => match {
+                // Bounded, like fast_sync_entry: this runs FIRST for a returning wallet and
+                // holds the single load permit. Un-timed-out, a half-open node connection
+                // (e.g. Orbot up but the node unreachable) hangs the load forever with no
+                // error -- the wallet sits on "opening" and blocks every other load.
+                let c = self.request_client().await?;
+                match tokio::time::timeout(std::time::Duration::from_secs(8), c.get_shielded_tree_state(Some(cursor))).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        log::warn!("checkpoint cursor verification timed out ({cursor}); keeping checkpoint and retrying");
+                        return None;
+                    }
+                }
+            } {
                 Ok(ts) => Some(kaspa_shielded_core::tree::FrontierState {
                     size: ts.size,
                     leaf: (ts.size > 0).then(|| ts.leaf.as_bytes()),
@@ -8072,13 +8085,11 @@ mod warm_sweep_tests {
 /// new config — e.g. after the user switches nodes.
 pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>) -> Result<(), String> {
     let listen = cfg.listen;
-    // Route node gRPC through Tor/SOCKS when the embedder asked for it. Process-wide
-    // and first-set-wins, so it must happen before the first connect below.
-    if let Some(proxy) = cfg.node_socks_proxy.clone() {
-        if !proxy.is_empty() {
-            kaspa_grpc_client::set_node_socks_proxy(proxy);
-        }
-    }
+    // Route node gRPC through Tor/SOCKS when the embedder asked for it, and CLEAR it
+    // when they did not -- set on every start so toggling Tor off takes effect (a stale
+    // proxy with no Orbot leaves the node unreachable and the wallet stuck "opening").
+    // Must happen before the first connect below.
+    kaspa_grpc_client::set_node_socks_proxy(cfg.node_socks_proxy.clone());
     let wallet_dir = cfg.wallet_dir;
     let _ = std::fs::create_dir_all(&wallet_dir);
 
