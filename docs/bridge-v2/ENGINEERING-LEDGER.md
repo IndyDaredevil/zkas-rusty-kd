@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-099 (2026-09-04)
+### Last entry: BL-102 (2026-09-04)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -3044,3 +3044,166 @@ execution request carries its fence verbatim, including closings.
 **Lesson:** ASCII smoke tests certify the pipe, not the payload — test
 with the bytes production will send. And a port is not free just because
 its owner was told to stop.
+
+## 2026-09-04 — S22: the turnstile scrutinized, ZKas's Orchard lineage proven, two PRs opened upstream
+
+**BL-100 · 2026-09-04 · turnstile verdict — the public ledger cannot see a
+proof-system counterfeit; §3 overclaims, §8.2 concedes; ZKas does NOT inherit
+the 2026 Orchard bug (proven from crate bytes to genesis); posted to Discord**
+TRIGGER: public post — "the turnstile tracks coinbase−fees and never observes
+hidden note value; a soundness failure passing bundle validation would not
+trip it." CODE READ (firecash/zkas-rusty main @ 783d4084…, 2026-09-04;
+files pinned: shielded-core/src/turnstile.rs 381 ln 1811123d…, state.rs 848
+ac9d5d03…, consensus/…/utxo_validation.rs 1270 0004f2e7…, bundle.rs 639
+0f5043b4…, verify.rs 492 510f37dc…): two consensus rules, both over public
+integers — (1) `SupplyLedger::pool_value()` = coinbase+pegged_in−fees−burns,
+checked-sub, rejects on underflow (turnstile.rs:178–192), fed per chain block
+with coinbase note values + Σ declared `value_balance` (state.rs:328–342;
+fee = `bundle.value_balance` after a <0 reject, :88–106); (2) delta-equality
+Δcoinbase−Δfees == Σ mergeset subsidy ± dev-fee accrual
+(utxo_validation.rs:540–575) — pins the COINBASE, not the pool. Whole-tree
+grep (n=all non-test .rs under consensus/, shielded-core/, kaspad/, rpc/,
+mining/): the ONLY consensus consumer of `cv_net` is verify.rs:166–216,
+summing WITHIN one bundle into bvk; `payment_check.rs` is device-side wallet
+code with no consensus caller; `ValueCommitmentAccumulator`/`reconcile` are
+documented test utilities (turnstile.rs:33–44). TRACE of the paper's own
+cited class (nullifier forgery): balanced bundle, small fee → rule 1 stays
+positive, rule 2 equality exact → NO HALT; the only PoolUnderflow path is an
+attacker CHOOSING `value_balance` > cumulative issuance (the sole test of it:
+processes/shielded.rs:2109). No `MAX_SOMPI` bound on `value_balance` found
+(n=1 grep, shielded-core). VERDICT: the critic is right. §8.2's closing line
+("the per-bundle binding signature *is* the turnstile; nothing left at block
+level") describes the code and is the admission; §3's "degrades to a halt,
+not a counterfeit" is unsupported. ZIP-209 has the same mechanism limit (fires
+only when a pool's public exits exceed entries); ZKas has NO exit
+(`BRIDGE_ENABLED=false`, burn.rs:53) so is strictly weaker. What the ledger
+DOES catch: node accounting bugs (rule 2 has fired in production per the
+:570–575 comment), off-schedule coinbase, bridge exits once live.
+RESEARCH RAIL: Bowe/Tachyon 2026-07-07 taxonomy — implementation bugs are
+replay-detectable, SPEC bugs (circuits) are the undetectable class, remedy is
+formal verification of the verifier (Lean, Ironwood); Zcash NU6.3 Ironwood
+(07-28, block 3,428,143) = seal pool + forced turnstile crossing as RECOVERY,
+not detection; Liu's "aggregate supply proof" reduces to per-tx soundness —
+the whitepaper is right that aggregate reconciliation is impossible, wrong to
+call the consequence a halt. QED²/Wen-2024 = under-constraint tooling.
+ORCHARD LINEAGE (the Discord "patched from block 1" claim, VERIFIED):
+defect = `ecc::chip::mul` incomplete loop's `(x_p,y_p)` assigned, never
+anchored; fix = `copy_advice` of base at loop row 0 under
+`CircuitVersion::AnchoredBase`, sufficient because the pre-existing `q_mul_2`
+constancy gate propagates it (incomplete.rs:183–209, enabled on all rows but
+first/last; both hi and lo halves anchored; row indexing verified).
+halo2_gadgets 0.5.0 + orchard 0.14.0 published 2026-06-03 (all prior
+halo2_gadgets yanked). ZKas: no orchard dep before cf89920 (06-29,
+"shielded-core: new crate") which pinned 0.14.0/0.5.0 from birth; d749389
+(08-30) → zakura-orchard/-halo2-gadgets 1.0.1 (crates created 06-08,
+published from zakura-core/common @ 344e5946… per .cargo_vcs_info.json;
+tarball ⟷ repo files IDENTICAL; lockfile checksum c601160505e5… matches the
+downloaded .crate); verify.rs:492 `CIRCUIT_VERSION = FixedPostNu6_2` →
+`AnchoredBase` (zakura circuit.rs:185–188), 12 build sites; mainnet genesis
+timestamp 1785079572000 = 2026-07-26 15:26:12 UTC, 53 days post-fix.
+GAP FOUND: no pinned VK fingerprint anywhere in verify.rs (n=1 grep) — the
+live VK is asserted by a constant + "hard fork" comment only. → BL-101.
+PUBLISHED: Discord #general reply r13 (9c1e496f…, 203 words, 1,564 ch),
+message 1545476937076576266, 2026-09-04; embeds removed post-edit. Long-form
+r5 (a5af76fa…, 1,056 w) and short r6 (79a6e75f…, 553 w, 17 permalinks to
+783d4084…/344e5946…) held for a technical thread. Fourteen forum revisions
+(r1→r13): r1 mis-cited processes/shielded.rs:2109 as state.rs:2109
+(corrected r3); r4→r5 swapped "will open an issue" for the PR links.
+**Lesson:** "the invariant holds" and "the invariant is observable" are
+different claims; the paper wrote the first and promised the second.
+
+**BL-101 · 2026-09-04 · PR set opened — zkas-rusty#8 (crate-identity pin,
+A1) and zakura-core/common#362 (VK fingerprint, B); A2 (fail-closed guard)
+written, tested, held for B's release; all three verified on the MacBook**
+DESIGN: A1 (zkas-rusty, self-contained) — `shielded-core/build.rs` reads
+Cargo.lock line-wise (CRLF-safe), bakes `ZKAS_ORCHARD_CRATE` /
+`ZKAS_HALO2_GADGETS_CRATE` = "name version sha256"; `verify::circuit_identity()`
+one-liner for startup log / getInfo; test `verify::e2e::orchard_stack_is_pinned`
+asserts CIRCUIT_VERSION + both triples by value; fixes the stale "0.14.0"
+Cargo.toml comment. B (zakura-orchard) — `VerifyingKey::pinned_description()`
+(= the `round_trip_*` fixture text; `alloc::string::String`, crate is
+no_std+alloc) and `::fingerprint()` = BLAKE2b-256 person "Orchard-VkFprint"
+over it; test pins all three versions: InsecurePreNu6_2 6e6df084…,
+FixedPostNu6_2 **1bee049ad3ff027c…6591fb**, PostNu6_3 3409b1d4…; the constants
+equal the hash of the shipped `circuit_description_*` fixtures (1,285,701 B
+each, fixed≠insecure at byte 1,283,597). A2 (zkas-rusty, DEPENDS ON B) —
+`verify::VK_FINGERPRINT` = 1bee049a…, `circuit::verifying_key()` builds,
+hashes, PANICS on mismatch (fail closed; ~0.1–0.5 s VK-only keygen, cost nil);
+test `verifying_key_fingerprint_matches_pin`.
+VERIFICATION (MacBook/zsh, rustc 1.91 for zkas-rusty @783d408; rustc 1.97.1
+auto-pulled by zakura's rust-toolchain.toml @main): A1 test ok (33 s build);
+B test ok on 1.0.1@344e5946 (0.22 s) AND on main@666159a (0.23 s; 172 filtered
+vs 167 — 1.1.0 released 3 h earlier); A2 test ok (0.10 s) under a 10-crate
+`[patch.crates-io]` override (single-crate override SPLITS the graph — two
+`pasta_curves::Fq`, E0308 — override every `zakura-*` in the lockfile);
+sandbox x86-64 (apt rustc-1.91) reproduced B: 3 keygens match → fingerprint is
+platform-stable. Clippy on A1+A2 tree with override: zero findings on any
+patched line (pre-existing: wallet.rs unused imports, deprecated RngCore ×8,
+kaspa-hashes/merkle ×2 each). rustfmt-clean per each repo's config (r1 cuts
+FAILED `.rustfmt.toml` max_width=135; re-cut). Combined A1r2+A2r2 diff vs
+783d408: +124/−3, sha b38a3173…50e0 IDENTICAL on both machines.
+FINAL PINS: A1 r2 4e1a31ed816dcff2… 118 ln · A2 r2 f38616ee67213798… 66 ·
+B r4 b8d2d4087fea043b… 72 (code-only, on main) · PR-SET r4 bb5d12bb… 116 ·
+PR-BODY-A1 bf70776e… · PR-BODY-B 5c933227…. VOID: A1 r1, A2 r1 (fmt), B r1
+(bare `String`), B r2 (no CHANGELOG), B r3 (CHANGELOG hunk — see below).
+VENUE NORMS READ FROM THE VENUE (V.3): zkas-rusty CONTRIBUTING (rusty-kaspa's:
+fork, ≤50-char subject, what/why/testing/compat body, `./check` = fmt+clippy
+workspace; base is `main` not "master"); zakura-core/common has NO
+CONTRIBUTING but `.claude/skills/changelog-fragment` + `changelog.yml` CI:
+NEVER edit CHANGELOG.md — one `docs/changelog/unreleased/<PR>.md` fragment
+created AFTER the draft PR number exists, `./scripts/changelog.py check`;
+versions bump in lockstep at release only (semver CI vs crates.io baseline
+— whether unchanged-version additive API passes is CI's answer, not ours);
+rust-toolchain.toml pins 1.97.1 dev / 1.91 MSRV. B r3's CHANGELOG hunk would
+have failed CI on first contact — caught by the read, re-cut r4.
+OPENED: **zakura-core/common#362** "orchard: add VerifyingKey fingerprint",
+IndyDaredevil:orchard-vk-fingerprint → main@666159a, commits 56156db (code)
++ e61d08f (fragment 362.md; `validated 4 changelog fragment(s)`), body
+readback via `gh pr view --json body` OK, marked READY; five workflows
+(Supply chain, Documentation, Semver policy, CI, Changelog fragments) at
+`action_required` = first-contributor approval gate; Socket Security ×2
+pass. **firecash/zkas-rusty#8** "shielded: pin the Orchard stack identity",
+IndyDaredevil:shielded-pin-orchard-identity (on fork zkas-rusty-kd) →
+main@783d408, commit 6a609d8, body readback OK, `Tests` workflow
+`action_required`. A2 NOT opened: waits for a zakura-orchard release carrying
+#362, then a one-line Cargo.toml bump + PR-A2 r2.
+gh QUIRKS: `gh repo fork <repo> --remote` rejected on this gh version — run
+`gh repo fork --remote --remote-name fork` INSIDE the clone; `--head
+owner:branch` (fork name never appears); `gh repo set-default` needed once
+two remotes exist. LOCAL TREES: ~/zkas/pr/zkas-rusty @6a609d8 on branch,
+~/zkas/pr/common @e61d08f on branch, ~/zkas/pr/common-main not on MacBook.
+SIDE FINDING for upstream (in PR-BODY-A1, not patched): workspace Cargo.toml
+`[profile.release.package.{halo2_gadgets,halo2_proofs,orchard,pasta_curves}]`
+match no package since the Zakura port — the fast-arithmetic profile is
+silently NOT applied; four-spec rename is a one-line PR.
+**Lesson:** a fork's contribution norms live in its CI and skills, not its
+README — read the workflows before cutting the artifact.
+
+**BL-102 · 2026-09-04 · S22 incidents I-16..I-18 — toolchain absence claimed
+from PATH alone; stale PR-B artifact reported as re-cut; `git stash` vs
+intent-to-add; `tail -1` hiding the fork error**
+I-16 (II.2): "no Rust toolchain in this environment" asserted from `which
+cargo` = empty; apt (archive.ubuntu.com, allowed) carried rustc-1.91/cargo-
+1.91 — PATH is one rail. Cost: an "unbuilt, eye-reviewed" caveat that was
+false-by-omission, and — worse — the operator's remark "I think we have a
+toolchain" (meaning the MacBook) was misread as sandbox and answered with an
+unrequested install + builds. Two errors: rail scope, and taking a
+statement about the operator's machine as a statement about mine.
+I-17 (I.1/IV.2): PR-B fixed in the tree (`String`→`alloc::string::String`)
+but the patch file was NOT regenerated; reported as "corrected"; the
+UNCHANGED sha (78885648…) was read as confirmation instead of as the failure
+signal. Caught by the operator's compile error. Mechanism: after any intended
+content edit, re-pin and REQUIRE the sha to differ.
+I-18 (III.6/III.2): `git stash` silently does not stash an intent-to-add
+(`add -N`) file → `checkout -b` refused "not uptodate"; the chain's second
+command line ran anyway (heredoc ended line 1). Separately `gh repo fork …
+| tail -1` swallowed the real error ("--remote unsupported with repo arg").
+Fixes: never `add -N` in a tree that will be stashed; one command line per
+gated chain; never `tail` a command whose failure mode is text.
+Also: II.2 fired TWICE more this session — ledger tip recalled as BL-087/
+BL-092, rail read BL-099; three "no such file" landings where the fence
+shipped but the download precondition had not (IV.2(ii) — landing confirmed
+by the next command's failure, not before). Appendix B rows I-16–I-18 owed
+to SESSION-CONDUCT-LAWS v2-r2.
+**Lesson:** the sandbox and the MacBook are different rails with different
+toolchains; every "we have X" needs its rail named before it is acted on.
