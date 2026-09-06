@@ -1,5 +1,5 @@
 # ITEM REGISTRY — the operation's project-management list
-### Content r5 · created 2026-09-03, revised 2026-09-05 (r5: mailbox lane live, kaspa_double column of record, T-6 closed, dashboard items re-ranked — BL-103..105) · Successor to the registry role of SCOPE-v2.0.1.5 (retired at D2)
+### Content r6 · created 2026-09-03, revised 2026-09-06 (r6: P9/P10/R-6/T-5 CLOSED, zkas-wallet#3 filed, W-1 opened — BL-106) · Successor to the registry role of SCOPE-v2.0.1.5 (retired at D2)
 
 **Why this doc exists:** SCOPE carried the item definitions and retired with
 its version (D2 pass, 09-03) — leaving codes referenced everywhere and
@@ -67,13 +67,11 @@ evidence; this is the map.
   gauge to Supabase — r7 candidate (with the difficulty feed). Dashboard
   sitting CLOSED 5/5 w/ 28.4-vs-28.9 cross-check; future card noted:
   "Expected (network)" beside pace = drought instrument in UI.
-- **P9 · dashboard page cap — OPEN (row 20/21).** fetchZkasBlocks()
-  returns ≤1000 rows; all-time stats truncated. Fix: .range() paging or
-  server-side aggregates. Prerequisite for P10.
-- **P10 · double-block KPI — DATA READY (BL-104), card pending row 21.**
-  kaspa_double is the column of record (r6 live capture + backfill,
-  1158/213/0, 84.5%). Card = count(kaspa_double)/count(*) from the full
-  table. Counter-mirror plan WITHDRAWN.
+- **P9 · dashboard page cap — CLOSED at BL-106** (row 23: .range() loop +
+  head/count + RPC zkas_blocks_total_amount; verified 1,420 / 68,146.61).
+- **P10 · double-block KPI — CLOSED at BL-106** (row 22/23: card queries
+  the full table; 1198/1420 = 84.4% verified). kaspa_double is the column
+  of record; counter mirror withdrawn.
 - **P11 · stale-pending aging + expected-vs-pace + kron_events timeline —
   OPEN, ranked (BL-105).** Display-only; network_history holds d_z /
   est_hashrate_z; restarts→kron_events generalization.
@@ -101,8 +99,9 @@ evidence; this is the map.
   (kaspad.exe/kaspad/zkas-node) undermine port scoping — profile-aware
   audit, explicit rules made authoritative (KRON-HARDENING §6.8).
 - **R-5** RcReporterDown fire drill — never run.
-- **R-6** Button r3: add walletd version pin (v1.0.5→1.0.8 passed the
-  liveness-only check silently). Reconcile check-kron.ps1 vs check-kron-r3.
+- **R-6** CLOSED at BL-106: check-kron-r3 (walletd impostor check,
+  B5B1DDA9 pin) adopted as the live check-kron.ps1 (8CECBABC); r2 patch
+  archived. Button 8/8 with walletd pinned.
 - **R-7** Reporter: widen the TG edit-path WARN to log Telegram's error
   text (duplicate-card diagnosis, BL-105).
 
@@ -119,12 +118,23 @@ evidence; this is the map.
   BL-087 — the instrument earns its keep.)
 - **T-6** CLOSED 09-04: first card cb9c364d… (dt 1s), birth form + self-
   edit witnessed 06:06/06:09Z. Card doctrine: buzz every block + 24h digest.
-- **T-7** 24h double-rate convergence: SQL 69.8% vs counters 90.4% at
-  backfill time; expect convergence over one full r6 day, else investigate.
+- **T-7** 24h double-rate convergence: 69.8% at backfill → **83.0%** one
+  day later (BL-106); expect ~90% by the next read, else investigate.
 - **T-4** Brick experiment (running since 09-02 14:12): falsifier =
   another 41/6008 + zero PowerPanel rows → convicts barrel/board.
-- **T-5** Upstream watch: firecash seed-side tip-drop note on #6 (ours
-  already confirmed).
+- **T-5** CLOSED: zkas-rusty#6 CLOSED 2026-09-01 07:52Z (3 comments).
+
+## W — WALLET APP (MacBook, custody + Covenants++ harness)
+
+- **W-1 · zkas-wallet#3 — FILED 2026-09-06, OPEN.** Desktop connects to
+  the public node pre-unlock; own-node choice reverts to "Set up"; node
+  left stopped; run-mode dialog defaults to Mining. Published body pinned
+  1fe41ce1…; comment #1 = plist 1.0.31-1 + post-unlock lsof. Watch for
+  maintainer reply; interim procedure: Own node + Shielded history first
+  on every launch. Verification rule for this app: badge + asset sha,
+  never About/plist.
+- **W-2 · release cadence** — on 1.0.32 (d49597a1…). Batch-by-default;
+  upgrade on desktop custody/key/money changes or to reproduce for #3.
 
 ## DOCS SWEEP (batch)
 

@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-105 (2026-09-05)
+### Last entry: BL-106 (2026-09-06)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -3321,3 +3321,80 @@ unrelated) — UNREPORTED. Draft ISSUE-DRAFT-desktop-default-public
 minimize restarts.
 **Lesson:** three corrections in one mailbox thread is not thrash when
 each one names what it weakens and lands closer to the primary source.
+
+## 2026-09-06 — S24: zkas-wallet#3 filed from a measured walkthrough; the day's loose ends closed
+
+**BL-106 · 2026-09-06 · wallet 1.0.32 + upstream issue #3 · dashboard arc
+14→23 closed · checker consolidated (R-6) · corrections I-25, row 16 ·
+T-5/T-7 · verification-rule change for the wallet app**
+WALLET 1.0.32: custody protocol (hex-key reconfirmed → clean quit → cold
+copy `wallet-backup-pre-1.0.32-20260905-233850`, 423 files / 3.5 GB,
+manifest 423 → DMG `d49597a14c31063dd6596ca84e549485dd58165cf0a52cedaed2f
+9382c071bce` 13 MB → install → **balance gate PASSED** wallet one
+2004518.02596746 ZKAS / 7 notes = 200,451,802,596,746 sompi). FINDING: the
+in-app badge reads v1.0.32; ZKas→About and BOTH Info.plist version fields
+read `1.0.31-1` — the bundle string was not bumped for the 1.0.32 build.
+**Verification rule for this app changes: identity = badge + release-asset
+sha; About/plist are not trusted.** (BL-090's About check is superseded.)
+The Downloads asset name is version-less (`ZKas-Wallet-macos-aarch64.dmg`)
+and `--clobber` overwrote 1.0.29's in place — future downloads rename with
+`-O` to carry the version.
+THE WALKTHROUGH (operator-led, "assume nothing"), measured on 1.0.29 and
+reproduced identically on 1.0.32: step 0 app closed → lsof empty; step 1
+launch → **Unlock screen, and lsof already shows two ESTABLISHED
+connections zkas-desk→185.147.157.125:16110 BEFORE the PIN is entered**, no
+node process; step 2 PIN/Unlock → wallet view, chooser "This computer ·
+public node" (previous session: own node), Node page Stopped with the card
+still reading "Mode: Shielded history"; step 3 chooser → "This computer ·
+your own node" shows **Set up**, not Use; step 4 Node tab → Run node →
+"Choose how to run it" **defaults to Mining** ("does not keep old wallet
+notes") → re-pick Shielded history → node syncs (Kron 108.95.94.128:16811
+was its IBD peer; Kron also answered its history request — the v1.0.7
+serving feature observed with our archival node serving). Post-unlock
+lsof: same two public-node connections (same FDs/ports) + loopback pairs
+internal to the app; still no node. Four non-persisted/premature
+behaviors, all measured; the chooser's own text ("Your keys stay on this
+device either way") confirms the I-24 retraction from the app side.
+FILED: **firecash/zkas-wallet#3** (open; the repo's third issue ever),
+title "Desktop: connects to the public node at process start (before
+unlock); 'your own node' reverts to 'Set up' every launch, node left
+stopped, run-mode dialog defaults to Mining". Draft r6 54d07d00… (six
+revisions, every one driven by a measurement or screenshot the operator
+supplied); published body pinned as its own revision
+ISSUE-desktop-default-public-PUBLISHED-3.md
+1fe41ce1f4c87e66cc254b18835e5cc975ba05dc4df877bc6277bb6c0851cffe;
+comment #1 (issuecomment-5556751560) carries the plist values and the
+post-unlock lsof. Adversary pass: every claim about their code is a
+question; our observations carry version, platform, asset sha.
+I-25 (II.4): the app log's `[app] launching zkas-node …` line was read as
+"auto-started"; it records that a start happened, not who triggered it —
+the operator's Run-node click did. Corrected same hour by the operator's
+statement + screenshot. A record of WHAT happened is not a record of WHO
+acted.
+DASHBOARD ARC 14→23 CLOSED: row 22 (05:43Z) — the double card fix landed
+hours before row 21; row 16's "truncated array" diagnosis WAS RIGHT for
+that card (BL-105's note that it was "wrong in scope" is corrected: right
+diagnosis, then the page cap was found to be page-wide as well). Row 23:
+page-cap fix (`.range()` loop + head/count + new RPC
+`zkas_blocks_total_amount`, a migration in mining-dash's lane), double
+card from the full table, drought card full-height. **Every pin verified
+against zkas_blocks before ack: 1,420 rows / 68,146.61 zKAS / 1,198
+doubles = 84.4% / 24h 44/53 = 83.0% — exact.** Rows 22, 23 acked; both
+inboxes clear. Registry P9, P10 CLOSED.
+T-7 first reading: 24h double rate 83.0% (from 69.8% at backfill time);
+converging toward the counters' ~90%; one more day.
+CHECKER CONSOLIDATED (R-6 CLOSED): two checkers found — check-kron.ps1
+(r2 + this lane's v106→v108 patch, 7C477761) and check-kron-r3.ps1 (the H8
+executor's, 8CECBABC). Diff: r3 is the superset — same v108 node pin PLUS
+the walletd impostor check (C:\zkas\walletd-v108\zkas-walletd.exe,
+B5B1DDA9…) and v1.0.8 launcher remedies; the patched r2 still named
+start-walletd-v1.0.5. r3 adopted as the live check-kron.ps1 (both names
+8CECBABC), r2 archived as archive-check-kron-r2-v108patch.ps1. Button:
+**8/8, walletd "v1.0.8 pinned."** BL-094's reconcile item closes.
+T-5 CLOSED: firecash/zkas-rusty#6 CLOSED 2026-09-01 07:52Z, 3 comments
+(SESSION-STATE Q7 answered). Downloads swept: 13 August-era artifacts
+removed; the other project's LEDGER-APPEND-S22-r1.md left in place.
+**Lesson:** the issue that got filed is the one the operator walked
+through step by step with lsof at each point, not the one this lane
+inferred from release notes and commit messages. Six drafts, one truth,
+all of it measured.
