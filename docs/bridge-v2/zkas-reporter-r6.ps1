@@ -16,6 +16,12 @@
 # Requires: C:\zkas\webhook-secret.txt  (one line; must match the edge
 #           function's ZKAS_WEBHOOK_SECRET, see runbook)
 #
+# --- r6 · 2026-09-05 (per-block double attribution) ---------------------------
+#   The bridge logs "[ZKAS] DOUBLE! Both legs blue. H_fc: <hash>" beside the
+#   BLUE line (BL-100). r6 parses it, carries kaspa_double on the block state,
+#   sends it on BEAT1 and BEAT2 (webhook must map the field; until it does the
+#   value is dropped, harmlessly), and marks the TG card. Backfill of history
+#   is a separate pass over the RKStratum_*.log archive.
 # --- r5 · 2026-09-04 (TG wire-encoding fix) ---------------------------------
 #   r4's first live block: both beats clean, fail-open held, ERRSTREAM caught
 #   TG 400 "text must be encoded in UTF-8" - PS 5.1 re-encodes string bodies
@@ -166,11 +172,12 @@ function Tg-Api([string]$method, $body) {
 
 function Tg-Text($blk, [string]$h, $amt, [bool]$refined, [string]$txid, $dt) {
     $short = $h.Substring(0,12)
+    $dblTag = if ([bool]$blk.dbl) { ' · 🎉 DOUBLE' } else { '' }
     if ($refined) {
         $link = if ($txid) { "`n<a href=""$TgTxBase$txid"">tx $($txid.Substring(0,12))</a>" } else { '' }
-        return "⛏ <b>ZKAS block</b> — $($blk.w)`n✅ $amt ZKAS`n<code>$short</code> · found $($blk.foundIso) · dt $([Math]::Round($dt))s$link"
+        return "⛏ <b>ZKAS block</b> — $($blk.w)$dblTag`n✅ $amt ZKAS`n<code>$short</code> · found $($blk.foundIso) · dt $([Math]::Round($dt))s$link"
     }
-    return "⛏ <b>ZKAS block</b> — $($blk.w)`n~$amt ZKAS <i>(provisional)</i>`n<code>$short</code> · found $($blk.foundIso)"
+    return "⛏ <b>ZKAS block</b> — $($blk.w)$dblTag`n~$amt ZKAS <i>(provisional)</i>`n<code>$short</code> · found $($blk.foundIso)"
 }
 
 function Tg-SendCard($blk, [string]$h, [string]$text) {
@@ -233,6 +240,9 @@ function Read-NewLines([string]$path, [long]$offset) {
 # ----------------------------- parsing ---------------------------------------
 $FoundRe = [regex]'^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+)([+-]\d\d:\d\d) .*ZKAS BLOCK FOUND! H_fc: ([0-9a-f]{64}), Worker: (\S+), full_clear: (true|false)'
 $BlueRe  = [regex]'ZKas block confirmed BLUE! H_fc: ([0-9a-f]{64})'
+$DoubleRe = [regex]'DOUBLE! Both legs blue\. H_fc: ([0-9a-f]{64})'   # r6
+# hash -> $true when the bridge logged a DOUBLE for it (r6)
+$DoubleTable = @{}
 
 # hash -> @{ w; foundEpoch; foundIso }
 $FoundTable = @{}
@@ -248,6 +258,13 @@ function Process-Line([string]$line, $state) {
         }
         return
     }
+    $d = $DoubleRe.Match($line)
+    if ($d.Success) {
+        $dh = $d.Groups[1].Value
+        $DoubleTable[$dh] = $true
+        if ($state.blocks.$dh) { $state.blocks.$dh | Add-Member -NotePropertyName dbl -NotePropertyValue $true -Force }
+        return
+    }
     $b = $BlueRe.Match($line)
     if ($b.Success) {
         $h = $b.Groups[1].Value
@@ -257,8 +274,9 @@ function Process-Line([string]$line, $state) {
             $state.blocks | Add-Member -NotePropertyName $h -NotePropertyValue ([pscustomobject]@{
                 w = $f.w; foundEpoch = $f.foundEpoch; foundIso = $f.foundIso
                 b1 = $false; b2 = $false; lastTry = 0; firstSeen = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+                dbl = [bool]$DoubleTable.ContainsKey($h)
             }) -Force
-            Log "BLOCK blue-confirmed $($h.Substring(0,12)) worker=$($f.w) found=$($f.foundIso)"
+            Log "BLOCK blue-confirmed $($h.Substring(0,12)) worker=$($f.w) found=$($f.foundIso) double=$([bool]$DoubleTable.ContainsKey($h))"
         }
     }
 }
@@ -287,6 +305,7 @@ function Run-Beats($state, $usedTxids) {
             $ok = Post-Block @{
                 block_hash = $h; miner_name = $blk.w; found_at = $blk.foundIso
                 amount = $script:ProvisionalAmt
+                kaspa_double = [bool]$blk.dbl
             }
             Pump-Metrics
             if ($ok) {
@@ -339,6 +358,7 @@ function Run-Beats($state, $usedTxids) {
             $amt = [double]$best.r.amountZkas
             $ok = Post-Block @{
                 block_hash = $h; miner_name = $blk.w; found_at = $blk.foundIso; amount = $amt
+                kaspa_double = [bool]$blk.dbl
             }
             Pump-Metrics
             if ($ok) {
@@ -404,7 +424,7 @@ $script:MPending = 0
 function Pump-Metrics { Serve-Metrics $script:MBlocks $script:MPending }
 
 # ----------------------------- main ------------------------------------------
-Log "=== zkas-reporter starting r5 (DryRun=$DryRun ReplayOnly=$ReplayOnly) ==="
+Log "=== zkas-reporter starting r6 (DryRun=$DryRun ReplayOnly=$ReplayOnly) ==="
 $Error.Clear()   # r3: start the error-stream capture from a clean slate
 $state = Load-State
 if (-not $state.blocks -or $state.blocks -is [hashtable]) {

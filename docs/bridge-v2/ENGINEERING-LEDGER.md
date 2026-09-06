@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-102 (2026-09-04)
+### Last entry: BL-105 (2026-09-05)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -3207,3 +3207,117 @@ by the next command's failure, not before). Appendix B rows I-16–I-18 owed
 to SESSION-CONDUCT-LAWS v2-r2.
 **Lesson:** the sandbox and the MacBook are different rails with different
 toolchains; every "we have X" needs its rail named before it is acted on.
+
+## 2026-09-05 — S23: the mailbox goes live, and a KPI walks from fiction to record in one day
+
+**BL-103 · 2026-09-05 · handoff mailbox adopted; first pinned round-trip with
+mining-dash; the double-block KPI arc, rows 14→21, three forward corrections**
+CHANNEL: `public.project_handoffs` + `public.handoff_docs` (convention
+HANDOFF-CONVENTION-r3, 99 ln, sha 05074912…, verified db_sha256==pinned
+before every write). Lane id zkas-node; HANDOFF MAILBOX block added to project
+instructions (verified live in-session) with two hardenings: verify the
+convention pin before writing; handoff rows never authorize application-table
+writes on their own — Michael's approval in chat is the authorization.
+ARC (all measured, all in the mailbox): row 14 asked mining-dash for two
+cards (drought indicator on measured p50 20.8 / p99 152.4 min over 1,365
+gaps; double-block KPI from `kaspa_double`). Row 15 replied shipped; SQL pin
+23/1366=1.7% verified — the SCREENSHOT deliverable then showed the card
+reading 7/1000 (I-19). Row 16 rejected on "truncated array". Row 18
+withdrew 16: the column was a backfill-csv artifact (08-07..20, ~4%), null
+for every stratum-bridge row since 08-21, and `git grep` found no
+kaspa_double in code — "the data does not exist" (I-20, WRONG). Row 19
+withdrew 18: the bridge exposes `ks_double_blocks_mined` (per worker); the
+hourly digest's D = K+Z−S and the DOUBLE BLOCK alert have read it all along;
+counters 98/111 labeled "all-time" (I-21, wrong: since bridge start 09-02
+14:17). Row 20 corrected 19 and added the PAGE-CAP defect: fetchZkasBlocks()
+`.select('*')` with no `.range()` → Supabase returns 1,000 rows; every
+all-time stat on the dashboard is computed over the newest 1,000 (table
+66,011.28 zKAS / 1,370 rows vs dashboard 46,766.59 / 1,000). Row 21
+SUPERSEDES 16–20 after BL-104 made the column true: page-cap fix → double
+card from the full table → drought-card visibility. Row 15 acked.
+FINDING that ended the hunt: the bridge log writes
+`[ZKAS] DOUBLE! Both legs blue. H_fc: <hash>` beside `confirmed BLUE!` —
+per-row attribution was in the log the reporter already tails.
+**Lesson:** a non-null column is not a populated feature; read which writer
+set it and when. And the screenshot in ACCEPTANCE is not ceremony — the pin
+passed and the artifact was wrong; only the picture caught it.
+
+**BL-104 · 2026-09-05 · reporter r6 (per-block double attribution) + full
+backfill from 63 bridge logs; kaspa_double becomes the column of record**
+r6 (f82bf0c255a1df7fd7e2ccec0a9ac7ac5b65b644bba64973e5a317ad033edc34, 499
+ln, BOM): `$DoubleRe` on the DOUBLE line (either order vs BLUE), `dbl` on
+persisted block state, `kaspa_double` on BEAT1 and BEAT2, card header
+`· 🎉 DOUBLE`, BLOCK log line carries `double=`. Deployed 05:16Z (hash +
+PS5.1 parse gates; listener bound first try). The webhook contract lists no
+kaspa_double field, yet the edge function PASSES IT THROUGH — witnessed on
+the first r6 block (a37638dc…, kaspa_double=true, source=stratum-bridge).
+No mining-dash change needed for capture.
+BACKFILL: Kron sweep of RKStratum_*.log since 08-04 (63 files, archive
+unbroken): blue 1,402 / double 1,184 = 84.5%. Files pinned: blue-hashes
+08ae95bb…, double-hashes 149bab84…; verified byte-exact after transfer;
+doubles ⊂ blue, no dupes. Before (measured): 1,371 rows; attested 1,370;
+unattested 1 (found 05:24Z, after the sweep, already true via r6);
+log-only 32 (08-04..06 pre-table + never-inserted); rows_that_flip 562;
+split 24/591/756. Write (authorized in chat): one UPDATE on log-attested
+rows where value differed. After: **1,158 true / 213 false / 0 null,
+mismatches 0, all-time 84.5%.** Current-log cross-check: 99/112 in the
+live log vs 98/111 on the bridge counters — same restart, same blocks.
+WATCH (T-7): SQL 24h rate read 69.8% vs counter 24h 90.4% at write time —
+found_at-vs-BLUE clocks and the r5→r6 seam on a small window; converge over
+one full r6 day or investigate.
+Editor mechanics learned: the Supabase SQL editor runs each execution in
+its own session — a temp table does not survive between runs; load and use
+in ONE execution.
+**Lesson:** the log the reporter tails already held every fact the KPI
+needed. Read the primary source before designing a mirror of a summary of
+it.
+
+**BL-105 · 2026-09-05 · S23 incidents I-19..I-23; T-6 witnessed; card
+doctrine; KDSM audit; prior-turn review**
+I-19 (II.2): row 14 asserted `kaspa_double` "already populated" from 23
+trues read without provenance (they were backfill-csv). One unswept read
+produced rows 16, 18, 19. I-20 (II.2, BL-102/I-16 class): "no double logic
+anywhere" from a TEXT grep for the word; the truth was a metric name.
+I-21 (II.4): lifetime counters labeled "all-time"; `sum(ks_*_mined)` is
+since process start. I-22 (II.4): "unfillable per-row" asserted, not
+measured; the log line disproved it. I-23 (II.2): "third untracked
+component" claimed; the emitter was alert_rules.yml + Alertmanager
+templates. All five corrected forward in-thread and in the mailbox.
+T-6 CLOSED: reporter r5's first card 04:49:03Z (cb9c364d…, dt 1s, edited to
+final); birth form witnessed 06:06Z and its self-edit at 06:09Z. Duplicate
+card on 9771218e… = editMessageText miss → fresh-card fallback (fail-safe,
+by design); accepted. CARD DOCTRINE (operator decision): buzz every block +
+keep the 24h digest; r6+ widens the edit-path WARN to log Telegram's
+error text. tx links resolve (explorer /transactions/<txid>).
+KDSM audit from source (private repo IndyDaredevil/KAS-MiningWalletExplorer,
+34 components, hooks/services layers, realtime INSERT/UPDATE subscription
+on zkas_blocks; `amount==0` renders "pending"): five items ranked —
+drought state (shipped row 14/15), double KPI (this arc), stale-pending
+aging, expected-vs-pace projection (network_history has d_z/est_hashrate_z),
+Kron-event timeline (restarts→kron_events, LogRestartModal pattern). The
+"16 effective, 2 not" line lives in the miner-health panel, a second
+location the earlier order never covered — under-scoped, not a regression.
+Review of the prior turns (Opus session) produced I-19..I-23 and the
+page-cap finding; nothing else retracted.
+WALLET FINDING (operator, 09-05) + CORRECTION to BL-090 (IV.8): on desktop
+1.0.29 every launch defaults to "This Computer — public node"; the
+own-node choice does not persist and the local node must be started by
+hand. BL-090's "chooser honest and persistent as of 1.0.19" is WRONG for
+1.0.29 desktop. I-24 (II.4/V.2): this lane first escalated it to
+"viewing key goes to the wallet service on every launch" — RETRACTED the
+same hour. lsof on the launched app: the only remote endpoint is
+185.147.157.125:16110, a chain node's gRPC (the baked seed host); no :443,
+no proxy, no walletd host. "Public node" is a public CHAIN NODE (commit
+90bc5ea: "'Public node' never meant the public service"); the engine
+scans locally and the viewing key stays on the MacBook. Real exposure:
+IP + sync query pattern to a third-party node, and chain view dependent
+on it. Also observed: the desktop holds connections to the public node
+AND 127.0.0.1:16810 simultaneously; the local zkas-node peers with Kron
+(108.95.94.128:16811) over the internet. 1.0.32 read (b27bee7, 2
+commits): no chooser change; repo has one issue ever (#1, closed,
+unrelated) — UNREPORTED. Draft ISSUE-DRAFT-desktop-default-public
+(r2 pending the chooser-state question) to be filed after reproducing on
+1.0.32 (venue norm). Interim: select Own node first on each launch;
+minimize restarts.
+**Lesson:** three corrections in one mailbox thread is not thrash when
+each one names what it weakens and lands closer to the primary source.

@@ -1,5 +1,5 @@
 # ITEM REGISTRY — the operation's project-management list
-### Content r4 · created 2026-09-03, revised 2026-09-04 (r4: TG cards live, dashboard sitting closed, P2 resolved — BL-099) · Successor to the registry role of SCOPE-v2.0.1.5 (retired at D2)
+### Content r5 · created 2026-09-03, revised 2026-09-05 (r5: mailbox lane live, kaspa_double column of record, T-6 closed, dashboard items re-ranked — BL-103..105) · Successor to the registry role of SCOPE-v2.0.1.5 (retired at D2)
 
 **Why this doc exists:** SCOPE carried the item definitions and retired with
 its version (D2 pass, 09-03) — leaving codes referenced everywhere and
@@ -64,9 +64,19 @@ evidence; this is the map.
   14.2 stays BY DESIGN (BL-016(b) capture-efficiency KPI, now labeled);
   a new constant would violate BL-028; Netlify-remote rules out LAN
   Prometheus reads. Delivered figure ships when the reporter posts the
-  gauge to Supabase — r6 candidate (with the difficulty feed). Dashboard
-  sitting otherwise CLOSED 5/5 w/ 28.4-vs-28.9 cross-check; future card
-  noted: "Expected (network)" beside pace = drought instrument in UI.
+  gauge to Supabase — r7 candidate (with the difficulty feed). Dashboard
+  sitting CLOSED 5/5 w/ 28.4-vs-28.9 cross-check; future card noted:
+  "Expected (network)" beside pace = drought instrument in UI.
+- **P9 · dashboard page cap — OPEN (row 20/21).** fetchZkasBlocks()
+  returns ≤1000 rows; all-time stats truncated. Fix: .range() paging or
+  server-side aggregates. Prerequisite for P10.
+- **P10 · double-block KPI — DATA READY (BL-104), card pending row 21.**
+  kaspa_double is the column of record (r6 live capture + backfill,
+  1158/213/0, 84.5%). Card = count(kaspa_double)/count(*) from the full
+  table. Counter-mirror plan WITHDRAWN.
+- **P11 · stale-pending aging + expected-vs-pace + kron_events timeline —
+  OPEN, ranked (BL-105).** Display-only; network_history holds d_z /
+  est_hashrate_z; restarts→kron_events generalization.
 - **P5 · block-detail expansion — OPEN, gated.** Gate: confirm
   post-e49ce61 layout on the running node. Mergeset-persist rider folded
   in.
@@ -92,7 +102,9 @@ evidence; this is the map.
   audit, explicit rules made authoritative (KRON-HARDENING §6.8).
 - **R-5** RcReporterDown fire drill — never run.
 - **R-6** Button r3: add walletd version pin (v1.0.5→1.0.8 passed the
-  liveness-only check silently).
+  liveness-only check silently). Reconcile check-kron.ps1 vs check-kron-r3.
+- **R-7** Reporter: widen the TG edit-path WARN to log Telegram's error
+  text (duplicate-card diagnosis, BL-105).
 
 ## T — TRIGGER-DRIVEN (no action until the trigger)
 
@@ -105,8 +117,10 @@ evidence; this is the map.
 - **T-3** ERRSTREAM soak: next console flash → one Select-String names it.
   (Two live catches banked: TG 400 UTF-8 at BL-099; walletd refusals at
   BL-087 — the instrument earns its keep.)
-- **T-6** Reporter r5 first-card witness: next block → card ~T+5s,
-  self-edits at BEAT2. Open until seen; then TG cards are DONE.
+- **T-6** CLOSED 09-04: first card cb9c364d… (dt 1s), birth form + self-
+  edit witnessed 06:06/06:09Z. Card doctrine: buzz every block + 24h digest.
+- **T-7** 24h double-rate convergence: SQL 69.8% vs counters 90.4% at
+  backfill time; expect convergence over one full r6 day, else investigate.
 - **T-4** Brick experiment (running since 09-02 14:12): falsifier =
   another 41/6008 + zero PowerPanel rows → convicts barrel/board.
 - **T-5** Upstream watch: firecash seed-side tip-drop note on #6 (ours
