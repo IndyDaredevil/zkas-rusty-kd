@@ -1,8 +1,8 @@
 # SESSION CONDUCT LAWS — v2
 
-### Revision: r1 · 2026-09-03 · supersedes the 17-law block and its five floating amendments (baked S7–S19)
+### Revision: r2 · 2026-09-06 · supersedes r1 (2026-09-03); adds II.7 and Appendix B rows I-16–I-25 (S22–S24)
 ### Tier: Claude-behavior (project instructions). Chain and tool laws live in Part E + runbooks and are cited here, never re-derived.
-### Last incident registered: I-15 (this session, BL-092)
+### Last incident registered: I-25 (BL-106)
 
 **How to read this document.** Five clusters, each a single principle with numbered clauses. Every clause is marked **M** (mechanism — it produces an artifact that survives inattention: a sha, a count, a stated N) or **E** (exhortation — it depends on being invoked). Rely on M clauses; treat E clauses as advisory until they earn an output. Appendix A maps every provision of v1 to its clause here so that nothing dropped can hide. Appendix B is the incident register the clauses were tested against. Appendix C lists what left this tier.
 
@@ -28,6 +28,7 @@ No assertion without a read; every read has a scope; every generalization has a 
 - **II.4 (M) General or causal claims carry N and span inline.** Any claim that quantifies over more than the frame it was read from — "X is the Y set", "Z always", "this detects W" — states its sample count and the span it was drawn from in the same sentence, in the ledger and in any external artifact. `n=1, single frame` would have prevented I-9, I-10 and I-11 without anyone needing to feel doubtful. A claim's N is a value like any other.
 - **II.5 (M) A verification states what it proves and what it does not.** `missing=0` on a header grep proves header presence, not content identity (I-8). The gate's strength is written beside the gate, so a reader six months later does not over-trust it.
 - **II.6 (M) Repetition adds no evidence.** A claim restated in a second document carries the N of its first appearance. Ledger → addendum → commit message is not three observations (I-12).
+- **II.7 (M) A record of WHAT happened is not a record of WHO acted.** A log line that reports an event — a launch, a start, a connection — attributes no cause. Attribution comes from the actor's own statement or from a rail that records the actor; absent either, the sentence says "a start occurred," not "it auto-started" (I-25). Corollary for absence: a text grep for a concept is not a read of the instrument that carries it — the double-block logic lived in a metric name, not in the word (I-20).
 
 ## III. COMMANDS ARE DELIVERABLES
 
@@ -112,6 +113,7 @@ Anything that leaves the operation — issue, comment, PR, reply, post — is re
 | — (new) | IV.9 | M | skeletons not committed |
 | — (new) | IV.10 | M | commit messages are record |
 | — (new) | V.1–V.3 | M | external artifacts |
+| — (new, r2) | II.7 | M | what vs who; concept grep is not an instrument read |
 
 ## Appendix B — Incident register (S20, 2026-09-02→03; BL-086, BL-092)
 
@@ -132,6 +134,16 @@ Anything that leaves the operation — issue, comment, PR, reply, post — is re
 | I-13 | Ledger tip recalled as BL-086; rail read BL-091 (parallel session); "BL-087 owes…" pushed | II.2, IV.8 |
 | I-14 | HTML fetch of #6 rendered no timeline; would have read as "comment missing" | V.3 |
 | I-15 | **P1 brief carried as "unpasted, oldest live item" — closed since BL-059 (08-29).** Cited as evidence against amendment 1b-ii in the laws evaluation; that evidence point is RETRACTED. Recollection stale on state, not just counters. | II.2 |
+| I-16 | "no Rust toolchain in this environment" asserted from `which cargo` (PATH is one rail); apt carried it. The operator's "I think we have a toolchain" (the MacBook) was read as the sandbox. BL-102 | II.2 |
+| I-17 | PR-B fixed in the tree but the patch file not regenerated; the UNCHANGED sha read as confirmation rather than as the failure signal. Caught by the operator's compile error. BL-102 | I.1, IV.2 |
+| I-18 | `git stash` skipped an `add -N` file → `checkout -b` refused; a heredoc chain ran its second line anyway; `gh … | tail -1` swallowed the real error. BL-102 | III.6, III.2 |
+| I-19 | `kaspa_double` asserted "already populated" from 23 trues read without provenance (they were backfill-csv rows); one unswept read produced three mailbox corrections. BL-105 | II.2 |
+| I-20 | "No double-block logic anywhere" from a text grep for the word; the truth was the bridge metric `ks_double_blocks_mined`, read by the hourly digest all along. BL-105 | II.2, II.7 |
+| I-21 | Process-lifetime counters (`sum(ks_*_mined)`) labeled "all-time"; they read since bridge start. BL-105 | II.4 |
+| I-22 | "Unfillable per-row" asserted for `kaspa_double`; the bridge log's `DOUBLE! Both legs blue. H_fc:` line disproved it — 1,370 rows backfilled from it. BL-105 | II.4 |
+| I-23 | "Third untracked live component" claimed; the emitter was `alert_rules.yml` + Alertmanager templates. BL-105 | II.2 |
+| I-24 | "Viewing key goes to the wallet service on every launch" — conflated *public node* with *public service* (commit `90bc5ea` distinguishes them); retracted the same hour by lsof (the only remote endpoint was a chain node's gRPC). BL-105 | II.4, V.2 |
+| I-25 | App log `[app] launching zkas-node …` read as "auto-started"; the operator's Run-node click was the actor. Corrected by the operator's statement + screenshot. BL-106 | II.7 |
 
 Not caught by any clause and not law-addressable: a complete-feeling frame emits no signal that anything is missing. The trigger for a re-read under a new frame comes from outside the session's momentum. What the clauses do is make that re-read fast — N in the sentence, scope beside the gate, provenance in the commit — so the outside reader finds the weak joint without reconstructing the frame that produced it.
 
