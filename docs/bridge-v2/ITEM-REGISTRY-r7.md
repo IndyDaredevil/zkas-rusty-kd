@@ -1,5 +1,5 @@
 # ITEM REGISTRY — the operation's project-management list
-### Content r6 · created 2026-09-03, revised 2026-09-06 (r6: P9/P10/R-6/T-5 CLOSED, zkas-wallet#3 filed, W-1 opened — BL-106) · Successor to the registry role of SCOPE-v2.0.1.5 (retired at D2)
+### Content r7 · created 2026-09-03, revised 2026-09-06 (r7: P7 CLOSED with findings, laws r2 cross-lane, P11 first half shipped — BL-107) · Successor to the registry role of SCOPE-v2.0.1.5 (retired at D2)
 
 **Why this doc exists:** SCOPE carried the item definitions and retired with
 its version (D2 pass, 09-03) — leaving codes referenced everywhere and
@@ -72,9 +72,10 @@ evidence; this is the map.
 - **P10 · double-block KPI — CLOSED at BL-106** (row 22/23: card queries
   the full table; 1198/1420 = 84.4% verified). kaspa_double is the column
   of record; counter mirror withdrawn.
-- **P11 · stale-pending aging + expected-vs-pace + kron_events timeline —
-  OPEN, ranked (BL-105).** Display-only; network_history holds d_z /
-  est_hashrate_z; restarts→kron_events generalization.
+- **P11 · dashboard remainder — HALF SHIPPED.** Pending-row aging and the
+  efficacy-line removal shipped (row 27, BL-107; screenshot owed).
+  Remaining: expected-vs-pace projection (network_history d_z /
+  est_hashrate_z) and the kron_events timeline.
 - **P5 · block-detail expansion — OPEN, gated.** Gate: confirm
   post-e49ce61 layout on the running node. Mergeset-persist rider folded
   in.
@@ -82,9 +83,13 @@ evidence; this is the map.
   polling (BL-052 zeroed-object discipline + v1.0.7 `missing_history`
   refusal handling) OR the wallet-app view-key/watch-only route (v1.0.29).
   Design decision before build.
-- **P7 · chain-block status — OPEN.** First step is ONE question: is
-  chain/blue status persisted or computed-on-demand? Answer decides the
-  red-rate observability design.
+- **P7 · chain-block share — CLOSED at BL-107.** Persisted: KAS via
+  `cached_transactions.is_accepted` (payment copy, red = absence); zKAS via
+  amount>0. Dashboard rule replicated exactly (payload subsidy decode).
+  Findings: Toccata 06-30 halved the share 40.5→17.2% (merge set
+  unchanged); the custom bridge lifted it 16.9→22.4% (~4σ); 200 ms poll vs
+  WS2 listener not separable (n=155). Optional card: chain share by week
+  with the 06-30 and 08-02 markers (one handoff row).
 - **P8 · restart logging — OPEN.** Step 1: pin the actual exporter
   start-time metric name on this build (obvious candidate returned NO
   DATA). Then a recording rule retires the dashboard's manual field.

@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-106 (2026-09-06)
+### Last entry: BL-107 (2026-09-06)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -3398,3 +3398,75 @@ removed; the other project's LEDGER-APPEND-S22-r1.md left in place.
 through step by step with lsof at each point, not the one this lane
 inferred from release notes and commit messages. Six drafts, one truth,
 all of it measured.
+
+## 2026-09-06 (evening, S25) — laws r2 on five rails; P7 answered from persisted data
+
+**BL-107 · 2026-09-06 · laws v2-r2 published + adopted cross-lane · rows 24–30 ·
+P7 CLOSED (KAS chain-block share: Toccata halved it, the custom bridge won
+a third of it back) · I-26..I-28**
+LAWS r2: committed 353801c (152 ln, f41f8591…) by anchored patch on r1
+(3eb68117…); pasted into project instructions; reconstructed in the
+container from the instruction-held r1 and matched byte-for-byte; published
+to `handoff_docs` as SESSION-CONDUCT-LAWS-v2-r2 with the pin computed
+in-database (f41f8591…, pin_ok). Adoption rows 25 (covenants) and 26
+(mining-dash). Row 29: **covenants adopted** — db pin verified, container
+cut byte-identical, landed at ~/mwp-lab/handoffs/, header pasted back, lane
+sections intact — the first cross-lane document pulled by pin from
+`handoff_docs`. Row 28/30: mining-dash carries no laws block (its
+instructions are the operator's system prompt); row 26 WITHDRAWN.
+I-26 (IV.2/II.2): the r2 paste into project instructions overwrote the
+HANDOFF MAILBOX block (whole-document selection); recovered within the
+hour from the conversation rail, the rail of first resort. The block now
+ships as INSTRUCTIONS-HANDOFF-MAILBOX-r1.md so the instructions can always
+be rebuilt from versioned text. I-27 (II.4/V.2): row 26 addressed a lane
+that carries no laws — a claim about another lane's configuration, unread.
+I-28 (II.1): elapsed time and "tonight" narrated from recollection across a
+day-long gap; the DB clock (now() = 2026-09-07 03:24Z) corrected it.
+Clocks are read, not remembered.
+ROW 24 → 27 (mining-dash): pending-row aging ("pending (Nm)" amber; 
+"unrefined" muted after 60 min with the walletd tooltip) and the
+restart-efficacy line removed from the miner-health panel, gap-color math
+kept. Acked; screenshot to come from the operator.
+P7 — CLOSED WITH FINDINGS (registry P7; intent: did the chain-block share
+of our KAS blocks change with faster block templates?). Instrument:
+`cached_transactions` (16,284 coinbase txs, 2026-05-04 → today; the one
+2025-05-02 row is an outlier). Semantics learned: `is_accepted` marks
+WHICH COPY of a reward's coinbase paid (the same output appears in the
+chain block's coinbase and in sibling blocks'; only the chain block's is
+accepted) — NOT a blue/red flag; a red block is an ABSENCE (no accepted
+copy), not a row. 3,508 accepted, 0 paying us twice, 2 with no output to
+us. The dashboard's chain-block rule (miningClassification.ts): subsidy
+decoded from coinbase payload bytes 8–15 LE; `chain_block` iff wallet
+outputs > subsidy. Replicated in SQL exactly: 808 chain / 2,638 blue
+(dashboard 808 / 2,637 + one newer). Match by address, not script hex
+(the address appears under more than one script encoding; first attempt
+read 134).
+Findings (N and span inline; single miner; observational):
+(1) **Toccata (2026-06-30 16:15Z, DAA 474,165,565) halved our chain share
+to the hour**: 40.5% (612 blocks, 05-04→06-30) → 17.2% (1,463, 06-30→08-05);
+on 06-30 itself 10/18 before the fork hour, 1/7 after; 12%, 9% the next two
+days. Merge-set size unchanged (4.95 → 4.80 miners per chain block, median
+5 both) — a protocol effect on selected-parent competition, not DAG width.
+Pre-Toccata we sat at 2× the no-edge expectation under the STOCK bridge;
+post-Toccata at exactly the expectation. (2) **The custom bridge raised
+it**: stock under Toccata 221/1,308 = 16.9% (18.4% early July, 15.6% late
+July); custom from 08-06 on 308/1,372 = 22.4%, flat across three windows
+(22.3 / 22.4 / 22.5). +5.5 points, ~4σ. The 08-02→08-05 window (custom,
+200 ms polling fallback, BL-006) is 155 blocks at 20.0 ± 3.2 — cannot
+separate the 200 ms poll from the WS2 node-push listener (merged 08-06,
+documented in production 08-12 per BL-012); both are template-latency
+improvements and the data credits "the custom bridge" as one change.
+(3) The block-rate step (~25 → 40–50/day around 07-03) did not move the
+share — rate is hashrate; share is propagation. (4) zKAS cannot test this:
+the merged bridge only ever ran post-Toccata; its clean number is 212/212
+paid since the 09-02 restart (red rate 0 over the window). Money framing:
+fees per chain block ≈ 0.003 KAS on a 2.18 KAS subsidy — the +26% chain
+share is ~0.1% of income; its value is as persisted propagation-quality
+instrumentation. Confounders not controlled: node/kaspad versions and rig
+changes in August.
+CHECKER, MAILBOX STATE: both inboxes clear at 05:20Z 09-06 (row 30 acked
+by mining-dash). Registry: P7 CLOSED, W-1 unchanged.
+**Lesson:** the instrument for "did our change work" was in the table all
+along — the dashboard's own classification rule, replicated exactly, over
+3,446 blocks, with a protocol event to control against. Read the rule
+from the code, match the counts to the tenth, then ask the question.
