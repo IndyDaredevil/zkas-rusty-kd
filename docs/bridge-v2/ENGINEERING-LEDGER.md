@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-107 (2026-09-06)
+### Last entry: BL-112 (2026-09-08)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -3470,3 +3470,233 @@ by mining-dash). Registry: P7 CLOSED, W-1 unchanged.
 along — the dashboard's own classification rule, replicated exactly, over
 3,446 blocks, with a protocol event to control against. Read the rule
 from the code, match the counts to the tenth, then ask the question.
+
+## 2026-09-07→08 — S26: supply became a KPI, both PRs landed upstream, the "unsound key" question went to Tachyon, the archive got its first rows
+
+**BL-108 · 2026-09-07 · getShieldedSupply read on two nodes; supply-check r8
+LIVE on Kron (hourly, Prometheus, TG); drift baseline {+9.72,+11.97} ZKAS;
+BL-100 corrected: DAA score counts REWARDED blocks (reds included)**
+INSTRUMENT: `getShieldedSupply` (rpc/core message.rs:705–770; gRPC :16810,
+no reflection → `-proto messages.proto`). MacBook wallet node (loopback P2P,
+`--shielded-history=on`): f90285af… DAA 3,556,573 minted 188,717,486.55 /
+pool 188,407,815.90; da9c1f2e… DAA 3,672,127 minted 193,913,373.41 / pool
+193,602,881.79. Kron tip 02:32Z: c6b52b16… DAA 3,674,478 minted 194,018,266.58.
+SCHEDULE (coinbase.rs read, 783d408): subsidy = floor(SUBSIDY_BY_MONTH_TABLE
+[step]·3/22) sompi, step = floor(DAA/657,450) at 1 BPS; dev fee 50‰ accrued,
+paid every 1,000 DAA (accrual since DAA 757,000); expected pool = Σ subsidy
+over DAA units − unpaid accrual. Reconstruction: read1 +9.7246, read2 +11.9721
+ZKAS (0.000006%). BL-100 CORRECTION (IV.8): "reds earn nothing / DAA×schedule
+mis-counts them" was wrong — Kaspa-lineage coinbase pays every DAA-window
+mergeset block and DAA advances by exactly that count; compare to poolValue
+(minted − re-minted fees), not cumulativeCoinbase. Residual is BIMODAL per
+1,000-DAA payout interval, quantum 2.2475 = one dev-fee cut (my per-unit
+accrual model is off by the boundary block); n=9 reads over 2 nodes.
+SHIP: supply-check r1→r8 on Kron. Seven PS-5.1 ship defects in one script:
+`??` (verify one-liner), non-ASCII em-dash/emoji → cp1252 `”` string
+terminator, `$P`/`$p` case-insensitive collision, native-arg quote stripping
+(fix: JSON via stdin `-d '@'`), bare `@` = splat (quote it), `++` on bigint,
+`[decimal]$bigint` cast. r7 = first PASS 02:32:12Z; r8 (5f5dace84c1ca5c4,
+164 ln) writes `C:\zkas\textfile\zkas_supply.prom` atomically on every exit
+path. Deps: grpcurl 1.9.4 (zip 412dbe98…) + protos 28be9e68…/0bad660d… at
+783d408 into C:\zkas\{bin,proto}. Task `ZkasSupplyCheck` hourly (`-Command`).
+EXPOSITION: reporter-textfile-hook-r1 (9bd44da52c290ef4) anchored on r6's
+`$buf = …GetBytes($body)`; running reporter was r6 + BOM (LF-normalized sha
+6df02a2c… = mount r6); after: 505 ln, **95ba8e98c49516bb** = reporter r7
+state (header still says r6); backup .bak-pre-textfile-20260906-223914.
+RULES: alert-rules-supply-hook-r1 (faa63a069952df39): digest line
+`supply NNN.NNM  drift +N.N` after the `up …` row of HourlyMergedReport;
+group zkas_supply = ZkasSupplyCheckStale (warn, >2h/absent),
+ZkasSupplyCheckFail (crit, status≠0), ZkasSupplyDrift (crit, |diff|>100).
+promtool 44 rules; alert_rules.yml 893→934 ln **bf8b34a71b89ade1**; backup
+.bak-pre-supply-20260906-224539; reload 200; group loaded (my readback
+false-negative: `$rules` shadowed `$Rules`). FAIL PATH PROVEN: -ToleranceZkas 5
+→ status 1 02:47:58Z → Prometheus firing → Alertmanager active → cleared
+02:54:30Z. 24 h of hourly PASS through 09-08 03:00Z (DAA 3,762,285, minted
+197,966,131.80). Step 6 (DAA 3,944,700) ≈ 2026-09-10 09:00Z = first drift
+calibration event. Public dashboards (zkas.stream, "Shielded Pool") report
+197.71M = cumulativeCoinbase, ~40 min behind tip; their "shielded notes 4.71M"
+≠ node noteCount 7.30M — definitional, unresolved, theirs to answer.
+SCOPE LINE (for every reader): accounting integrity across nodes; NOT a
+soundness/counterfeit detector (BL-100).
+**Lesson:** for Kron scripts the operator's first run IS the dry-run; ship
+the smallest testable unit first, and every fence in every step (no pointers
+back).
+
+**BL-109 · 2026-09-07/08 · #362 MERGED (ebfull, b4f90dd, 43/43) · #8 LANDED
+(firecash, 737521e, author IndyDaredevil) · Discord reply r13 posted · A2
+gated on zakura-orchard > 1.1.0 · Zakura contribution norms read from CI**
+ZAKURA: no CONTRIBUTING; `.claude/skills/changelog-fragment` + changelog.yml
+= NEVER edit CHANGELOG.md, one `docs/changelog/unreleased/<PR>.md` after the
+draft exists, `./scripts/changelog.py check`; versions bump in lockstep at
+release; semver CI vs crates.io baseline; rust-toolchain 1.97.1 dev / 1.91
+MSRV. B r3's CHANGELOG hunk VOID → r4 (b8d2d4087fea043b, code-only, on
+main@666159a; test 0.23 s under 1.97.1). Draft PR via `gh repo fork --remote
+--remote-name fork` INSIDE the clone (`gh repo fork <repo> --remote` rejected)
+→ #362 08:… fragment 362.md (`validated 4 fragments`) → ready. ValarDragon:
+"Good idea, didn't realize this was missing"; CI 25/18/0, semver ×4 pass,
+CLEAN. ebfull: "we do have these pinned" → reply (published sha
+b86bab539c081584, 219 w): fixtures pin the crate's own circuit; `vk` is
+`pub(crate)`; fingerprint = BLAKE2b over the same text; offered passthrough.
+ebfull: "Thanks! I misunderstood what your use case was" → APPROVED, MERGED
+b4f90dd, 43 checks. Closing reply posted; branch deleted. crates.io still
+1.1.0 (09-04) → A2 waits.
+ZKAS: #8 (6a609d8) body readback OK; comment 5565610539 (09-07 05:40Z)
+announcing #362. 09-08 11:00:53Z firecash rebased onto a681d3b, ran
+`orchard_stack_is_pinned` themselves, landed **737521e author=IndyDaredevil
+committer=firecash**, closed PR; wrote that the fail-closed guard "stays a
+separate follow-up PR once a zakura-orchard release carries #362" =
+pre-approval in principle. Verified from raw files at 737521e: build.rs,
+verify.rs (ORCHARD_CRATE, circuit_identity, test), Cargo.toml comment.
+DISCORD: reply r13 (9c1e496f5d20c911, 203 w, 1,564 ch) posted 09-04 to
+#general, message 1545476937076576266, embeds removed; lineage: r5 long
+(a5af76fa…, 1,056 w), r6 short (79a6e75f…, 553 w, 17 permalinks) held for a
+technical thread; r7–r12 were the "baby without the bathwater" cuts (verbatim
+§3 phrase "degrades to a halt, not a counterfeit"; "same limit in Zcash; the
+sentence, not the design, is off"; drive-by-contributor line).
+**Lesson:** a fork's norms live in its CI and skills; read the workflows
+before the artifact ships (V.3 in practice).
+
+**BL-110 · 2026-09-07 · the "unsound key" question — what public data cannot
+detect, two retractions, ZKas's circuit is byte-identical to the Lean model's
+base layout, zcash/ironwood#223 opened, fork proposal drafted and HELD**
+RETRACTION 1 (amends BL-100 research rail): "replay under a post-fix VK
+catches past exploitation of a disclosed circuit bug" — WRONG. Proofs are
+bound to the VK; a circuit fix changes the VK; ALL old proofs (honest or
+forged) fail under it; replay says nothing. Replay detects verifier
+IMPLEMENTATION bugs only. This is why Zcash could not tell whether 2022–26
+was exploited and sealed the pool instead.
+RETRACTION 2 (amends BL-100/BL-101 sizing): "every coinbase mints two notes;
+user activity ~0.09 outputs/block; near-silent chain" — WRONG. Dev fee
+accrues; a block mints ONE note (+ one dev payout per 1,000 DAA; coinbase.rs
+:194,:274). noteCount 7.30M − 3.67M coinbase = ~3.6M user notes ≈ 1/block;
+zkas.stream 3,531 payments/h and 623K nullifiers agree. Archive sizing was
+corrected three times (1e5 rows → 1.5 GB → tens of GB); root cause: the
+coinbase note rule was never read before estimating.
+WHAT WOULD DETECT A ZCASH-CLASS FORGERY: the prover's witness. Three ways to
+get witness-equivalent data, all protocol decisions: (1) auditor viewing key
+(full detection, one party sees everything), (2) a second proof under an
+independent circuit (prevention, ~2× proving), (3) a public counter value
+must cross = audit epoch (late, aggregate, bounds). Public data is the fourth
+category and cannot contain the witness. Exact public bound that exists:
+cumulative nullifiers ≤ cumulative notes (greedy forger only).
+AUDIT EPOCH (design held): pool VERSION = same circuit, new domain separator,
+own tree/nullifier/turnstile; per-bundle public crossing value; consensus
+rule Σ out(N) ≤ Σ in(N); old version receive-closed, never spend-closed (no
+deadline, nothing lost); wallets cross on next spend or in randomized
+background chunks; epochs tied to circuit upgrades, not the calendar. Costs
+that remain: per-crossing amount leakage; detection late and bounded by
+never-migrated value.
+LEAN: Tachyon's proof SHIPPED 2026-07-28 (zcash/ironwood, 2,700+ theorems).
+PROVENANCE.md: pre-NU6.3 circuit = orchard 0.14.0, `actionBase` dump
+byte-identical to it; post-NU6.3 = 0.15.0 + `synthesize_cross_address_checks`.
+zakura-orchard 1.0.1 `circuit_description_fixed` = orchard 0.14.0 = 0.15.5 =
+**e51a737b95b741a3…** (1,285,701 B) — the circuit ZKas pins IS the Lean base
+layout; A2's 1bee049a… is BLAKE2b over that file. But capstones
+(`orchard_action_adaptiveStatement_deployed_2pow123_knowledge_finite_security`,
+Capstones/Action.lean:458) are stated over `actionCircuit` = post-NU6.3
+(TopLevel.lean:215; synthCrossAddressChecks in Circuit.lean:2133–2200) and
+instantiated by PostNu63.lean fixtures (`capturedCircuitId = "PostNu6_3"`);
+`aProgramBase` is a VK-layout TEST only (TestVkLayoutActionBase.lean).
+Assumptions any "verified" sentence carries: straight-line algebraic
+adversary, Fiat–Shamir + generator derivation as ROs, DLOG on Pallas;
+verifier IMPLEMENTATION (zakura fork) outside the proof.
+POSTED: **zcash/ironwood#223** (09-07 08:05:18Z, published sha
+a080edfa6ecce447 = draft r2, 399 w): "Is the pre-NU6.3 base layout
+(aProgramBase) a soundness object, or a layout-test fixture only?" — with the
+Zcash-side reason (Orchard pool exit-only but still verifies under the base
+key). r1 VOID (asked for fixture-capture labor; unverified claim that the
+2pow endpoints were stated at the captured key).
+HELD: GH-ISSUE-zkas-circuit-alignment-r2 (90cf2344cf854dac, 597 w): fork to
+PostNu6_3 = BUNDLE_VERSION v2→v3, CIRCUIT_VERSION, strict activation DAA,
+VK_FINGERPRINT → 3409b1d4…; "not a soundness fix today"; migration stated as
+the BET it is (in-place vs epoch turnstile, decide on purpose). Opens only on
+#223's answer. Roadmap reordered: ask → adversarial read of verify.rs → A2 →
+proposal → epoch spec → auditor L0/L2/L3 → whitepaper §3/§8.
+DESIGN DOC: SUPPLY-INTEGRITY-DESIGN-r1.md (73416fc59947296a, 81 ln): scope
+line first; L0 exact invariants / L1 pinned VK / L2 replay / L3 probabilistic
+/ L4 circuit / L5 recovery; status ledger.
+**Lesson:** "the invariant holds", "the invariant is observable", and "the
+circuit is proven" are three different sentences; the paper wrote the first,
+promised the second, and only the third touches the Zcash class.
+
+**BL-111 · 2026-09-07/08 · shielded archive: mailbox rows 31/32/35/38/40 →
+covenants; rows 34/36 read+acked; schema r1 + revoke_anon r2 live; extractor
+r4; first 20 blocks landed through the shielded_extractor JWT; backfill NOT
+on Kron; Pi 5 ordered**
+DESIGN (critiqued twice): replay of record = a fresh archival node sync built
+on the corrected verifier (needs sighash context + anchor validity + nullifier
+state; per-bundle re-verification is the wrong unit); archive = full accepted
+tx incl. coinbase (mint outputs), tx_bytes = RPC JSON minus top-level
+verboseData (no hand-rolled consensus serialization), sha per row; writer =
+Kron sidecar (gRPC stays loopback), Pi reads Supabase only; verified_root
+NULL from the extractor, stage-2 Rust recompute (Sinsemilla/Pallas) sets it.
+MAILBOX: convention r3 pin verified (05074912…). Row 31 (07:24Z, d0c319fd…)
+ownership + schema ask; row 32 (07:34Z, 5153218c…, reply_to 31) no bucket /
+inline bytes / Kron writer. Row 34 (covenants, 08:09Z): migration
+20260907080811 shielded_archive_schema_r1 — shielded_txs(12) /
+shielded_blocks(8) / audit_runs(12), RLS, role shielded_extractor
+nologin/noinherit — ALL pins verified by live reads; row 35 reply; ack. Row
+36 (15:57Z): revoke_anon r2 (20260907155724) after their own negative test
+("rows hidden ≠ access denied", their default-privileges catch), ES256 JWT
+kid 0b8614eb… exp 1820305448 (2027-09-07, ROTATION DEADLINE) held out of band;
+verified grants/migration/0-0-0 rows; row 38 reply; ack. Row 40 (22:21Z,
+reply_to 38): LANDING — first row txid 37e1e33dcc074a63…, tx_sha256
+50b2a11fa061aa41…, DAA 0, block b8a667904dc249c1…, root def25700729804…;
+three writer-contract amendments (coinbase rows; RPC-JSON bytes; verified_root
+NULL). Sizing in row 40 (1.5 GB) is ALREADY WRONG per BL-110 retraction 2 —
+correction row owed (bucket or Pi-local bytes + Supabase index).
+KEY PATH: store-extractor-secrets-r1 (1b6953d72f892542) — NAME=value temp
+file → DPAPI CurrentUser → zero-fill + delete → readback: role=
+shielded_extractor exp=1820305448, url 40 / anon 208 / jwt 291 chars. Two
+wrong pastes caught by length alone (36 = the kid; 88 = a key fragment).
+sb-ping-r1 (c255efdcea52cf36): HTTP 200 body=[] through the token.
+EXTRACTOR: shielded-extract r1→r4 (**80c4dd78932bd0b9**, 207 ln): cursor =
+max(daa) block in shielded_blocks (genesis b63f7fe8e50402af… exclusive on
+first run; empty startHash does not parse), getShieldedBlocks pages →
+getBlock(includeTransactions) → coinbase = transactions[0] (index
+coinbaseTxid is ZERO for early blocks; accepted txid EMPTY for the coinbase
+mint record — both handled), shielded_commitment = coinbase payload bytes
+16..47, mergeset fallback for accepted txs, on_conflict ignore-duplicates,
+audit_runs row per run, zkas_extractor.prom. First run r3 09-07 22:20Z: 20
+blocks / 20 txs / 3 s / cursor DAA 47. NOT scheduled: per-block getBlock on
+the bridge host would cost RPC latency for days; backfill moves to a second
+archival node.
+PI: RasTech Pi 5 4 GB kit (no PSU) + SanDisk Extreme 2 TB USB-3 ($289; 1 TB
+was $259) + official 27 W PSU ordered; 32 GB SD = OS only; node fit on 4 GB
+pending Kron `zkas-node` working-set read; fallback = auditor-only + throttled
+extraction.
+**Lesson:** the schema owner's negative test found what my positive tests
+never would; "zero rows returned" is not "no access".
+
+**BL-112 · 2026-09-08 · S26 incidents I-29..I-36**
+I-29 (III.1/II.2): `project_handoffs_subject_check` (80 chars) hit TWICE
+with covenants' warning in hand — ids 37 and 39 consumed; plus the row-31 prep
+query for a `pinned_sha256` column that does not exist (real: `sha256`).
+Mechanism now: subject length counted programmatically before every insert.
+I-30 (IV.2(ii)): task `ZkasSupplyCheck` registered against supply-check-r7
+while r8 was assumed live (manual r8 runs read as proof); caught by the
+operator's "r7 or r8?"; re-registered, r7 deleted. Read the task's
+`Actions.Arguments` back after any re-cut.
+I-31 (III.2/III.8): seven PS-5.1 defects across supply-check r1–r7 plus the
+`$rules`/`$Rules` readback false-negative in the rules hook; RIDER OWED to
+laws III.2: *Kron = Windows PowerShell 5.1: ASCII-only body + UTF-8 BOM; no
+`??`/`?.`/ternary; no `++` on bigint; native JSON via stdin `-d '@'` (quoted);
+variable names case-insensitive; `[decimal]::Parse(bigint.ToString())`;
+`git stash` skips intent-to-add; never `tail -1` a command whose failure is
+text; paste clips ~500 chars → files, not one-liners.*
+I-32 (II.4): "red blocks earn nothing" asserted from recollection of Kaspa;
+the reconstruction to 10 ZKAS disproved it (BL-108).
+I-33 (II.4/V.2): "replay catches disclosed circuit bugs" — retracted (BL-110).
+I-34 (II.4): user activity undercounted 10× (coinbase note rule unread);
+three sizing corrections sent to another lane before the read happened.
+I-35 (III.3): `rm -f supply-check-r3.ps1` on its own line after a failed edit
+(not `&&`-gated) — r3 destroyed, rebuilt from r1 via the transform chain and
+sha-checked (472c46e1… reproduced) before r4 was cut.
+I-36 (II.2, tone): the operator's "I think we have a Rust toolchain" (MacBook)
+read as a claim about the sandbox → unrequested install + builds; and "the
+value you have is not the token" delivered as instruction rather than
+observation. Both corrected on the turn. Statements about the operator's
+machines are not statements about mine.
+**Lesson:** the repeat incidents in this session (subject cap ×2, unread
+rule ×2) are the class the laws say only a mechanism fixes; the two
+mechanisms added are: count before insert, read the rule before the estimate.
