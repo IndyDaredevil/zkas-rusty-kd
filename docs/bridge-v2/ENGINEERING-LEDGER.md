@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-112 (2026-09-08)
+### Last entry: BL-116 (2026-09-09)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -3700,3 +3700,150 @@ machines are not statements about mine.
 **Lesson:** the repeat incidents in this session (subject cap ×2, unread
 rule ×2) are the class the laws say only a mechanism fixes; the two
 mechanisms added are: count before insert, read the rule before the estimate.
+
+## 2026-09-09 — S27: P11 shipped through the mailbox, near-miss became a card, the treasury reconciled to the sompi, and the seed turned out to be one GET away
+
+**BL-113 · 2026-09-09 · dashboard — P11 remainder SHIPPED via rows 44–57;
+kron_events replaces restarts; three Expecteds on the drought card**
+ROWS 44/46 (Expected-vs-pace): shared `expectedBlocksPerDay()` in
+src/utils/expectedBlocks.ts — (nameplate/avg24h est_hashrate)·BPS·86400, BPS
+{z:1,k:10} (est_hashrate/d ratio z 2.01–2.07, k 21.4–21.8 = 2·BPS, read from
+network_history 09-09). Bolt confirmed the "Your Hashrate" column has ALWAYS
+been the nameplate sum stepped by activation (1.6→5.8→10.0→14.2); its offer
+to derive an effective hashrate from block finds REFUSED (BL-066
+self-certification). Accepted 06:30Z: SQL at the 06:25Z render clock, n=288,
+Z 33.66 PH/s→36.44/day, K 329.13→37.28; card 33.62/36.50, within 0.1. Since-
+midnight line (BL-066(d)) live: 3.79 = 36.50·2.49h/24. Row 46 found the KAS
+expression already in Network Performance (37.22 at 329.7 PH/s) — reuse, not
+a second copy. ROWS 45/47: kron_events (id, wallet_address, event_type,
+occurred_at, note, metadata jsonb) — 18 restarts migrated to 17 (Aug 27 02:55
+duplicate merged, "Power Outage" kept), 0 unmigrated, span 07-19→08-28; modal
+generalized (restart/outage/firmware/config_change/note); markers on
+daily/weekly/monthly (5 in the 30D view = the 5 events ≥08-10). ROW 48 riders
+(built, row 49, verified from pg_constraint): metadata.source='manual' +
+metadata.component on restarts (P8 vocabulary fixed now: source
+exporter|reporter, component zkas-node|kaspad|bridge|walletd);
+kron_events_event_type_check on the five snake_case values; pace label
+"pace (32.9d, 1568 blks)" — pace IS the lifetime mean since the first zKAS
+block (1566/33.1d = 47.4/day by DB read), not a window. Row 50 closed 44–49.
+DASHBOARD FINDINGS (single frame 01:28 EDT, n=1 unless stated): (1) Hourly
+Mining Pattern peak/lowest/maintenance-window text is NOISE — 3,532 blocks,
+24 cells, mean 147.2, χ²=22.6 on 23 df, p=0.48; the card recommends
+scheduling restarts on structure that is not there (row not filed; fix =
+"no hour-of-day effect detected"). (2) Health header "Restart recommended"
+while the bar needle sat in Monitor (open gap 64 min / 52.1 expected =
+1.23×) — header and bar read different quantities; watch. (3) Row 27 pending-
+row aging never captured live (pay latency ~1 min); operator decision:
+SYNTHETIC ROW TEST — row 58: one zkas_blocks row amount=0 source='test',
+held ≥65 min, two captures, delete; in the table 08:43:10Z. Registry:
+P11 CLOSED except the row-58 captures; P8 unblocked by the metadata contract.
+**Lesson:** when a lane pastes "acceptance", re-run the arithmetic on the
+rail at the render clock; the 0.06 deltas were 5-min buckets rolling, and
+the one that was not (the raw-reference multiplier) was a defect.
+
+**BL-114 · 2026-09-09 · sampler r2 LIVE — near-miss counters in
+network_history; the drought card carries three independent Expecteds**
+MOTIVE: near-miss rate is the only instrument that separates unlucky from
+broken (BL-066); nothing in Supabase carried it; Netlify cannot read
+Prometheus (BL-099). SHAPE: not the reporter — one-shot 5-min task (BL-059
+pattern). r1 reconstructed byte-identical from the operator's paste (145 ln,
+e48694020231f701 = Kron); r2 = r1 + delta (205 ln,
+7f586bf0b1f2236b1695f10a5e90ef6d30e5bc1703ef88e89faac2d05342e92a): sums
+`ks_near_miss_total{chain,worker}` per chain (7 workers × 2 chains, VERIFIED
+live 09-09), posts near_miss_kas, near_miss_zkas, near_miss_workers (RAW
+counters, never a rate; negative delta = bridge restart, skipped), nulls +
+WARN if absent, `-Depth 5` (PS 5.1 default 2 flattens the object). "Shares
+reaching >=1% of a chain target" ⇒ P(block|near miss)=1/100 by construction:
+the 100:1 law is exact per chain. No fleet gauge on /metrics; delivered
+hashrate stays a Prometheus rule. GATE HELD: row 51 → mining-dash added three
+nullable columns + optional keys in network-history-webhook (row 53; prior
+function destructured 7 fields and ignored extras — the manual r2 run's
+DUPLICATE at 08:00Z was safe for that reason, not by design). Task repointed;
+first task-fired non-null bucket 08:15:00Z kas 26780 / zkas 29920 (workers
+object, 7 keys per chain); 08:10 null (r1's last). Rates 08:15→08:30: KAS
+19/14/20 per 5 min = 212.0/hr trailing, zKAS 17/12/18 = 188.0/hr — card
+matched to the decimal after two fixes (row 56): the multiplier printed the
+raw reference (228.0×) instead of rate/ref (1.00×); the headline was all-time
+instead of trailing 1h (σ of a single 5-min delta of ~15 is ±27%). Expecteds
+at 08:30Z: nameplate 35.5 / near-miss KAS 50.9 / near-miss zKAS 45.1 — the
+~40% gap is the BL-066 190/hr-vs-46/day capture-efficiency reading, now on
+screen every 5 min. Rows 51–57 closed. Follow-ons queued as rows: P8
+automated kron_events; per-rig share from near_miss_workers.
+**Lesson:** post the counter, not the rate — the consumer can always derive
+a window, and a restart shows up as a sign, not as a silent zero.
+
+**BL-115 · 2026-09-09 · treasury reconciliation — the 5,999.78 "constant"
+decomposed; auto-consolidate identified as the only spender; walletd history
+begins at the wallet's birthday, not the chain's**
+ASK: treasury 80,469.97222184 ZKAS (walletd 8501, read 08:38Z) vs card
+74,470.19 → "add a constant". BL-028 refused a bare constant. READS:
+zkas_blocks sum 74,470.18899290 / 1,568 rows (residual exactly 5,999.78322894
+= 599,978,322,894 sompi; the operator's 5,999.78222184 used the rounded card).
+walletd-history-export-r1 (100 ln, dc33ec6d…; csv 6b01c50c…, 1,580 rows):
+history BEGINS 2026-08-07 06:15:54Z — the same second as zkas_blocks — with
+NO earlier rows; 1,572 coinbase in window = 74,989.36054820; 8 kind=sent
+1.966288. DECOMPOSITION: (a) three "surplus" coinbase rows 287.58657402 /
+95.86219134 / 90.48185996 = 6×47.9311, 2×47.9311, 2×45.2409 EXACTLY —
+auto-consolidate outputs relabelled coinbase (NODE-CONTRACT v1.0.6 known
+mislabel); NOT income; the reporter's ≥1.5× filter had excluded them
+correctly; my row-61 "surplus income" label RETRACTED same hour. (b) one
+block walletd paid that zkas_blocks never recorded: 2026-08-28T00:16:47.809Z
+45.24092998 (4,524,092,998 sompi) txid 0cb72a22…d63dfd — found by
+find-missing-block-r1 (362 ln, b9237431…; 319 dashboard timestamps embedded,
+±30 s match; its one dashboard-side "unmatched" was a first-hit artifact of
+two real blocks 4 s apart, II.5). (c) the 8 sends: identical 24,578,600 sompi
+every ~16 h from 09-03 19:48Z — the day after v1.0.8 — NOT button tests:
+walletd log walletd-20260903-040930.out.log:4037 `auto-consolidate: merged 38
+notes into one (369048216509 sompi)`; deterministic fee for a deterministic
+tx; ~0.36 ZKAS/day, 0.015% of income; nothing external spends. (d) remainder
+= mining before the wallet's history: 5,956.50858696 = 595,650,858,696 sompi,
+DERIVED (plug). DEFINITION (operator): Total zKAS Earned = treasury balance.
+ROW 62 (supersedes 60/61): one real backfill row (source walletd-backfill);
+zkas_adjustments rows −196,628,800 (fees, 8 txids) and +595,650,858,696
+(pre-08-07, derived); card = blocks + adjustments = treasury; corrections as
+new negative rows, never edits. BALANCE CHECK: 80,640.77922860 at the later
+read = +170.807 = 4 blocks at 42.7018. NOTES (490 = 8,064,077,922,860 sompi,
+complete): oldest position 5,855,929 is a 45.2409 (late Aug); nothing
+pre-08-07 survives as a note — manual consolidations early on + auto since
+merged them (36,948.96 note at pos 7,421,706; 13 zero-value dust notes count
+toward the 38-note merge limit). MacBook engine (127.0.0.1:63788, token
+`wallet-token`) is NOT the treasury: it holds the OTC wallet
+(zkas:py0qksg9…, ~2.0M ZKAS) and the Covenants demo wallet — excluded.
+WHY HISTORY STARTS 08-07: import payloads carry `birthday`; a wallet scans
+forward from its birthday; balance is right because the note tree is global.
+REMEDY EXISTS on Kron without moving the key: `/api/wallet/watch`
+{fvk_hex,birthday} + `/api/wallet/rescan` on the canary profile (8502,
+--no-custodial, own dir) — but `/api/wallet/reveal` returns
+{address,network,seed_hex}, not an fvk, so the import would carry the seed.
+OPERATOR DECISION: WAIT. Plug stands, labeled; revisit when an fvk can be
+derived off the production host (Pi resync).
+**Lesson:** a residual is a sum of causes until each has an instrument; the
+"constant" was four things, one of them the wallet spending on itself.
+
+**BL-116 · 2026-09-09 · S27 incidents I-37..I-41; a hardening finding**
+I-37 (III.4/III.2): `Get-ChildItem C:\zkas\node -Filter '*wallet*'` + `& $w
+--help` matched the LAUNCHER script, not the binary, and STARTED a canary
+walletd (PID 17836, :8502, own dir, --no-custodial); stopped by guarded
+Stop-Process within the turn; the binary was C:\zkas\walletd-v108\
+zkas-walletd.exe (B5B1DDA9…) per the launcher's own banner. A path guessed
+from a description executed something. I-38 (III.2): `for f in $(find …)`
+word-split "Application Support"; read-only, all failures. I-39 (III.2):
+`exit 1` in a guard typed at an interactive zsh prompt closed the login shell;
+scripts exit, prompts return. I-40 (III.2): a >500-char one-liner clipped in
+the Kron console (the I-31 rider, repeated) — shipped as probe-watch-r1.ps1
+(33 ln, d7fe735f…) instead. I-41 (III.2): unbalanced brace in a one-liner
+left PowerShell at `>>`. Mechanism for I-37 class: any `&`/`.` invocation
+names its executable by full path, never by glob; globs are for reads.
+HARDENING FINDING (KRON-HARDENING item, new): `GET /api/wallet/reveal` on
+walletd returns `seed_hex` to the bearer of the wallet token; that token is
+plaintext at zkas-reporter.ps1:75 (`$WalletToken`). One readable script →
+the seed, over loopback, no second factor. Pre-existing; read today.
+Candidate fixes: token to a DPAPI blob (the set-*-secret pattern), and/or
+ask upstream for `reveal` to require the wallet secret or to be disableable
+(`--no-custodial` may already gate it — unverified, n=0).
+Also for W-1: the desktop app launched its wallet engine against
+`node 185.147.157.125:16110` (public) this morning while Own node was
+selected (services.log 1788946298806); the 09-08 start used 127.0.0.1:16810.
+Reproduction with a log line for zkas-wallet#3.
+**Lesson:** the incidents that repeat are the ones the laws already name;
+the fix is the mechanism (full path for execution), not another reminder.
