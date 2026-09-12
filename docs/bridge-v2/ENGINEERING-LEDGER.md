@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-116 (2026-09-09)
+### Last entry: BL-121 (2026-09-11)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -3847,3 +3847,150 @@ selected (services.log 1788946298806); the 09-08 start used 127.0.0.1:16810.
 Reproduction with a log line for zkas-wallet#3.
 **Lesson:** the incidents that repeat are the ones the laws already name;
 the fix is the mechanism (full path for execution), not another reminder.
+
+## 2026-09-09 → 09-11 — S28: the dashboard finished arguing with itself, T-7 turned out to be a regex, and restarts became a rail
+
+**BL-117 · 2026-09-09 · dashboard rows 63–81 CLOSED — reconciliation labels,
+hourly-pattern noise, health header, Poisson panel; row 27 closed on the
+synthetic-row captures (forward line for BL-113)**
+ROW 27: synthetic zkas_blocks row (amount 0, source test, 08:43:10Z) captured
+amber "pending (<1m)" and, after the hour, muted "unrefined" beside paid rows;
+both render paths witnessed; deleted, source='test' now excluded from every
+count (rows 58/59/63/65). Count effect measured: 1,569 at 04:43 EDT incl. the
+test row → 1,573 an hour later with four real blocks. RECONCILIATION (rows
+62/65/66/67): backfill fa063169 (08-28 00:16:47.809Z, 45.24092998,
+walletd-backfill); zkas_adjustments ac2211d5 −196,628,800 (8 consolidation
+fees) and 8a81225e +595,650,858,696 (pre-08-07, derived); card =
+80,640.77922860 = treasury + post-08:38Z blocks, delta 0.00000000; sub-line
+corrected from the net "5,954.54" to "incl. 5,956.51 pre-08-07, less 1.97
+consolidation fees" (row 67). HOURLY PATTERN (rows 69/71): 3,532 blocks / 24
+cells, χ²=22.62 on 23 df, p=0.48 → peak/lowest/maintenance-window cards
+REMOVED, one live line "no hour-of-day effect detected (p, n)", cards gated
+behind p<0.01 & n>5,000. HEALTH HEADER (rows 70/72/74/75/77): root cause — the
+red threshold had been CALIBRATED FROM RESTART OUTCOMES (BL-066's
+self-certification, in code); removed; bands Normal/Monitor/Investigate;
+"Restart recommended" gone everywhere; one expected gap (trailing-7d mean
+34.7 min) for label, needle, multiplier; the 1.39× defect was the live gauge
+ratio printed under the completed-gap label (two quantities, one label). GAP
+DISTRIBUTION VS POISSON replaces Restart Backtest (rows 75/77/80/81): the
+first cut still read the lifetime 51.5-min mean and reported p=0.009
+"deviates"; on the 7d mean the SAME 117 gaps read 47/43.0 >1×, 17/15.8 >2×,
+longest 5.83× vs 5.34×, χ² 0.70, p=0.873 "consistent with Poisson" —
+BL-066's "no fault found", computed live. restartEffectiveness.ts deleted.
+RIDER: expected-for-this-hour → flat rate everywhere (p=0.48 says the hour
+baseline was 24 noisy estimates of one number).
+**Lesson:** a p-value on the wrong denominator is a confident wrong
+verdict; the sentence "consistent with Poisson" is only as good as the mean
+it was tested against — read the mean on the panel before the p.
+
+**BL-118 · 2026-09-10/11 · T-7 RESOLVED — the double rate was a reporter
+parse gap, not a bridge loss; corrected 89–90%; reporter r8 live**
+READ (Supabase, 09-10): doubles since the 09-02 bridge 77.5% (251/324) vs
+lifetime 83.7% — 3σ below, "explain 77.5%" replaced "confirm ~90%". Daily
+table showed direction with d_z/d_k but not level (09-08 doubles > ratio;
+09-09 ratio 1.208 yet 75%). LAN READ (09-10 22:xx, last 3 RKStratum logs):
+the bridge logs a double in TWO templates — `[ZKAS] DOUBLE! Both legs blue.
+H_fc:` (r6 parsed) and `[BLOCK] DOUBLE! Both legs blue. Parent:` (KAS leg
+confirmed first; hash = KAS parent, not H_fc). 484 zKAS blocks = 431
+full_clear:true + 53 full_clear:false; doubles 394 + 38 = 432 = every
+full_clear share. Matched to zkas_blocks: the 53 full_clear:false hashes are
+all kaspa_double=false (KAS target not met — difficulty); the 38 Parent-form
+lines each sit 2.1 s mean / 4.2 s max after one row, all 38 false; 53+38 = 91
+= every false since 08-30; ZERO red/orphan loss on the KAS leg. Operator's
+hypothesis (zKAS hashrate) right at the mechanism (full_clear:false moves
+with d_z/d_k), wrong at the level. FIX 1 — reporter: r7 (7d8dc12b) VOID: cut
+from the sealed mount r6 (6df02a2c) while the LIVE file was r6 + BOM +
+textfile-hook r1 (95ba8e98; reconstructed byte-identical from mount r6 +
+lines 408–413 + BOM) — the sha gate at step 1 caught it, the hook would have
+been lost (I-42). r8 (542 ln, e01206ae4d3b8942…, BOM) = live + Parent-form
+parser: attributes to the newest FOUND within 10 s; dry run attributed 43 in
+the current log at dt 2.0–4.4 s, none unattributed; live 11:18 EDT after a
+two-minute window with TWO reporters running (an unset `$rp` in a fence —
+I-43); /metrics on 9151 served zkas_supply_check_status from r8 → the hook
+lives. FIX 2 — backfill rows 82/84 → 83/86: 38 + 7 (09-10/11) = 45 hashes
+set true; since 08-30 489/542 = 90.2% (my read), 497/552 = 90.0% (Bolt's);
+lifetime 86.0%. Going forward the flag comes from r8.
+**Lesson:** a "loss" that tracks a template count exactly is a parser; check
+every log form of an event before blaming the thing the log describes.
+
+**BL-119 · 2026-09-11 · P8 SHIPPED — restart logging, both halves; three
+manual restarts the same day were the last recorded by hand**
+STEP 1 (the one that stalled the item): the exporter's metric is
+`windows_process_start_time_seconds_timestamp` — the earlier candidate
+lacked `_seconds_timestamp` and read NO DATA. Labels process, process_id,
+creating_process_id; six stack binaries; plus `windows_system_boot_time_
+timestamp`. First read: kaspad 12:01:54, zkas-node 12:02:04, stratum-bridge
+12:42:14 EDT today — manual (operator), on no rail until the modal.
+DESIGN FACT: a restart ENDS a pid-labelled series and STARTS another;
+changes() on the raw metric is always 0 → recording rule
+`kron:process_start_seconds = max without (process_id, creating_process_id)
+(…)`, alerts read the recorded series. RULES HALF: alert-rules-p8-hook r1
+VOID — read the file via Get-Content -Raw in ANSI and re-wrote cp1252-
+undefined bytes as UTF-8 C1 controls (promtool "control characters are not
+allowed"), AND died at the promtool call (native stderr under -EA Stop)
+before its own restore ran (I-44/I-45); r2 (1cf49811d98abc58) reads/writes
+UTF-8 bytes with BOM state preserved, cmd /c + $LASTEXITCODE, severity
+`warning` (the file's vocabulary): alert_rules.yml 935→962 ln
+(db8a753ab9638dc8), promtool 48 rules, reload 200, group kron_process
+(kron:process_start_seconds, kron:host_boot_seconds, KronProcessRestarted,
+KronHostBooted) health=ok 21:08:27 EDT. WRITE HALF: row 85 → 87:
+kron-events-webhook (X-Webhook-Secret vs env KRON_EVENTS_SECRET, fail-closed;
+dedupe_key component:epoch, partial UNIQUE index; DEFAULT_WALLET_ADDRESS);
+secret minted by the operator (openssl, clipboard) into the Bolt form and a
+DPAPI blob C:\zkas\ke-secret.dpapi (masked Read-Host would not take an RDP
+paste; Get-Clipboard did). kron-events-sampler r1 VOID (one-element result
+unrolled to a PSCustomObject whose .Count is $null in 5.1 → host_boot never
+read, I-46); r2 (152 ln, 9a1c5675a55a712c) re-wraps with @(), seeds a null
+host_boot silently; state C:\zkas\kron-events-state.json (six processes +
+host_boot 1788372769 = 09-02 14:12:49 EDT); task KronEventsSampler every 5
+min under inmyh (RepetitionDuration 3650d — [TimeSpan]::MaxValue is
+rejected). PROOF: POST pair for kaspad's 12:01:54 → inserted 7063477b /
+duplicate 7063477b; row carries dedupe_key kaspad:1789142514 = the sampler's
+state epoch. Two instruments, one event, from here on. Reporter is not in
+the exporter's include regex → r9 exports its own start gauge (queued with
+the token hardening, one restart).
+**Lesson:** the metric that "returned NO DATA" was a name guessed once and
+never read; one label-values query ended a month-old open item.
+
+**BL-120 · 2026-09-09/11 · hardening + hardware: stage table dropped; the
+reveal/token finding; Kron-2 returned; the Pi re-scoped**
+LINTER (09-09 10:11Z): rls_disabled_in_public on zkas_double_backfill_stage —
+the only table in the schema without RLS; anon key had READ+WRITE via
+PostgREST since 09-05; a BL-104 staging artifact named nowhere in the ledger.
+RLS enabled (operator), archive zkas_double_backfill_stage_rows.csv 281 rows
+(241 true / 40 false, CRLF — the first grep read 1 true through the CR;
+tr -d '\r' read 241) sha ea31cbf91c92200083f10371f33a0311546b6878c37a0114de1
+be091543fdfb7, table counts matched, then migration
+drop_zkas_double_backfill_stage; 0 tables without RLS; row 68. Archive on the
+laptop under ~/zkas/. RULE MINTED: a stage table is named at creation and
+retired at close, as append skeletons are (IV.9). REVEAL FINDING (BL-116)
+stands; fix queued as reporter r9 + DPAPI token. HARDWARE: Kron-2 (ACEMAGIC
+K1 7730U, Amazon Resale) arrived with 24 GB against 32 listed → RETURN (the
+six-point acceptance did its job); rebuild-from-runbooks plan (not image)
+stands for a correct unit. Pi 5 4 GB KEPT ($86): off-host deadman for Kron
+(the one alarm Kron cannot raise about itself), NUT master, trigger pollers,
+second supply-check witness; pwsh 7 on linux-arm64 for the pollers (systemd
+timers, no DPAPI); NOT a node. T-1 splits: T-1a Pi (on hand), T-1b Kron-2 (on
+correct stock).
+**Lesson:** an untracked table is an unlocked door; the linter found in four
+days what no session had reason to look for.
+
+**BL-121 · 2026-09-11 · S28 incident register I-42..I-46 (+2 sub-class)**
+I-42 (II.2, I.1): r7 cut from the mount rail while the live file differed
+(hook + BOM); pin at step 1 caught it. Mechanism: for any file that is ALSO
+live, pin the live copy before cutting. I-43 (III.1): a fence carried `$rp`
+for the operator to fill; it ran unfilled → Stop-Process no-op, second
+reporter started; fixed within two minutes by a guarded stop-all/start-one.
+Mechanism: values the operator holds are their own numbered step BEFORE the
+fence, never a variable inside it. I-44 (III.2): native stderr under -EA Stop
+terminated the hook before its restore; mechanism: external tools via cmd /c
+and $LASTEXITCODE. I-45 (encoding): Get-Content -Raw without -Encoding on a
+UTF-8 file; mechanism: bytes in, bytes out, BOM state preserved. I-46 (PS
+5.1): one-element unroll + PSCustomObject .Count; mechanism: @() at the call
+site. Sub-class: row 79 (82-char subject shipped after counting 82 — the
+count must gate, I-29 again); [TimeSpan]::MaxValue rejected by Task
+Scheduler. Also: expected output shipped inside a fence and executed by
+paste (I-5 class) — expected output is prose, always. Also: `exit 1` at an
+interactive zsh prompt closed the login shell (I-39, again).
+**Lesson:** five of seven were the same law re-learned on a new tool; the
+laws are right, the mechanisms need to be in the templates I cut from.
