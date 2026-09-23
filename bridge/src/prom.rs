@@ -425,17 +425,37 @@ fn try_read_static_file(url_path: &str) -> Option<(String, Vec<u8>)> {
     // URL layout expected by the dashboard:
     // - / -> index.html
     // - /raw.html
-    // - /static/... -> maps to bridge/static/... (strip leading /static/)
+    // - /static/... -> maps to bridge/static/... (strip leading /static/ once)
     let rel = match url_path {
         "/" => "index.html".to_string(),
         "/index.html" => "index.html".to_string(),
         "/raw.html" => "raw.html".to_string(),
-        p if p.starts_with("/static/") => p.trim_start_matches("/static/").to_string(),
-        _ => return None,
+        p => p.strip_prefix("/static/")?.to_string(),
     };
 
-    // Prevent path traversal
-    if rel.contains("..") || rel.contains('\\') {
+    // Rebuild the path from `Normal` components only. This rejects:
+    // - absolute remainders, e.g. `/static//etc/passwd` leaves `/etc/passwd`
+    //   after stripping the `/static/` prefix; joining that directly would
+    //   replace the static root,
+    // - `..` components,
+    // - backslashes, to reject Windows-style path syntax on Unix,
+    // and collapses duplicate separators.
+    //
+    // The raw request target is intentionally not percent-decoded, so encoded
+    // traversal sequences such as `%2e%2e%2f` remain literal path components
+    // and therefore do not traverse directories.
+    if rel.contains('\\') {
+        return None;
+    }
+    let mut normal_parts: Vec<&str> = Vec::new();
+    for component in std::path::Path::new(&rel).components() {
+        match component {
+            std::path::Component::Normal(part) => normal_parts.push(part.to_str()?),
+            _ => return None,
+        }
+    }
+    let rel = normal_parts.join("/");
+    if rel.is_empty() {
         return None;
     }
 
@@ -447,8 +467,17 @@ fn try_read_static_file(url_path: &str) -> Option<(String, Vec<u8>)> {
         return Some((rel, f.contents().to_vec()));
     }
 
-    let file_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("static").join(&rel);
-    let bytes = std::fs::read(&file_path).ok()?;
+    // The disk fallback is restricted to files beneath the canonicalized
+    // static root, so a symlinked asset inside the static tree cannot make
+    // the read escape it either.
+    let static_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("static");
+    let file_path = static_root.join(&rel);
+    let canonical_root = std::fs::canonicalize(&static_root).ok()?;
+    let canonical_file = std::fs::canonicalize(&file_path).ok()?;
+    if !canonical_file.starts_with(&canonical_root) {
+        return None;
+    }
+    let bytes = std::fs::read(&canonical_file).ok()?;
     Some((rel, bytes))
 }
 
