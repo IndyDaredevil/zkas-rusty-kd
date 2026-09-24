@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-121 (2026-09-11)
+### Last entry: BL-123 (2026-09-23)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -3994,3 +3994,101 @@ paste (I-5 class) — expected output is prose, always. Also: `exit 1` at an
 interactive zsh prompt closed the login shell (I-39, again).
 **Lesson:** five of seven were the same law re-learned on a new tool; the
 laws are right, the mechanisms need to be in the templates I cut from.
+
+## 2026-09-22/23 — S29: rusty-kaspa v2.1.0 evaluated; bridge B1 path traversal confirmed on Kron and ported
+
+**BL-122 · 2026-09-22/23 · kaspad v2.1.0 evaluated (maintenance release, no
+resync); bridge static-file path traversal (B1) CONFIRMED on Kron by
+loopback probe; upstream fix ported to the fork, compiled, pushed,
+bridge-check green**
+EVAL (KASPAD-EVAL-v2.1.0-r1, 09-22, sandbox; full tag-to-tag read
+v2.0.1 cfafeb4c… → v2.1.0 01b532e8…, 21 non-merge commits, 300 files):
+LATEST_DB_VERSION 7 in both tags (factory.rs:63) → in-place upgrade, no
+resync; kaspad/src/args.rs byte-identical → config.toml unchanged;
+rpc/grpc/core/proto/* identical → bridge wire unchanged; no new
+ForkActivation in params; P2P protocol 11 (chunked IBD), accepts ≥10;
+new `assert!(fd_total_budget > 0)` at startup (only fires on very large
+peer/client counts). Verdict: upgrade RECOMMENDED, NOT MANDATORY; nothing
+executed on Kron. Release zip re-pinned 09-23: 46,608,118 B
+fb25743a4b432d376c4ca49d8799769dbc6d5b070f0b502350ce32cfdb38ec0f
+(unchanged from the 09-22 pin); kaspad.exe inside 40,668,160 B
+16bd68241c79113858c873ee16c5267809d7b8df11e878bfdec9802e2a33a1da.
+Tag v2.1.0 still at 01b532e8… by ls-remote 09-23. firecash/zkas-rusty
+main @ 07ed6dd (09-22 18:22Z) still workspace version 2.0.1; v2.1.0 is
+NOT an ancestor (merge-base --is-ancestor, full ancestry) → NODE-CONTRACT
+revision trigger has not fired.
+B1 (the finding that matters): upstream 2a47b24 ("Arithmetic safety and
+more", 09-22) rebuilt `try_read_static_file` from `Normal` path
+components + canonicalized disk fallback. Ours on merged-v2.0.1.5
+(prom.rs:423–453) was `trim_start_matches("/static/")` + a substring
+check for `..`/`\`: an absolute remainder replaces the static root under
+`Path::join`. Served on every web AND prom port; default bind 0.0.0.0
+(net_utils.rs:33) → LAN-reachable. KRON PROBE (operator, 09-23,
+PowerShell, loopback :3034, `--path-as-is`,
+`/static/C:/Windows/win.ini`): **HTTP 200** — B1 confirmed on Kron (n=1,
+one path form; body not read). PORT: upstream function body dropped in
+verbatim on a branch off 6e22eb7; sandbox `cargo check -p
+kaspa-stratum-bridge` OK (17m15s, protoc installed via apt first —
+first attempt failed on missing protoc, I-28), 5 warnings none in
+prom.rs; component logic unit-tested standalone on Linux (n=8 inputs:
+`//etc/hostname`, `..`, `js/../../x`, empty → None; `%2e%2e/x` stays
+literal). NOTE (n=0 on Windows, source reasoning): `C:/…` passes the
+Normal filter on Linux (`C:` is a Normal component there) but on Windows
+parses as `Prefix` → rejected; the canonicalize-starts_with guard is the
+platform-independent backstop. Kron re-probe after deploy is the real
+check. PATCH r2 = format-patch of the commit, 80 ln
+519df35a548ee3550cd82076b5ad473e822c3d63da41b08a010ecf03de27dab2 (r1
+file of 09-22, 67 ln 345d501e…, VOID — a bare diff, no commit header).
+LANDED (MacBook, ~/zkas/zkas-rusty-kd): `git am` → 002f635 on branch
+ws2-b1-static-traversal; tree b56fa08f98b730062d31fd84a69ad5441dfb58ef
+IDENTICAL to the sandbox commit dce6c58 (commit shas differ by
+committer; the tree is the identity). Branch renamed ws2-* BEFORE push
+because bridge-check.yaml fires only on `ws2-*`/`merged-*` (read from
+the workflow, not recalled). Pushed 09-23; run 35820403168 bridge-check
+✓ 14m4s (check + clippy-advisory + test, --locked). Run 35820403220
+`Tests` ✗ 51m35s — PRE-EXISTING: the last three `Tests` runs on
+merged-v2.0.1.5 (34667115534, 34666851125, 34665958082, 09-11) all ✗
+(n=3); failing job `Check no_std` dies on `num_cpus` E0463 "can't find
+crate for std" before any bridge code compiles; also an install-action
+error in Test Suite. Not a gate for the bridge crate; not caused by
+this branch.
+OPEN: deploy of the fixed bridge to Kron (bridge restart = KAS leg
+down briefly) and the post-deploy re-probe (expected 404); interim
+firewall rule on :3034 if the deploy waits; B2–B5 (accept-error retry,
+Connection: close, ip label host-only, gauge cap — B5 not to be ported
+blind); kaspad cutover per EVAL §5 with the §3.4 firewall decision
+(R-4) still the operator's; STARTUP-ORDER r2→r3 after cutover.
+Mount observation: the project panel lists ITEM-REGISTRY-r7 while the
+repo carries r8 — the mount is one revision behind on that doc.
+**Lesson:** the release that "changes nothing for us" carried the one
+fix we needed most, on the component we forked — read the bridge crate
+diff of every upstream release, not just the node's.
+
+**BL-123 · 2026-09-23 · S29 incidents I-26..I-28 — cwd assumed in a
+shipped fence; second workflow gate not read before predicting one;
+stalled cargo holding the build lock**
+I-26 (III.4): a fence opened with `cd "$(git rev-parse --show-toplevel)"`
+assuming the operator's shell was already inside the fork checkout; it
+ran from `~` → "not a git repository" twice. Cost: one round trip. The
+destination is FOUND (find + remote-URL match, one line of output) and
+then written LITERALLY into the next fence; a `$(...)` that resolves to
+the wrong place is a placeholder with extra steps. Also caught in the
+same fence class: `test -d .git` / `test -f <patch>` guards added so an
+empty resolution fails loud (III.7).
+I-27 (II.2): "let bridge-check.yaml run" predicted ONE gate; the push
+fired two (`Tests` also triggers on the branch). The second was not a
+blocker (BL-122) but was not known until the run list was read.
+Mechanism: `ls .github/workflows/` + each `on:` block before predicting
+what a push does — the same read that caught the ws2-* branch-name
+trigger.
+I-28 (III.6): first `cargo check` failed on missing protoc, then sat in
+"waiting for other jobs to finish" holding the target-dir lock; the
+second run (after apt protoc) blocked on the lock for >7 min. Killed
+the first; second completed. Mechanism: check `which protoc` before a
+workspace build (kaspa-p2p-lib build.rs requires it), and never start a
+second cargo in the same target dir while the first is alive.
+Non-incident, recorded for reuse: `git am` yields a different commit
+sha per committer; the tree hash (`git rev-parse HEAD^{tree}`) is the
+cross-machine identity check and was used as the gate before push.
+**Lesson:** every fence that starts with `cd` names a path that was read
+this session, not one implied by the previous message's prompt.
