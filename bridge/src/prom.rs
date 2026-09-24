@@ -3,9 +3,7 @@ use prometheus::proto::MetricFamily;
 use prometheus::{Counter, register_counter};
 use prometheus::{CounterVec, Gauge, GaugeVec, register_counter_vec, register_gauge, register_gauge_vec};
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "rkstratum_cpu_miner")]
-use std::collections::VecDeque;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -21,6 +19,15 @@ const INVALID_LABELS: &[&str] = &["instance", "worker", "miner", "wallet", "ip",
 
 /// Block labels
 const BLOCK_LABELS: &[&str] = &["instance", "worker", "miner", "wallet", "ip", "nonce", "bluescore", "timestamp", "hash"];
+
+/// B5 (upstream 2a47b24): maximum number of recent per-block series retained in
+/// each of `ks_mined_blocks_gauge`, `ks_zkas_mined_blocks_gauge` and
+/// `ks_double_mined_blocks_gauge`. Each block carries unique hash/nonce/timestamp
+/// labels, so without a cap a gauge grows one permanent series per block for the
+/// process lifetime. Older series are evicted past this bound; the monotonic
+/// `ks_*_blocks_mined` counters keep the true lifetime totals (and /api/stats
+/// falls back to them for the K total, as it already did for Z and D).
+pub const BLOCK_GAUGE_HISTORY_LIMIT: usize = 512;
 
 /// Error labels
 const ERROR_LABELS: &[&str] = &["instance", "wallet", "error"];
@@ -82,6 +89,12 @@ static BLOCK_GAUGE: OnceLock<GaugeVec> = OnceLock::new();
 // works identically for all three chains/event-types.
 static ZKAS_BLOCK_GAUGE: OnceLock<GaugeVec> = OnceLock::new();
 static DOUBLE_BLOCK_GAUGE: OnceLock<GaugeVec> = OnceLock::new();
+/// B5: insertion-ordered label-set history per per-event gauge (newest first),
+/// used to evict the oldest series once BLOCK_GAUGE_HISTORY_LIMIT is exceeded.
+type GaugeHistory = OnceLock<parking_lot::Mutex<VecDeque<Vec<String>>>>;
+static BLOCK_GAUGE_HISTORY: GaugeHistory = OnceLock::new();
+static ZKAS_BLOCK_GAUGE_HISTORY: GaugeHistory = OnceLock::new();
+static DOUBLE_BLOCK_GAUGE_HISTORY: GaugeHistory = OnceLock::new();
 
 /// Disconnect counter - number of disconnects by worker
 static DISCONNECT_COUNTER: OnceLock<CounterVec> = OnceLock::new();
@@ -491,16 +504,27 @@ async fn write_response(
     if let Some(body) = body_bytes {
         stream.write_all(&body).await?;
     }
+    let _ = stream.shutdown().await;
+    Ok(())
+}
+
+/// B3: write a complete response and half-close, so the client sees EOF and
+/// the socket does not linger in CLOSE_WAIT (upstream 2a47b24).
+async fn send_response(
+    mut stream: tokio::net::TcpStream,
+    response: impl AsRef<[u8]>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::AsyncWriteExt;
+    stream.write_all(response.as_ref()).await?;
+    let _ = stream.shutdown().await;
     Ok(())
 }
 
 async fn handle_http_request(
-    mut stream: tokio::net::TcpStream,
+    stream: tokio::net::TcpStream,
     request: &str,
     mode: &HttpMode,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::io::AsyncWriteExt;
-
     let path = request.lines().next().and_then(|line| line.split_whitespace().nth(1)).unwrap_or("/");
 
     if request.starts_with("GET /metrics") {
@@ -514,11 +538,11 @@ async fn handle_http_request(
         encoder.encode(&metric_families, &mut buf)?;
 
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
             buf.len(),
             String::from_utf8_lossy(&buf)
         );
-        stream.write_all(response.as_bytes()).await?;
+        send_response(stream, response).await?;
         return Ok(());
     }
 
@@ -534,11 +558,11 @@ async fn handle_http_request(
             WebStatusResponse { kaspad_address: status_cfg.kaspad_address, kaspad_version, instances: status_cfg.instances, web_bind };
         let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
             json.len(),
             json
         );
-        stream.write_all(response.as_bytes()).await?;
+        send_response(stream, response).await?;
         return Ok(());
     }
 
@@ -549,22 +573,22 @@ async fn handle_http_request(
         };
         let json = serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string());
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
             json.len(),
             json
         );
-        stream.write_all(response.as_bytes()).await?;
+        send_response(stream, response).await?;
         return Ok(());
     }
 
     if matches!(mode, HttpMode::Instance { .. }) && request.starts_with("GET /api/config") {
         let config_json = get_config_json().await;
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
             config_json.len(),
             config_json
         );
-        stream.write_all(response.as_bytes()).await?;
+        send_response(stream, response).await?;
         return Ok(());
     }
 
@@ -573,11 +597,11 @@ async fn handle_http_request(
             let json_response =
                 r#"{"success": false, "message": "Config write disabled. Set RKSTRATUM_ALLOW_CONFIG_WRITE=1 to enable."}"#;
             let response = format!(
-                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
                 json_response.len(),
                 json_response
             );
-            stream.write_all(response.as_bytes()).await?;
+            send_response(stream, response).await?;
             return Ok(());
         }
 
@@ -590,26 +614,27 @@ async fn handle_http_request(
             r#"{"success": false, "message": "Failed to update config"}"#
         };
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
             json_response.len(),
             json_response
         );
-        stream.write_all(response.as_bytes()).await?;
+        send_response(stream, response).await?;
         return Ok(());
     }
 
     if request.starts_with("GET /") {
         if let Some((rel, bytes)) = try_read_static_file(path) {
             let ct = content_type_for_path(&rel);
-            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n", ct, bytes.len());
+            let response =
+                format!("HTTP/1.1 200 OK\r\nContent-Type: {}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", ct, bytes.len());
             write_response(stream, response, Some(bytes)).await?;
         } else {
-            stream.write_all("HTTP/1.1 404 Not Found\r\n\r\n".as_bytes()).await?;
+            send_response(stream, "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n").await?;
         }
         return Ok(());
     }
 
-    stream.write_all("HTTP/1.1 404 Not Found\r\n\r\n".as_bytes()).await?;
+    send_response(stream, "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n").await?;
     Ok(())
 }
 
@@ -625,7 +650,17 @@ async fn serve_http_loop(listener: tokio::net::TcpListener, mode: HttpMode) -> R
     const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     loop {
-        let (mut stream, _) = listener.accept().await?;
+        // B2 (upstream 2a47b24): an accept() error used to `?` out of this loop
+        // and end the web/metrics server for the life of the process while
+        // mining continued. Warn, back off 50 ms, keep serving.
+        let (mut stream, _) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!("TCP accept error on web dashboard: {}", e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         let mode = mode.clone();
         tokio::spawn(async move {
             let mut buffer = [0; 8192];
@@ -691,7 +726,10 @@ impl WorkerContext {
             worker_name: worker_name.to_string(),
             miner: miner.to_string(),
             wallet: ctx.wallet_addr.lock().clone(),
-            ip: format!("{}:{}", ctx.remote_addr(), ctx.remote_port()),
+            // B4 (upstream 2a47b24): host only. The ephemeral remote port changed on
+            // every reconnect and minted a fresh series per session (BL-010); the
+            // host alone is bounded by the real fleet.
+            ip: ctx.remote_addr().to_string(),
         }
     }
 }
@@ -703,7 +741,7 @@ pub fn worker_context(instance_id: &str, ctx: &crate::stratum_context::StratumCo
         worker_name: ctx.effective_worker_name(),
         miner: miner.into(),
         wallet: ctx.wallet_addr.lock().clone(),
-        ip: format!("{}:{}", ctx.remote_addr(), ctx.remote_port()),
+        ip: ctx.remote_addr().to_string(),
     }
 }
 
@@ -863,24 +901,41 @@ pub fn record_block_found(worker: &WorkerContext, nonce: u64, bluescore: u64, ha
         counter.with_label_values(&worker.labels()).inc();
     }
     if let Some(gauge) = BLOCK_GAUGE.get() {
-        set_block_event_gauge(gauge, worker, nonce, bluescore, hash);
+        set_block_event_gauge(gauge, &BLOCK_GAUGE_HISTORY, worker, nonce, bluescore, hash);
     }
 }
 
 // c.10: shared by all three per-event gauges (K/Z/D) — one implementation,
 // timestamp always taken at call time (i.e. at blue-confirm for K and Z,
 // matching when their respective counters increment too).
-fn set_block_event_gauge(gauge: &GaugeVec, worker: &WorkerContext, nonce: u64, bluescore: u64, hash: String) {
-    let mut labels = worker.labels();
-    let nonce_str = nonce.to_string();
-    let bluescore_str = bluescore.to_string();
-    let timestamp_str =
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs().to_string();
-    labels.push(&nonce_str);
-    labels.push(&bluescore_str);
-    labels.push(&timestamp_str);
-    labels.push(&hash);
-    gauge.with_label_values(&labels).set(1.0);
+fn set_block_event_gauge(gauge: &GaugeVec, history: &GaugeHistory, worker: &WorkerContext, nonce: u64, bluescore: u64, hash: String) {
+    // Owned labels in BLOCK_LABELS order so the set can be retained for eviction (B5).
+    let mut labels = worker.labels().iter().map(|s| s.to_string()).collect::<Vec<String>>();
+    labels.push(nonce.to_string());
+    labels.push(bluescore.to_string());
+    labels.push(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs().to_string());
+    labels.push(hash);
+    let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
+    gauge.with_label_values(&label_refs).set(1.0);
+    remember_block_gauge_labels(gauge, history, labels);
+}
+
+/// B5 (upstream 2a47b24): record a per-event gauge label set and evict the oldest
+/// series once BLOCK_GAUGE_HISTORY_LIMIT is exceeded.
+fn remember_block_gauge_labels(gauge: &GaugeVec, history: &GaugeHistory, labels: Vec<String>) {
+    let history = history.get_or_init(|| parking_lot::Mutex::new(VecDeque::with_capacity(BLOCK_GAUGE_HISTORY_LIMIT)));
+    let mut history = history.lock();
+    if let Some(existing_idx) = history.iter().position(|existing| existing == &labels) {
+        history.remove(existing_idx);
+    }
+    history.push_front(labels);
+    while history.len() > BLOCK_GAUGE_HISTORY_LIMIT {
+        let Some(old_labels) = history.pop_back() else {
+            break;
+        };
+        let old_refs = old_labels.iter().map(String::as_str).collect::<Vec<_>>();
+        let _ = gauge.remove_label_values(&old_refs);
+    }
 }
 
 /// c.10: zKAS-chain twin of `record_block_found` — called from hook E on
@@ -889,7 +944,7 @@ fn set_block_event_gauge(gauge: &GaugeVec, worker: &WorkerContext, nonce: u64, b
 /// reasoning as the color-check call).
 pub fn record_zkas_block_found_event(worker: &WorkerContext, nonce: u64, bluescore: u64, hash: String) {
     if let Some(gauge) = ZKAS_BLOCK_GAUGE.get() {
-        set_block_event_gauge(gauge, worker, nonce, bluescore, hash);
+        set_block_event_gauge(gauge, &ZKAS_BLOCK_GAUGE_HISTORY, worker, nonce, bluescore, hash);
     }
 }
 
@@ -900,7 +955,7 @@ pub fn record_zkas_block_found_event(worker: &WorkerContext, nonce: u64, bluesco
 pub fn record_double_block_found_event(worker: &WorkerContext, nonce: u64, bluescore: u64, kas_hash: String, zkas_hash: String) {
     if let Some(gauge) = DOUBLE_BLOCK_GAUGE.get() {
         let joined = format!("{}|{}", kas_hash, zkas_hash);
-        set_block_event_gauge(gauge, worker, nonce, bluescore, joined);
+        set_block_event_gauge(gauge, &DOUBLE_BLOCK_GAUGE_HISTORY, worker, nonce, bluescore, joined);
     }
 }
 
@@ -1314,6 +1369,9 @@ async fn get_stats_json_filtered(instance_id: Option<&str>) -> StatsResponse {
     let mut worker_start_times: HashMap<String, f64> = HashMap::new(); // Store start times for hashrate calculation
     let mut worker_difficulties: HashMap<String, f64> = HashMap::new(); // Store current difficulty for each worker
     let mut block_set: HashSet<String> = HashSet::new();
+    // B5: the K gauge is capped, so its unique-hash count can undercount once older
+    // series are evicted; the monotonic ks_blocks_mined counter is the total's truth.
+    let mut total_blocks_from_counters = 0u64;
     let mut zkas_block_set: HashSet<String> = HashSet::new(); // c.10
     let mut double_block_set: HashSet<String> = HashSet::new(); // c.10
 
@@ -1511,6 +1569,7 @@ async fn get_stats_json_filtered(instance_id: Option<&str>) -> StatsResponse {
                 if !worker_key.is_empty() {
                     let key = format!("{}:{}:{}", instance, worker_key, wallet);
                     let count = metric.get_counter().value() as u64;
+                    total_blocks_from_counters = total_blocks_from_counters.saturating_add(count);
                     let entry = worker_stats.entry(key.clone()).or_insert_with(|| new_worker_info(instance, worker_key, wallet));
                     // Aggregate across multiple time series for the same (instance,worker,wallet)
                     entry.blocks = entry.blocks.saturating_add(count);
@@ -1757,6 +1816,8 @@ async fn get_stats_json_filtered(instance_id: Option<&str>) -> StatsResponse {
     }
 
     stats.workers = active_workers;
+    // B5: fall back to the counter total once the capped gauge has evicted blocks.
+    stats.totalBlocks = stats.totalBlocks.max(total_blocks_from_counters);
     // Active workers are the number of Stratum workers, plus the internal CPU miner if present.
     stats.activeWorkers = stats.workers.len() + stats.internalCpu.as_ref().map(|_| 1).unwrap_or(0);
 
@@ -1998,6 +2059,35 @@ mod tests {
         std::env::temp_dir().join(format!("rkstratum_config_test_{}_{}.yaml", std::process::id(), nanos))
     }
 
+    #[test]
+    fn block_event_gauge_is_capped_and_evicts_oldest() {
+        // B5: a private registry so this test does not collide with init_metrics().
+        let gauge = GaugeVec::new(prometheus::Opts::new("test_block_gauge", "cap test"), BLOCK_LABELS).unwrap();
+        static HISTORY: GaugeHistory = OnceLock::new();
+        let worker = WorkerContext {
+            instance_id: "1".into(),
+            worker_name: "w1m".into(),
+            miner: "".into(),
+            wallet: "kaspa:test".into(),
+            ip: "192.168.1.27".into(),
+        };
+        let n = BLOCK_GAUGE_HISTORY_LIMIT + 25;
+        for i in 0..n {
+            set_block_event_gauge(&gauge, &HISTORY, &worker, i as u64, 1000 + i as u64, format!("hash{}", i));
+        }
+        use prometheus::core::Collector;
+        let series = gauge.collect().iter().map(|mf| mf.get_metric().len()).sum::<usize>();
+        assert_eq!(series, BLOCK_GAUGE_HISTORY_LIMIT, "gauge must hold exactly the cap after {} events", n);
+        // The newest is present, the oldest evicted.
+        let labels_newest = ["1", "w1m", "", "kaspa:test", "192.168.1.27"];
+        let mut newest = labels_newest.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        newest.extend([(n - 1).to_string(), (1000 + n - 1).to_string()]);
+        let hist = HISTORY.get().unwrap().lock();
+        assert!(hist.front().unwrap().starts_with(&newest[..]));
+        assert!(hist.iter().all(|l| l[8] != "hash0"), "hash0 (the oldest) must have been evicted");
+        assert_eq!(hist.len(), BLOCK_GAUGE_HISTORY_LIMIT);
+    }
+
     #[tokio::test]
     async fn test_http_routing_and_config_write() {
         let config_path = temp_config_path();
@@ -2018,6 +2108,7 @@ min_share_diff: 8192
 
         let status_resp = send_request(mode.clone(), "GET /api/status HTTP/1.1\r\n\r\n").await;
         assert!(status_resp.contains("200 OK"));
+        assert!(status_resp.contains("Connection: close")); // B3
         assert!(status_resp.contains("\"kaspad_address\""));
         assert!(status_resp.contains("\"instances\":2"));
 
