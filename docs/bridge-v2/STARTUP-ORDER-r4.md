@@ -1,4 +1,6 @@
-# STARTUP-ORDER — Kron full-stack manual start · r2 · 2026-09-11 (r1 was 2026-08-30)
+# STARTUP-ORDER — Kron full-stack manual start · r4 · 2026-09-25 (r2 was 2026-09-11; r1 2026-08-30; r3 cut 09-24, never landed, VOID)
+### r4: kaspad v2.1.0 via versioned launcher (BL-126); stratum-bridge v2.0.1.6
+### (B1–B5 port of upstream 2a47b24, BL-124). §§1 and 4 revised.
 ### r2: node + walletd at v1.0.8 (H8, BL-093/094); walletd v1.0.8 status gate;
 ### §7 gains ZkasSupplyCheck + KronEventsSampler + the two-reporter trap;
 ### §8 = 8 PASS, ELEVATED. Rollback identities retained as notes.
@@ -29,13 +31,26 @@
 7   scheduled tasks — VERIFY, never hand-start
 Then §8: the button.
 
-## 1 · kaspad (KAS leg) — Kron · cmd, new window
+## 1 · kaspad v2.1.0 (KAS leg) — Kron · cmd, new window
 ```cmd
-C:\rusty-kaspa-v2\target\release\kaspad.exe --configfile "C:\Node-v2\config.toml"
+C:\rusty-kaspa-v210\run-kaspad-v210.cmd
 ```
-Gate: 16110 + 17110 listening. NOTE: only leg without a launcher .cmd yet
-(queued; H2 prerequisite). `externalip` in its TOML is a dead key on this
-engine (BL-063 drop-trap class) — do not rely on it.
+Identity (BL-126, 09-25): the launcher runs C:\rusty-kaspa-v210\kaspad.exe =
+16BD68241C79113858C873EE16C5267809D7B8DF11E878BFDEC9802E2A33A1DA (official
+kaspanet/rusty-kaspa v2.1.0 win64 asset, zip FB25743A…8EC0F) with the
+unchanged C:\Node-v2\config.toml (appdir ~/.rusty-kaspa-v2, DB version 7 in
+both v2.0.1 and v2.1.0 — no resync; synced within ~18 s on cutover). Banner:
+`kaspad v2.1.0`. Gate: 16110 + 17110 listening, owned by
+C:\rusty-kaspa-v210\kaspad.exe; bridge status line `v=2.1.0 … zk=ok`.
+Firewall: program+port rule "kaspad v2.1.0 P2P inbound" (16111, R-4 style)
+minted 09-25 before first launch; no first-run prompt appeared (n=1).
+Rollback operand (untouched): C:\rusty-kaspa-v2\target\release\kaspad.exe =
+084C2B928CB3DCEB2F752728581DE39EF2471640F5F894EF73C2ED1BBBC82743 (v2.0.1);
+relaunch it with the same --configfile line if v2.1.0 must come down.
+kaspad logs: nologfiles = false → C:\Users\inmyh\AppData\Local\.rusty-kaspa-v2\
+kaspa-mainnet\logs (KASPAD-EVAL r1 §3.3 said "no log file" — wrong, corrected
+BL-126). `externalip` in its TOML is a dead key on this engine (BL-063
+drop-trap class) — do not rely on it.
 
 ## 2 · zkas-node v1.0.8 — Kron · cmd, new window
 ```cmd
@@ -72,7 +87,7 @@ carries `/api/wallet/warm` + `warm_wallets` (cutover rider, BL-093);
 semantics unread here (n=0) — the status gate above is the contract.
 Rollback identity (note only): wallet dir cold copy backup\wallets-pre-v108.
 
-## 4 · stratum-bridge v2.0.1.5 — Kron · cmd, new window (lifecycle dialect)
+## 4 · stratum-bridge v2.0.1.6 — Kron · cmd, new window (lifecycle dialect)
 ```cmd
 C:\Users\inmyh\zkas-rusty-kd\run-rc-merged.cmd
 ```
@@ -80,6 +95,15 @@ READ THE HEADER EVERY LAUNCH (BL-017/BL-019): the two ENABLED env lines are
 the contract. Gate: BOTH "MERGED MINING ENABLED" lines (node + treasury
 address echo) · 5755/5765/3034 owned by ONE pid (BL-039) · worker table
 fills to 7 within ~1 min · status line `zk=ok`.
+Identity (BL-124, 09-24): the launcher runs
+C:\Users\inmyh\zkas-rusty-kd\target\release\stratum-bridge.exe =
+82CC5917EB90FF6F4A67692056A29C3706698629691E2DD7157EDE1B411171CF (CI asset of
+release v2.0.1.6-win, tag eac767d). Banner: `RC merged bridge v2.0.1.6
+(engine 2.0.1)`. Rollback operand beside it: `stratum-bridge.exe.bak-v2015` =
+F1484FB5DCC7631CB29BCED90F2B8E89F8A5B7EACF5432CFF3603642B3E7A3F0 (the soaked
+v2.0.1.5 bytes; retires after one clean day, BL-031). Post-start B1 check:
+`curl.exe -s -o NUL -m 5 -w "%{http_code}" --path-as-is
+http://127.0.0.1:3034/static/C:/Windows/win.ini` must print 404.
 
 ## 5 · alertmanager — Kron · cmd (cwd is LOAD-BEARING: alertmanager.yml is
 ## cwd-relative)
@@ -146,6 +170,11 @@ r1 cut from live-process readback + cutover pins, 2026-08-30, after BL-065.
 r2 cut 2026-09-11 from the ledger rail (BL-093/094/106/108/114/116/118/119)
 and the 09-11 elevated process read (walletd path + Button 8/8); no live
 launch was re-executed for r2 — §§1, 4, 5, 6 carry r1's readback unchanged.
+r4 cut 2026-09-25 from two live readbacks: the v2.0.1.6 bridge deploy
+(FLEET-DEPLOY v2.0.1.6 r1 gates 4a–4e + production-path hash, BL-124; §4)
+and the kaspad v2.1.0 cutover (KASPAD-EVAL v2.1.0 r1 §5 steps 1–4 + the
+bridge status line, BL-126; §1). §§2, 3, 5, 6 unchanged from r2. r3 (§4
+only, 7224419e…) was cut 09-24 and superseded before landing — VOID.
 Revision triggers: any component cutover, launcher mint, H2 service
 migration (which retires §§1–6 of this doc in favor of service definitions
 and demotes it to the manual-fallback reference).

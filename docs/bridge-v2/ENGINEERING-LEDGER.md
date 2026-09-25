@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-123 (2026-09-23)
+### Last entry: BL-127 (2026-09-25)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -4092,3 +4092,181 @@ sha per committer; the tree hash (`git rev-parse HEAD^{tree}`) is the
 cross-machine identity check and was used as the gate before push.
 **Lesson:** every fence that starts with `cd` names a path that was read
 this session, not one implied by the previous message's prompt.
+
+## 2026-09-24/25 — S30: bridge v2.0.1.6 deployed to Kron (B1–B5); kaspad cut over to v2.1.0; branch line consolidated
+
+**BL-124 · 2026-09-24 · bridge v2.0.1.6 DEPLOYED on Kron — B1 path traversal
+CLOSED (probe 200→404), B2–B5 ported, ip label host-only live; no canary
+(operator decision); all gates read verbatim**
+PORT (sandbox, ws2-b1-static-traversal): eac767d on top of 002f635 (B1),
+tree 692b633e67f98a559e29353e5059a48e2aca3981; patch r1 404 ln
+7b7ba282280ddd0ab2f2255f089ccec31ba38e5fa53ae8045a690492f9e170fe, applied
+by `git am` on the MacBook, TREE-MATCH. B2 accept-loop warn+50 ms retry
+(was `accept().await?`, prom.rs:628 pre-port). B3 `Connection: close` on all
+seven response sites + `shutdown()` after every write (new `send_response`).
+B4 `ip` = `ctx.remote_addr()` host only at both WorkerContext builders —
+the bridge-side fix prometheus.yml:142–145 named as the REAL FIX (BL-010
+lineage). B5 K/Z/D per-event gauges capped at BLOCK_GAUGE_HISTORY_LIMIT=512
+with newest-first history + `remove_label_values` eviction, one history per
+gauge; /api/stats totalBlocks = max(gauge unique hashes, Σ ks_blocks_mined)
+(Z/D already counter-sourced). BRIDGE_BUILD 5→6. NOT PORTED, on purpose:
+upstream `resolve_miner_label` (miner label from the live connection) — on
+Kron it would stamp miner="IceRiverMiner-v1.1" on the counting path and
+prometheus.yml:160–162 drops that regex → fleet vanishes from Prometheus.
+VERIFY: sandbox `cargo check` clean; `cargo test -p kaspa-stratum-bridge
+--locked` 47+120+3 passed / 0 failed incl. NEW `block_event_gauge_is_capped_
+and_evicts_oldest` (537 events → exactly 512 series, hash0 evicted) and a
+B3 header assert in the routing test; clippy: nothing on changed lines;
+fmt: the 12 flagged prom.rs sites are all pre-existing lines (n=12, listed
+by line, none inside the port's hunks). bridge-check 35960021888 ✓ on
+eac767d. CONSUMER READ for B4/B5 before porting (n=5 files: prometheus.yml,
+alert_rules.yml, zkas-reporter-r6.ps1, dashboard.js, prom.rs stats parser):
+gauge consumers = the in-process /api/stats parser only (+ one verification
+query in a prometheus.yml comment); ip consumers = `sum without (ip)` in
+every block rule (now a no-op) and the drop/labeldrop pair, both safe with
+host-only ip. RELEASE v2.0.1.6-win (tag @ eac767d, target ws2-b1-static-
+traversal; guard `OK: tag matches banner v2.0.1.6` by construction of the
+sed at deploy.yaml:33–50, run log not pasted): asset
+zkas-v2.0.1.6-win-win64.zip 47,755,079 B
+47e7a68068a4d571a1f7a1239c4924b40488a90927cc407e0c6be896aea91591; six exes
++ README at archive ROOT (layout changed from v2.0.1.5's bin\ — read from
+the zip, deploy.yaml:135–156 on the branch builds all six);
+stratum-bridge.exe 15,247,360 B
+82cc5917eb90ff6f4a67692056a29c3706698629691e2dd7157ede1b411171cf; strings
+`Connection: close` ×5, `TCP accept error on web dashboard` ×1 in the exe.
+DEPLOY (Kron, 09-24, FLEET-DEPLOY-v2.0.1.6-r1 §§1–4; §1/§2/§3 outputs not
+pasted — the operator ran them; landing proven by the reads below): banner
+`RC merged bridge v2.0.1.6 (engine 2.0.1)` at 10:26:38.520-04:00, log
+RKStratum_1790259998.log; BOTH `MERGED MINING ENABLED` lines (node
+127.0.0.1:16810 + treasury zkas:px7g…3nqv…); 5755/5765/3034 owned by ONE
+pid 7004; B1 probe `/static/C:/Windows/win.ini` → **404** (was 200 on the
+same form pre-fix, BL-122), `/static/js/dashboard.js` → 200; /metrics:
+`Connection: close` header present, 0 series with ip="host:port", live
+series ip="192.168.1.21" (w1m); production path
+C:\Users\inmyh\zkas-rusty-kd\target\release\stratum-bridge.exe hash
+82CC5917…71CF (= CI asset); parked rollback
+stratum-bridge.exe.bak-v2015 = F1484FB5…A3F0 (= the soaked v2.0.1.5 bytes,
+FLEET-DEPLOY v2.0.1.5 r1). KAS-leg downtime not measured (no timestamps
+taken around 3b–3d). Observed, expected, unchanged: w1m carries two series
+miner="" and miner="IceRiverMiner-v1.1" (warm-up zero-init vs counting
+path) — the pair the relabel drop handles; not a regression. Button r3
+(8CECBABC…) not re-run this session; r2 in the repo checks the bridge by
+port ownership only (check-kron-r2.ps1:33–36), so the exe swap should read
+PASS — run it at the next §8.
+RECORD: STARTUP-ORDER §4 revised (version, identity + rollback operand, B1
+post-start check; §10 provenance) — cut as r3 (164 ln, 7224419e…) on 09-24,
+superseded by r4 before landing (BL-126); r3 VOID.
+FLEET-DEPLOY-v2.0.1.6-r1.md 125 ln
+f53cccd13ff4d10ce7a8b84d4450185000c0bd22816f01d4d5037fde316e08a0 added to
+docs/bridge-v2/ and the mount. `.bak-v2015` retires after one clean day
+(BL-031). B1–B5 CLOSED; the ITEM-REGISTRY A-stream item BL-122 asked for
+is closed at birth.
+**Lesson:** the consumer read before B4/B5 found the one upstream change
+that would have blanked the fleet — a port is only "the same fix" when the
+consumers on this side are read too.
+
+**BL-125 · 2026-09-24 · S29/S30 incidents I-29..I-30; branch line
+consolidated to merged-v2.0.1.6 (decision A)**
+I-29 (III.2, IV.10): the ledger-commit message for BL-122/123 shipped in a
+fence whose OUT sha was fabricated past its 16th character, followed in
+the SAME message by "don't run that block" and a corrected fence; the
+defective block ran (it was first) → 3eb45d2 pushed with a false pin.
+Amended to 2cdf081 with `--force-with-lease=merged-v2.0.1.5:3eb45d2…`
+while unreferenced (IV.10); OUT
+cc28ec63ab801cefcc23eca8056bb2dcfcbbe2dd0a84c8e28df8dd98fceaa871 computed
+from the rail. Operator rule, stated 09-24 and adopted: a fence found
+defective before send is DELETED from the message, never shipped beside
+its correction — the operator reads instructions top-down and executes.
+I-30 (II.2): the sandbox's local `ws2` ref was stale (002f635) when the
+consolidation merge was first simulated → "1 file changed" and
+BRIDGE_BUILD=6 count 0 read as a merge result; re-fetched eac767d, re-ran:
+2 files + ledger, clean. Mechanism: `git --no-pager log -1 --format=%h
+<ref>` beside every simulated merge, and fetch with `+` before simulating.
+BRANCH LINE (rail read 09-24, ls-remote): merged-v2.0.1.2..5 one per bridge
+version, tags v2.0.1.2-win..v2.0.1.5-win on them; v2.0.1.6-win is the
+first tag on a ws2-* work branch, and BL-122's commit (2cdf081) is on
+merged-v2.0.1.5 which eac767d does not contain. DECISION A (operator):
+new line `merged-v2.0.1.6` = `--no-ff` merge of merged-v2.0.1.5@2cdf081 +
+ws2-b1-static-traversal@eac767d (simulated clean in the sandbox: 2 code
+files + ledger, 0 conflicts); the tag stays on eac767d (it identifies the
+built bytes); merged-v2.0.1.5 freezes; this append + STARTUP-ORDER r3 +
+FLEET-DEPLOY-v2.0.1.6-r1 land on the new line; bridge-check fires on
+`merged-*`. ws2-b1-static-traversal kept/deleted per the operator's
+answer (recorded in the landing commit's message).
+**Lesson:** an instruction set is executed in order, top to bottom; the
+only safe place for a known-bad fence is nowhere.
+
+**BL-126 · 2026-09-25 · kaspad CUT OVER to v2.1.0 on Kron via a versioned
+launcher; no resync (synced ~18 s); firewall handled by a pre-minted
+program+port rule, no prompt; KASPAD-EVAL r1 §3.3 log claim corrected**
+PRE-FLIGHT (Kron, 09-25, EVAL §5 step 1, all read-only): rollback pin
+C:\rusty-kaspa-v2\target\release\kaspad.exe =
+084C2B928CB3DCEB2F752728581DE39EF2471640F5F894EF73C2ED1BBBC82743 and that
+path WAS the running exe (STARTUP-ORDER §1 current). config.toml keys:
+appdir "~/.rusty-kaspa-v2", utxoindex=false, ram-scale=2.0,
+nologfiles=false, outpeers=42, maxinpeers=8, rpcmaxclients absent (default
+128). New startup assert cannot fire: kaspad raises the Windows stdio limit
+to 8192 first (daemon.rs:53 DESIRED_DAEMON_SOFT_FD_LIMIT, fd_budget.rs:56
+setmaxstdio) then subtracts 128+8+42 → budget ≈ 8014 (source read, v2.1.0).
+Firewall port rules on 16110/16111/17110: "Kaspa P2P Inbound" Allow
+enabled, "Kaspa gRPC MacBook only" Allow enabled, "Kaspa-Borsh-Laptop
+Only" disabled. Verdict: Cancel at a first-run prompt is NOT safe (a
+program Block rule outranks both port allows); Allow mints the Any/Any
+class R-4 retires. Chosen: pre-mint a program+port rule
+"kaspad v2.1.0 P2P inbound" (Program C:\rusty-kaspa-v210\kaspad.exe,
+Inbound TCP 16111, Allow, Profile Any; elevated New-NetFirewallRule,
+readback True/Allow) BEFORE first launch. RESULT: no prompt appeared (n=1).
+STAGE (EVAL §5 step 2, idempotent): C:\rusty-kaspa-v210\ — zip
+rusty-kaspa-v2.1.0-win64.zip hash-eq FB25743A…8EC0F True; kaspad.exe
+hash-eq 16BD6824…1DA True; launcher run-kaspad-v210.cmd = 3 lines, last
+`"C:\rusty-kaspa-v210\kaspad.exe" --configfile "C:\Node-v2\config.toml"`
+(kaspad's first versioned launcher; production off the target\release
+overwrite path, BL-019). CUTOVER: Ctrl+C on the v2.0.1 console (time not
+recorded by the operator — downtime unmeasured, again); new cmd window,
+launcher; banner `kaspad v2.1.0` 01:05:40.461-04:00, appdir
+C:\Users\inmyh\AppData\Local/.rusty-kaspa-v2 (same datadir), GRPC
+0.0.0.0:16110 / P2P 0.0.0.0:16111 / WRPC 127.0.0.1:17110 up by
+01:05:41.079; a gRPC connection from 127.0.0.1:58172 at 01:05:41.088 (a
+connection occurred; actor not named by the log — II.7). GATES: 16110 and
+17110 owned by C:\rusty-kaspa-v210\kaspad.exe; bridge status line
+`KSB : connected|synced | n=Mainnet | v=2.1.0 | p=43 … zk=ok` at
+01:05:58.076 (~18 s after launch; blk=1361912/1361912; four consecutive
+lines through 01:06:28 all synced, zk=ok, p=46); /api/status
+kaspad_version "2.1.0". No resync, as the DB-version read (7 in both
+tags) predicted. BUTTON (elevated, check-kron.ps1 r3) after cutover:
+`ALL 8 UP - stack correct`, kaspad line `[PASS] kaspad pid=2204` — the
+IMPOSTOR expectation stated during the cutover did not hold, and the
+reason is a FINDING: the r3 checker verifies kaspad by process presence
+only (pid; no path, no sha), unlike zkas-node/walletd which it pins by
+path+sha (n=1, this run). A wrong kaspad exe would pass the Button.
+Item owed: pin kaspad in check-kron r4 (path C:\rusty-kaspa-v210\
+kaspad.exe + 16BD6824…1DA) so the next legitimate upgrade fails as
+IMPOSTOR the way BL-094 intends. CORRECTION (IV.8) to KASPAD-EVAL
+v2.1.0-r1 §3.3: it claimed `nologfiles = true` → "no log to time it
+from"; the config read says nologfiles=false and kaspad printed its logs
+directory (…\.rusty-kaspa-v2\kaspa-mainnet\logs). The r1 claim was
+recollection, not a read. Defender exclusion inventory (BL-048) still
+lists C:\rusty-kaspa-v2, not C:\rusty-kaspa-v210 — open, operator's call.
+RECORD: STARTUP-ORDER r2→r4 (§1 kaspad v2.1.0 launcher + identity +
+rollback + firewall rule; §4 bridge v2.0.1.6 from the VOID r3; §10) OUT
+151 74278cbcc5423bde5c33ad5a041dddac4010c3287cc372f45a51d627030c2a03, IN
+180 eff2c96aa5dfdd0dc48127e3aef7e3691f9fa6d83b09ab88b6e248a191853ff3.
+Rollback: relaunch the §1-r2 line from C:\rusty-kaspa-v2\target\release;
+its hash is pinned above. v2.0.1 exe retires after one clean day (BL-031).
+**Lesson:** the firewall question had a third answer — mint the scoped
+rule before the program ever listens — and it came from reading the rule
+table, not from choosing between the two the prompt offers.
+
+**BL-127 · 2026-09-25 · I-31 — I-29 repeated the same day**
+I-31 (III.2, I-29 class): the step-2 launcher fence shipped with a typo
+in its readback path (`C:\rusted-…`), followed by "use this one instead"
+and the corrected fence; the operator ran the first. Cost: one error line,
+no state damage (Set-Content is idempotent; the file was correct). This
+is the exact pattern the operator called out on 09-24 (BL-125/I-29) and
+that this session had adopted as a rule an hour earlier. Mechanism, now
+stated as the only acceptable form: a fence with a known defect is
+REMOVED from the outgoing message; the message carries one fence per
+step and no "not that one". A message that needs to say "don't run the
+block above" has already failed.
+**Lesson:** a rule adopted in prose is not a mechanism; the mechanism is
+that the defective text never leaves the draft.
