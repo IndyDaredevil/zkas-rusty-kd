@@ -2202,6 +2202,78 @@ async fn dev_fee_end_and_forged_coinbases_through_real_blocks() {
     ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("honest chain continues");
 }
 
+/// Mainnet shape: the dev fee ends on the security-fork block itself. Pre-fork blocks pay per-block miner
+/// outputs and dev notes only on interval crossings; the first block at or past F is post-fork AND
+/// ended at once: it pays the carried dev balance as the one final note and starts the miner accrual
+/// slot. Every block validates (coinbase, pool delta, state root v0 then v1), no dev output exists
+/// afterwards, and post-fork miner outputs appear only on accrual payout crossings.
+#[tokio::test]
+async fn dev_fee_ends_on_the_security_fork_block() {
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    params.security_fork_activation = ForkActivation::new(10);
+    params.dev_fee_end_activation = ForkActivation::new(10);
+    params.dev_fee_accrual_activation = ForkActivation::always();
+    params.dev_fee_payout_interval = 4;
+    params.miner_accrual_payout_interval = 5;
+    let dev_spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&params.dev_fee_recipient.unwrap()));
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.shielded_anchor_depth = 1;
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).expect("orchard address");
+    let miner_spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr));
+    ctx.miner_data = MinerData::new(miner_spk.clone(), vec![]);
+
+    let (mut dev_notes, mut prev_daa, mut final_note_block) = (Vec::new(), 0u64, None);
+    let mut post_fork_miner_payouts = 0;
+    for _ in 0..30 {
+        let b = ctx.mine_real_pow_block();
+        let daa = b.header.daa_score;
+        let cb = &b.transactions[0];
+        for o in cb.outputs.iter().filter(|o| o.script_public_key == dev_spk) {
+            dev_notes.push((daa, prev_daa, o.value));
+        }
+        let miner_outputs = cb.outputs.iter().filter(|o| o.script_public_key == miner_spk).count();
+        if daa >= 10 {
+            if prev_daa < 10 {
+                final_note_block = Some(daa);
+            }
+            if miner_outputs > 0 {
+                assert!(daa / 5 > prev_daa / 5, "post-fork miner output only on an accrual payout crossing (daa {daa})");
+                post_fork_miner_payouts += 1;
+            }
+        }
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("every block validates across F = dev end");
+        prev_daa = daa;
+    }
+    let first = final_note_block.expect("the chain crossed F");
+    let after: Vec<_> = dev_notes.iter().filter(|(d, _, _)| *d >= 10).collect();
+    assert_eq!(after.len(), 1, "exactly one dev note at or past F: {dev_notes:?}");
+    assert_eq!(after[0].0, first, "and it is in the first post-fork block");
+    assert!(after[0].2 > 0);
+    assert!(dev_notes.iter().any(|(d, _, _)| *d < 10), "the dev fee was paid before F");
+    for (d, pd, _) in dev_notes.iter().filter(|(d, _, _)| *d < 10) {
+        assert!(d / 4 > pd / 4, "before F, dev notes only on interval crossings (daa {d})");
+    }
+    assert!(post_fork_miner_payouts > 0, "the accrual slot paid out after F");
+
+    // A dev payout after F is refused (taken from nowhere: nothing is carried any more).
+    let forged = ctx.mine_real_pow_block_tampering_coinbase(|cb| {
+        cb.outputs.push(kaspa_consensus_core::tx::TransactionOutput::new(1_000, dev_spk.clone()));
+    });
+    let r = ctx.consensus.validate_and_insert_block(forged).virtual_state_task.await;
+    assert!(
+        r.is_err() || matches!(r, Ok(kaspa_consensus_core::blockstatus::BlockStatus::StatusDisqualifiedFromChain)),
+        "a dev payout after F must be refused, got {r:?}"
+    );
+    let b = ctx.mine_real_pow_block();
+    ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("honest chain continues");
+}
+
 /// Security fork: a ZKas block whose coinbase carries a merge-mining commitment is invalid, so a
 /// ZKas block can no longer serve as the aux parent of another ZKas block.
 #[tokio::test]

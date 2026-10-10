@@ -506,7 +506,8 @@ pub struct Params {
     /// DAA score from which the dev fee is zero: every rewarded block's whole subsidy goes to its
     /// miner, and the first block at or past the score pays out whatever dev fee is still accrued as
     /// one final note (nothing is stranded or burned; total issuance is unchanged). Judged by the
-    /// DAA score of the block whose coinbase pays the rewards. Mainnet: the next halving.
+    /// DAA score of the block whose coinbase pays the rewards. Mainnet: the security fork block
+    /// ([`ZKAS_DEV_FEE_END_DAA`]).
     pub dev_fee_end_activation: ForkActivation,
 
     /// Security fork: DAA-score interval at which the miner accrual slot is paid out, by the same
@@ -533,7 +534,7 @@ pub struct Params {
     /// - the coinbase output size bound is k + 4 (k + 1 blues, a red reward, the slot payout, the
     ///   dev note);
     /// - a shielded bundle decodes in the anchor-block format (decided per carrying block's DAA).
-    /// `never()` on mainnet until a score is chosen and announced.
+    /// Mainnet: [`ZKAS_SECURITY_FORK_DAA`].
     pub security_fork_activation: ForkActivation,
 
     /// ZKas launch difficulty schedule — number of blocks (blue-score units) at the
@@ -915,20 +916,28 @@ pub const ZKAS_DEV_FEE_RECIPIENT: [u8; 43] = [
 /// [`ZKAS_DEV_FEE_RECIPIENT`].
 pub const ZKAS_DEV_FEE_PERMILLE: u64 = 50;
 
-/// Mainnet DAA score from which the dev fee is zero: the SECOND halving. The subsidy halves every
-/// `3 * SECONDS_PER_MONTH` (2,629,800 s) of DAA score from `deflationary_phase_daa_score` (0 on
-/// mainnet, 1 BPS), so halving `k` is at `k * 7_889_400`. The first (7,889,400) was ~19 days away
-/// when this was set (mainnet DAA 6,238,072 on 2026-10-06), too soon for every node and pool to
-/// upgrade; the second is ~110 days out (late January 2027).
-pub const ZKAS_DEV_FEE_END_DAA: u64 = 2 * 7_889_400;
+/// Mainnet DAA score of the security fork (`security_fork_activation`). Set 2026-10-10 at mainnet DAA
+/// 6,590,925, measured rate ~0.945 DAA/s: ~5 days out (~15 October 2026, evening UTC). 500 mod 1,000
+/// so it is not a dev-payout block. The merge-mining tag ban starts `2 * finality_depth` earlier
+/// (6,914,100, ~1 day before), so every node and pool must run this release by then. Replaces the
+/// 8,700,500 of 23767efa (never tagged or released): a node built from that commit splits here.
+pub const ZKAS_SECURITY_FORK_DAA: u64 = 7_000_500;
 
-/// Mainnet DAA score of the security fork (`security_fork_activation`). Set 2026-10-07 at mainnet DAA
-/// 6,313,429: ~27.6 days out at 1 BPS (~4 November 2026), ~9 days after the first halving, 500 mod
-/// 1,000 so it is not a dev-payout block, and 7.08M DAA before the dev-fee end (the fork must activate,
-/// and its pruning point pass it, before the end: at least `pruning_depth + finality_depth`). The
-/// merge-mining tag ban starts `2 * finality_depth` earlier (8,614,100), so every node and pool must
-/// run this release by then. Moving it later is a full release; it can never move earlier.
-pub const ZKAS_SECURITY_FORK_DAA: u64 = 8_700_500;
+/// Mainnet DAA score from which the dev fee is zero: the security fork itself, one activation.
+/// The first block at or past it pays the carried dev balance as one final note; afterwards no dev
+/// output exists and miners keep the whole subsidy.
+///
+/// Why exactly at F and not elsewhere:
+/// - before F, the split at the end would be unprotected (identical transaction format on both
+///   sides, so transactions replay); at F the security fork already separates the two chains;
+/// - after F, the old rollout constraint applied (F + pruning_depth + finality_depth before the end, so
+///   `zkas_state_root1` binds the carried balance); at F nothing is carried past the boundary at all:
+///   every post-fork block has `dev_accrued == 0`, which the pruning-point import enforces by rule.
+///   A pruning point below F still carries an unbound balance (the v0 root does not cover it), exactly
+///   as before this change: a lying IBD peer can make a syncing node refuse the next payout block
+///   (here possibly the final-note block). Sync new nodes from peers we run until the pruning point
+///   passes F.
+pub const ZKAS_DEV_FEE_END_DAA: u64 = ZKAS_SECURITY_FORK_DAA;
 
 pub const MAINNET_PARAMS: Params = Params {
     // ZKas is a distinct network with its own genesis; it MUST NOT advertise or
@@ -1308,14 +1317,15 @@ mod tests {
             assert!(p.max_shielded_anchor_age() < p.finality_depth(), "{:?}", p.net);
             assert!(p.blockrate.shielded_anchor_depth < p.max_shielded_anchor_age(), "{:?}", p.net);
         }
-        // The mainnet security fork: set, after the coinbase-tag ban lead, before the dev-fee end with
-        // its pruning point past the fork (so `zkas_state_root1` binds the carried dev balance before the
-        // final note), and not on a dev-payout block.
+        // The mainnet security fork: set, after the coinbase-tag ban lead, not on a dev-payout block, and
+        // the dev-fee end on the same block (never before it: that split would be replay-unprotected;
+        // never inside the fork's binding gap: see `ZKAS_DEV_FEE_END_DAA`).
         let m = MAINNET_PARAMS;
         let f = m.security_fork_activation.daa_score();
         assert_eq!(f, ZKAS_SECURITY_FORK_DAA);
         assert!(!m.security_fork_activation.is_active(f - 1) && m.security_fork_activation.is_active(f));
-        assert!(f + m.pruning_depth() + m.finality_depth() <= m.dev_fee_end_activation.daa_score());
+        assert_eq!(m.dev_fee_end_activation.daa_score(), f, "the dev fee ends with the security fork");
+        assert!(m.dev_fee_accrual_activation.daa_score() < f, "a balance is carried up to the end and paid once");
         assert_ne!(f % m.dev_fee_payout_interval, 0, "the fork block must not be a dev payout block");
         assert_eq!(m.coinbase_commitment_ban_activation().daa_score(), f - 2 * m.finality_depth());
         // The miner accrual payout interval is about 100 seconds of blocks on every network.

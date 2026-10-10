@@ -1428,22 +1428,82 @@ mod tests {
         assert_eq!(miner_value(&after), sub);
     }
 
-    /// The mainnet end score is the second halving, computed independently from the halving rule.
+    /// Mainnet shape (dev end = security fork) at the coinbase level, with what a straight test chain does
+    /// not produce: several miners and a red merged across the boundary, and a DAA jump straight over F
+    /// that also crosses a dev-payout and a miner-payout boundary. Before F: per-block miner outputs, 5%
+    /// accrued. The boundary block: post-fork AND ended, so every merged reward (even of blocks mined
+    /// before F) keeps its whole subsidy, the carried dev balance is paid once, rewards go through the
+    /// slot. Value is conserved in every case.
     #[test]
-    fn mainnet_dev_fee_ends_at_the_second_halving() {
-        use kaspa_consensus_core::config::params::ZKAS_DEV_FEE_END_DAA;
+    fn dev_fee_end_on_the_fork_block_with_reds_and_a_jump() {
+        use kaspa_hashes::Hash;
+        use std::sync::Arc;
+        let mut p = MAINNET_PARAMS.clone();
+        p.dev_fee_accrual_activation = ForkActivation::always();
+        p.dev_fee_payout_interval = 1_000;
+        p.security_fork_activation = ForkActivation::new(5_000);
+        p.dev_fee_end_activation = ForkActivation::new(5_000);
+        p.miner_accrual_payout_interval = 100;
+        let cbm = create_manager(&p);
+        let dev_spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&p.dev_fee_recipient.unwrap()));
+        let spk = |b: u8| ScriptPublicKey::new(0, ScriptVec::from_slice(&[b; 43]));
+        let (m1, m2, me) = (spk(1), spk(2), spk(3));
+        let sub = 1_000_000_000u64;
+        let (b1, b2, r) = (Hash::from_u64_word(1), Hash::from_u64_word(2), Hash::from_u64_word(3));
+        let mut rewards = BlockHashMap::default();
+        rewards.insert(b1, BlockRewardData::new(sub, 7, m1.clone()));
+        rewards.insert(b2, BlockRewardData::new(sub, 0, m2.clone()));
+        rewards.insert(r, BlockRewardData::new(sub, 5, m2.clone()));
+        let gd = GhostdagData { mergeset_blues: Arc::new(vec![b1, b2]), mergeset_reds: Arc::new(vec![r]), ..Default::default() };
+        let build = |daa: u64, parent: u64, dev: u64, slot: &MinerAccrual| {
+            cbm.expected_coinbase_transaction(daa, MinerData::new(me.clone(), vec![]), &gd, &rewards, &Default::default(), [0u8; 32], parent, dev, slot)
+                .unwrap()
+        };
+        let paid = |t: &CoinbaseTransactionTemplate, s: &ScriptPublicKey| t.tx.outputs.iter().filter(|o| &o.script_public_key == s).map(|o| o.value).sum::<u64>();
+        let cut = sub / 20;
+
+        // Pre-fork, off-interval: one output per blue, the red reward to the merging miner, 5% of each accrued.
+        let pre = build(4_990, 4_989, 40_000, &MinerAccrual::default());
+        assert_eq!(paid(&pre, &dev_spk), 0);
+        assert_eq!(pre.dev_accrued, 40_000 + 3 * cut);
+        assert_eq!((paid(&pre, &m1), paid(&pre, &m2), paid(&pre, &me)), (sub - cut + 7, sub - cut, sub - cut + 5));
+        assert!(pre.miner_accrual.is_empty());
+
+        // The boundary block jumps 4,990 -> 5,007: post-fork, ended, and crossing both payout boundaries.
+        let end = build(5_007, 4_990, pre.dev_accrued, &pre.miner_accrual);
+        assert_eq!(paid(&end, &dev_spk), pre.dev_accrued, "the carried balance is paid once as the final note");
+        assert_eq!(end.dev_accrued, 0);
+        assert_eq!((paid(&end, &m1), paid(&end, &m2), paid(&end, &me)), (sub + 7, sub, sub + 5), "whole subsidies, the slot flushed");
+        assert!(end.miner_accrual.is_empty());
+        assert_eq!(end.tx.outputs.iter().map(|o| o.value).sum::<u64>(), 3 * sub + 12 + pre.dev_accrued, "value conserved");
+
+        // The boundary block without a jump (4,999 -> 5,000 is also a dev-payout crossing): same final note,
+        // the last reward stays in the slot (miner payout crossings are judged per 100, 4,999 -> 5,000 is one).
+        let end2 = build(5_000, 4_999, 123_456, &MinerAccrual::default());
+        assert_eq!(paid(&end2, &dev_spk), 123_456);
+        assert_eq!(end2.dev_accrued, 0);
+        // And a post-fork off-interval block afterwards: no dev output, rewards carried in the slot.
+        let after = build(5_050, 5_049, 0, &MinerAccrual::default());
+        assert_eq!(paid(&after, &dev_spk), 0);
+        assert_eq!(after.dev_accrued, 0);
+        assert_eq!(after.miner_accrual.amount, sub + 5, "the merging miner's red reward waits in the slot");
+        assert_eq!(after.tx.outputs.iter().map(|o| o.value).sum::<u64>() + after.miner_accrual.amount, 3 * sub + 12);
+    }
+
+    /// The mainnet dev fee ends at the security fork (one activation), before the first halving, and the
+    /// end block keeps the curve subsidy (the end changes who is paid, never how much is minted).
+    #[test]
+    fn mainnet_dev_fee_ends_at_the_security_fork() {
+        use kaspa_consensus_core::config::params::{ZKAS_DEV_FEE_END_DAA, ZKAS_SECURITY_FORK_DAA};
         let p = MAINNET_PARAMS.clone();
         assert_eq!(p.deflationary_phase_daa_score, 0);
         assert_eq!(p.bps(), 1);
-        assert_eq!(ZKAS_DEV_FEE_END_DAA, 2 * SUBSIDY_HALVING_INTERVAL_MONTHS * SECONDS_PER_MONTH);
+        assert_eq!(ZKAS_DEV_FEE_END_DAA, ZKAS_SECURITY_FORK_DAA);
         assert_eq!(p.dev_fee_end_activation, ForkActivation::new(ZKAS_DEV_FEE_END_DAA));
+        assert_eq!(p.security_fork_activation, ForkActivation::new(ZKAS_DEV_FEE_END_DAA));
+        assert!(ZKAS_DEV_FEE_END_DAA < SUBSIDY_HALVING_INTERVAL_MONTHS * SECONDS_PER_MONTH, "before the first halving");
         let cbm = create_manager(&p);
-        // The curve is at a quarter of genesis's there (two halvings; Kaspa's table decays by
-        // 2^(1/12) per step, 12 steps per halving here).
-        let s0 = cbm.curve_subsidy(0);
-        let s1 = cbm.curve_subsidy(ZKAS_DEV_FEE_END_DAA);
-        assert!((s1 as i128 - (s0 / 4) as i128).abs() <= (s0 / 1000) as i128, "{s0} -> {s1}");
-        assert!(cbm.curve_subsidy(ZKAS_DEV_FEE_END_DAA - 1) > s1, "the step happens at the end score");
+        assert_eq!(cbm.calc_block_subsidy(ZKAS_DEV_FEE_END_DAA - 1), cbm.calc_block_subsidy(ZKAS_DEV_FEE_END_DAA));
     }
 
     /// The payout test is "crossed an interval boundary", not "landed on one". A DAG
