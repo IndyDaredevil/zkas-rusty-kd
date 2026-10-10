@@ -1896,6 +1896,78 @@ async fn backfill_refuses_records_that_collide_with_the_chain_index() {
     assert!(above_tip.is_empty(), "the tip's index entry was not re-pointed below the anchor");
 }
 
+/// The real first chunk on a fast-synced node: its pruning point sits at LOCAL index 0, the peer numbers
+/// it from genesis, and the chunk carries the anchor's own record plus the blocks below it. That chunk
+/// must land (it used to be refused: the collision check read the anchor's index after the re-base had
+/// been staged into the cached store and added the shift a second time, so every fresh node's backfill
+/// failed). And a chunk refused for any reason must leave the index exactly as it was (a refusal after
+/// the staged re-base left the cached index re-based while the database was not).
+#[tokio::test]
+async fn backfill_first_chunk_on_a_fast_synced_node_lands_and_refusals_leave_the_index_alone() {
+    use crate::model::stores::selected_chain::SelectedChainStoreReader;
+    let mut params = MAINNET_PARAMS.clone();
+    params.shielded_coinbase = true;
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.shielded_anchor_depth = 1;
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([7u8; 32]).expect("orchard address");
+    ctx.miner_data = MinerData::new(ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr)), vec![]);
+    let mut chain = Vec::new();
+    for _ in 0..8 {
+        let b = ctx.mine_real_pow_block();
+        let h = b.header.hash;
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.unwrap();
+        chain.push(h);
+    }
+    // Linear chain: genesis at 0, chain[i] at i + 1. What a serving peer sends for anchor chain[5]
+    // (genesis index 6): the anchor's own record and everything below it down to chain[0].
+    let records: Vec<_> = (0..=5).rev().map(|i| (i as u64 + 1, ctx.consensus.get_shielded_chain_block_data(chain[i]).unwrap())).collect();
+    let (anchor, anchor_index) = (chain[5], 6u64);
+
+    // Re-number this node's index as a fast-synced node holds it: chain[5] (its pruning point) at 0.
+    let vp = ctx.consensus.virtual_processor();
+    {
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut sc = vp.selected_chain_store.write();
+        for i in 0..6u64 {
+            let h = sc.get_by_index(i).unwrap();
+            sc.delete_entry(&mut batch, i, h).unwrap();
+        }
+        for i in 6..=8u64 {
+            let h = sc.get_by_index(i).unwrap();
+            sc.rebase_entry(&mut batch, i, h, i - 6).unwrap();
+        }
+        sc.set_highest_index(&mut batch, 2).unwrap();
+        drop(sc);
+        vp.write_batch_for_test(batch);
+    }
+    let index_of = |h| vp.selected_chain_store.read().get_by_hash(h).unwrap();
+    assert_eq!((index_of(anchor), index_of(chain[7])), (0, 2));
+
+    // A chunk refused on a record's content (a padded action blob) after the anchor check: nothing moves.
+    let mut padded = records.clone();
+    padded[3].1.accepted_actions.push(vec![0u8; 1]);
+    padded[3].1.accepted_txids.push(Default::default());
+    assert!(ctx.consensus.backfill_shielded_history(anchor, anchor_index, &padded).is_err());
+    assert_eq!((index_of(anchor), index_of(chain[7])), (0, 2), "a refused chunk leaves the index as it was");
+    assert_eq!(vp.selected_chain_store.read().get_tip().unwrap().0, 2);
+    assert!(vp.selected_chain_store.read().get_by_hash(chain[0]).is_err());
+
+    // The honest first chunk lands: five entries below the anchor, the node's index re-based to genesis.
+    let (idx, _) = ctx.consensus.backfill_shielded_history(anchor, anchor_index, &records).expect("the first chunk lands");
+    assert_eq!(idx, 5);
+    assert_eq!((index_of(chain[0]), index_of(anchor), index_of(chain[7])), (1, 6, 8));
+    assert_eq!(vp.selected_chain_store.read().get_tip().unwrap(), (8, chain[7]));
+    assert_eq!(vp.selected_chain_store.read().get_by_index(6).unwrap(), anchor);
+    let meta = ctx.consensus.pruning_meta_stores.read();
+    assert!(meta.shielded_history_backfilled());
+    assert_eq!(meta.shielded_history_own_base(), Some(anchor), "the node's own base is its pruning point");
+}
+
 /// Verification binds what the leaf replay alone does not: each record's coinbase outputs must derive
 /// exactly the commitments it carries (a forged value beside the real commitment used to verify, and a
 /// wallet then credited it), and blue scores must rise and DAA scores never fall along the index.

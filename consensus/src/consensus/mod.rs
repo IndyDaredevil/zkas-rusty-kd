@@ -1069,27 +1069,28 @@ impl ConsensusApi for Consensus {
         // claiming an absurd index (say u64::MAX/2) re-bases our entries sky-high and then
         // wedges this node for good: both the verification enumeration and the Mismatch
         // purge walk `0..anchor_index` densely. The invariant that caps it needs no trust:
-        // a selected-chain block's genesis-based index can never exceed its DAA score
-        // (every chain step advances DAA by at least its own mergeset, i.e. >= 1). And a
+        // a selected-chain block's genesis-based index can never exceed its BLUE score (each
+        // chain step adds at least the selected parent itself as a blue). Not the DAA score:
+        // genesis and its child share one, so a chain index runs one above it there. And a
         // rebase only ever happens on the FIRST chunk, whose anchor is our own pruning
-        // point - a block whose header we hold - so the DAA bound comes from local data,
+        // point - a block whose header we hold - so the bound comes from local data,
         // not from the peer. Later chunks anchor at blocks we already numbered (shift 0)
         // and never hit this path.
         if shift > 0 {
-            let anchor_daa = self
+            let anchor_blue = self
                 .headers_store
                 .get_compact_header_data(anchor)
                 .optional()
                 .unwrap()
-                .map(|h| h.daa_score)
+                .map(|h| h.blue_score)
                 .ok_or_else(|| {
                     ConsensusError::GeneralOwned(format!(
                         "shielded history anchor {anchor} needs a re-base but its header is not available to sanity-check the peer's index claim"
                     ))
                 })?;
-            if anchor_index > anchor_daa {
+            if anchor_index > anchor_blue {
                 return Err(ConsensusError::GeneralOwned(format!(
-                    "peer claims chain index {anchor_index} for anchor {anchor}, but its DAA score is {anchor_daa} - a chain index can never exceed the DAA score; rejecting the backfill chunk"
+                    "peer claims chain index {anchor_index} for anchor {anchor}, but its blue score is {anchor_blue} - a chain index can never exceed the blue score; rejecting the backfill chunk"
                 )));
             }
         }
@@ -1153,6 +1154,62 @@ impl ConsensusApi for Consensus {
             }
         }
 
+        // Every per-record refusal happens HERE, before the first staged write. The index stores are
+        // cached and a staged write updates the cache at once: refusing a record after the re-base below
+        // left this node's in-memory chain index re-based while its database was not, and reading an
+        // index after the re-base returned the shifted value (so the collision check below added the
+        // shift twice and refused the anchor of every first chunk on a fresh node).
+        {
+            let mut seen = kaspa_consensus_core::BlockHashSet::default();
+            for (index, r) in records.iter() {
+                if *index > ours_from {
+                    continue;
+                }
+                // A peer-chosen hash must not already be indexed elsewhere, nor repeat in the chunk. Writing
+                // it anyway re-pointed `index_by_hash` of a real (possibly validated) block to a low index:
+                // the chain index then disagreed with itself (locators, the export window and the cursor
+                // pages read it), and a later purge deleted that block's own scan record.
+                if !seen.insert(r.hash) {
+                    return Err(ConsensusError::GeneralOwned(format!("backfill chunk repeats block {}", r.hash)));
+                }
+                // `existing` is in this node's numbering (nothing is re-based yet); `index` is the peer's.
+                if let Some(existing) = sc.get_by_hash(r.hash).optional().unwrap() {
+                    if existing + shift != *index {
+                        return Err(ConsensusError::GeneralOwned(format!(
+                            "backfilled block {} is already in this node's chain index at {existing} (+{shift}), not {index}",
+                            r.hash
+                        )));
+                    }
+                }
+                // Commitments, when present, are one per output (`get(i)` on the serving side silently
+                // dropped extras).
+                if !r.coinbase_commitments.is_empty() && r.coinbase_commitments.len() != r.coinbase_outputs.len() {
+                    return Err(ConsensusError::GeneralOwned(format!(
+                        "backfilled block {} carries {} coinbase commitments for {} outputs",
+                        r.hash,
+                        r.coinbase_commitments.len(),
+                        r.coinbase_outputs.len()
+                    )));
+                }
+                // Every action blob must be a whole number of `CompactActionRecord`s. The frontier replay
+                // that is supposed to bind this data reads it with `chunks_exact`, which silently DROPS a
+                // short remainder, so arbitrary trailing padding on each blob was invisible to
+                // verification and was stored, served and never reclaimed.
+                if let Some(bad) = r
+                    .accepted_actions
+                    .iter()
+                    .find(|a| a.len() % kaspa_shielded_core::wallet::CompactActionRecord::SERIALIZED_LEN != 0)
+                {
+                    return Err(ConsensusError::GeneralOwned(format!(
+                        "backfilled block {} carries a {}-byte action blob, not a multiple of {}",
+                        r.hash,
+                        bad.len(),
+                        kaspa_shielded_core::wallet::CompactActionRecord::SERIALIZED_LEN
+                    )));
+                }
+            }
+        }
+
         let mut batch = rocksdb::WriteBatch::default();
         // The lowest block this node indexed itself: index 0 before the first chunk lands. Recorded
         // with that chunk's writes, so the purge, the serving gate and the birthday locator know where
@@ -1172,52 +1229,9 @@ impl ConsensusApi for Consensus {
         }
 
         let (mut idx_written, mut rec_written) = (0u64, 0u64);
-        let mut seen = kaspa_consensus_core::BlockHashSet::default();
         for (index, r) in records.iter() {
             if *index > ours_from {
                 continue; // above the anchor is our own validated range; ours is authoritative
-            }
-            // A peer-chosen hash must not already be indexed elsewhere, nor repeat in the chunk. Writing
-            // it anyway re-pointed `index_by_hash` of a real (possibly validated) block to a low index:
-            // the chain index then disagreed with itself (locators, the export window and the cursor
-            // pages read it), and a later purge deleted that block's own scan record.
-            if !seen.insert(r.hash) {
-                return Err(ConsensusError::GeneralOwned(format!("backfill chunk repeats block {}", r.hash)));
-            }
-            // `existing` is in this node's numbering before the re-base staged above; `index` is the peer's.
-            if let Some(existing) = sc.get_by_hash(r.hash).optional().unwrap() {
-                if existing + shift != *index {
-                    return Err(ConsensusError::GeneralOwned(format!(
-                        "backfilled block {} is already in this node's chain index at {existing}, not {index}",
-                        r.hash
-                    )));
-                }
-            }
-            // Commitments, when present, are one per output (`get(i)` on the serving side silently
-            // dropped extras).
-            if !r.coinbase_commitments.is_empty() && r.coinbase_commitments.len() != r.coinbase_outputs.len() {
-                return Err(ConsensusError::GeneralOwned(format!(
-                    "backfilled block {} carries {} coinbase commitments for {} outputs",
-                    r.hash,
-                    r.coinbase_commitments.len(),
-                    r.coinbase_outputs.len()
-                )));
-            }
-            // Every action blob must be a whole number of `CompactActionRecord`s. The frontier replay
-            // that is supposed to bind this data reads it with `chunks_exact`, which silently DROPS a
-            // short remainder — so arbitrary trailing padding on each blob was invisible to
-            // verification and was stored, served and never reclaimed. Reject it before any write.
-            if let Some(bad) = r
-                .accepted_actions
-                .iter()
-                .find(|a| a.len() % kaspa_shielded_core::wallet::CompactActionRecord::SERIALIZED_LEN != 0)
-            {
-                return Err(ConsensusError::GeneralOwned(format!(
-                    "backfilled block {} carries a {}-byte action blob, not a multiple of {}",
-                    r.hash,
-                    bad.len(),
-                    kaspa_shielded_core::wallet::CompactActionRecord::SERIALIZED_LEN
-                )));
             }
             // The anchor's own record is the exception, and dropping it was a real bug. Its INDEX
             // entry we already hold, so we must not rewrite it — but its scan RECORD we may not
@@ -2975,12 +2989,12 @@ mod tests {
                 timestamp: 0,
             },
         );
-        // Genesis sits at local index 0 with DAA score 0; a peer claiming index 10^15 for it
-        // demands a 10^15-entry re-base - rejected on the DAA invariant before any write.
+        // Genesis sits at local index 0 with blue score 0; a peer claiming index 10^15 for it
+        // demands a 10^15-entry re-base - rejected on the blue-score invariant before any write.
         let err = consensus.backfill_shielded_history(genesis, 1_000_000_000_000_000, std::slice::from_ref(&record));
         assert!(err.is_err(), "an impossible peer index claim must be rejected");
         let msg = format!("{}", err.unwrap_err());
-        assert!(msg.contains("can never exceed the DAA score"), "rejected for the right reason: {msg}");
+        assert!(msg.contains("can never exceed the blue score"), "rejected for the right reason: {msg}");
     }
 
     /// The index reaching genesis is NOT enough once any of it came from a peer: between the
