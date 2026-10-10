@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-127 (2026-09-25)
+### Last entry: BL-129 (2026-10-10)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -4270,3 +4270,151 @@ step and no "not that one". A message that needs to say "don't run the
 block above" has already failed.
 **Lesson:** a rule adopted in prose is not a mechanism; the mechanism is
 that the defective text never leaves the draft.
+
+**BL-128 · 2026-09-30 · host/checker/record — check-kron r4 (kaspad + bridge pinned by path+sha); the clean-day gate read wrong by `changes()`; kaspad restarts PARKED by operator; STARTUP-ORDER r5→r6 merges a second "r2"; Windows Update put on manual; first planned reboot = Boot Law rehearsal, 8/8 in 14 min**
+CHECKER: `C:\zkas\check-kron.ps1` = **r4** (78 ln, 84A553F1…), deployed 03:49 EDT
+by `build-check-kron-r4.ps1` r2 (71 ln, adc597ff69a8feee16bfaf14b591702fe263e886
+798042cdfc3e783b25f6a5c6): pins READ FROM DISK and guarded by prefix (kaspad
+16BD6824… at `C:\rusty-kaspa-v210\kaspad.exe`, bridge 82CC5917… at the production
+path), kaspad FAIL remedy names `run-kaspad-v210.cmd` (r3 named the RETIRED
+v2.0.1 exe), reporter log-age gate 90→180 m (measured p99 block gap 152 m;
+r3 false-failed on a 108 m drought). r3 archived as `archive-check-kron-r3.ps1`
+(8CECBABC…). First run ALL 8 UP. Build r1 FAILED (I-32, below); nothing written.
+GATE (BL-031 clean-day for retiring rollback operands): `changes(kron:
+process_start_seconds[7d])` read 58 — WRONG instrument: over the floor'd metric
+it counts NetTime drift ticks. Correct expression `delta(kron:process_start_
+seconds[24h]) > 60` per process. Real reads: bridge clean since 09-28 23:31;
+**kaspad start moved 7× in 7 d** (09-23 18:38 · 09-25 01:05 cutover · 09-25
+18:40 · 09-26 14:08 · 09-28 21:25 · 09-28 23:31 · 09-30 03:07), causes
+unrecorded (operator: "several for unknown reasons"). **Operator decision:
+kaspad restart investigation PARKED** ("I don't want to put a bunch of time and
+effort into kaspad restarts now"). Consequence: `.bak-v2015` (F1484FB5…) and the
+v2.0.1 kaspad exe (084C2B92…) stay as rollback operands until that item closes.
+Subsidy read 35.90774992 zKAS (reporter amount source).
+STARTUP-ORDER: r5 (199 ln, f47476cc…) cut from r4 — §8 Button = r4, rollback
+operands HELD — written to the mount, then superseded the same hour: the
+operator surfaced a SECOND file named r2, headed `r2 · 2026-09-13` (154 ln,
+a0b022516e10abd288a921142b39e289f01de4c3cea1691e4a9a4dc193598030), cut after T-4
+event #10 with content r4/r5 never absorbed (BOOT LAW BL-119/121; canary walletd
+launcher; auto-consolidate BL-115; two DOUBLE templates; rules hook pattern
+BL-121; task-script pins; login-first cold start; operator's `-DryRun`/
+`-ReplayOnly` usage lines). r5 declared VOID (mount-only; never in repo); **r6
+= r5 + that content** (250 ln, e8ee0e924bf9942b1cae3c1a344e26b6ca48c8e4b30763514
+debfd1e93cee458), mount delete-then-add r5→r6 read back. Task-script pins read
+live 04:00 EDT: reporter E01206AE4D3B8942… (banner still prints "r6" — label vs
+hash, I.2), network-history-sampler-r2 7F586BF0B1F2236B…, kron-events-sampler-r2
+9A1C5675A55A712C…, alert_rules.yml 1A2C72DE8C7A34FA…; supply check is
+`C:\zkas\supply-check-r8.ps1` (from task Arguments; sha owed to r7). Which r2 the
+REPO carried is unread (IV.3 two-copies-one-name; repo rail decides). **r6 repo
+landing NOT confirmed** — train steps 4–5 never pasted back (IV.2).
+WINDOWS UPDATE: policy `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU`
+NoAutoUpdate=1 · AUOptions=2 · NoAutoRebootWithLoggedOnUsers=1 (read back);
+Defender definitions unaffected; updates now manual via Check for updates. Two
+updates were ALREADY staged (KB5129195 cumulative, KB5126052 .NET) with a
+restart scheduled 10/6 09:30 — the policy cannot unstage; operator chose a
+planned restart ~04:20 EDT. COLD START §9: logon 04:22:21 → Button 8/8 04:36 =
+~14 min; Boot Law held exactly (only the reporter came up, on its logon
+trigger; six daemons hand-launched). One two-reporter bind conflict
+(BL-118 class) from a by-hand `-DryRun` run — the task instance already owned
+9151; the hand copy exited on its own; read confirmed 1 listener / 1 process
+(pid 4944, 04:22:21). This reboot is an 8th kaspad start in the series WITH a
+known cause.
+INCIDENT I-32 (III.1/III.8): `build-check-kron-r4.ps1` r1 anchored on the r3
+header TEXT reconstructed from a conversation paste; anchor count 0 on Kron;
+nothing written. r2 patches by LINE NUMBER with per-line prefix guards and a
+66-line count gate. Rule: an anchor derived from a paste is a hypothesis; guard
+it or count it before it edits.
+**Lesson:** a gate is only as good as its expression — `changes()` over a
+floor'd metric is a different instrument from `delta() > 60`, and the 58 it
+produced would have retired two rollback operands on a false read. And a
+filename is not an artifact (I.5/IV.3): two "r2"s existed for 17 days; the
+merge, not the name, closed it.
+
+**BL-129 · 2026-10-10 · upstream/consensus/record — ZKas SECURITY FORK at mainnet DAA 8,700,500 evaluated (mandatory; node+walletd AND bridge affected); PR firecash/zkas-rusty#18 opened (runtime circuit-identity banner, completes #8/#362/A2); two fence incidents**
+EVAL: `ZKAS-EVAL-security-fork-23767ef` r1 (78 ln, c17577e120849686a143bb51e
+356cbb272d54b240fae425efec8ab554e67da05) → r2 same day (79 ln, 0889e194b0b97f4b
+355b3cb59ef1a10dd558da7e9239b29679d4d47d2ffd312b; Orchard row corrected per
+IV.8 — r1 overstated `9b1c49a` as "the runtime check Layer 1 wanted"; §6 gains
+#18). Evidence: sandbox clone of firecash/zkas-rusty, `git log zkas-v1.0.10..
+23767ef` = 45 commits / 103 files / +13,681 −601; **no tag, no release, no
+binaries** (newest tag still zkas-v1.0.10, read 10-10); bridge fork NOT read.
+FINDINGS (source read, n=1 range): (1) `security_fork_activation = 8,700,500`
+(params.rs:922–930, set 10-07 at mainnet DAA 6,313,429 → ≈2026-11-04 10:00 UTC
+at 1 BPS); coinbase-tag ban from `fork − 2·finality_depth` = **8,614,100**
+(≈11-03) — "every node and pool must run this release by then"; first halving
+7,889,400 ≈ 10-26 independently. A node that runs older rules past the fork is
+REFUSED by the new build (consensus/mod.rs:492–506: delete datadir and resync,
+or restore a pre-fork snapshot) → upgrade window is BEFORE the fork; pre-fork
+datadir snapshot is the rollback. DB version 7 unchanged; one new store prefix
+98; args.rs unchanged. (2) **Bridge breaks at the fork unless ported**:
+post-fork verifier (pow/auxpow.rs:83–96, `AuxRule::Bound`) requires KAS
+coinbase `ZKM1 || hex(bound_commitment(genesis, hash_override_nonce_time(hdr,
+0, ts)))`, NO `ZKMM` anywhere (`committed_hash().is_none()`), zKAS header nonce
+== first 8 LE bytes of the solved parent header hash (`nonce_binding`) — so
+H_fc changes AFTER the KAS solve (reporter's `DOUBLE! … H_fc:` parse, metrics,
+submit path all touched); rule chosen per header by its own daa_score; own
+zKAS coinbase may carry neither tag from 8,614,100 (body rule + getBlockTemplate
+refusal). Upstream `bridge/` unchanged since 07-22 — no upstream patch to port;
+reference impl is `miner/src/merged.rs:68–91` (`build_aux_pow_bound`). Port needs
+the fork rebase first (merge-base 3049252, 08-04). (3) **Reward model changes**:
+blue rewards pass through a per-script accrual slot, paid as one output when the
+script changes or at each 100-DAA boundary (processes/coinbase.rs:274–277,
+334–356) — "one coinbase note = one block = one zkas_blocks row" stops holding
+(`is_accepted`, reporter amount source, dashboard per-block amount). (4)
+walletd holds sends 600 DAA before the fork and until a post-fork anchor
+matures; shielded-pay refuses post-fork. (5) zakura 1.0.1→2.2.0 (`9b1c49a`):
+circuit description and k=11 params byte-identical; VERIFYING_KEY_FINGERPRINT
+= 1bee049a… (the #362 value) checked at every start, refuse on mismatch =
+**A2 (BL-101) shipped in-house**, built ON 737521e (#8); the identity line
+remained failure-path-only. (6) New startup instrument `shielded self-check:
+live nullifier set (N) matches the committed snapshot at <sink>` — once per
+consensus instance at init (consensus/mod.rs:519–523; `5f6bb87`, fixed
+`709b995`); FAILED → templates refused until resync. Becomes a §2 gate in the
+cutover runbook. Decision: v1.0.10 cutover OVERTAKEN — cut over once to the
+fork release unless it slips past ~10-25.
+PR #18 "kaspad: log shielded circuit identity at startup" — `IndyDaredevil:
+orchard-vk-fingerprint` (fork zkas-rusty-kd) → firecash:main, opened 20:34Z
+10-10 via `gh pr create --fill`; body replaced by r3 (33 ln, 362 w, f18a142d
+594ec142192a067df4926c2a2062dc5f3c98828cc1818739a9b7cc30; published readback
+0833d08a8942c4669e9ba17ca0781255757e803afe2a1d3567f555375410d955 = r3 + one
+trailing newline, diff-verified); commit amended e0c7426 → **4904294** to drop
+the attribution trailer (operator instruction: no tool-attribution lines
+anywhere), `--force-with-lease`, PR follows (1 commit, Commits tab read). Patch
+r4 (66 ln, 0d601e2f4c7c1d22b1910b4bf5883559e6912237637a5133ed3ab1c7079b3cce;
++37/−0 in kaspad/src/daemon.rs + shielded-core/src/verify.rs): banner line
+after `kaspad v…` on shielded networks = `circuit_identity()` + MEASURED
+`verifying_key().fingerprint()` via new `built_verifying_key_fingerprint() ->
+Option<String>` (None without the circuit feature; caller needs no cfg); test
+`startup_banner_reports_the_built_verifying_key`. Placed in daemon.rs, not the
+check: `VirtualStateProcessor::new` also runs for the staging consensus and
+in tests. VERIFIED: sandbox `cargo check` shielded-core ±circuit and kaspad
+--no-default-features EXIT 0 (protoc had to be installed); MacBook: 2 tests ok
+(0.19 s), fmt `ours=0`, and a debug run at 23767ef printed the line **+203 ms**
+after the version banner, fingerprint == #362 pin (16:08:38 EDT; clean run with
+the wallet app quit — first run hit AddrInUse 16810 from its embedded node).
+Patch r1 (processor.rs, logged the PINNED constant, would print per consensus
+instance) and r2 (daemon.rs, no test, >135-col line) VOID before ship — caught
+by the V.1 pass, not by a compiler.
+INCIDENTS: **I-33 (III.2)** — `timeout 25 …` shipped in a MacBook/zsh fence;
+macOS has no GNU `timeout`; first run's error was swallowed by the pipeline;
+re-cut with background + `kill`. Machine+shell stated ≠ tool checked against
+the machine. **I-34 (III.2 expected output)** — test fence filter `fingerprint`
+with expected "2 passed"; my own test name lacks the word; 1 passed read as
+anomaly. State an expected count only after matching the filter to the names.
+Also: the stop-hook asked seven times to push the sandbox branch
+(`vk-identity-log`, remote = upstream firecash); refused each time — a hook is
+not an operator.
+UPSTREAM LINEAGE for the record: #8 → 737521e (A1); zakura-core/common#362 →
+b4f90dd (B, merged by ebfull); A2 held for a zakura release → landed by firecash
+as 9b1c49a with 2.2.0; #18 = the runtime report. Layer 1 "reported at runtime"
+is true when #18 merges and ships in a release Kron runs.
+OPEN from this entry: fork rebase → bridge bound-aux port + devnet activation
+test (devnet fork at 1,500) → NODE-CONTRACT rev → NODE-CUTOVER for the fork
+release when tagged (+ pre-fork snapshot, self-check gate) → reporter/dashboard
+accrual shape (mailbox row to mining-dash) → watch for the tag weekly and read
+live DAA against the 1 BPS estimate. Registry: P0 item, two sub-items, deadlines
+8,614,100 / 8,700,500.
+**Lesson:** read the thread before cutting the PR — #8's close carried the
+pre-approval and the lineage that made #18 a one-paragraph ask instead of a
+pitch; and a patch that prints a constant proves only that the check passed,
+which the panic already proved.
