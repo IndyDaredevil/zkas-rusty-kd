@@ -1091,14 +1091,19 @@ impl ShieldedStateManager {
             return Ok(0);
         }
         let aged = self.anchor_gc.peek_upto(limit, cap);
+        // Producer removals are grouped per root and written once each (see `remove_producers_batch`).
+        let mut removals: std::collections::BTreeMap<[u8; 32], Vec<Hash>> = Default::default();
         for &(blue, anchor, block) in &aged {
             if self.anchor_block.get(&anchor)? == Some(block) {
                 self.anchor_block.delete_batch(batch, anchor)?;
             }
-            self.anchor_producers.remove_producer_batch(batch, anchor, block)?;
+            removals.entry(anchor).or_default().push(block);
             self.anchor_window.delete_entry_batch(batch, block)?;
             self.anchor_source_scores.delete_batch(batch, block)?;
             self.anchor_gc.delete_batch(batch, blue, anchor, block)?;
+        }
+        for (anchor, blocks) in removals {
+            self.anchor_producers.remove_producers_batch(batch, anchor, &blocks)?;
         }
         Ok(aged.len())
     }
@@ -2017,6 +2022,36 @@ mod tests {
         assert_eq!(mgr.anchor_block.get(&root).unwrap(), None, "an anchor with no live producer is fully dropped");
         assert!(mgr.anchor_producer_blocks(&root).unwrap().is_empty());
         assert!(mgr.anchor_gc.peek_upto(u64::MAX, 100).is_empty(), "queue fully drained");
+    }
+
+    /// Siblings of one root that age out in the SAME GC pass are all removed. The pruner's manager is
+    /// uncached, so removing them one staged write each read the stored list every time and the last
+    /// write put the earlier siblings back, while their queue rows were drained: never collected again.
+    #[test]
+    fn anchor_gc_removes_every_aged_sibling_of_a_root_in_one_pass() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = ShieldedStateManager::new(db.clone(), CachePolicy::Empty);
+        let (a, b, c) = (Hash::from_bytes([51u8; 32]), Hash::from_bytes([52u8; 32]), Hash::from_bytes([53u8; 32]));
+        let root = [9u8; 32];
+        let mut batch = WriteBatch::default();
+        mgr.anchor_producers.set_producers_batch(&mut batch, root, vec![a, b, c]).unwrap();
+        mgr.anchor_block.set_batch(&mut batch, root, c).unwrap();
+        mgr.anchor_gc.enqueue_batch(&mut batch, 100, root, a).unwrap();
+        mgr.anchor_gc.enqueue_batch(&mut batch, 101, root, b).unwrap();
+        mgr.anchor_gc.enqueue_batch(&mut batch, 900, root, c).unwrap();
+        db.write(batch).unwrap();
+
+        let mut batch = WriteBatch::default();
+        assert_eq!(mgr.gc_aged_anchors(&mut batch, 130, 10, 1000).unwrap(), 2);
+        db.write(batch).unwrap();
+        assert_eq!(mgr.anchor_producer_blocks(&root).unwrap(), vec![c], "both aged siblings are gone, the young one stays");
+        assert_eq!(mgr.anchor_block.get(&root).unwrap(), Some(c));
+
+        let mut batch = WriteBatch::default();
+        assert_eq!(mgr.gc_aged_anchors(&mut batch, 100_000, 10, 1000).unwrap(), 1);
+        db.write(batch).unwrap();
+        assert!(mgr.anchor_producer_blocks(&root).unwrap().is_empty(), "the row is dropped with its last producer");
+        assert_eq!(mgr.anchor_block.get(&root).unwrap(), None);
     }
 
     fn cmx(n: u32) -> ExtractedNoteCommitment {

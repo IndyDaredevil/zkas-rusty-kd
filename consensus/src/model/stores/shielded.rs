@@ -842,12 +842,14 @@ impl DbAnchorProducersStore {
         self.access.delete_all(BatchDbWriter::new(batch))
     }
 
-    /// Remove one producer of `anchor`; drops the row entirely when it was the last.
-    /// Only the age-based GC calls this.
-    pub fn remove_producer_batch(&self, batch: &mut WriteBatch, anchor: [u8; 32], block: Hash) -> StoreResult<()> {
+    /// Remove `blocks` from the producers of `anchor` in ONE staged write; drops the row entirely when
+    /// none is left. Only the age-based GC calls this, once per root: it reads the list from the
+    /// database (the pruner's manager is uncached), so removing siblings one call each staged lists
+    /// that each still held the other, and the last write resurrected every earlier removal.
+    pub fn remove_producers_batch(&self, batch: &mut WriteBatch, anchor: [u8; 32], blocks: &[Hash]) -> StoreResult<()> {
         let mut producers = self.get_producers(&anchor)?;
         let before = producers.len();
-        producers.retain(|p| *p != block);
+        producers.retain(|p| !blocks.contains(p));
         if producers.len() == before {
             return Ok(());
         }
