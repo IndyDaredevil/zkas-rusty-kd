@@ -916,12 +916,13 @@ pub const ZKAS_DEV_FEE_RECIPIENT: [u8; 43] = [
 /// [`ZKAS_DEV_FEE_RECIPIENT`].
 pub const ZKAS_DEV_FEE_PERMILLE: u64 = 50;
 
-/// Mainnet DAA score of the security fork (`security_fork_activation`). Set 2026-10-10 at mainnet DAA
-/// 6,590,925, measured rate ~0.945 DAA/s: ~5 days out (~15 October 2026, evening UTC). 500 mod 1,000
+/// Mainnet DAA score of the security fork (`security_fork_activation`). Set 2026-10-11 at mainnet DAA
+/// 6,638,072 (09:33 UTC), measured rate ~0.945 DAA/s: ~15 October 2026 ~15:00 UTC. 500 mod 1,000
 /// so it is not a dev-payout block. The merge-mining tag ban starts `2 * finality_depth` earlier
-/// (6,914,100, ~1 day before), so every node and pool must run this release by then. Replaces the
-/// 8,700,500 of 23767efa (never tagged or released): a node built from that commit splits here.
-pub const ZKAS_SECURITY_FORK_DAA: u64 = 7_000_500;
+/// (6,897,100, ~14 October ~13:40 UTC), so every node and pool must run this release by then. Replaces
+/// the 8,700,500 of 23767efa and the 7,000,500 of 1e684932 (neither tagged or released): a node built
+/// from either splits here.
+pub const ZKAS_SECURITY_FORK_DAA: u64 = 6_983_500;
 
 /// Mainnet DAA score from which the dev fee is zero: the security fork itself, one activation.
 /// The first block at or past it pays the carried dev balance as one final note; afterwards no dev
