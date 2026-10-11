@@ -1140,10 +1140,14 @@ pub const TESTNET_PARAMS: Params = Params {
     dev_fee_payout_interval: 1_000,
     // About 100 seconds of blocks (see Params::miner_accrual_payout_interval).
     miner_accrual_payout_interval: 100,
-    dev_fee_end_activation: ForkActivation::never(),
+    // Testnet runs mainnet's post-fork rules from genesis, so pools and integrators can test the bound
+    // (`ZKM1`) merge-mining form, the miner accrual slot and named anchor blocks before mainnet reaches
+    // `ZKAS_SECURITY_FORK_DAA`: the security fork and the dev-fee end (on the fork block, as on mainnet)
+    // are active from block 0. Testnet has no seeders and no shared history, so this re-cuts nothing.
+    dev_fee_end_activation: ForkActivation::always(),
     // On testnet, merged mining is available from genesis for testing.
     merged_mining_activation: ForkActivation::always(),
-    security_fork_activation: ForkActivation::never(),
+    security_fork_activation: ForkActivation::always(),
 
     // Launch difficulty schedule disabled on testnet.
     low_difficulty_start_blocks: 0,
@@ -1326,6 +1330,12 @@ mod tests {
         assert!(!m.security_fork_activation.is_active(f - 1) && m.security_fork_activation.is_active(f));
         assert_eq!(m.dev_fee_end_activation.daa_score(), f, "the dev fee ends with the security fork");
         assert!(m.dev_fee_accrual_activation.daa_score() < f, "a balance is carried up to the end and paid once");
+        // Testnet is mainnet after the fork, from genesis: the bound merge-mining form, the accrual slot,
+        // named anchors, the own-coinbase tag ban, and no dev output.
+        let t = TESTNET_PARAMS;
+        assert!(t.security_fork_activation.is_active(0) && t.dev_fee_end_activation.is_active(0));
+        assert!(t.coinbase_commitment_ban_activation().is_active(0) && t.merged_mining_activation.is_active(0));
+        assert!(t.toccata_activation.is_active(0) && t.shielded_coinbase);
         assert_ne!(f % m.dev_fee_payout_interval, 0, "the fork block must not be a dev payout block");
         assert_eq!(m.coinbase_commitment_ban_activation().daa_score(), f - 2 * m.finality_depth());
         // The miner accrual payout interval is about 100 seconds of blocks on every network.

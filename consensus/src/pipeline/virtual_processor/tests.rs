@@ -2346,6 +2346,44 @@ async fn dev_fee_ends_on_the_security_fork_block() {
     ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("honest chain continues");
 }
 
+/// Testnet runs mainnet's post-fork rules from genesis (so pools can test the new formats before
+/// mainnet's fork): real blocks validate from block 0, no coinbase ever pays the dev fund, miner rewards
+/// leave the accrual slot only on payout crossings, and a coinbase carrying a merge-mining tag is refused.
+#[tokio::test]
+async fn testnet_runs_the_post_fork_rules_from_genesis() {
+    use kaspa_consensus_core::{auxpow::AuxPow, config::params::TESTNET_PARAMS};
+    let mut params = TESTNET_PARAMS;
+    params.miner_accrual_payout_interval = 5;
+    let dev_spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&params.dev_fee_recipient.unwrap()));
+    let config = ConfigBuilder::new(params)
+        .edit_consensus_params(|p| {
+            p.genesis.bits = 0x207fffff;
+            p.blockrate.shielded_anchor_depth = 1;
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let miner_addr = kaspa_shielded_core::wallet::address_bytes_from_seed([9u8; 32]).expect("orchard address");
+    let miner_spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&miner_addr));
+    ctx.miner_data = MinerData::new(miner_spk.clone(), vec![]);
+    let (mut prev_daa, mut payouts) = (0u64, 0);
+    for _ in 0..20 {
+        let b = ctx.mine_real_pow_block();
+        let daa = b.header.daa_score;
+        let cb = &b.transactions[0];
+        assert!(cb.outputs.iter().all(|o| o.script_public_key != dev_spk), "no dev output on testnet (daa {daa})");
+        if cb.outputs.iter().any(|o| o.script_public_key == miner_spk) {
+            assert!(daa / 5 > prev_daa / 5, "miner rewards leave the slot only on a payout crossing (daa {daa})");
+            payouts += 1;
+        }
+        ctx.consensus.validate_and_insert_block(b).virtual_state_task.await.expect("testnet blocks validate from genesis");
+        prev_daa = daa;
+    }
+    assert!(payouts > 0, "the accrual slot paid out");
+    ctx.miner_data = MinerData::new(miner_spk.clone(), AuxPow::embed_commitment_v1(&[], Hash::from_u64_word(7), &[]));
+    let tagged = ctx.mine_real_pow_block();
+    assert!(ctx.consensus.validate_and_insert_block(tagged).virtual_state_task.await.is_err(), "a tagged coinbase is refused");
+}
+
 /// Security fork: a ZKas block whose coinbase carries a merge-mining commitment is invalid, so a
 /// ZKas block can no longer serve as the aux parent of another ZKas block.
 #[tokio::test]
