@@ -64,6 +64,14 @@ pub const MAX_ACTIONS_PER_BUNDLE: usize = 512;
 /// bundle without a burn is byte-identical to the pre-bridge format.
 pub const BUNDLE_FLAG_BURN: u8 = 0b100;
 
+/// Bundle flag bit marking a named **anchor block** (security fork, 2026-10).
+///
+/// Bit 3 says a trailing 32-byte block hash follows the burn declaration (if any): the block whose
+/// own note-commitment tree root is `anchor`. Consensus checks `root(anchor_block) == anchor` and
+/// that the block is a matured selected-chain ancestor, instead of searching an index for whichever
+/// block produced the root. Mandatory from the activation score, refused before it.
+pub const BUNDLE_FLAG_ANCHOR_BLOCK: u8 = 0b1000;
+
 /// Serialized length of a burn declaration: `value(8) | kaspa_recipient(32)`.
 pub const BURN_DECL_LEN: usize = 8 + 32;
 
@@ -166,6 +174,9 @@ pub struct ShieldedBundle {
     /// `value_balance` (see [`crate::state::ShieldedTx`]), so the binding signature already
     /// constrains it — a burn cannot move value the bundle did not prove is leaving the pool.
     pub burn: Option<(u64, [u8; sizes::FIELD])>,
+    /// The block whose tree root is `anchor`. Present iff [`BUNDLE_FLAG_ANCHOR_BLOCK`] is set.
+    /// Covered by the sighash, so a relayer cannot repoint it.
+    pub anchor_block: Option<[u8; 32]>,
 }
 
 /// Error attaching a burn declaration to a bundle.
@@ -302,11 +313,33 @@ impl ShieldedBundle {
             w.u64(*value);
             w.bytes(recipient);
         }
+        if let Some(block) = &self.anchor_block {
+            w.bytes(block);
+        }
         w.buf
     }
 
-    /// Decode from canonical payload bytes. Rejects malformed and trailing input.
+    /// Decode from canonical payload bytes in the security-fork format (a set
+    /// [`BUNDLE_FLAG_ANCHOR_BLOCK`] carries a trailing 32-byte block hash). Rejects malformed and
+    /// trailing input. Consensus must use [`Self::from_bytes_at`], which picks the format by the
+    /// carrying block's DAA score.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, BundleDecodeError> {
+        Self::decode(bytes, true)
+    }
+
+    /// Decode in the format of the chain at a given point: the security-fork format when
+    /// `security_fork_active`, otherwise exactly the format every node parsed before the fork, in
+    /// which bit 3 of the flags is an unknown flag that carries no field (the bundle decodes and
+    /// is later refused by the verifier for non-canonical flags, as it always was).
+    ///
+    /// The difference matters before the activation: the parse runs in the context-free block-body
+    /// check, so a byte string the two formats judge differently would make old and new nodes
+    /// disagree about a block's validity.
+    pub fn from_bytes_at(bytes: &[u8], security_fork_active: bool) -> Result<Self, BundleDecodeError> {
+        Self::decode(bytes, security_fork_active)
+    }
+
+    fn decode(bytes: &[u8], anchor_block_field: bool) -> Result<Self, BundleDecodeError> {
         let mut r = Reader::new(bytes);
         let flags = r.u8()?;
         let value_balance = r.i64()?;
@@ -347,11 +380,23 @@ impl ShieldedBundle {
         } else {
             None
         };
+        let anchor_block = if anchor_block_field && flags & BUNDLE_FLAG_ANCHOR_BLOCK != 0 {
+            Some(r.array::<32>().map_err(|_| BundleDecodeError::UnexpectedEof)?)
+        } else {
+            None
+        };
         if !r.finished() {
             return Err(BundleDecodeError::TrailingBytes);
         }
 
-        Ok(Self { actions, flags, value_balance, anchor, proof, binding_sig, burn })
+        Ok(Self { actions, flags, value_balance, anchor, proof, binding_sig, burn, anchor_block })
+    }
+
+    /// Name the block whose tree root is `anchor`, setting the flag bit and the field together so
+    /// the encoding stays canonical. Must be done BEFORE the sighash is computed and signed.
+    pub fn set_anchor_block(&mut self, block: [u8; 32]) {
+        self.anchor_block = Some(block);
+        self.flags |= BUNDLE_FLAG_ANCHOR_BLOCK;
     }
 
     /// Attach a bridge peg-out declaration to a proven bundle.
@@ -404,6 +449,7 @@ impl ShieldedBundle {
             proof: vec![0xab; 32],
             binding_sig: [0xcd; sizes::SIG],
             burn: None,
+            anchor_block: None,
         }
     }
 
@@ -430,6 +476,94 @@ mod tests {
         }
     }
 
+    /// The pre-fork and security-fork formats must judge the two bit-3 byte forms oppositely, and the
+    /// pre-fork judgement must be exactly the old parser's: bit 3 alone decodes (the verifier later
+    /// refuses it), bit 3 with a trailing block hash is trailing garbage. Otherwise old and new nodes
+    /// disagree about a block body before the activation.
+    #[test]
+    fn anchor_block_field_is_format_gated_and_pre_fork_parse_is_unchanged() {
+        let mut flag_only = sample_bundle(2);
+        flag_only.flags |= BUNDLE_FLAG_ANCHOR_BLOCK;
+        flag_only.anchor_block = None;
+        let flag_only = flag_only.to_bytes();
+        let mut named = sample_bundle(2);
+        named.set_anchor_block([0xAB; 32]);
+        let named = named.to_bytes();
+
+        let pre = ShieldedBundle::from_bytes_at(&flag_only, false).expect("pre-fork: an unknown flag bit decodes, as it always did");
+        assert!(pre.anchor_block.is_none() && pre.flags & BUNDLE_FLAG_ANCHOR_BLOCK != 0);
+        assert_eq!(ShieldedBundle::from_bytes_at(&named, false), Err(BundleDecodeError::TrailingBytes), "pre-fork: the field is trailing bytes");
+        assert_eq!(ShieldedBundle::from_bytes_at(&flag_only, true), Err(BundleDecodeError::UnexpectedEof), "post-fork: the field is required");
+        assert_eq!(ShieldedBundle::from_bytes_at(&named, true).unwrap().anchor_block, Some([0xAB; 32]));
+        // A bundle without the bit is the same in both formats.
+        let plain = sample_bundle(2).to_bytes();
+        assert_eq!(ShieldedBundle::from_bytes_at(&plain, false), ShieldedBundle::from_bytes_at(&plain, true));
+    }
+
+    /// Fuzz: random mutations (byte flips, truncations, extensions, flag rewrites, splices) of valid
+    /// bundles in both formats. The decoder must never panic; an accepted string must re-encode to
+    /// exactly itself (canonical, so a txid fixes the bundle); and when flag bit 3 is set the two
+    /// formats must never both accept the same bytes (that is what keeps pre- and post-fork nodes
+    /// from judging one body differently).
+    #[test]
+    fn fuzz_decode_is_total_canonical_and_format_exclusive() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n.max(1)
+        };
+        let mut seeds = vec![];
+        for n in 1..4u8 {
+            seeds.push(sample_bundle(n).to_bytes());
+            let mut named = sample_bundle(n);
+            named.set_anchor_block([n; 32]);
+            seeds.push(named.to_bytes());
+            let mut flag_only = sample_bundle(n);
+            flag_only.flags |= BUNDLE_FLAG_ANCHOR_BLOCK;
+            seeds.push(flag_only.to_bytes());
+        }
+        let mut accepted = [0usize; 2];
+        for i in 0..100_000 {
+            let mut b = seeds[i % seeds.len()].clone();
+            for _ in 0..1 + rnd(3) {
+                match rnd(6) {
+                    0 if !b.is_empty() => {
+                        let at = rnd(b.len() as u64) as usize;
+                        b[at] ^= 1 << rnd(8);
+                    }
+                    1 => b.truncate(rnd(b.len() as u64 + 1) as usize),
+                    2 => b.extend((0..rnd(40)).map(|_| rnd(256) as u8)),
+                    3 if !b.is_empty() => b[0] = rnd(256) as u8,
+                    4 if !b.is_empty() => b[0] ^= BUNDLE_FLAG_ANCHOR_BLOCK,
+                    _ => {
+                        let cut = rnd(b.len() as u64 + 1) as usize;
+                        let other = &seeds[rnd(seeds.len() as u64) as usize];
+                        let from = rnd(other.len() as u64 + 1) as usize;
+                        b.truncate(cut);
+                        b.extend_from_slice(&other[from..]);
+                    }
+                }
+            }
+            let pre = ShieldedBundle::from_bytes_at(&b, false);
+            let post = ShieldedBundle::from_bytes_at(&b, true);
+            for (k, r) in [&pre, &post].into_iter().enumerate() {
+                if let Ok(d) = r {
+                    accepted[k] += 1;
+                    assert_eq!(d.to_bytes(), b, "case {i}: an accepted bundle re-encodes to exactly its bytes");
+                    assert_eq!(d.anchor_block.is_some(), k == 1 && d.flags & BUNDLE_FLAG_ANCHOR_BLOCK != 0);
+                }
+            }
+            if !b.is_empty() && b[0] & BUNDLE_FLAG_ANCHOR_BLOCK != 0 {
+                assert!(!(pre.is_ok() && post.is_ok()), "case {i}: bit 3 set and both formats accept");
+            } else {
+                assert_eq!(pre.is_ok(), post.is_ok(), "case {i}: without bit 3 the formats agree");
+            }
+        }
+        assert!(accepted[0] > 100 && accepted[1] > 100, "the fuzz reached accepting inputs: {accepted:?}");
+    }
+
     fn sample_bundle(n: u8) -> ShieldedBundle {
         ShieldedBundle {
             actions: (0..n).map(sample_action).collect(),
@@ -439,7 +573,23 @@ mod tests {
             proof: vec![0xab; 1000],
             binding_sig: [0xcd; sizes::SIG],
             burn: None,
+            anchor_block: None,
         }
+    }
+
+    /// The named anchor block is signed: changing it, adding it or removing it changes the sighash,
+    /// so a relayer cannot swap a spend onto another block that produced the same root.
+    #[test]
+    fn anchor_block_is_covered_by_the_sighash() {
+        let (domain, tx_context) = ([1u8; 32], b"tx".as_slice());
+        let sig = |b: &ShieldedBundle| crate::verify::sighash(b, &domain, tx_context);
+        let plain = sample_bundle(2);
+        let (mut a, mut b) = (plain.clone(), plain.clone());
+        a.set_anchor_block([7u8; 32]);
+        b.set_anchor_block([8u8; 32]);
+        assert_ne!(sig(&a), sig(&b), "a different named block must change the sighash");
+        assert_ne!(sig(&a), sig(&plain), "naming a block must change the sighash");
+        assert_eq!(sig(&plain), sig(&plain.clone()));
     }
 
     #[test]
@@ -526,6 +676,7 @@ mod tests {
             proof: vec![],
             binding_sig: [0u8; sizes::SIG],
             burn: None,
+            anchor_block: None,
         };
         assert_eq!(ShieldedBundle::from_bytes(&at_cap.to_bytes()).map(|b| b.actions.len()), Ok(MAX_ACTIONS_PER_BUNDLE));
     }
@@ -538,10 +689,7 @@ mod tests {
         b.value_balance = 30;
 
         assert_eq!(b.declare_burn(0, [1; sizes::FIELD]), Err(BurnDeclareError::ZeroValue));
-        assert_eq!(
-            b.declare_burn(31, [1; sizes::FIELD]),
-            Err(BurnDeclareError::ExceedsValueBalance { burn: 31, value_balance: 30 }),
-        );
+        assert_eq!(b.declare_burn(31, [1; sizes::FIELD]), Err(BurnDeclareError::ExceedsValueBalance { burn: 31, value_balance: 30 }),);
         assert_eq!(b.burn, None, "a rejected declaration must not mutate the bundle");
         assert_eq!(b.flags & BUNDLE_FLAG_BURN, 0);
 

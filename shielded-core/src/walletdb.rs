@@ -43,13 +43,16 @@ use orchard::{
     value::NoteValue,
 };
 use std::cell::OnceCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use zcash_note_encryption::try_output_recovery_with_ovk;
 
 use crate::bundle::ShieldedBundle;
 use crate::coinbase::{CoinbaseNoteDesc, coinbase_note_commitment};
 use crate::tree::{FrontierState, GlobalTree, TREE_DEPTH};
-use crate::wallet::scan::{CompactActionRecord, ReceivedNote, reconstruct_action, scan_bundle_prepared, scan_compact_prepared, trim_memo};
+use crate::wallet::scan::{
+    CompactActionRecord, ReceivedNote, reconstruct_action, scan_bundle_prepared, scan_compact_auto, scan_compact_auto_cached, scan_compact_prepared, trim_memo,
+};
 
 /// A note the wallet owns and can spend. The membership witness is **not** held
 /// live per note (that made scanning O(N²) — every leaf advanced every owned
@@ -72,6 +75,11 @@ impl OwnedNote {
     /// The note's value in the base unit.
     pub fn value(&self) -> u64 {
         self.note.value().inner()
+    }
+
+    /// The nullifier this note's spend reveals on-chain.
+    pub fn nullifier(&self) -> [u8; 32] {
+        self.nullifier
     }
 }
 
@@ -107,6 +115,35 @@ pub enum HistoryKind {
     Sent = 2,
 }
 
+/// One output of a history row: which address was paid, how much, and its memo.
+///
+/// A single shielded transaction routinely touches this wallet more than once — a
+/// payer settling two invoices to two of our diversified addresses, or a
+/// `send_many` paying several payees. The row's `amount` is their sum and
+/// `recipient` is only the first, which is why a merchant reconciling by address
+/// needs this breakdown: `sum(credits.value) == amount`, and each entry names the
+/// address that actually received its share.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Credit {
+    /// Raw Orchard address: ours (Received rows) or the payee's (Sent rows).
+    pub recipient: [u8; 43],
+    /// Value delivered to that address by this transaction.
+    pub value: u64,
+    /// Trimmed memo attached to that output (empty = none).
+    pub memo: Vec<u8>,
+}
+
+/// What a [`scan receipt`](WalletDb::to_scan_receipt) carries besides the wallet itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanReceiptMeta {
+    /// The DAA score the exporting wallet had scanned to. The importer resumes here
+    /// instead of at its birthday — which is the whole point of the receipt.
+    pub scanned_daa: u64,
+    /// Absolute leaf count the receipt is anchored at. Every witness in it roots to
+    /// the tree at exactly this size.
+    pub anchor_leaves: u64,
+}
+
 /// One row of the wallet's chain-derived transaction history, recorded during
 /// ingest and persisted in the checkpoint (v6 section) — so it survives restarts
 /// and, unlike the browser-local 0-conf list, a seed restore (for everything the
@@ -127,15 +164,33 @@ pub struct HistoryEntry {
     /// v2 `GetShieldedBlocks` fields).
     pub timestamp_ms: u64,
     /// Coinbase/Received: value arriving. Sent: value paid to others (fee not
-    /// included; OVK-recovered when available, else net outflow minus fee).
+    /// included; OVK-recovered when available, else net outflow minus fee). A
+    /// compact-only historical send instead stores its net outflow; see
+    /// [`Self::amount_is_net_outflow`].
     pub amount: u64,
     /// Sent rows: the public fee the bundle burned (`value_balance`); else 0.
     pub fee: u64,
+    /// `true` when a compact archive reconstructed a historical spend. Compact
+    /// records reveal our spent notes and change, but omit the full bundle's
+    /// recipient, memo, and fee; `amount` is therefore net outflow (paid amount
+    /// plus fee), not the amount delivered to the recipient.
+    pub amount_is_net_outflow: bool,
+    /// Whether `fee` came from the full bundle. `false` for compact-only
+    /// historical sends, where a displayed zero must not be mistaken for zero fee.
+    pub fee_known: bool,
     /// Sent rows: the recipient's raw Orchard address, when recoverable via our
     /// OVK. `None` for pre-OVK sends (recipient unknowable even to us).
     pub recipient: Option<[u8; 43]>,
     /// Trimmed memo bytes (empty = no memo).
     pub memo: Vec<u8>,
+    /// Per-output breakdown of `amount` (v10). Received rows: one entry per note
+    /// this transaction paid us, so two invoices settled by one transaction are two
+    /// entries rather than one summed row attributed to whichever address happened
+    /// to come first. Sent rows: one entry per OVK-recovered payee. Empty for
+    /// coinbase rows, for compact-only rows, and for rows restored from a
+    /// pre-v10 checkpoint — an empty vector means "no breakdown available", never
+    /// "nothing was received", so a client falls back to `amount`/`recipient`.
+    pub credits: Vec<Credit>,
 }
 
 /// Chain-block metadata for dating history rows, from the v2 `GetShieldedBlocks`
@@ -168,6 +223,46 @@ impl Preview {
     }
 }
 
+/// Where a scan's CPU actually goes, accumulated across ingest calls.
+///
+/// A wallet scan has exactly two heavy parts and nobody had ever measured their
+/// ratio: **trial decryption** (one Pallas variable-base scalar multiplication per
+/// action per ivk — the cost of privacy, and irreducible per (wallet, action) pair)
+/// and **tree append** (one Sinsemilla combine per leaf, amortized — the cost of
+/// being able to witness later). They call for completely different remedies, so
+/// guessing which dominates is how optimization effort gets spent in the wrong place.
+///
+/// Counters only; reading them is free and they are never persisted.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct ScanCost {
+    /// Nanoseconds inside `scan_compact_prepared` / `scan_bundle_prepared`.
+    pub decrypt_ns: u128,
+    /// Nanoseconds inside `append_leaf` — all of the Sinsemilla tree work.
+    pub tree_ns: u128,
+    /// Of `tree_ns`, the part spent appending this wallet's own MIRROR tree.
+    ///
+    /// Split out because the two halves have opposite answers. The mirror tree is
+    /// public — every wallet on the chain computes the identical thing, so it can be
+    /// borrowed from a shared tree or adopted from a node frontier and the work simply
+    /// disappears. The subtree cache is this wallet's own index and is what makes its
+    /// spends fast; paying it is a trade, not waste. A phone measured 44.5 us/leaf
+    /// across both and there was no way to tell which one to attack.
+    pub mirror_ns: u128,
+    /// Of `tree_ns`, the part spent keeping the complete-subtree cache in step.
+    pub subtree_ns: u128,
+    /// Actions offered to trial decryption.
+    pub actions: u64,
+    /// Leaves appended to the commitment tree.
+    pub leaves: u64,
+}
+
+impl ScanCost {
+    /// Both halves together.
+    pub fn total_ns(&self) -> u128 {
+        self.decrypt_ns + self.tree_ns
+    }
+}
+
 /// A wallet's running view of the global note-commitment tree: it walks the
 /// canonical commitment stream, recognises its own notes, and keeps a spendable
 /// witness for each.
@@ -183,6 +278,21 @@ pub struct WalletDb {
     fvk: FullViewingKey,
     /// This wallet's raw external address — matches coinbase recipients.
     my_address: [u8; 43],
+    /// Every diversified address this wallet can plausibly have handed out, so a
+    /// coinbase paid to one is recognised. See [`Self::recover_coinbase_note`].
+    ///
+    /// Derived eagerly for indices `0..COINBASE_DIVERSIFIER_SCAN` because the hot path
+    /// must stay a hash lookup: a coinbase note publishes its recipient in the clear,
+    /// so the alternative is FF1-decrypting the diversifier for a candidate index and
+    /// confirming with `address_at(j)` — a scalar multiplication, on roughly half of
+    /// all leaves, for every stranger's coinbase as well as ours.
+    ///
+    /// ⚠️ **This is a bound, not a proof.** An address issued above the bound and not
+    /// requested again in this process's lifetime is still missed. Closing that gap
+    /// properly means persisting the issued-index set in the checkpoint, which is a
+    /// format change; two other changes are already contending for the next
+    /// `CHECKPOINT_VERSION`, so it is deliberately not done here.
+    known_addresses: std::collections::HashSet<[u8; 43]>,
     /// A running mirror of the global tree, used only to report the current tip
     /// [`anchor`](Self::anchor) cheaply (one append per leaf). Initialised from
     /// [`base_frontier`](Self::base_frontier), so it already reflects everything up
@@ -201,8 +311,16 @@ pub struct WalletDb {
     /// The note-commitment stream **after** `base_size`, in append order. Retaining
     /// it lets the wallet build a membership witness for any owned position **on
     /// demand** (see [`Self::witness_path`]) instead of advancing a per-note witness
-    /// on every append — the difference between an O(N) and an O(N²) scan. At 32
-    /// bytes/leaf this is ~1 MB per million notes, cheap next to 625M hashes.
+    /// on every append — the difference between an O(N) and an O(N²) scan.
+    ///
+    /// **Cost, corrected.** This previously read "~1 MB per million notes, cheap next
+    /// to 625M hashes". That is wrong by 32×: 32 bytes × 1M leaves is **32 MB**, and
+    /// [`Self::decoded`] holds a second copy of the same size, so a wallet at the
+    /// current ~2.05 M leaves carries **~130 MB** of purely public data. It is not
+    /// cheap and it is not per-wallet data — every wallet's copy is byte-identical.
+    /// Multiplied across a hosted daemon's resident wallets this is the dominant
+    /// term in its RSS (measured: 6.8 GB across 39 wallets). Keeping ONE keyless copy
+    /// for everyone is what [`Self::set_leaves_only`] exists for.
     leaves: Vec<[u8; 32]>,
     /// The leaf stream decoded to curve points, built on first use.
     ///
@@ -261,10 +379,64 @@ pub struct WalletDb {
     /// holder must explicitly accept that before anything is written. Turning it
     /// off purges what was recorded ([`Self::set_history_enabled`]).
     history_enabled: bool,
+    /// Decryption results for the page currently being ingested, keyed by the action's
+    /// nullifier (unique per action).
+    ///
+    /// Trial decryption is now ~99% of a scan's cost, and it was being done one
+    /// TRANSACTION at a time — a handful of actions per call. That is too small to
+    /// parallelise usefully and far below the ~100-point batch a GPU needs to beat the
+    /// CPU at all, so both levers were blocked by the batch size rather than by
+    /// anything hard. Deciding a whole page at once unblocks both.
+    ///
+    /// Only what the page contains, cleared per page. A miss simply falls through to
+    /// the old per-transaction path, so this is a memo and can never change a result.
+    predecrypted: Option<std::collections::HashMap<[u8; 32], Option<ReceivedNote>>>,
+    /// This wallet's key-agreement scalar, derived once so the GPU path does not have
+    /// to re-derive it per page. `None` only if the key could not yield one, in which
+    /// case scanning stays on the CPU.
+    agree_scalar: Option<pasta_curves::pallas::Scalar>,
+    /// Skip trial decryption in the ingest path — see [`Self::set_leaves_only`].
+    /// Deliberately NOT persisted: it describes what this in-memory copy is for,
+    /// not anything about the stream it holds, and a checkpoint written by a
+    /// shared tree must stay loadable as an ordinary (if noteless) wallet.
+    leaves_only: bool,
+    /// Set when an ingested page repeated a nullifier this database already appended a leaf for.
+    /// Consensus never applies a second spend of one nullifier, and the node serves only applied
+    /// transactions, so a repeat proves the data source is faulty or lying. The bundle is still
+    /// skipped (as before), but the caller must now treat this database as diverged: discard it and
+    /// reload from the last checkpoint rather than persist a forked tree. Not persisted.
+    poisoned: bool,
+    /// Do not maintain this wallet's own mirror `tree` — the daemon-wide shared tree
+    /// holds an identical one and will supply its frontier.
+    ///
+    /// The tree is 80% of a scan (measured: 319 s of Sinsemilla against 79 s of trial
+    /// decryption) and it is *public*: every wallet ingesting the same blocks builds
+    /// bit-identical nodes. Having N wallets each build their own is the single
+    /// largest piece of duplicated work in the daemon.
+    ///
+    /// Not persisted — it describes how this copy is being driven right now, not
+    /// anything about the stream.
+    borrow_tree: bool,
+    /// Whether `tree` currently reflects `size`.
+    ///
+    /// False from the moment a leaf is appended without hashing it in. The frontier of
+    /// a commitment tree at N leaves is a pure function of leaves 0..N, so the shared
+    /// tree's frontier at the same `size` IS this wallet's frontier — that is what
+    /// [`Self::adopt_tip_frontier`] installs, and why borrowing is sound rather than a
+    /// guess. Until then nothing may read `anchor()`.
+    tree_valid: bool,
     /// Spends submitted but not yet observed on-chain — see [`PendingSpend`].
     /// Excluded from the balance and from spend selection (like spent notes), but
     /// recoverable if the transaction is lost.
     pending_spends: Vec<PendingSpend>,
+    /// Change owed back by each parked spend, keyed by txid — see
+    /// [`Self::note_pending_outflow`]. Display-only: `mark_spent` removes the WHOLE
+    /// input note from the balance, so without this a one-note wallet reads 0 from
+    /// submit until the change note is decrypted on-chain. Never spendable, never in
+    /// `balance()`. Lives exactly as long as a pending spend carries its txid (pruned
+    /// wherever `pending_spends` shrinks) and is NOT persisted: after a restart the
+    /// figure simply reverts to the preview-derived `pending_in`.
+    pending_change: HashMap<[u8; 32], u64>,
     /// DAA score of the newest block ingested with [`BlockMeta`] — the wallet's
     /// chain clock. Only advances as blocks are actually ingested, so pending-spend
     /// expiry never runs ahead of what the wallet has really seen.
@@ -273,12 +445,79 @@ pub struct WalletDb {
     /// step by `append_leaf`; built (and gated) by `build_subtree_cache`. Inactive until
     /// built, and every consumer falls back to the replay when it cannot serve.
     subtree: SubtreeCache,
+    /// Scan cost counters — see [`ScanCost`]. Not persisted; reset on load.
+    scan_cost: ScanCost,
 }
 
 /// How many owned notes keep a live witness. Beyond this, advancing every witness on
 /// every leaf would reintroduce the O(N·k) scan that once made a wallet op take 33
 /// minutes; the excess notes fall back to the on-demand rebuild.
 const MAX_LIVE_WITNESSES: usize = 256;
+
+/// A subtree-cache build detached from the wallet that owns it.
+///
+/// The cache is a pure function of `(base_frontier, base_size, leaf stream)` and the fold
+/// mutates none of them, so it does not need the wallet lock — and holding that lock for
+/// the ~247 s a full build takes is what made background builds unaffordable. Slicing the
+/// build to keep the lock available instead capped it at one 2 s slice per sync lap: on the
+/// live daemon that was a ~10 % duty cycle, and **no build completed at all** while users
+/// went on paying the full 247 s inline on their first send.
+///
+/// Snapshot the inputs under the lock (a memcpy of the decoded leaves, ~61 MB at 1.9 M
+/// leaves), release it, fold on a blocking thread, then install with
+/// [`WalletDb::install_subtree_cache`], which re-checks that the snapshot still matches.
+pub struct SubtreeBuildJob {
+    base_frontier: Frontier<MerkleHashOrchard, TREE_DEPTH>,
+    base_size: u64,
+    leaves: Vec<MerkleHashOrchard>,
+}
+
+/// A folded cache awaiting installation — see [`SubtreeBuildJob::run`].
+pub struct BuiltSubtreeCache {
+    cache: SubtreeCache,
+    base_size: u64,
+}
+
+impl SubtreeBuildJob {
+    /// How many leaves this build has to fold (for progress reporting).
+    pub fn leaves(&self) -> usize {
+        self.leaves.len()
+    }
+
+    /// Fold the snapshot. Pure CPU over owned data — belongs on a blocking thread.
+    /// `None` if the frontier cannot seed the cache or a subtree root cannot be
+    /// recorded, in which case the caller keeps the replay path.
+    pub fn run(self) -> Option<BuiltSubtreeCache> {
+        self.run_with_progress(&AtomicU64::new(0))
+    }
+
+    /// As [`Self::run`], counting leaves folded so far into `progress` (relative to this
+    /// job, so `progress / leaves()` is the fraction done). The fold is parallel — see
+    /// `SubtreeCache::fold_parallel` — and the counter is bumped every
+    /// `PROGRESS_EVERY` leaves from whichever thread folded them, so a caller polling
+    /// it from another thread sees a monotone, slightly coarse figure. No logging here:
+    /// this crate has no logger; the daemon reports what it reads.
+    pub fn run_with_progress(self, progress: &AtomicU64) -> Option<BuiltSubtreeCache> {
+        let mut c = SubtreeCache::default();
+        if !c.seed_from_frontier(&self.base_frontier, self.base_size) {
+            return None;
+        }
+        if !c.fold_parallel(self.base_size, &self.leaves, PAR_WINDOW_LOG2, progress) {
+            return None;
+        }
+        Some(BuiltSubtreeCache { cache: c, base_size: self.base_size })
+    }
+}
+
+/// Leaves folded between bumps of a build's progress counter. Coarse enough to keep the
+/// atomic off the hot path, fine enough (~0.2–0.3 s of work) for a live percentage.
+const PROGRESS_EVERY: usize = 1024;
+
+/// Window size (log2) of the parallel fold: `2^14` = 16,384 leaves per window. At
+/// ~150–260 µs per combine a window is ~3 s of work, so a multi-million-leaf stream
+/// splits into hundreds of independent windows — plenty to keep every core busy — while
+/// the ragged head and tail that must fold sequentially stay under one window each.
+const PAR_WINDOW_LOG2: u8 = 14;
 
 /// Level at or above which [`SubtreeCache`] retains complete subtree roots. Below it a
 /// note's siblings are folded from its own `2^CACHE_LEVEL`-leaf window at spend time.
@@ -327,6 +566,13 @@ struct SubtreeCache {
     /// A build was attempted and rejected. Prevents re-paying an O(chain) build every
     /// sync tick for a wallet whose shape the cache cannot serve.
     failed: bool,
+    /// This is an **in-progress** build that stood down part-way, not a usable cache.
+    /// `active` is false, so no consumer can serve from it; the next build resumes from
+    /// `upto` instead of starting over. Deliberately in-memory only — `write_subtree_section`
+    /// does not persist it, and a reloaded checkpoint therefore comes back as a plain
+    /// inactive cache that simply rebuilds from scratch. Losing progress across a restart
+    /// is safe; serving from a half-built index would not be.
+    partial: bool,
 }
 
 impl SubtreeCache {
@@ -356,7 +602,17 @@ impl SubtreeCache {
 
     /// Fold one leaf into the mountain range, recording every subtree it completes.
     fn push_leaf(&mut self, pos: u64, leaf: MerkleHashOrchard) -> bool {
-        let mut node = (0u8, pos, leaf);
+        self.push_node(0, pos, leaf)
+    }
+
+    /// Fold one COMPLETE subtree root (level `level`, index `idx`) into the mountain
+    /// range exactly as pushing its last leaf would have: merge with genuine left
+    /// siblings, recording every subtree the merges complete. A leaf is the level-0
+    /// case; [`Self::fold_parallel`] pushes whole windows this way. The node itself is
+    /// NOT recorded here — a leaf is below `CACHE_LEVEL`, and a window root has already
+    /// been recorded by the window that folded it.
+    fn push_node(&mut self, level: u8, idx: u64, hash: MerkleHashOrchard) -> bool {
+        let mut node = (level, idx, hash);
         while let Some(&(tl, ti, th)) = self.peaks.last() {
             // Merge only with a genuine left sibling: same level, even index, adjacent.
             if tl != node.0 || ti % 2 != 0 || ti + 1 != node.1 {
@@ -370,8 +626,90 @@ impl SubtreeCache {
             }
         }
         self.peaks.push(node);
-        self.upto = pos + 1;
+        self.upto = (idx + 1) << level;
         true
+    }
+
+    /// Push `leaves` (absolute positions from `first_pos`) one by one, bumping
+    /// `progress` every [`PROGRESS_EVERY`] leaves and once more for the remainder.
+    fn fold_run(&mut self, first_pos: u64, leaves: &[MerkleHashOrchard], progress: &AtomicU64) -> bool {
+        for (i, leaf) in leaves.iter().enumerate() {
+            if !self.push_leaf(first_pos + i as u64, *leaf) {
+                return false;
+            }
+            if (i + 1) % PROGRESS_EVERY == 0 {
+                progress.fetch_add(PROGRESS_EVERY as u64, Ordering::Relaxed);
+            }
+        }
+        progress.fetch_add((leaves.len() % PROGRESS_EVERY) as u64, Ordering::Relaxed);
+        true
+    }
+
+    /// Fold `leaves` (absolute position `base + i`, of which the first `upto - base`
+    /// are already folded) into the mountain range across every core.
+    ///
+    /// The sweep is one Sinsemilla combine per leaf, and every root it records is a
+    /// pure function of the leaves beneath it — so the stream is cut at absolute
+    /// `2^window_log2` boundaries and each full window folds on its own thread into a
+    /// private cache. A full window is one complete subtree: its cache holds exactly the
+    /// level-`CACHE_LEVEL..=window_log2` roots the sequential sweep would have recorded
+    /// inside it (dense, in index order), and its single peak is what that sweep would
+    /// have been carrying when it left the window. Windows are then replayed in order:
+    /// their roots appended level by level (consecutive aligned windows keep
+    /// [`Self::record`]'s contiguity) and each peak pushed with [`Self::push_node`],
+    /// which performs the merges above `window_log2` in the same order the sequential
+    /// sweep would. The ragged head (up to the first boundary) and tail fold
+    /// sequentially.
+    ///
+    /// The result is identical to the sequential fold — asserted by
+    /// `parallel_fold_matches_sequential` — and every build is root-gated by its caller
+    /// anyway, so a wrong merge could only cost speed, never a wrong witness. This was
+    /// the single-core, hour-long step behind "first send pins one core for an hour":
+    /// on a self-hosted daemon with no shared tree, the first spend paid this whole
+    /// sweep on one thread.
+    fn fold_parallel(&mut self, base: u64, leaves: &[MerkleHashOrchard], window_log2: u8, progress: &AtomicU64) -> bool {
+        use rayon::prelude::*;
+        let Some(start) = self.upto.checked_sub(base) else { return false };
+        let start = start as usize;
+        if start > leaves.len() {
+            return false;
+        }
+        let win = 1usize << window_log2;
+        // Windows are subtrees of the GLOBAL tree, so align absolute positions, not
+        // stream offsets: a compacted wallet's stream starts at an arbitrary `base`.
+        let head_end = {
+            let abs = base + start as u64;
+            let aligned = abs.div_ceil(win as u64) * win as u64;
+            ((aligned - base) as usize).min(leaves.len())
+        };
+        if !self.fold_run(base + start as u64, &leaves[start..head_end], progress) {
+            return false;
+        }
+        let body_end = head_end + ((leaves.len() - head_end) / win) * win;
+        let windows: Vec<Option<SubtreeCache>> = leaves[head_end..body_end]
+            .par_chunks(win)
+            .enumerate()
+            .map(|(k, chunk)| {
+                let mut c = SubtreeCache::default();
+                c.fold_run(base + (head_end + k * win) as u64, chunk, progress).then_some(c)
+            })
+            .collect();
+        for w in windows {
+            let Some(w) = w else { return false };
+            for (l, roots) in w.levels.iter().enumerate() {
+                for (k, h) in roots.iter().enumerate() {
+                    if !self.record(l as u8, w.first[l] + k as u64, *h) {
+                        return false;
+                    }
+                }
+            }
+            // A full aligned window leaves exactly one peak, at `window_log2`.
+            let &[(l, idx, h)] = &w.peaks[..] else { return false };
+            if l != window_log2 || !self.push_node(l, idx, h) {
+                return false;
+            }
+        }
+        self.fold_run(base + body_end as u64, &leaves[body_end..], progress)
     }
 
     /// Seed the peaks with the complete subtrees of `[0, size)` summarised by a
@@ -440,6 +778,15 @@ impl SubtreeCache {
 /// checkpoint blob.
 const HISTORY_CAP: usize = 20_000;
 
+/// How many diversified addresses to derive up front for coinbase recognition.
+///
+/// Each costs one scalar multiplication at wallet load (~256 of them is a few ms,
+/// paid once), and buys a coinbase check that is a hash lookup rather than a curve
+/// operation on half of every block's leaves. 256 covers per-customer deposit
+/// addresses at the scale this daemon actually serves; see `known_addresses` for
+/// what it does not cover.
+const COINBASE_DIVERSIFIER_SCAN: u32 = 256;
+
 impl WalletDb {
     /// Build a wallet view from a 32-byte seed. Returns `None` if the seed is not
     /// a valid Orchard spending key (negligibly rare).
@@ -448,13 +795,18 @@ impl WalletDb {
         let fvk = FullViewingKey::from(&sk);
         let ivk = fvk.to_ivk(Scope::External);
         let prepared_ivk = ivk.prepare();
+        let agree_scalar = crate::wallet::ivk_agreement_scalar(&ivk);
         let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+        let known_addresses = (0..COINBASE_DIVERSIFIER_SCAN)
+            .map(|i| fvk.address_at(i, Scope::External).to_raw_address_bytes())
+            .collect();
         let ovk = fvk.to_ovk(Scope::External);
         Some(Self {
             ivk,
             prepared_ivk,
             fvk,
             my_address,
+            known_addresses,
             tree: CommitmentTree::empty(),
             base_frontier: Frontier::empty(),
             base_size: 0,
@@ -470,9 +822,17 @@ impl WalletDb {
             ovk,
             history: Vec::new(),
             history_enabled: true,
+            agree_scalar,
+            predecrypted: None,
+            leaves_only: false,
+            poisoned: false,
+            borrow_tree: false,
+            tree_valid: true,
             pending_spends: Vec::new(),
+            pending_change: HashMap::new(),
             last_daa: 0,
             subtree: SubtreeCache::default(),
+            scan_cost: ScanCost::default(),
         })
     }
 
@@ -488,13 +848,18 @@ impl WalletDb {
         let fvk = FullViewingKey::from_bytes(fvk_bytes)?;
         let ivk = fvk.to_ivk(Scope::External);
         let prepared_ivk = ivk.prepare();
+        let agree_scalar = crate::wallet::ivk_agreement_scalar(&ivk);
         let my_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+        let known_addresses = (0..COINBASE_DIVERSIFIER_SCAN)
+            .map(|i| fvk.address_at(i, Scope::External).to_raw_address_bytes())
+            .collect();
         let ovk = fvk.to_ovk(Scope::External);
         Some(Self {
             ivk,
             prepared_ivk,
             fvk,
             my_address,
+            known_addresses,
             tree: CommitmentTree::empty(),
             base_frontier: Frontier::empty(),
             base_size: 0,
@@ -510,9 +875,17 @@ impl WalletDb {
             ovk,
             history: Vec::new(),
             history_enabled: true,
+            agree_scalar,
+            predecrypted: None,
+            leaves_only: false,
+            poisoned: false,
+            borrow_tree: false,
+            tree_valid: true,
             pending_spends: Vec::new(),
+            pending_change: HashMap::new(),
             last_daa: 0,
             subtree: SubtreeCache::default(),
+            scan_cost: ScanCost::default(),
         })
     }
 
@@ -522,10 +895,27 @@ impl WalletDb {
         &self.fvk
     }
 
+    /// The wallet's outgoing viewing key — what decrypts the details of its own sends
+    /// (see [`crate::payproof`]). Cloned so a caller can use it after dropping the
+    /// wallet lock.
+    pub fn ovk(&self) -> OutgoingViewingKey {
+        self.ovk.clone()
+    }
+
     /// This wallet's receive address, as raw Orchard address bytes. Derived from the
     /// viewing key, so a watch-only wallet knows it too.
     pub fn my_address_bytes(&self) -> [u8; 43] {
         self.my_address
+    }
+
+    /// The wallet's diversified address at `index` (0 = [`Self::my_address_bytes`]).
+    /// Every diversified address of a wallet is paid into the SAME notes/balance and is
+    /// found by the same scan: trial decryption uses the incoming viewing key, which does
+    /// not depend on the diversifier, and a received note carries the diversified address
+    /// it was sent to (recorded in its history row). So a service can hand each customer
+    /// their own address and attribute deposits by address — no memo required.
+    pub fn address_bytes_at(&self, index: u32) -> [u8; 43] {
+        self.fvk().address_at(index, Scope::External).to_raw_address_bytes()
     }
 
     /// Build a wallet that **fast-syncs** from a checkpoint frontier: the tree starts
@@ -569,6 +959,20 @@ impl WalletDb {
     /// The wallet's owned, unspent notes.
     pub fn notes(&self) -> &[OwnedNote] {
         &self.notes
+    }
+
+    /// Whether the restored notes were derived under THIS wallet's viewing key: every
+    /// stored nullifier must equal the one this key derives for its note. A checkpoint
+    /// blob carries no key material, so this is the only binding between a blob found
+    /// on disk and the key it is being restored under — a blob scanned by another key
+    /// would otherwise install that key's notes here. At most `sample` notes are checked
+    /// (one foreign note is proof enough, and each nullifier is a curve operation).
+    /// `None` when there are no notes to bind with.
+    pub fn notes_bound_to_key(&self, sample: usize) -> Option<bool> {
+        if self.notes.is_empty() {
+            return None;
+        }
+        Some(self.notes.iter().take(sample).all(|n| n.note.nullifier(&self.fvk).to_bytes() == n.nullifier))
     }
 
     /// Absolute position of the first leaf this wallet actually scanned: 0 for a
@@ -640,7 +1044,9 @@ impl WalletDb {
             // (consensus would already have rejected the block, so this is just
             // defensive — an un-appendable leaf can carry no note for us either).
             let Ok(cmx) = coinbase_note_commitment(desc, *value) else { continue };
-            let owned = self.recover_coinbase_note(desc, *value);
+            // Key-independent: the commit-or-skip decision above is what shapes the
+            // stream, and it has already been made. See `set_leaves_only`.
+            let owned = if self.leaves_only { None } else { self.recover_coinbase_note(desc, *value) };
             if owned.is_some() {
                 if let Some(m) = meta {
                     self.record_coinbase_history(*value, m);
@@ -660,7 +1066,11 @@ impl WalletDb {
     /// caller must supply exactly the notes [`ingest_block`] would keep, in the same
     /// order (skip a note whose `coinbase_note_commitment` errors), so the leaf
     /// stream is byte-identical to the non-shared path.
-    pub fn ingest_block_precomputed(&mut self, coinbase: &[(CoinbaseNoteDesc, u64, ExtractedNoteCommitment)], txs: &[&ShieldedBundle]) {
+    pub fn ingest_block_precomputed(
+        &mut self,
+        coinbase: &[(CoinbaseNoteDesc, u64, ExtractedNoteCommitment)],
+        txs: &[&ShieldedBundle],
+    ) {
         self.ingest_block_precomputed_with_meta(coinbase, txs, None);
     }
 
@@ -694,6 +1104,7 @@ impl WalletDb {
     fn ingest_bundles(&mut self, txs: &[&ShieldedBundle], meta: Option<&BlockMeta>) {
         for (bi, bundle) in txs.iter().enumerate() {
             if bundle.actions.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
+                self.poisoned = true;
                 continue;
             }
             // What this bundle takes from us — measured BEFORE the retain below
@@ -711,6 +1122,7 @@ impl WalletDb {
                 // for good.
                 self.notes.retain(|n| n.nullifier != action.nullifier);
                 self.pending_spends.retain(|p| p.note.nullifier != action.nullifier);
+                self.prune_pending_change();
                 self.spent_nullifiers.insert(action.nullifier);
 
                 let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&action.cmx)) else {
@@ -748,7 +1160,9 @@ impl WalletDb {
         }
         for (desc, value) in coinbase {
             let Ok(cmx) = coinbase_note_commitment(desc, *value) else { continue };
-            let owned = self.recover_coinbase_note(desc, *value);
+            // Key-independent: the commit-or-skip decision above is what shapes the
+            // stream, and it has already been made. See `set_leaves_only`.
+            let owned = if self.leaves_only { None } else { self.recover_coinbase_note(desc, *value) };
             if owned.is_some() {
                 if let Some(m) = meta {
                     self.record_coinbase_history(*value, m);
@@ -773,7 +1187,10 @@ impl WalletDb {
             self.last_daa = self.last_daa.max(m.daa_score);
         }
         for (desc, value, cmx) in coinbase {
-            let owned = self.recover_coinbase_note(desc, *value);
+            // `leaves_only`: recognising the note is the only key-dependent step here.
+            // The commit-or-skip rule that decides whether this leaf exists at all was
+            // applied by the caller when it built `coinbase`, so the stream is unchanged.
+            let owned = if self.leaves_only { None } else { self.recover_coinbase_note(desc, *value) };
             if owned.is_some() {
                 if let Some(m) = meta {
                     self.record_coinbase_history(*value, m);
@@ -789,13 +1206,42 @@ impl WalletDb {
     fn ingest_bundles_compact(&mut self, txs: &[Vec<CompactActionRecord>], meta: Option<&BlockMeta>) {
         for (bi, records) in txs.iter().enumerate() {
             if records.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
+                self.poisoned = true;
                 continue;
             }
             let spent: u64 = records.iter().filter_map(|a| self.owned_note_value(&a.nullifier)).sum();
-            let received = scan_compact_prepared(&self.prepared_ivk, records);
+            // The nullifier drop rule above is key-independent and has already run, so
+            // skipping decryption cannot change which bundles append leaves — only
+            // whether we notice that one of those leaves is ours. See `set_leaves_only`.
+            let t_dec = std::time::Instant::now();
+            let from_memo = self.predecrypted.is_some();
+            let received = if self.leaves_only {
+                Vec::new()
+            } else if let Some(hits) = self.predecrypted.as_ref().filter(|m| records.iter().all(|r| m.contains_key(&r.nullifier))) {
+                // Whole transaction already decided by the page pass.
+                records
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| {
+                        hits.get(&r.nullifier).and_then(|o| o.clone()).map(|mut n| {
+                            n.action_index = i;
+                            n
+                        })
+                    })
+                    .collect()
+            } else {
+                scan_compact_auto(&self.prepared_ivk, self.agree_scalar.as_ref(), records)
+            };
+            // A memo hit did its decryption in `predecrypt_page`, which already charged
+            // for it; charging again here would double-count the same actions.
+            if !from_memo {
+                self.scan_cost.decrypt_ns += t_dec.elapsed().as_nanos();
+                self.scan_cost.actions += records.len() as u64;
+            }
             for (i, rec) in records.iter().enumerate() {
                 self.notes.retain(|n| n.nullifier != rec.nullifier);
                 self.pending_spends.retain(|p| p.note.nullifier != rec.nullifier);
+                self.prune_pending_change();
                 self.spent_nullifiers.insert(rec.nullifier);
 
                 let Some(cmx) = Option::<ExtractedNoteCommitment>::from(ExtractedNoteCommitment::from_bytes(&rec.cmx)) else {
@@ -806,23 +1252,42 @@ impl WalletDb {
             }
             if let Some(m) = meta {
                 if let Some(txid) = m.txids.get(bi).copied() {
-                    self.record_income_history_compact(spent, &received, txid, m);
+                    self.record_history_compact(spent, &received, txid, m);
                 }
             }
         }
     }
 
-    /// Record income history for a compact-ingested tx. Compact records carry no
-    /// out_ciphertext / value_balance, so an outgoing spend's recipient/memo/fee are
-    /// not reconstructable from the chain (that detail is recorded at send time);
-    /// here we record only income we received (memo is empty in compact form).
-    fn record_income_history_compact(&mut self, spent: u64, received: &[ReceivedNote], txid: [u8; 32], meta: &BlockMeta) {
+    /// Record history for a compact-ingested transaction. Compact records carry no
+    /// out_ciphertext / value_balance, so an outgoing spend's recipient, memo, and
+    /// exact fee are not reconstructable. Still record the spend: our nullifiers and
+    /// decryptable change give its exact net outflow, which is vital for historical
+    /// watch-only reconciliation after a rescan.
+    fn record_history_compact(&mut self, spent: u64, received: &[ReceivedNote], txid: [u8; 32], meta: &BlockMeta) {
         if !self.history_enabled {
             return;
         }
         let received_value: u64 = received.iter().map(|r| r.value()).sum();
-        if spent > 0 || received_value == 0 {
-            return; // our own spend (recorded at send time) or not our tx
+        if spent > 0 {
+            self.push_history(HistoryEntry {
+                kind: HistoryKind::Sent,
+                txid,
+                daa_score: meta.daa_score,
+                timestamp_ms: meta.timestamp_ms,
+                amount: spent.saturating_sub(received_value),
+                fee: 0,
+                amount_is_net_outflow: true,
+                fee_known: false,
+                recipient: None,
+                memo: Vec::new(),
+                // Compact records carry no out_ciphertext, so there is nothing to
+                // attribute the outflow to.
+                credits: Vec::new(),
+            });
+            return;
+        }
+        if received_value == 0 {
+            return; // not our transaction
         }
         let entry = HistoryEntry {
             kind: HistoryKind::Received,
@@ -831,10 +1296,13 @@ impl WalletDb {
             timestamp_ms: meta.timestamp_ms,
             amount: received_value,
             fee: 0,
+            amount_is_net_outflow: false,
+            fee_known: true,
             recipient: received.first().map(|note| note.note.recipient().to_raw_address_bytes()),
             memo: Vec::new(),
+            credits: credits_from_received(received),
         };
-        self.history.push(entry);
+        self.push_history(entry);
     }
 
     /// Value of the owned note (unspent or pending-spend) this nullifier would
@@ -859,8 +1327,11 @@ impl WalletDb {
             timestamp_ms: meta.timestamp_ms,
             amount: value,
             fee: 0,
+            amount_is_net_outflow: false,
+            fee_known: true,
             recipient: None,
             memo: Vec::new(),
+            credits: Vec::new(),
         });
     }
 
@@ -871,7 +1342,14 @@ impl WalletDb {
     /// spends the recipient/paid-amount/memo are recovered with our OVK when the
     /// send was built with it; otherwise the row falls back to `net outflow − fee`
     /// with no recipient — still a correct amount, just less descriptive.
-    fn record_bundle_history(&mut self, bundle: &ShieldedBundle, spent: u64, received: &[ReceivedNote], txid: [u8; 32], meta: &BlockMeta) {
+    fn record_bundle_history(
+        &mut self,
+        bundle: &ShieldedBundle,
+        spent: u64,
+        received: &[ReceivedNote],
+        txid: [u8; 32],
+        meta: &BlockMeta,
+    ) {
         if !self.history_enabled {
             return;
         }
@@ -886,10 +1364,12 @@ impl WalletDb {
             let mut recipient = None;
             let mut memo = Vec::new();
             let mut recovered_paid = 0u64;
+            let mut credits = Vec::new();
             for a in &bundle.actions {
                 let Some(action) = reconstruct_action(a) else { continue };
                 let domain = OrchardDomain::for_action(&action);
-                let Some((note, addr, m)) = try_output_recovery_with_ovk(&domain, &self.ovk, &action, action.cv_net(), &a.out_ciphertext)
+                let Some((note, addr, m)) =
+                    try_output_recovery_with_ovk(&domain, &self.ovk, &action, action.cv_net(), &a.out_ciphertext)
                 else {
                     continue;
                 };
@@ -897,11 +1377,15 @@ impl WalletDb {
                 if addr_bytes == self.my_address {
                     continue; // our own change
                 }
+                let m = trim_memo(&m);
                 recovered_paid = recovered_paid.saturating_add(note.value().inner());
                 if recipient.is_none() {
                     recipient = Some(addr_bytes);
-                    memo = trim_memo(&m);
+                    memo = m.clone();
                 }
+                // One entry per payee, so a send_many is not collapsed into its
+                // first recipient.
+                credits.push(Credit { recipient: addr_bytes, value: note.value().inner(), memo: m });
             }
             HistoryEntry {
                 kind: HistoryKind::Sent,
@@ -910,8 +1394,11 @@ impl WalletDb {
                 timestamp_ms: meta.timestamp_ms,
                 amount: if recipient.is_some() { recovered_paid } else { net_out.saturating_sub(fee) },
                 fee,
+                amount_is_net_outflow: false,
+                fee_known: true,
                 recipient,
                 memo,
+                credits,
             }
         } else {
             HistoryEntry {
@@ -921,14 +1408,84 @@ impl WalletDb {
                 timestamp_ms: meta.timestamp_ms,
                 amount: received_value,
                 fee: 0,
+                amount_is_net_outflow: false,
+                fee_known: true,
                 // A diversified address is private on-chain but visible to this
                 // wallet's FVK. Preserve it so a watch-only merchant gateway can
                 // reconcile one unique invoice address without amount matching.
                 recipient: received.first().map(|note| note.note.recipient().to_raw_address_bytes()),
                 memo: received.iter().find(|r| !r.memo.is_empty()).map(|r| r.memo.clone()).unwrap_or_default(),
+                credits: credits_from_received(received),
             }
         };
         self.push_history(entry);
+    }
+
+    /// Sent rows still missing what only the full transaction can tell: recipient, paid
+    /// amount, memo and fee. A row ingested from compact records is stored as a bare net
+    /// outflow (`fee_known == false`); this lists them oldest-first as `(txid, daa)` so the
+    /// daemon can fetch each transaction's full bundle and call
+    /// [`Self::recover_sent_from_bundle`]. Rows already attempted are marked `fee_known`
+    /// whether or not a recipient came out, so a send built without our OVK is never
+    /// re-fetched.
+    pub fn unrecovered_sends(&self, from: usize) -> Vec<([u8; 32], u64)> {
+        self.history
+            .iter()
+            .skip(from)
+            .filter(|h| h.kind == HistoryKind::Sent && h.recipient.is_none() && !h.fee_known)
+            .map(|h| (h.txid, h.daa_score))
+            .collect()
+    }
+
+    /// Fill in a compact-ingested Sent row from the transaction's full bundle: recipient,
+    /// paid amount and memo via our outgoing viewing key (when the send was built with
+    /// it), and the exact fee from the value balance. Same recovery as
+    /// [`Self::record_bundle_history`], applied to a row that already exists. Returns
+    /// whether a recipient was recovered. The row is marked `fee_known` either way.
+    pub fn recover_sent_from_bundle(&mut self, txid: &[u8; 32], bundle: &ShieldedBundle) -> bool {
+        let Some(pos) = self.history.iter().rposition(|h| h.kind == HistoryKind::Sent && &h.txid == txid) else {
+            return false;
+        };
+        let fee = bundle.value_balance.max(0) as u64;
+        let mut recipient = None;
+        let mut memo = Vec::new();
+        let mut recovered_paid = 0u64;
+        let mut credits = Vec::new();
+        for a in &bundle.actions {
+            let Some(action) = reconstruct_action(a) else { continue };
+            let domain = OrchardDomain::for_action(&action);
+            let Some((note, addr, m)) =
+                try_output_recovery_with_ovk(&domain, &self.ovk, &action, action.cv_net(), &a.out_ciphertext)
+            else {
+                continue;
+            };
+            let addr_bytes = addr.to_raw_address_bytes();
+            if addr_bytes == self.my_address {
+                continue; // our own change
+            }
+            let m = trim_memo(&m);
+            recovered_paid = recovered_paid.saturating_add(note.value().inner());
+            if recipient.is_none() {
+                recipient = Some(addr_bytes);
+                memo = m.clone();
+            }
+            credits.push(Credit { recipient: addr_bytes, value: note.value().inner(), memo: m });
+        }
+        let h = &mut self.history[pos];
+        let net_out = if h.amount_is_net_outflow { h.amount } else { h.amount.saturating_add(h.fee) };
+        h.fee = fee;
+        h.fee_known = true;
+        h.amount_is_net_outflow = false;
+        if recipient.is_some() {
+            h.amount = recovered_paid;
+            h.recipient = recipient;
+            h.memo = memo;
+            h.credits = credits;
+            true
+        } else {
+            h.amount = net_out.saturating_sub(fee);
+            false
+        }
     }
 
     fn push_history(&mut self, entry: HistoryEntry) {
@@ -996,7 +1553,62 @@ impl WalletDb {
                 i += 1;
             }
         }
+        // A reclaimed spend owes no change: the note itself is back in `notes`.
+        self.prune_pending_change();
         reclaimed
+    }
+
+    /// Record what a just-submitted spend `txid` sends AWAY (amount + fee), so the
+    /// remainder of its parked input notes can be shown as change coming back.
+    /// Call right after the [`Self::mark_spent`] calls for that transaction. A no-op
+    /// when nothing is parked under `txid`; records no change when nothing is left over.
+    pub fn note_pending_outflow(&mut self, txid: [u8; 32], outflow: u64) {
+        let parked: u64 = self.pending_spends.iter().filter(|p| p.txid == txid).map(|p| p.note.value()).sum();
+        if parked == 0 {
+            return;
+        }
+        let change = parked.saturating_sub(outflow);
+        if change > 0 {
+            self.pending_change.insert(txid, change);
+        } else {
+            self.pending_change.remove(&txid);
+        }
+    }
+
+    /// Change owed back by this wallet's own in-flight spends — the part of each
+    /// parked input note that is neither the amount paid nor the fee. Not in
+    /// [`Self::balance`] and never spendable: it exists on-chain only once the send
+    /// is mined and lands in `notes` when that block is ingested.
+    pub fn pending_change(&self) -> u128 {
+        self.pending_change
+            .iter()
+            .filter(|(txid, _)| self.pending_spends.iter().any(|p| &p.txid == *txid))
+            .map(|(_, v)| *v as u128)
+            .sum()
+    }
+
+    /// Drop change entries whose spend is no longer parked (confirmed on-chain or
+    /// reclaimed) — the change is then either a real note in `notes` or moot.
+    fn prune_pending_change(&mut self) {
+        if self.pending_change.is_empty() {
+            return;
+        }
+        let ps = &self.pending_spends;
+        self.pending_change.retain(|t, _| ps.iter().any(|p| &p.txid == t));
+    }
+
+    /// Whether this bundle is one of the wallet's own submitted spends whose change
+    /// is already published via [`Self::pending_change`]. Its input left the balance
+    /// at submit, so previewing it would count the change a second time (as
+    /// `incoming`). Matched on the whole nullifier set — the builder shuffles
+    /// actions, so no single action index can identify the transaction.
+    fn accounted_pending_spend(&self, mut nullifiers: impl Iterator<Item = [u8; 32]>) -> bool {
+        if self.pending_change.is_empty() {
+            return false;
+        }
+        nullifiers.any(|nf| {
+            self.pending_spends.iter().any(|p| p.note.nullifier == nf && self.pending_change.contains_key(&p.txid))
+        })
     }
 
     /// What an **unsettled** block would do to this wallet's balance, without touching
@@ -1026,6 +1638,10 @@ impl WalletDb {
             // Same drop rule as ingest: a bundle re-spending an already-spent nullifier
             // appends nothing, so it must not be previewed either.
             if bundle.actions.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
+                continue;
+            }
+            // Our own parked spend with its change already reported: nothing to add.
+            if self.accounted_pending_spend(bundle.actions.iter().map(|a| a.nullifier)) {
                 continue;
             }
             // What this bundle takes from us: an action reveals the nullifier of the note it
@@ -1067,11 +1683,11 @@ impl WalletDb {
             if records.iter().any(|a| self.spent_nullifiers.contains(&a.nullifier)) {
                 continue;
             }
-            let spent: u128 = records
-                .iter()
-                .filter_map(|a| self.notes.iter().find(|n| n.nullifier == a.nullifier))
-                .map(|n| n.value() as u128)
-                .sum();
+            if self.accounted_pending_spend(records.iter().map(|a| a.nullifier)) {
+                continue;
+            }
+            let spent: u128 =
+                records.iter().filter_map(|a| self.notes.iter().find(|n| n.nullifier == a.nullifier)).map(|n| n.value() as u128).sum();
             let received: u128 =
                 scan_compact_prepared(&self.prepared_ivk, records).iter().map(|r| r.note.value().inner() as u128).sum();
             if spent > 0 {
@@ -1204,6 +1820,21 @@ impl WalletDb {
     /// O(leaves-below-target) rebuild bounded so the caller can spread it across sync passes.
     /// Returns `true` if the base can still be rolled further toward `target`.
     pub fn advance_base_capped(&mut self, target: u64, max_leaves: u64) -> bool {
+        // A shared tree NEVER compacts. Compaction is bounded by the earliest note the
+        // wallet still holds — and a `leaves_only` tree holds none, so that bound is
+        // `size` and it would roll the base straight to the tip, discarding the entire
+        // leaf stream it exists to keep. Observed live 2026-08-07 within minutes of
+        // enabling it: `base_size=2061411 == matured 2061411`, i.e. the shared stream
+        // had summarised away every leaf and could witness nothing for anybody. It also
+        // made the off-lock cache build unable to ever install (`built.base_size !=
+        // self.base_size` on every attempt, logged as "the stream moved under it").
+        //
+        // Its whole job is to hold positions 0..tip on behalf of wallets whose own
+        // bases have moved far past them, so "no notes" means "keep everything", not
+        // "keep nothing".
+        if self.leaves_only {
+            return false;
+        }
         // Never roll past a note we still hold, or past what we've ingested. A note
         // parked in `pending_spends` counts as HELD: it left `notes` when its spend
         // was submitted, but `reclaim_expired` returns it if the transaction never
@@ -1401,10 +2032,7 @@ impl WalletDb {
     /// Recovery requires older wallet state whose leaf stream still covers the
     /// note (see the walletd graft tooling), or an archival replay of the chain.
     pub fn stranded_notes(&self) -> Vec<&OwnedNote> {
-        self.notes
-            .iter()
-            .filter(|n| n.position < self.base_size && !self.witnesses.iter().any(|(p, _)| *p == n.position))
-            .collect()
+        self.notes.iter().filter(|n| n.position < self.base_size && !self.witnesses.iter().any(|(p, _)| *p == n.position)).collect()
     }
 
     fn live_witness_path(&self, position: u64, matured_leaves: u64) -> Option<MerklePath> {
@@ -1423,8 +2051,11 @@ impl WalletDb {
     /// send error) rather than silently root to a wrong tree.
     fn decoded_leaves(&self) -> &[MerkleHashOrchard] {
         self.decoded.get_or_init(|| {
+            // Each leaf decodes independently; a multi-million-leaf stream is seconds of
+            // one core, so spread it.
+            use rayon::prelude::*;
             self.leaves
-                .iter()
+                .par_iter()
                 .map(|b| Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(b)))
                 .collect::<Option<Vec<_>>>()
                 .unwrap_or_default()
@@ -1440,6 +2071,10 @@ impl WalletDb {
     }
 
     fn append_leaf(&mut self, cmx: ExtractedNoteCommitment, owned: Option<Note>) {
+        // ~25 ns of clock against ~150 us of Sinsemilla: under 0.02% overhead, and it
+        // is the only place every ingest path (full, compact, precomputed) converges.
+        let t_leaf = std::time::Instant::now();
+        self.scan_cost.leaves += 1;
         let leaf = MerkleHashOrchard::from_cmx(&cmx);
         self.leaves.push(leaf.to_bytes());
         // Keep an already-materialised cache in step rather than invalidating it — a
@@ -1447,19 +2082,206 @@ impl WalletDb {
         if let Some(d) = self.decoded.get_mut() {
             d.push(leaf);
         }
-        // `append` only errors when the tree is full (2^32 leaves) — unreachable.
-        let _ = self.tree.append(leaf);
+        // The mirror tree is the expensive half of a scan and it is PUBLIC — the shared
+        // tree is building the identical thing. A borrowing wallet skips it and adopts
+        // that frontier instead (see `adopt_tip_frontier`), which is sound because the
+        // frontier at N leaves depends only on leaves 0..N.
+        let t_mirror = std::time::Instant::now();
+        if self.borrow_tree {
+            self.tree_valid = false;
+        } else {
+            // `append` only errors when the tree is full (2^32 leaves) — unreachable.
+            let _ = self.tree.append(leaf);
+        }
+        self.scan_cost.mirror_ns += t_mirror.elapsed().as_nanos();
+        let t_subtree = std::time::Instant::now();
         // Keep the complete-subtree cache in step: one combine per leaf, amortized. If
         // the mountain range ever refuses a leaf the cache is dropped, not patched — a
         // half-updated cache must never be consulted.
         if self.subtree.active && self.subtree.upto == self.size && !self.subtree.push_leaf(self.size, leaf) {
             self.subtree = SubtreeCache { failed: true, ..Default::default() };
         }
+        self.scan_cost.subtree_ns += t_subtree.elapsed().as_nanos();
         if let Some(note) = owned {
             let nullifier = note.nullifier(&self.fvk).to_bytes();
-            self.notes.push(OwnedNote { note, position: self.size, nullifier });
+            // The stream already carried this note's nullifier, so the note was spent before it
+            // appeared here. The chain's own order never does that, but a backfilled history archive
+            // is bound by its leaf sequence and its nullifier multiset, not by which action carries
+            // each nullifier, so a record can move a spend earlier than the note it spends. The
+            // nullifier set is the truth either way: keep the leaf (the tree must not change) and
+            // never offer the note as spendable.
+            if !self.spent_nullifiers.contains(&nullifier) {
+                self.notes.push(OwnedNote { note, position: self.size, nullifier });
+            }
         }
         self.size += 1;
+        self.scan_cost.tree_ns += t_leaf.elapsed().as_nanos();
+    }
+
+    /// Stop maintaining this wallet's own mirror tree; the shared tree supplies it.
+    ///
+    /// Turning this ON invalidates `tree` as soon as the next leaf arrives, so
+    /// `anchor()` must not be read until [`Self::adopt_tip_frontier`] succeeds.
+    /// Turning it OFF does not repair anything — the wallet keeps hashing from that
+    /// point on, but the leaves it skipped are still missing from `tree`, so it stays
+    /// invalid until a frontier is adopted or the wallet is reloaded.
+    pub fn set_borrow_tree(&mut self, on: bool) {
+        self.borrow_tree = on;
+    }
+
+    /// Is this wallet relying on the shared tree rather than maintaining its own?
+    ///
+    /// Callers need this to know what a `false` from [`Self::tree_is_valid`] MEANS. For
+    /// a wallet keeping its own tree it is a fault worth refusing over. For a borrowing
+    /// wallet it is the normal resting state — `borrow_tree` invalidates the mirror on
+    /// the very next leaf — and the anchor it would produce is the shared tree's
+    /// frontier anyway, so demanding one asks the wallet to answer for a tree it does
+    /// not own.
+    pub fn is_borrowing(&self) -> bool {
+        self.borrow_tree
+    }
+
+    /// This wallet's tip frontier, as a portable [`FrontierState`] — how the shared
+    /// tree hands its tree to everyone else.
+    ///
+    /// Returns `None` when `tree` does not describe `size` (a borrowing wallet that has
+    /// not adopted one yet), so a stale frontier can never be handed on as if it were
+    /// current.
+    pub fn tip_frontier_state(&self) -> Option<FrontierState> {
+        if !self.tree_valid {
+            return None;
+        }
+        let f = self.tree.to_frontier();
+        Some(match f.value() {
+            None => FrontierState { size: 0, leaf: None, ommers: Vec::new() },
+            Some(nef) => FrontierState {
+                size: self.size,
+                leaf: Some(nef.leaf().to_bytes()),
+                ommers: nef.ommers().iter().map(|o| o.to_bytes()).collect(),
+            },
+        })
+    }
+
+    /// Whether `tree` reflects `size` — i.e. whether `anchor()` means anything.
+    pub fn tree_is_valid(&self) -> bool {
+        self.tree_valid
+    }
+
+    /// Install a tip frontier taken from the shared tree, making `tree` valid again.
+    ///
+    /// **Refuses unless the frontier describes exactly this wallet's `size`.** A
+    /// commitment tree's frontier at N leaves is determined by leaves 0..N alone, so a
+    /// frontier at the same size is provably this wallet's own — and one at a
+    /// different size provably is not. That single equality check is the whole safety
+    /// argument for borrowing, which is why it is enforced here rather than trusted
+    /// from the caller.
+    pub fn adopt_tip_frontier(&mut self, fs: &crate::tree::FrontierState) -> bool {
+        if fs.size != self.size {
+            return false;
+        }
+        let Ok(t) = GlobalTree::from_state(fs) else { return false };
+        self.tree = CommitmentTree::from_frontier(t.frontier());
+        self.tree_valid = true;
+        true
+    }
+
+    /// Trial-decrypt an entire page up front, so the expensive per-action work happens
+    /// once over a large batch instead of once per transaction.
+    ///
+    /// Call immediately before ingesting the page's blocks; the results are consumed by
+    /// [`Self::ingest_block_compact_precomputed_with_meta`] and dropped by
+    /// [`Self::end_page`]. Purely an optimisation: anything not found is decrypted the
+    /// old way, so a bug here can cost time but not notes.
+    pub fn predecrypt_page(&mut self, all: &[CompactActionRecord]) {
+        self.predecrypt_page_cached(all, None)
+    }
+
+    /// As [`Self::predecrypt_page`], reusing the ephemeral keys the decoded page already
+    /// decompressed for the whole cohort. Decompression is key-independent, so without
+    /// this every wallet on a page repeats the identical modular square roots.
+    pub fn predecrypt_page_cached(
+        &mut self,
+        all: &[CompactActionRecord],
+        epks: Option<&[Option<pasta_curves::pallas::Point>]>,
+    ) {
+        self.predecrypt_page_prepared(all, epks, None)
+    }
+
+    /// As [`Self::predecrypt_page_cached`], also reusing the DEVICE-READY form of those
+    /// keys — affine limbs packed once for the cohort. With a device filter installed
+    /// this is the whole of the per-wallet host cost: gather one ciphertext byte per
+    /// action, ask, hand the survivors to orchard. `None` for either cache falls back
+    /// exactly as before, so a drift here costs time and never a note.
+    pub fn predecrypt_page_prepared(
+        &mut self,
+        all: &[CompactActionRecord],
+        epks: Option<&[Option<pasta_curves::pallas::Point>]>,
+        prep: Option<&crate::wallet::PreparedEpks>,
+    ) {
+        if self.leaves_only || all.is_empty() {
+            return;
+        }
+        // Count this against the scan's decrypt budget. Moving the work here without
+        // moving the timer made both counters read ~0.1 us/action while the daemon was
+        // doing exactly as much work as before — telemetry that flatters the change it
+        // is supposed to measure is worse than none, and I nearly reported it as a win.
+        let t_dec = std::time::Instant::now();
+        let found = crate::wallet::scan_compact_auto_prepared(&self.prepared_ivk, self.agree_scalar.as_ref(), all, prep, epks);
+        self.scan_cost.decrypt_ns += t_dec.elapsed().as_nanos();
+        self.scan_cost.actions += all.len() as u64;
+        let mut map: std::collections::HashMap<[u8; 32], Option<ReceivedNote>> = all.iter().map(|r| (r.nullifier, None)).collect();
+        for n in found {
+            if let Some(rec) = all.get(n.action_index) {
+                map.insert(rec.nullifier, Some(n));
+            }
+        }
+        self.predecrypted = Some(map);
+    }
+
+    /// Drop the page memo. Always call after the page's blocks are ingested — a stale
+    /// memo would answer for a later page it never saw.
+    pub fn end_page(&mut self) {
+        self.predecrypted = None;
+    }
+
+    /// Ingest for the **tree only**, skipping trial decryption.
+    ///
+    /// A Merkle path is a statement about the chain, not about a viewing key: every
+    /// wallet ingesting the same blocks builds a byte-identical leaf stream. That
+    /// shared half is also where a scan's CPU actually goes — measured live at
+    /// **169 µs/leaf of tree against 107 µs/action of decryption**, ~80/20. A daemon
+    /// syncing many wallets pays the shared half once *per wallet* today; it only
+    /// ever needs to pay it once in total, if one keyless copy of the stream is kept
+    /// for everyone to witness against.
+    ///
+    /// This flag makes that copy cheap. Only the two calls that try to *recognise* a
+    /// note are suppressed. Everything that determines the leaf STREAM is
+    /// key-independent and still runs — the nullifier drop rule, the coinbase
+    /// commit-or-skip rule, the append order — so the stream stays identical to a
+    /// real wallet's leaf for leaf. That is why this is a flag on the ordinary
+    /// ingest rather than a separate "append these commitments" entry point: the
+    /// caller cannot get the sequence wrong, because it is the same code.
+    ///
+    /// Such a wallet can never own a note, so `notes` stays empty and no balance,
+    /// history or spend path is meaningful on it.
+    /// Whether ingest has seen data that consensus could never have applied (see `poisoned`).
+    pub fn poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Mark this database diverged on evidence found outside ingest (e.g. its root disagrees with
+    /// the node's consensus frontier at the same block). Same consequences as `poisoned`.
+    pub fn mark_poisoned(&mut self) {
+        self.poisoned = true;
+    }
+
+    pub fn set_leaves_only(&mut self, on: bool) {
+        self.leaves_only = on;
+    }
+
+    /// Whether this is a keyless shared tree — see [`Self::set_leaves_only`].
+    pub fn is_leaves_only(&self) -> bool {
+        self.leaves_only
     }
 
     /// Build a membership witness for the owned note at `position`, as an Orchard
@@ -1518,7 +2340,69 @@ impl WalletDb {
     /// keeps using the replay. So a bug in the mountain range, in the frontier seeding,
     /// or in the indexing cannot produce a wrong witness; it can only fail to help.
     pub fn build_subtree_cache(&mut self) {
-        self.build_subtree_cache_until(|| false);
+        self.build_subtree_cache_with_progress(&AtomicU64::new(0));
+    }
+
+    /// As [`Self::build_subtree_cache`], folding across every core
+    /// (`SubtreeCache::fold_parallel`) and counting leaves folded into `progress`
+    /// (relative to where this build started). Runs to completion: this is the
+    /// never-yield path a caller takes when the cache is wanted NOW. The sliced,
+    /// resumable [`Self::build_subtree_cache_until`] stays sequential, since a stood-down
+    /// partial must be a plain left-to-right prefix.
+    pub fn build_subtree_cache_with_progress(&mut self, progress: &AtomicU64) -> bool {
+        if self.subtree.failed || (self.subtree.active && self.subtree.upto == self.size) {
+            return self.subtree.active;
+        }
+        let Some((mut c, _)) = self.subtree_build_start() else { return false };
+        let ok = {
+            let leaves = self.decoded_leaves();
+            c.fold_parallel(self.base_size, leaves, PAR_WINDOW_LOG2, progress)
+        };
+        if !ok {
+            self.subtree = SubtreeCache { failed: true, ..Default::default() };
+            return false;
+        }
+        c.partial = false;
+        c.active = true;
+        let ok = self.cache_matches_tree(&c);
+        self.subtree = if ok { c } else { SubtreeCache { failed: true, ..Default::default() } };
+        ok
+    }
+
+    /// The cache a build starts from and the stream offset to fold from: a stood-down
+    /// partial resumed at its `upto`, or a fresh cache seeded from the base frontier.
+    /// `None` marks the cache failed (the frontier could not seed it).
+    fn subtree_build_start(&mut self) -> Option<(SubtreeCache, usize)> {
+        // Resume a build that stood down earlier rather than repeat it. The sweep is a
+        // pure left-to-right fold, so a partial cache is a valid prefix and continuing
+        // from `upto` yields exactly the same structure as starting over.
+        //
+        // Without this, yielding costs the WHOLE pass — measured live at 243-296 s per
+        // wallet. That made every stand-down ruinously expensive, which is why the old
+        // code could only afford to yield for proving, and why it could not afford to
+        // yield for a request waiting on the wallet lock at all. Cheap yields are what
+        // make aggressive yielding affordable.
+        //
+        // Only resume when the partial still lines up with the current stream: base
+        // compaction can move `base_size` and re-index `decoded_leaves`, so a prefix
+        // that starts below the current base is discarded rather than reinterpreted.
+        let resume_from = if self.subtree.partial && !self.subtree.active {
+            self.subtree.upto.checked_sub(self.base_size).filter(|&r| r as usize <= self.decoded_leaves().len())
+        } else {
+            None
+        };
+        let c = match resume_from {
+            Some(_) => std::mem::take(&mut self.subtree),
+            None => {
+                let mut c = SubtreeCache::default();
+                if !c.seed_from_frontier(&self.base_frontier, self.base_size) {
+                    self.subtree = SubtreeCache { failed: true, ..Default::default() };
+                    return None;
+                }
+                c
+            }
+        };
+        Some((c, resume_from.unwrap_or(0) as usize))
     }
 
     /// As [`Self::build_subtree_cache`], but abandons the sweep as soon as `should_yield`
@@ -1546,17 +2430,19 @@ impl WalletDb {
             return self.subtree.active;
         }
         let reject = SubtreeCache { failed: true, ..Default::default() };
-        let mut c = SubtreeCache::default();
-        if !c.seed_from_frontier(&self.base_frontier, self.base_size) {
-            self.subtree = reject;
-            return false;
-        }
+        // Resume a stood-down partial or seed afresh — see `subtree_build_start`.
+        let Some((mut c, start)) = self.subtree_build_start() else { return false };
         {
             let leaves = self.decoded_leaves();
             let base = self.base_size;
-            for (i, leaf) in leaves.iter().enumerate() {
-                if i % YIELD_CHECK_EVERY == 0 && i > 0 && should_yield() {
-                    return false; // stand down; retried later, cache untouched
+            for (i, leaf) in leaves.iter().enumerate().skip(start) {
+                if i % YIELD_CHECK_EVERY == 0 && i > start && should_yield() {
+                    // Stand down, KEEPING the prefix folded so far. Not usable (active
+                    // stays false); resumed by the next call.
+                    c.partial = true;
+                    c.active = false;
+                    self.subtree = c;
+                    return false;
                 }
                 if !c.push_leaf(base + i as u64, *leaf) {
                     self.subtree = reject;
@@ -1564,16 +2450,123 @@ impl WalletDb {
                 }
             }
         }
+        c.partial = false;
         c.active = true;
-        let ok = self.root_from(&c, self.size).is_some_and(|r| r == self.tree.root());
+        let ok = self.cache_matches_tree(&c);
         self.subtree = if ok { c } else { reject };
         ok
+    }
+
+    /// Snapshot everything a subtree-cache build needs, so it can run **off the wallet
+    /// lock** — see [`SubtreeBuildJob`].
+    pub fn subtree_build_job(&self) -> SubtreeBuildJob {
+        SubtreeBuildJob {
+            base_frontier: self.base_frontier.clone(),
+            base_size: self.base_size,
+            leaves: self.decoded_leaves().to_vec(),
+        }
+    }
+
+    /// Install a cache folded off-lock by [`SubtreeBuildJob::run`].
+    ///
+    /// Accepted only if it still describes THIS stream: base compaction re-indexes the
+    /// leaves, so a cache folded over an older base cannot be reinterpreted against the
+    /// current one and is refused rather than adjusted. Leaves appended while the build
+    /// ran are folded in here — the tail only, which is cheap — and the result must pass
+    /// exactly the same root gate as an in-line build before anything can serve from it.
+    /// Returns false on any mismatch, leaving the wallet on the replay path.
+    pub fn install_subtree_cache(&mut self, built: BuiltSubtreeCache) -> bool {
+        self.install_subtree_cache_reason(built).is_ok()
+    }
+
+    /// As [`Self::install_subtree_cache`], but says WHY it refused.
+    ///
+    /// 728 of 846 builds on the hosted daemon were discarded, all of them logged as "the
+    /// stream moved under it" — a single message covering four distinct rejections, only
+    /// one of which is actually a moving stream. Four minutes of CPU per attempt were being
+    /// thrown away without recording which precondition failed, so there was nothing to fix
+    /// against. The caller logs this string.
+    pub fn install_subtree_cache_reason(&mut self, built: BuiltSubtreeCache) -> Result<(), &'static str> {
+        if self.subtree.failed {
+            return Err("cache already marked failed");
+        }
+        // The base is the one thing a build CANNOT absorb: it summarises away the very
+        // leaves the cache indexes, so a compaction mid-build invalidates the result.
+        if built.base_size != self.base_size {
+            return Err("base moved during the build");
+        }
+        let mut c = built.cache;
+        {
+            let base = self.base_size;
+            let Some(start) = c.upto.checked_sub(base) else { return Err("cache starts below the base") };
+            let leaves = self.decoded_leaves();
+            if start as usize > leaves.len() {
+                return Err("cache reaches past the leaf stream");
+            }
+            // Leaves that arrived WHILE the build ran are simply folded in here, so a
+            // growing stream is expressly not a failure.
+            for (i, leaf) in leaves.iter().enumerate().skip(start as usize) {
+                if !c.push_leaf(base + i as u64, *leaf) {
+                    return Err("catch-up leaf rejected by the cache");
+                }
+            }
+        }
+        c.active = true;
+        c.partial = false;
+        match self.root_from(&c, self.size) {
+            None => Err("cache cannot produce a root at the wallet size"),
+            // A borrowed tree is not this wallet's to disagree with — see
+            // `cache_matches_tree`.
+            Some(r) if !self.tree_valid || r == self.tree.root() => {
+                self.subtree = c;
+                Ok(())
+            }
+            Some(_) => Err("cache root disagrees with the wallet tree"),
+        }
+    }
+
+    /// Give back every byte this wallet is holding that it can rebuild.
+    ///
+    /// Only the decoded leaf cache qualifies: it mirrors `leaves` index-for-index and
+    /// `decoded_leaves()` recreates it on demand, so dropping it costs one re-decode the
+    /// next time a witness is climbed and nothing else. At ~32 bytes per leaf it is the
+    /// largest reclaimable allocation a wallet has — tens to hundreds of MB — and until
+    /// now it was released in exactly one place (base compaction) and otherwise held for
+    /// the life of the process.
+    ///
+    /// That is affordable on a server and is not on a phone, where the engine owns one
+    /// wallet, Android sends `onTrimMemory` before it starts killing, and the app is the
+    /// biggest thing on the device. Returns the number of decoded leaves dropped so a
+    /// caller can log what it actually reclaimed.
+    pub fn release_reclaimable(&mut self) -> usize {
+        let n = self.decoded.get().map(|d| d.len()).unwrap_or(0);
+        self.decoded = OnceCell::new();
+        n
+    }
+
+    /// Where this wallet's scan CPU has gone so far — see [`ScanCost`].
+    pub fn scan_cost(&self) -> ScanCost {
+        self.scan_cost
     }
 
     /// Whether the cache can serve witnesses at `matured` (used by callers to decide
     /// whether a spend needs the slow path at all).
     pub fn subtree_cache_ready(&self, matured: u64) -> bool {
         self.subtree.active && self.subtree.upto >= matured
+    }
+
+    /// The cache was attempted and rejected — it will not be retried, and this wallet
+    /// keeps the replay path. Distinguishes a genuine failure from a build that merely
+    /// stood down part-way, which reports the same `false` from
+    /// [`Self::build_subtree_cache_until`] but has kept its progress.
+    pub fn subtree_cache_failed(&self) -> bool {
+        self.subtree.failed
+    }
+
+    /// Absolute leaf index folded into the cache so far, complete or in progress. Lets a
+    /// caller report real progress for a sliced build instead of guessing.
+    pub fn subtree_build_upto(&self) -> u64 {
+        self.subtree.upto
     }
 
     /// Fold the `2^CACHE_LEVEL`-leaf window starting at `start` (which must be window
@@ -1638,6 +2631,34 @@ impl WalletDb {
             };
         }
         Some(out)
+    }
+
+    /// Whether `c` reproduces this wallet's own tree — the belt-and-braces check on an
+    /// assembled subtree cache.
+    ///
+    /// It is only ANSWERABLE when `tree_valid`. A wallet that borrows the shared chain
+    /// tree has no meaningful mirror of its own: `tree_valid` is cleared by every leaf
+    /// appended while borrowing, and a checkpoint written in that state records no tip
+    /// frontier, so `self.tree` restores empty. Comparing a correct cache against that
+    /// empty tree rejects it every single time.
+    ///
+    /// Measured on the hosted daemon 2026-09-24: 1140 install attempts, 1140 rejections,
+    /// ALL of them "root disagrees", zero successes — including builds of 733 leaves that
+    /// finished in 25 ms, where nothing can have moved. That is not a race; it is a
+    /// comparison against a tree that was never the wallet's.
+    ///
+    /// Dropping the comparison when it cannot be made is not dropping the guarantee. It
+    /// was never what kept a spend honest: `subtree_paths` re-derives the anchor root for
+    /// every assembled path and declines each one that does not reproduce it, so a wrong
+    /// cache costs a fall back to the O(chain) replay — the old slow path — and can never
+    /// produce a wrong witness. The structural requirement stays: a cache that cannot
+    /// produce a root at all is still refused.
+    fn cache_matches_tree(&self, c: &SubtreeCache) -> bool {
+        let Some(root) = self.root_from(c, self.size) else { return false };
+        if !self.tree_valid {
+            return true;
+        }
+        root == self.tree.root()
     }
 
     /// The tree root at exactly `matured` leaves, derived from the cache in O(depth).
@@ -1803,7 +2824,8 @@ impl WalletDb {
                     let mut parents: Vec<u64> = cur.keys().map(|j| j >> 1).collect();
                     parents.sort_unstable();
                     parents.dedup();
-                    let mut up: std::collections::HashMap<u64, MerkleHashOrchard> = std::collections::HashMap::with_capacity(parents.len());
+                    let mut up: std::collections::HashMap<u64, MerkleHashOrchard> =
+                        std::collections::HashMap::with_capacity(parents.len());
                     for pj in parents {
                         let lidx = pj << 1;
                         let Some(left) = cur.get(&lidx) else { continue }; // left child below/straddling base → left context
@@ -1903,17 +2925,35 @@ impl WalletDb {
     }
 
     /// Reconstruct a coinbase note if it was paid to this wallet. A coinbase note
-    /// is ours iff its stated recipient equals our address; the note is then fully
-    /// determined by the public `(recipient, ρ, rseed)` and the public `value`,
+    /// is ours iff its stated recipient is one of our addresses; the note is then
+    /// fully determined by the public `(recipient, ρ, rseed)` and the public `value`,
     /// exactly as [`crate::coinbase`] recomputes the commitment.
+    ///
+    /// **Every diversified address, not just index 0.** A shielded *output* is found
+    /// by trial decryption keyed on the incoming viewing key, which is diversifier-
+    /// independent — so `?index=N` addresses have always worked there, exactly as the
+    /// endpoint advertises ("all of them pay into the same wallet and are found by its
+    /// one scan"). A coinbase note carries its recipient in the clear and took a
+    /// different path: a raw equality against `my_address`, which is `address_at(0)`.
+    /// So a coinbase paid to any issued `?index=N` address — the custodial
+    /// per-customer deposit address that same endpoint exists to provide — was
+    /// silently never recognised. The funds are on chain and this wallet holds the
+    /// key; the balance simply never showed them.
+    ///
+    /// The check is a set membership against addresses derived once at load
+    /// ([`Self::known_addresses`]), so it stays as cheap as the byte compare it
+    /// replaces. That matters: coinbase is roughly half of all leaves, and the old
+    /// comparison returning before any curve work is why coinbase scanning costs
+    /// nothing today. Deriving per candidate instead would have put a scalar
+    /// multiplication on that path.
     fn recover_coinbase_note(&self, desc: &CoinbaseNoteDesc, value: u64) -> Option<Note> {
-        if desc.recipient != self.my_address {
+        if desc.recipient != self.my_address && !self.known_addresses.contains(&desc.recipient) {
             return None;
         }
         let addr = Option::<Address>::from(Address::from_raw_address_bytes(&desc.recipient))?;
         let rho = Option::<Rho>::from(Rho::from_bytes(&desc.rho))?;
         let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(desc.rseed, &rho))?;
-        Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed))
+        Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))
     }
 
     /// Serialize the wallet's **scanned state** — the fast-sync base frontier, the
@@ -1928,6 +2968,235 @@ impl WalletDb {
     /// [base:0 | 1 (base_leaf:32)(n_ommers:u64)(ommer:32)*] [size:u64]
     /// [n_leaves:u64](leaf:32)* [n_notes:u64]
     /// (position:u64, nullifier:32, recipient:43, value:u64, rho:32, rseed:32)*`.
+    /// Serialize the **private** part of a completed scan: the owned notes, a live
+    /// membership witness for each, and the tree frontier they root to.
+    ///
+    /// This exists because a scan is expensive to redo and trivial to carry. A
+    /// checkpoint is ~572 MB, almost all of it the public commitment stream — the same
+    /// bytes for every wallet on the chain, and already obtainable from any node. What
+    /// is genuinely *this wallet's* is a few hundred bytes per note. A receipt is that
+    /// part alone, which is what makes "I switched my phone from the hosted service to
+    /// the on-device engine" cost a kilobyte instead of a full rescan from birthday.
+    ///
+    /// [`Self::from_frontier`] already starts a wallet at a frontier, but its notes must
+    /// then live *above* it, because a frontier alone cannot produce a path to a leaf
+    /// beneath it. Shipping the witnesses is exactly what lifts that restriction, and it
+    /// is why this is not just "send a frontier".
+    ///
+    /// Nothing secret is written. Every field is either public chain state or something
+    /// the recipient's own viewing key would derive by scanning; the nullifiers are
+    /// deliberately *not* written, because the importer recomputes them from its own key
+    /// (see [`Self::from_scan_receipt_fvk`]). Spend authority is not involved.
+    ///
+    /// Returns `None` when the wallet cannot be represented this way: a borrowed or stale
+    /// tree, witnesses not advanced to the tip of what was scanned, a note with no live
+    /// witness (the importer has no leaf stream to rebuild one from), or more notes than
+    /// [`RECEIPT_MAX_NOTES`]. The caller should fall back to an ordinary scan and say so.
+    /// The anchor is taken from `lag_tree`, which is by definition the tree at exactly
+    /// `witnessed_upto` and the thing every live witness roots to. An earlier version
+    /// asked the caller for the tip frontier instead; that was wrong, and wrong in a way
+    /// that made the whole feature inert: a hosted wallet normally *borrows* the shared
+    /// chain tree, so its own mirror is invalid and the shared frontier sits at a
+    /// different leaf count, which the size check then rejected. Every real wallet
+    /// answered 409. Deriving the anchor from the witnesses themselves cannot disagree
+    /// with them.
+    ///
+    /// `witnessed_upto` must equal `size` all the same, for a different reason: the
+    /// receipt resumes the importer at `scanned_daa`, which is where `size` reached. If
+    /// the witnesses lagged, the importer would start its tree at `witnessed_upto` and
+    /// then skip the leaves between there and `scanned_daa` — a silently wrong tree, and
+    /// unspendable notes. Refusing is the only safe answer; the caller advances the
+    /// witnesses and retries.
+    ///
+    /// The `Err` says which condition failed, because "cannot export" with no reason is
+    /// what made this take a production round trip to diagnose.
+    pub fn to_scan_receipt(&self, genesis: [u8; 32], scanned_daa: u64) -> Result<Vec<u8>, String> {
+        if self.notes.len() > RECEIPT_MAX_NOTES {
+            return Err(format!("holds {} notes, more than a receipt carries ({RECEIPT_MAX_NOTES})", self.notes.len()));
+        }
+        if self.witnessed_upto != self.size {
+            return Err(format!(
+                "witnesses are at leaf {} but the wallet has scanned to {} ({} behind); retry once they catch up",
+                self.witnessed_upto,
+                self.size,
+                self.size.saturating_sub(self.witnessed_upto),
+            ));
+        }
+        let unwitnessed = self.notes.iter().filter(|n| !self.witnesses.iter().any(|(p, _)| *p == n.position)).count();
+        if unwitnessed > 0 {
+            return Err(format!(
+                "{unwitnessed} of {} notes have no live witness, and the importer has no leaf stream to rebuild one from",
+                self.notes.len()
+            ));
+        }
+        // The tree the witnesses actually root to.
+        let f = self.lag_tree.to_frontier();
+        let fs = match f.value() {
+            None => {
+                return Err("this wallet has witnessed nothing yet".to_string());
+            }
+            Some(nef) => FrontierState {
+                size: self.witnessed_upto,
+                leaf: Some(nef.leaf().to_bytes()),
+                ommers: nef.ommers().iter().map(|o| o.to_bytes()).collect(),
+            },
+        };
+        let mut out = Vec::with_capacity(96 + self.notes.len() * 1200);
+        out.extend_from_slice(RECEIPT_MAGIC);
+        out.push(RECEIPT_VERSION);
+        out.extend_from_slice(&genesis);
+        // The anchor frontier, in the same shape the node serves from
+        // `GetShieldedTreeState` — so an importer can compare it field for field against
+        // its own node's answer and refuse a fabricated one.
+        out.extend_from_slice(&fs.size.to_le_bytes());
+        match fs.leaf {
+            None => out.push(0),
+            Some(leaf) => {
+                out.push(1);
+                out.extend_from_slice(&leaf);
+            }
+        }
+        out.extend_from_slice(&(fs.ommers.len() as u64).to_le_bytes());
+        for o in &fs.ommers {
+            out.extend_from_slice(o);
+        }
+        out.extend_from_slice(&scanned_daa.to_le_bytes());
+        out.extend_from_slice(&self.last_daa.to_le_bytes());
+
+        out.extend_from_slice(&(self.notes.len() as u64).to_le_bytes());
+        for n in &self.notes {
+            out.extend_from_slice(&n.position.to_le_bytes());
+            out.extend_from_slice(&n.note.recipient().to_raw_address_bytes());
+            out.extend_from_slice(&n.note.value().inner().to_le_bytes());
+            out.extend_from_slice(&n.note.rho().to_bytes());
+            out.extend_from_slice(n.note.rseed().as_bytes());
+        }
+        out.extend_from_slice(&(self.witnesses.len() as u64).to_le_bytes());
+        for (pos, w) in &self.witnesses {
+            out.extend_from_slice(&pos.to_le_bytes());
+            write_witness(&mut out, w);
+        }
+        Ok(out)
+    }
+
+    /// Rebuild a wallet from a [`scan receipt`](Self::to_scan_receipt) and the viewing
+    /// key it belongs to.
+    ///
+    /// **Every note is verified, not trusted.** A receipt arrives from another machine,
+    /// so the importer treats it as a claim: each note's witness must root to the
+    /// receipt's own anchor frontier, with the commitment recomputed from the note's
+    /// fields. A sender cannot forge a path to a root it does not control, so the only
+    /// thing a dishonest receipt can do is *omit* — and an omission shows up as a balance
+    /// lower than a later full scan finds, never as money that is not there. The caller
+    /// should additionally check the anchor frontier against its own node's
+    /// `GetShieldedTreeState`; do that and a receipt is worth exactly as much as a scan.
+    ///
+    /// The nullifiers are recomputed here from `fvk_bytes`. Taking the sender's would let
+    /// a bad receipt mark a note unspendable, or hide that one was already spent.
+    pub fn from_scan_receipt_fvk(
+        fvk_bytes: &[u8; 96],
+        genesis: [u8; 32],
+        bytes: &[u8],
+    ) -> Option<(Self, ScanReceiptMeta)> {
+        let mut r = Cursor { buf: bytes, pos: 0 };
+        if r.take(4)? != RECEIPT_MAGIC.as_slice() || r.u8()? != RECEIPT_VERSION || r.arr::<32>()? != genesis {
+            return None;
+        }
+        let size = r.u64()?;
+        let leaf = match r.u8()? {
+            0 => None,
+            1 => Some(r.arr::<32>()?),
+            _ => return None,
+        };
+        let n_ommers = r.u64()? as usize;
+        if n_ommers > TREE_DEPTH as usize {
+            return None;
+        }
+        let mut ommers = Vec::with_capacity(n_ommers);
+        for _ in 0..n_ommers {
+            ommers.push(r.arr::<32>()?);
+        }
+        let fs = FrontierState { size, leaf, ommers };
+        let scanned_daa = r.u64()?;
+        let last_daa = r.u64()?;
+
+        let mut db = Self::from_fvk(fvk_bytes)?;
+        db.apply_frontier(&fs)?;
+        // The root every witness in this receipt must reproduce.
+        let anchor_root = CommitmentTree::from_frontier(GlobalTree::from_state(&fs).ok()?.frontier()).root();
+
+        let n_notes = r.u64()? as usize;
+        if n_notes > RECEIPT_MAX_NOTES {
+            return None;
+        }
+        let mut notes = Vec::with_capacity(n_notes);
+        for _ in 0..n_notes {
+            let position = r.u64()?;
+            let recipient = r.arr::<43>()?;
+            let value = r.u64()?;
+            let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
+            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
+            let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
+            let note = Option::<Note>::from(Note::from_parts(
+                addr,
+                NoteValue::from_raw(value),
+                rho,
+                rseed,
+                orchard::note::NoteVersion::V2,
+            ))?;
+            // Ours to derive, never the sender's to assert.
+            let nullifier = note.nullifier(&db.fvk).to_bytes();
+            notes.push(OwnedNote { note, position, nullifier });
+        }
+
+        let n_w = r.u64()? as usize;
+        if n_w > RECEIPT_MAX_NOTES {
+            return None;
+        }
+        let mut witnesses = Vec::with_capacity(n_w);
+        for _ in 0..n_w {
+            let pos = r.u64()?;
+            let w = read_witness(&mut r)?;
+            witnesses.push((pos, w));
+        }
+        r.done().then_some(())?;
+
+        // Verification. A note is kept only if the receipt proves it is in the tree at
+        // the position it claims, under the anchor the receipt itself names.
+        let mut kept = Vec::with_capacity(notes.len());
+        for n in notes {
+            let Some((_, w)) = witnesses.iter().find(|(p, _)| *p == n.position) else { continue };
+            let Some(path) = w.path() else { continue };
+            let cmx = ExtractedNoteCommitment::from(n.note.commitment());
+            if path.root(MerkleHashOrchard::from_cmx(&cmx)) == anchor_root {
+                kept.push(n);
+            }
+        }
+        if kept.len() != witnesses.len() && kept.is_empty() && !witnesses.is_empty() {
+            return None;
+        }
+        kept.sort_by_key(|n| n.position);
+        let owned: HashSet<u64> = kept.iter().map(|n| n.position).collect();
+        witnesses.retain(|(p, _)| owned.contains(p));
+
+        db.notes = kept;
+        db.witnesses = witnesses;
+        db.witnessed_upto = size;
+        db.lag_tree = db.tree.clone();
+        db.last_daa = last_daa;
+        Some((db, ScanReceiptMeta { scanned_daa, anchor_leaves: size }))
+    }
+
+    /// [`Self::from_scan_receipt_fvk`] for a wallet that holds its seed.
+    pub fn from_scan_receipt(
+        seed: [u8; 32],
+        genesis: [u8; 32],
+        bytes: &[u8],
+    ) -> Option<(Self, ScanReceiptMeta)> {
+        let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes(seed))?;
+        Self::from_scan_receipt_fvk(&FullViewingKey::from(&sk).to_bytes(), genesis, bytes)
+    }
+
     pub fn to_checkpoint(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64 + self.leaves.len() * 32 + self.notes.len() * 123);
         out.push(CHECKPOINT_VERSION);
@@ -1948,11 +3217,31 @@ impl WalletDb {
             out.extend_from_slice(&n.note.rho().to_bytes());
             out.extend_from_slice(n.note.rseed().as_bytes());
         }
-        // v3: the spent-nullifier set, sorted for a canonical encoding.
-        let mut nfs: Vec<&[u8; 32]> = self.spent_nullifiers.iter().collect();
-        nfs.sort();
-        out.extend_from_slice(&(nfs.len() as u64).to_le_bytes());
-        for nf in nfs {
+        // v3: the spent-nullifier set, in iteration order.
+        //
+        // This used to sort, "for a canonical encoding". Nothing wanted one: the reader
+        // below inserts each entry into a `HashSet`, so the order is semantically
+        // unobservable, and neither consumer of `to_checkpoint` (the daemon's
+        // `checkpoint_bytes`, the SDK engine) hashes, diffs or compares the bytes.
+        //
+        // It was the single largest consumer of CPU in the daemon. Measured live over a
+        // 180 s window: 62 checkpoints rewritten, 223.3 M nullifiers sorted at
+        // 0.853 us each = 190.5 core-seconds, **1.06 of the daemon's 4.92 cores (21.5%)**.
+        // Benched at the live mean (3.48 M nullifiers), the sort is 2.97 s of a 3.32 s
+        // serialisation — 89-94% of it. For scale, trial-decrypting every action at the
+        // tip for all ~2,000 wallets costs 0.047 cores; this sort was 22x the entire
+        // fleet's decryption budget, to produce an ordering nobody reads.
+        //
+        // And it ran with the wallet's `MutexGuard` held on a runtime thread, so each
+        // one also stalled that wallet's /api/status, /api/balance and send-prepare for
+        // 0.9-4.2 s.
+        //
+        // If a byte-stable checkpoint is ever genuinely needed (content-hash dedup,
+        // rsync-by-checksum), do NOT restore the sort: keep `spent_nullifiers` as an
+        // insertion-ordered Vec beside its HashSet index and write that. Chain order is
+        // already canonical and costs nothing.
+        out.extend_from_slice(&(self.spent_nullifiers.len() as u64).to_le_bytes());
+        for nf in &self.spent_nullifiers {
             out.extend_from_slice(nf);
         }
         // v4: the **tip** frontier — the mirror tree summarised in O(1). Without it a
@@ -1960,7 +3249,16 @@ impl WalletDb {
         // which is minutes of CPU per wallet and is why a daemon restart showed every
         // user `0 balance / 0 notes / syncing 0%` until their wallet finished reloading.
         // Same encoding as the base frontier above.
-        write_frontier(&mut out, &self.tree.to_frontier());
+        // Only write the tip frontier if it actually describes `size`. A borrowing
+        // wallet's mirror tree lags whatever it skipped, and persisting that would be
+        // worse than persisting nothing: the loader would trust it. The empty tag with
+        // a non-zero size is self-evidently "not recorded", and the load path treats it
+        // as such rather than as an empty tree.
+        if self.tree_valid {
+            write_frontier(&mut out, &self.tree.to_frontier());
+        } else {
+            out.push(0);
+        }
 
         // v5: the persisted per-note witnesses, as a length-prefixed, best-effort section
         // (see CHECKPOINT_VERSION). Layout: [witnessed_upto:u64][lag_tree][n:u64]
@@ -1990,6 +3288,7 @@ impl WalletDb {
             hsec.extend_from_slice(&h.timestamp_ms.to_le_bytes());
             hsec.extend_from_slice(&h.amount.to_le_bytes());
             hsec.extend_from_slice(&h.fee.to_le_bytes());
+            hsec.push((h.amount_is_net_outflow as u8) | ((h.fee_known as u8) << 1));
             match &h.recipient {
                 Some(r) => {
                     hsec.push(1);
@@ -2000,6 +3299,17 @@ impl WalletDb {
             let memo_len = h.memo.len().min(u16::MAX as usize) as u16;
             hsec.extend_from_slice(&memo_len.to_le_bytes());
             hsec.extend_from_slice(&h.memo[..memo_len as usize]);
+            // v10: the per-output breakdown, written inside the row (not as a
+            // trailing section) so a row and its credits cannot drift apart.
+            let ncred = h.credits.len().min(CREDITS_CAP) as u16;
+            hsec.extend_from_slice(&ncred.to_le_bytes());
+            for c in h.credits.iter().take(ncred as usize) {
+                hsec.extend_from_slice(&c.recipient);
+                hsec.extend_from_slice(&c.value.to_le_bytes());
+                let cm = c.memo.len().min(u16::MAX as usize) as u16;
+                hsec.extend_from_slice(&cm.to_le_bytes());
+                hsec.extend_from_slice(&c.memo[..cm as usize]);
+            }
         }
         out.extend_from_slice(&(hsec.len() as u64).to_le_bytes());
         out.extend_from_slice(&hsec);
@@ -2025,6 +3335,16 @@ impl WalletDb {
         }
         out.extend_from_slice(&(psec.len() as u64).to_le_bytes());
         out.extend_from_slice(&psec);
+
+        // v8: persist the root-gated complete-subtree index. Building this index is
+        // deliberately expensive (one Sinsemilla fold over the wallet's retained leaf
+        // stream), but it is pure public chain state and must not be thrown away on every
+        // daemon eviction/restart. The section is optional and best-effort: restore only
+        // activates it after reproducing the independently persisted tip tree root.
+        let mut ssec = Vec::new();
+        write_subtree_section(&mut ssec, &self.subtree);
+        out.extend_from_slice(&(ssec.len() as u64).to_le_bytes());
+        out.extend_from_slice(&ssec);
         out
     }
 
@@ -2102,7 +3422,7 @@ impl WalletDb {
             let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
             let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
             let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
-            let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed))?;
+            let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))?;
             db.notes.push(OwnedNote { note, position, nullifier });
         }
         let n_nfs = r.u64()? as usize;
@@ -2114,7 +3434,16 @@ impl WalletDb {
         // leaf stream (O(N) Sinsemilla), which is what every restore used to cost.
         db.tree = if has_tip_frontier {
             let tip = read_frontier(&mut r, size)?;
-            CommitmentTree::from_frontier(&tip)
+            // An EMPTY tip frontier on a non-empty stream means the writer was borrowing
+            // the shared tree and had nothing valid to record — not that the tree is
+            // empty. Restore what we can and mark it invalid so `anchor()` is not read
+            // until a frontier is adopted.
+            if size > 0 && tip.value().is_none() {
+                db.tree_valid = false;
+                CommitmentTree::from_frontier(&db.base_frontier)
+            } else {
+                CommitmentTree::from_frontier(&tip)
+            }
         } else if let Some(fs) = tip.filter(|fs| fs.size == size) {
             // A v3 blob carries no tip frontier, but the caller got one from the node for
             // exactly this cursor — same tree, so use it and skip the replay.
@@ -2144,15 +3473,30 @@ impl WalletDb {
         if version >= CHECKPOINT_VERSION_V6 {
             if let Some(hlen) = r.u64() {
                 if let Some(hbuf) = r.take(hlen as usize) {
-                    Self::read_history_section(&mut db, hbuf);
+                    Self::read_history_section(
+                        &mut db,
+                        hbuf,
+                        version >= CHECKPOINT_VERSION_V9,
+                        version >= CHECKPOINT_VERSION_V10,
+                    );
                 }
             }
         }
         // v7: pending spends + DAA clock — same length-prefixed best-effort contract.
-        if version >= CHECKPOINT_VERSION {
+        if version >= CHECKPOINT_VERSION_V7 {
             if let Some(plen) = r.u64() {
                 if let Some(pbuf) = r.take(plen as usize) {
                     Self::read_pending_section(&mut db, pbuf);
+                }
+            }
+        }
+        // v8: persisted complete-subtree index. It is an optimisation only and is
+        // accepted solely when it covers this exact tip and reproduces the independent
+        // commitment-tree root; malformed/stale data degrades to an empty cache.
+        if version >= CHECKPOINT_VERSION_V8 {
+            if let Some(slen) = r.u64() {
+                if let Some(sbuf) = r.take(slen as usize) {
+                    Self::read_subtree_section(&mut db, sbuf);
                 }
             }
         }
@@ -2160,6 +3504,68 @@ impl WalletDb {
             return None;
         }
         Some(db)
+    }
+
+    fn read_subtree_section(db: &mut Self, buf: &[u8]) {
+        let mut r = Cursor { buf, pos: 0 };
+        let parse = |r: &mut Cursor<'_>| -> Option<SubtreeCache> {
+            let active = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let failed = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let upto = r.u64()?;
+            let n_levels = r.u64()? as usize;
+            if n_levels > TREE_DEPTH as usize + 1 {
+                return None;
+            }
+            let mut levels = Vec::with_capacity(n_levels);
+            let mut first = Vec::with_capacity(n_levels);
+            for _ in 0..n_levels {
+                first.push(r.u64()?);
+                let n = r.u64()? as usize;
+                // A checkpoint cannot legitimately contain more cached roots than
+                // retained leaves (plus one base-frontier root per level).
+                if n > db.leaves.len().saturating_add(TREE_DEPTH as usize + 1) {
+                    return None;
+                }
+                let mut roots = Vec::with_capacity(n);
+                for _ in 0..n {
+                    roots.push(Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(&r.arr::<32>()?))?);
+                }
+                levels.push(roots);
+            }
+            let n_peaks = r.u64()? as usize;
+            if n_peaks > TREE_DEPTH as usize + 1 {
+                return None;
+            }
+            let mut peaks = Vec::with_capacity(n_peaks);
+            for _ in 0..n_peaks {
+                let level = r.u8()?;
+                if level > TREE_DEPTH {
+                    return None;
+                }
+                let index = r.u64()?;
+                let root = Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(&r.arr::<32>()?))?;
+                peaks.push((level, index, root));
+            }
+            // `partial: false` — the reader below accepts only a complete, root-verified
+            // cache, so a restored one is never an in-progress build.
+            r.done().then_some(SubtreeCache { levels, first, peaks, upto, active, failed, partial: false })
+        };
+        let Some(cache) = parse(&mut r) else { return };
+        // Never restore a partial active cache. A failed/inactive marker is harmless,
+        // but an active cache must describe precisely the tree persisted in this blob.
+        if cache.active && cache.upto == db.size && db.cache_matches_tree(&cache) {
+            db.subtree = cache;
+        } else if cache.failed {
+            db.subtree.failed = true;
+        }
     }
 
     /// Best-effort restore of the v7 pending-spend section — any malformed record
@@ -2178,7 +3584,7 @@ impl WalletDb {
                 let rho = Option::<Rho>::from(Rho::from_bytes(&r.arr()?))?;
                 let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(r.arr()?, &rho))?;
                 let addr = Option::<Address>::from(Address::from_raw_address_bytes(&recipient))?;
-                let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed))?;
+                let note = Option::<Note>::from(Note::from_parts(addr, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2))?;
                 let txid = r.arr::<32>()?;
                 let submitted_daa = r.u64()?;
                 out.push(PendingSpend { note: OwnedNote { note, position, nullifier }, txid, submitted_daa });
@@ -2194,9 +3600,10 @@ impl WalletDb {
         }
     }
 
-    /// Best-effort restore of the v6 history section. Any malformed row drops the
+    /// Best-effort restore of the v6 history section. v9 adds compact-send flags.
+    /// Any malformed row drops the
     /// whole section (history restarts from here on) — never fails the restore.
-    fn read_history_section(db: &mut Self, buf: &[u8]) {
+    fn read_history_section(db: &mut Self, buf: &[u8], has_compact_flags: bool, has_credits: bool) {
         let mut r = Cursor { buf, pos: 0 };
         let parse = |r: &mut Cursor<'_>| -> Option<Vec<HistoryEntry>> {
             let n = (r.u64()? as usize).min(HISTORY_CAP);
@@ -2213,6 +3620,15 @@ impl WalletDb {
                 let timestamp_ms = r.u64()?;
                 let amount = r.u64()?;
                 let fee = r.u64()?;
+                let (amount_is_net_outflow, fee_known) = if has_compact_flags {
+                    let flags = r.u8()?;
+                    if flags & !0b11 != 0 {
+                        return None;
+                    }
+                    (flags & 1 != 0, flags & 2 != 0)
+                } else {
+                    (false, true)
+                };
                 let recipient = match r.u8()? {
                     0 => None,
                     1 => Some(r.arr::<43>()?),
@@ -2220,7 +3636,33 @@ impl WalletDb {
                 };
                 let memo_len = u16::from_le_bytes(r.arr::<2>()?) as usize;
                 let memo = r.take(memo_len)?.to_vec();
-                out.push(HistoryEntry { kind, txid, daa_score, timestamp_ms, amount, fee, recipient, memo });
+                // A pre-v10 row has no breakdown; it restores with an empty vector
+                // and the client falls back to `amount`/`recipient` as before.
+                let mut credits = Vec::new();
+                if has_credits {
+                    let n = (u16::from_le_bytes(r.arr::<2>()?) as usize).min(CREDITS_CAP);
+                    credits.reserve(n);
+                    for _ in 0..n {
+                        let recipient = r.arr::<43>()?;
+                        let value = r.u64()?;
+                        let cm = u16::from_le_bytes(r.arr::<2>()?) as usize;
+                        let cmemo = r.take(cm)?.to_vec();
+                        credits.push(Credit { recipient, value, memo: cmemo });
+                    }
+                }
+                out.push(HistoryEntry {
+                    kind,
+                    txid,
+                    daa_score,
+                    timestamp_ms,
+                    amount,
+                    fee,
+                    amount_is_net_outflow,
+                    fee_known,
+                    recipient,
+                    memo,
+                    credits,
+                });
             }
             r.done().then_some(out)
         };
@@ -2237,7 +3679,11 @@ impl WalletDb {
     fn read_witness_section(db: &mut Self, buf: &[u8]) {
         let owned: HashSet<u64> = db.notes.iter().map(|n| n.position).collect();
         let mut r = Cursor { buf, pos: 0 };
-        let parse = |r: &mut Cursor<'_>| -> Option<(u64, CommitmentTree<MerkleHashOrchard, TREE_DEPTH>, Vec<(u64, IncrementalWitness<MerkleHashOrchard, TREE_DEPTH>)>)> {
+        let parse = |r: &mut Cursor<'_>| -> Option<(
+            u64,
+            CommitmentTree<MerkleHashOrchard, TREE_DEPTH>,
+            Vec<(u64, IncrementalWitness<MerkleHashOrchard, TREE_DEPTH>)>,
+        )> {
             let witnessed_upto = r.u64()?;
             let lag_tree = read_tree(r)?;
             let n = r.u64()? as usize;
@@ -2258,6 +3704,26 @@ impl WalletDb {
                 db.witnesses = ws;
             }
         }
+    }
+}
+
+fn write_subtree_section(out: &mut Vec<u8>, subtree: &SubtreeCache) {
+    out.push(u8::from(subtree.active));
+    out.push(u8::from(subtree.failed));
+    out.extend_from_slice(&subtree.upto.to_le_bytes());
+    out.extend_from_slice(&(subtree.levels.len() as u64).to_le_bytes());
+    for (level, roots) in subtree.levels.iter().enumerate() {
+        out.extend_from_slice(&subtree.first.get(level).copied().unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&(roots.len() as u64).to_le_bytes());
+        for root in roots {
+            out.extend_from_slice(&root.to_bytes());
+        }
+    }
+    out.extend_from_slice(&(subtree.peaks.len() as u64).to_le_bytes());
+    for (level, index, root) in &subtree.peaks {
+        out.push(*level);
+        out.extend_from_slice(&index.to_le_bytes());
+        out.extend_from_slice(&root.to_bytes());
     }
 }
 
@@ -2286,6 +3752,17 @@ fn read_frontier(r: &mut Cursor<'_>, size: u64) -> Option<Frontier<MerkleHashOrc
         1 => {
             let leaf = r.arr::<32>()?;
             let n_ommers = r.u64()? as usize;
+            // Bound BEFORE allocating. A frontier has one ommer per tree level at
+            // most, so anything larger is a corrupt record — and `with_capacity` on an
+            // unchecked `u64` turns that corruption into an allocation of arbitrary
+            // size, which aborts the process rather than failing the read. Every other
+            // length in this format is already bounded this way (`n_levels`, `n_peaks`,
+            // the per-level root count); this one was missed, and it is reachable from
+            // any damaged `.scan` on disk today. Failing the parse quarantines one
+            // wallet; aborting takes the whole daemon down with it.
+            if n_ommers > TREE_DEPTH as usize {
+                return None;
+            }
             let mut ommers = Vec::with_capacity(n_ommers);
             for _ in 0..n_ommers {
                 ommers.push(r.arr::<32>()?);
@@ -2370,7 +3847,36 @@ fn read_witness(r: &mut Cursor<'_>) -> Option<IncrementalWitness<MerkleHashOrcha
 /// clock as another length-prefixed best-effort section — a pure suffix of v6.
 /// Without it a restart forgot which notes were parked awaiting confirmation,
 /// which is half of how a lost transaction became lost money.
-const CHECKPOINT_VERSION: u8 = 7;
+/// v8 persists the root-gated complete-subtree index, avoiding a full Sinsemilla
+/// rebuild after every daemon eviction/restart. It contains public chain state only.
+/// v9 annotates history rows reconstructed from compact scan data, so clients never
+/// mistake their net outflow or placeholder fee for exact payment details.
+/// Magic and version of the **portable scan receipt** — deliberately its own format,
+/// independent of `CHECKPOINT_VERSION`. A receipt crosses between two daemons that are
+/// built from different checkouts (the hosted service and the copy inside the phone app),
+/// so tying it to the checkpoint version would make every skew between those two builds
+/// an outage. This format changes only when its own fields change.
+const RECEIPT_MAGIC: &[u8; 4] = b"ZKRC";
+const RECEIPT_VERSION: u8 = 1;
+
+/// Upper bound on notes carried in one receipt, so a malformed blob cannot make us
+/// allocate without limit. A wallet past this is too fragmented to move this way.
+const RECEIPT_MAX_NOTES: usize = 4096;
+
+const CHECKPOINT_VERSION: u8 = 10;
+/// v10 adds each history row's per-output breakdown ([`Credit`]). Gate it on THIS
+/// constant, never on `CHECKPOINT_VERSION` — see the v8 note below for what that
+/// mistake costs. The credits are written *inside* each row, so a v9 reader cannot
+/// parse a v10 section; that is contained, because the whole-blob version gate
+/// rejects v10 on an older binary and the section itself is best-effort.
+const CHECKPOINT_VERSION_V10: u8 = 10;
+const CHECKPOINT_VERSION_V9: u8 = 9;
+/// v8 introduced the persisted complete-subtree index. Gate its section on THIS
+/// constant, never on `CHECKPOINT_VERSION`: when v9 was added the gate silently moved to
+/// 9, every v8 checkpoint was left with 34 unread trailing bytes, `restore` rejected it
+/// as malformed, and every wallet (and the shared chain tree) fell into a full rescan.
+const CHECKPOINT_VERSION_V8: u8 = 8;
+const CHECKPOINT_VERSION_V7: u8 = 7;
 /// v6 appended the history rows. A pure suffix of v5.
 const CHECKPOINT_VERSION_V6: u8 = 6;
 /// v5 appended the persisted witnesses. A pure suffix of v4.
@@ -2381,6 +3887,26 @@ const CHECKPOINT_VERSION_V4: u8 = 4;
 /// tree rebuild once). Reading them is what lets a newer binary deploy without forcing
 /// every live wallet into a full rescan from birthday.
 const CHECKPOINT_VERSION_V3: u8 = 3;
+
+/// Upper bound on the per-row [`Credit`] entries written or parsed. A bundle cannot
+/// carry more outputs than this and still fit a block, so the cap only bounds what a
+/// corrupt blob can make us allocate.
+const CREDITS_CAP: usize = 256;
+
+/// One [`Credit`] per note this transaction paid us, in ingest order — the
+/// breakdown a payer's single transaction to several of our diversified addresses
+/// needs in order to be reconciled per address.
+fn credits_from_received(received: &[ReceivedNote]) -> Vec<Credit> {
+    received
+        .iter()
+        .take(CREDITS_CAP)
+        .map(|r| Credit {
+            recipient: r.note.recipient().to_raw_address_bytes(),
+            value: r.value(),
+            memo: r.memo.clone(),
+        })
+        .collect()
+}
 
 /// A minimal forward byte-reader for [`WalletDb::from_checkpoint`]: every read is
 /// bounds-checked and returns `None` past the end, so a truncated or corrupt blob
@@ -2442,6 +3968,45 @@ mod tests {
         crate::wallet::scan::address_bytes_from_seed(seed).unwrap()
     }
 
+    /// A coinbase paid to a DIVERSIFIED address is ours too.
+    ///
+    /// Shielded outputs are found by trial decryption on the incoming viewing key,
+    /// which ignores the diversifier, so `?index=N` addresses always worked there.
+    /// A coinbase publishes its recipient in the clear and was compared for raw
+    /// equality against `address_at(0)` alone — so a coinbase paid to an issued
+    /// per-customer deposit address was silently invisible, with the funds on chain
+    /// and the key in hand. This asserts the diversified case and pins the bound:
+    /// an address beyond `COINBASE_DIVERSIFIER_SCAN` is still missed, by design.
+    #[test]
+    fn a_coinbase_paid_to_a_diversified_address_is_recognised() {
+        let mine = [7u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        let fvk = db.fvk().clone();
+
+        let at = |i: u32| fvk.address_at(i, Scope::External).to_raw_address_bytes();
+        let stranger = address_of([9u8; 32]);
+
+        db.ingest_block(
+            &[
+                coinbase_for(at(0), b"d||0", 1_000),
+                coinbase_for(at(1), b"d||1", 2_000),
+                coinbase_for(at(37), b"d||37", 4_000),
+                coinbase_for(stranger, b"d||x", 8_000),
+            ],
+            &[],
+        );
+
+        assert_eq!(db.notes().len(), 3, "index 0, 1 and 37 are all ours; the stranger is not");
+        assert_eq!(db.balance(), 7_000, "1000 + 2000 + 4000, and none of the stranger's 8000");
+
+        // The bound is a bound. An index past the pre-derived window is still missed,
+        // which is why `known_addresses` says so out loud rather than implying coverage.
+        let beyond = at(COINBASE_DIVERSIFIER_SCAN + 1);
+        let mut far = WalletDb::from_seed(mine).unwrap();
+        far.ingest_block(&[coinbase_for(beyond, b"d||far", 5_000)], &[]);
+        assert_eq!(far.balance(), 0, "beyond the derived window — documented limitation, not a silent one");
+    }
+
     /// The wallet recognises a coinbase note paid to it, ignores one paid to a
     /// stranger, and the balance reflects only its own notes.
     #[test]
@@ -2457,6 +4022,27 @@ mod tests {
         assert_eq!(db.notes().len(), 1, "only the wallet's own coinbase note is tracked");
         assert_eq!(db.balance(), 5_000);
         assert_eq!(db.notes()[0].position, 0, "our note is leaf 0 (first coinbase note)");
+    }
+
+    /// A backfilled archive binds the nullifier multiset, not which action carries each nullifier, so a
+    /// record can show a note's spend BEFORE the note. The wallet must not then offer the note as
+    /// spendable: its nullifier was already in the stream when the note appeared.
+    #[test]
+    fn a_note_whose_nullifier_the_stream_already_carried_is_spent_on_arrival() {
+        let mine = [7u8; 32];
+        let cb = coinbase_for(address_of(mine), b"txid-a||0", 5_000);
+        let mut probe = WalletDb::from_seed(mine).unwrap();
+        probe.ingest_block(std::slice::from_ref(&cb), &[]);
+        let nf = probe.notes()[0].nullifier;
+
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        let early_spend = CompactActionRecord { nullifier: nf, cmx: [0xFF; 32], ephemeral_key: [0; 32], enc_ciphertext: [0; 52] };
+        db.ingest_block_compact_with_meta(&[], &[vec![early_spend]], None);
+        db.ingest_block(std::slice::from_ref(&cb), &[]);
+        assert!(db.notes().is_empty(), "a note spent before it appeared is never spendable");
+        assert_eq!(db.balance(), 0);
+        assert!(!db.poisoned(), "this is not a repeated nullifier");
+        assert_eq!(db.size(), probe.size(), "the leaf is still appended");
     }
 
     /// `ingest_block_precomputed` (the shared-cache path) must produce a wallet
@@ -2486,10 +4072,8 @@ mod tests {
             recompute.ingest_block(block, &[]);
             // The daemon-side precompute: derive each coinbase leaf commitment once,
             // dropping any that would not commit (exactly ingest_block's skip rule).
-            let pre: Vec<(CoinbaseNoteDesc, u64, ExtractedNoteCommitment)> = block
-                .iter()
-                .filter_map(|(d, v)| coinbase_note_commitment(d, *v).ok().map(|cmx| (d.clone(), *v, cmx)))
-                .collect();
+            let pre: Vec<(CoinbaseNoteDesc, u64, ExtractedNoteCommitment)> =
+                block.iter().filter_map(|(d, v)| coinbase_note_commitment(d, *v).ok().map(|cmx| (d.clone(), *v, cmx))).collect();
             shared.ingest_block_precomputed(&pre, &[]);
         }
 
@@ -2502,6 +4086,214 @@ mod tests {
         );
         assert_eq!(recompute.size(), shared.size(), "same leaf count");
         assert_eq!(recompute.anchor(), shared.anchor(), "identical tip anchor");
+    }
+
+    /// A **keyless, leaves-only** wallet builds a leaf stream identical to a real
+    /// wallet's, and can therefore witness that wallet's notes for it.
+    ///
+    /// This is the premise of the daemon-wide shared tree: ~80% of a scan is
+    /// building a structure that does not depend on any viewing key, so it should be
+    /// built once for all wallets rather than once per wallet. The test pins both
+    /// halves of that claim — the stream is the same (identical anchor, leaf for
+    /// leaf), and a path taken from the shared copy is accepted for a note the
+    /// shared copy has no idea it is looking at.
+    #[test]
+    fn leaves_only_tree_is_identical_and_can_witness_another_wallets_note() {
+        let mine = [7u8; 32];
+        let other = [8u8; 32];
+        let nobody = [9u8; 32]; // the shared tree's key: matches nothing on this chain
+
+        let blocks: Vec<Vec<(CoinbaseNoteDesc, u64)>> = (0..40u32)
+            .map(|b| {
+                vec![
+                    coinbase_for(address_of(mine), format!("txid-{b}||0").as_bytes(), 1_000 + b as u64),
+                    coinbase_for(address_of(other), format!("txid-{b}||1").as_bytes(), 7_000),
+                ]
+            })
+            .collect();
+
+        let mut wallet = WalletDb::from_seed(mine).unwrap();
+        let mut shared = WalletDb::from_seed(nobody).unwrap();
+        shared.set_leaves_only(true);
+        assert!(shared.is_leaves_only());
+        for block in &blocks {
+            wallet.ingest_block(block, &[]);
+            shared.ingest_block(block, &[]);
+        }
+
+        // The stream is the same object, built two ways.
+        assert_eq!(wallet.size(), shared.size(), "same leaf count");
+        assert_eq!(wallet.anchor(), shared.anchor(), "identical tip anchor");
+        // ...but the shared copy recognises nothing, which is what makes it cheap.
+        assert!(shared.notes().is_empty(), "a leaves-only tree can never own a note");
+        assert!(!wallet.notes().is_empty(), "the real wallet did find its notes");
+
+        // Now the point: witness the WALLET's note from the SHARED tree.
+        let matured = wallet.size();
+        let positions: Vec<u64> = wallet.notes().iter().map(|n| n.position).collect();
+        let from_shared = shared.witness_paths_at(&positions, matured);
+        let from_wallet = wallet.witness_paths_at(&positions, matured);
+        assert!(from_shared.iter().all(|p| p.is_some()), "shared tree served every path");
+        for (i, (a, b)) in from_shared.iter().zip(from_wallet.iter()).enumerate() {
+            let (a, b) = (a.as_ref().unwrap(), b.as_ref().unwrap());
+            assert_eq!(a.auth_path(), b.auth_path(), "auth path differs at note {i}");
+            assert_eq!(a.position(), b.position(), "position differs at note {i}");
+        }
+    }
+
+    /// The shared tree keeps serving correct paths after the *wallet* has compacted its
+    /// own base away.
+    ///
+    /// This is the case the daemon actually runs: the shared tree holds the whole stream
+    /// from position 0 and never compacts, while each wallet rolls its base up to its own
+    /// notes to bound memory. Their `base_size` values therefore diverge immediately, and
+    /// a note's position is absolute in the global stream — so the shared tree resolving
+    /// `position` against ITS base is only correct because both bases are offsets into
+    /// one stream. If that were ever wrong, this test fails and the daemon would be
+    /// handing out witnesses rooted at the wrong subtree.
+    #[test]
+    fn shared_tree_serves_paths_after_the_wallet_compacts_its_base() {
+        let mine = [11u8; 32];
+        let other = [12u8; 32];
+        let nobody = [13u8; 32];
+
+        let mut wallet = WalletDb::from_seed(mine).unwrap();
+        let mut shared = WalletDb::from_seed(nobody).unwrap();
+        shared.set_leaves_only(true);
+
+        // A long prefix of other people's leaves, then ours, then more of theirs — so the
+        // wallet's notes sit well above position 0 and its base can roll a long way.
+        for b in 0..60u32 {
+            let block = vec![coinbase_for(address_of(other), format!("pre-{b}").as_bytes(), 500)];
+            wallet.ingest_block(&block, &[]);
+            shared.ingest_block(&block, &[]);
+        }
+        for b in 0..4u32 {
+            let block = vec![coinbase_for(address_of(mine), format!("ours-{b}").as_bytes(), 9_000 + b as u64)];
+            wallet.ingest_block(&block, &[]);
+            shared.ingest_block(&block, &[]);
+        }
+        for b in 0..60u32 {
+            let block = vec![coinbase_for(address_of(other), format!("post-{b}").as_bytes(), 500)];
+            wallet.ingest_block(&block, &[]);
+            shared.ingest_block(&block, &[]);
+        }
+
+        // The wallet compacts; the shared tree does not.
+        let first_note = wallet.notes().iter().map(|n| n.position).min().unwrap();
+        while wallet.advance_base_capped(first_note, u64::MAX) {}
+        assert!(wallet.base_size() > 0, "wallet actually compacted");
+        assert_eq!(shared.base_size(), 0, "shared tree holds the stream from position 0");
+        assert_ne!(wallet.base_size(), shared.base_size(), "the bases diverge — the case under test");
+
+        let matured = wallet.size();
+        assert_eq!(matured, shared.size(), "same stream length");
+
+        let positions: Vec<u64> = wallet.notes().iter().map(|n| n.position).collect();
+        let from_shared = shared.witness_paths_at(&positions, matured);
+        let from_wallet = wallet.witness_paths_at(&positions, matured);
+        assert!(from_shared.iter().all(|p| p.is_some()), "shared tree served every path despite never compacting");
+        for (i, (a, b)) in from_shared.iter().zip(from_wallet.iter()).enumerate() {
+            let (a, b) = (a.as_ref().unwrap(), b.as_ref().expect("wallet still witnesses its own note"));
+            assert_eq!(a.position(), b.position(), "position differs at note {i}");
+            assert_eq!(a.auth_path(), b.auth_path(), "auth path differs at note {i} across divergent bases");
+        }
+    }
+
+    /// A shared (`leaves_only`) tree refuses to compact its base.
+    ///
+    /// Compaction is capped at the earliest note the wallet still holds. A shared tree
+    /// holds none, so that cap is `size` and it would summarise away the whole stream —
+    /// which is the one thing it exists to keep. Live, it did exactly that within
+    /// minutes (`base_size == matured`), leaving it able to witness nothing for anyone
+    /// and unable to ever install a subtree cache.
+    #[test]
+    fn leaves_only_tree_never_compacts_the_stream_away() {
+        let mut shared = WalletDb::from_seed([21u8; 32]).unwrap();
+        shared.set_leaves_only(true);
+        let mut ordinary = WalletDb::from_seed([21u8; 32]).unwrap();
+        for b in 0..40u32 {
+            let block = vec![coinbase_for(address_of([22u8; 32]), format!("x-{b}").as_bytes(), 100)];
+            shared.ingest_block(&block, &[]);
+            ordinary.ingest_block(&block, &[]);
+        }
+        let tip = shared.size();
+
+        // The ordinary wallet owns nothing either, so it compacts freely — this is the
+        // behaviour the shared tree must NOT inherit.
+        while ordinary.advance_base_capped(tip, u64::MAX) {}
+        assert_eq!(ordinary.base_size(), tip, "an ordinary noteless wallet does roll its base to the tip");
+
+        assert!(!shared.advance_base_capped(tip, u64::MAX), "shared tree refuses to compact");
+        assert_eq!(shared.base_size(), 0, "shared tree still holds the stream from position 0");
+        assert_eq!(shared.size(), tip, "and still has every leaf");
+
+        // The consequence that matters: it can still witness an arbitrary early position
+        // that a compacted wallet could not.
+        let paths = shared.witness_paths_at(&[3, 17], tip);
+        assert!(paths.iter().all(|p| p.is_some()), "shared tree witnesses early positions");
+        assert!(
+            ordinary.witness_paths_at(&[3, 17], tip).iter().all(|p| p.is_none()),
+            "the compacted wallet cannot — which is precisely why the shared tree must not compact",
+        );
+    }
+
+    /// A wallet that skips its own tree ends up with the SAME anchor as one that built
+    /// it, once it adopts the shared tree's frontier.
+    ///
+    /// This is the whole safety argument for borrowing, so it is asserted rather than
+    /// reasoned about: a commitment tree's frontier at N leaves is a pure function of
+    /// leaves 0..N, therefore the shared tree's frontier at the same size IS this
+    /// wallet's frontier. If that were ever false, a borrowing wallet would spend
+    /// against a wrong anchor and the node would reject every payment it made.
+    #[test]
+    fn a_borrowed_tree_produces_the_same_anchor_as_a_built_one() {
+        let mine = [31u8; 32];
+        let other = [32u8; 32];
+
+        let mut built = WalletDb::from_seed(mine).unwrap();
+        let mut borrowed = WalletDb::from_seed(mine).unwrap();
+        let mut shared = WalletDb::from_seed([33u8; 32]).unwrap();
+        shared.set_leaves_only(true);
+        borrowed.set_borrow_tree(true);
+
+        for b in 0..30u32 {
+            let block = vec![
+                coinbase_for(address_of(mine), format!("m-{b}").as_bytes(), 1_000 + b as u64),
+                coinbase_for(address_of(other), format!("o-{b}").as_bytes(), 500),
+            ];
+            built.ingest_block(&block, &[]);
+            borrowed.ingest_block(&block, &[]);
+            shared.ingest_block(&block, &[]);
+        }
+
+        // Skipping the hashing invalidates the mirror tree, and the wallet says so.
+        assert!(!borrowed.tree_is_valid(), "a borrowing wallet knows its tree is stale");
+        assert!(built.tree_is_valid());
+        assert_eq!(built.size(), borrowed.size(), "the same leaves were counted either way");
+        assert_eq!(built.notes().len(), borrowed.notes().len(), "and the same notes were found");
+        assert_eq!(
+            built.notes().iter().map(|n| n.position).collect::<Vec<_>>(),
+            borrowed.notes().iter().map(|n| n.position).collect::<Vec<_>>(),
+            "note POSITIONS are unaffected — they come from counting, not hashing",
+        );
+
+        // Adopt the shared tree's frontier at the same size.
+        let fs = shared.tip_frontier_state().expect("shared tree has a valid tree");
+        assert_eq!(fs.size, borrowed.size());
+        assert!(borrowed.adopt_tip_frontier(&fs), "frontier at the matching size is accepted");
+        assert!(borrowed.tree_is_valid());
+        assert_eq!(built.anchor(), borrowed.anchor(), "identical anchor");
+        assert_eq!(built.anchor(), shared.anchor(), "...and it is the shared tree's anchor");
+
+        // A frontier at ANY other size must be refused: that is the check the entire
+        // safety argument rests on, so it must not be advisory.
+        let mut ahead = shared;
+        ahead.ingest_block(&[coinbase_for(address_of(other), b"extra", 7)], &[]);
+        let stale = ahead.tip_frontier_state().expect("still valid");
+        assert_ne!(stale.size, borrowed.size());
+        assert!(!borrowed.adopt_tip_frontier(&stale), "a frontier at a different size is refused");
+        assert_eq!(built.anchor(), borrowed.anchor(), "and the refusal left the good one in place");
     }
 
     /// A **watch-only** wallet loaded from just the FVK discovers exactly the same
@@ -2691,6 +4483,236 @@ mod tests {
         }
     }
 
+    /// A growing chain must not cost a wallet its cache.
+    ///
+    /// `append_leaf` folds each new leaf in as it arrives — one combine, amortised —
+    /// but ONLY while `upto == size`. That invariant is what keeps a caught-up wallet
+    /// serving witnesses from the cache instead of replaying the stream, and it is
+    /// load-bearing: on a 1-BPS chain the stream grows every second, so a cache that
+    /// fell one leaf behind could never catch up on its own, and every spend from that
+    /// wallet would pay the O(chain) climb the cache exists to delete.
+    /// A wallet that BORROWS the shared chain tree must still be able to install a
+    /// subtree cache.
+    ///
+    /// `tree_valid` is cleared by every leaf appended while borrowing, and a checkpoint
+    /// written in that state records no tip frontier, so the restored mirror tree is
+    /// empty. The install gate compared the assembled cache's root against that empty
+    /// tree and therefore rejected every cache, forever. Live on 2026-09-24: 1140
+    /// attempts, 1140 rejections, all "root disagrees", zero successes — including
+    /// 733-leaf builds that finished in 25 ms, where nothing can have moved.
+    ///
+    /// The consequence was not a wrong witness; `subtree_paths` re-checks every path it
+    /// assembles. It was that no wallet on this daemon ever became spend-ready, so every
+    /// send paid the O(chain) replay the cache exists to delete.
+    #[test]
+    fn a_wallet_borrowing_the_shared_tree_can_still_install_a_cache() {
+        let mine = [37u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for b in 0..80u32 {
+            let recipient = if b % 9 == 0 { address_of(mine) } else { address_of([(b % 250 + 1) as u8; 32]) };
+            db.ingest_block(&[coinbase_for(recipient, &b.to_le_bytes(), 1_000 + b as u64)], &[]);
+        }
+        // Exactly the state a borrowing wallet is in: leaves of its own, no tree it can
+        // claim as its own.
+        db.tree_valid = false;
+
+        db.build_subtree_cache();
+        assert!(db.subtree_cache_ready(db.size()), "a borrowed tree is not a reason to refuse the cache");
+        assert!(!db.subtree_cache_failed());
+
+        // And the witnesses it serves are real, which is the property that actually
+        // matters — it is re-derived per path at spend time either way.
+        let positions: Vec<u64> = db.notes().iter().map(|n| n.position).collect();
+        assert!(!positions.is_empty(), "the wallet must own notes for this to prove anything");
+        assert!(db.witness_paths_at(&positions, db.size()).iter().all(Option::is_some));
+    }
+
+    /// The gate is only relaxed where it cannot be evaluated. A wallet with its OWN tree
+    /// still has its cache checked against it, and a cache that cannot produce a root at
+    /// all is refused whatever the tree's state.
+    #[test]
+    fn a_wallet_with_its_own_tree_still_has_the_cache_checked() {
+        let mine = [38u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for b in 0..80u32 {
+            db.ingest_block(&[coinbase_for(address_of(mine), &b.to_le_bytes(), 1_000 + b as u64)], &[]);
+        }
+        assert!(db.tree_is_valid(), "an ordinary wallet owns its tree");
+        db.build_subtree_cache();
+        assert!(db.cache_matches_tree(&db.subtree), "a correct cache matches the wallet's own tree");
+
+        // An empty cache cannot produce a root at this size, and is refused in both
+        // regimes — the structural requirement is not what was relaxed.
+        let empty = SubtreeCache::default();
+        assert!(!db.cache_matches_tree(&empty), "no root, no install (own tree)");
+        db.tree_valid = false;
+        assert!(!db.cache_matches_tree(&empty), "no root, no install (borrowed tree)");
+    }
+
+    #[test]
+    fn subtree_cache_keeps_serving_as_the_chain_grows() {
+        let mine = [36u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for b in 0..80u32 {
+            let recipient = if b % 9 == 0 { address_of(mine) } else { address_of([(b % 250 + 1) as u8; 32]) };
+            db.ingest_block(&[coinbase_for(recipient, &b.to_le_bytes(), 1_000 + b as u64)], &[]);
+        }
+        db.build_subtree_cache();
+        assert!(db.subtree_cache_ready(db.size()), "cache serves once built");
+        let upto_before = db.subtree_build_upto();
+
+        // The chain moves on, exactly as it does every second in production.
+        for b in 80..96u32 {
+            db.ingest_block(&[coinbase_for(address_of(mine), &b.to_le_bytes(), 2_000 + b as u64)], &[]);
+        }
+
+        assert!(db.subtree_cache_ready(db.size()), "appended leaves keep the cache in step");
+        assert!(db.subtree_build_upto() > upto_before, "and it advanced with them");
+        assert!(!db.subtree_cache_failed());
+
+        // The witnesses it serves must be the real ones, not merely present.
+        let positions: Vec<u64> = db.notes().iter().map(|n| n.position).collect();
+        assert!(db.witness_paths_at(&positions, db.size()).iter().all(Option::is_some));
+    }
+
+    /// The parallel fold must be bit-identical to the sequential sweep: same roots at
+    /// every level, same `first`, same peaks, same `upto` — for an unseeded stream, an
+    /// aligned base, an unaligned base, and window sizes from one leaf up to the real one.
+    /// The root gate would reject a wrong cache anyway, but the consequence of that is
+    /// a wallet silently on the O(chain) replay forever, which is exactly what this test
+    /// exists to catch before it ships.
+    #[test]
+    fn parallel_fold_matches_sequential() {
+        let mine = [37u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for b in 0..121u32 {
+            let theirs = coinbase_for(address_of([(b % 251) as u8 + 1; 32]), format!("s{b}").as_bytes(), 100 + b as u64);
+            if b % 3 == 0 {
+                let ours = coinbase_for(address_of(mine), format!("m{b}").as_bytes(), 1_000 + b as u64);
+                db.ingest_block(&[theirs, ours], &[]);
+            } else {
+                db.ingest_block(&[theirs], &[]);
+            }
+        }
+        db.ingest_block(&[coinbase_for(address_of(mine), b"odd", 5_000)], &[]);
+        assert_eq!(db.size() % 2, 1, "an odd stream exercises the ragged tail");
+
+        for &base in &[0u64, 64, 130] {
+            let mut w = WalletDb::from_seed(mine).unwrap();
+            w.leaves = db.leaves.clone();
+            // Compaction never rolls past a held note, so keep only the notes above
+            // `base` — otherwise every base collapses to the earliest note's position.
+            w.notes = db.notes.iter().filter(|n| n.position >= base).cloned().collect();
+            w.size = db.size;
+            w.tree = db.tree.clone();
+            if base > 0 {
+                // Returns whether MORE rolling remains; a full roll to `base` yields false.
+                let more = w.advance_base_capped(base, u64::MAX);
+                assert!(!more, "the roll to base={base} completes in one call");
+            }
+            assert_eq!(w.base_size(), base, "the base under test is the one folded");
+            // Sequential reference.
+            let mut seq = SubtreeCache::default();
+            assert!(seq.seed_from_frontier(&w.base_frontier, w.base_size));
+            for (i, leaf) in w.decoded_leaves().iter().enumerate() {
+                assert!(seq.push_leaf(w.base_size + i as u64, *leaf));
+            }
+            for &log2 in &[0u8, 3, 5, 6, PAR_WINDOW_LOG2] {
+                let progress = AtomicU64::new(0);
+                let mut par = SubtreeCache::default();
+                assert!(par.seed_from_frontier(&w.base_frontier, w.base_size));
+                assert!(par.fold_parallel(w.base_size, w.decoded_leaves(), log2, &progress), "fold base={base} log2={log2}");
+                assert!(par.levels == seq.levels, "levels base={base} log2={log2}");
+                assert!(par.first == seq.first, "first base={base} log2={log2}");
+                assert!(par.peaks == seq.peaks, "peaks base={base} log2={log2}");
+                assert_eq!(par.upto, seq.upto, "upto base={base} log2={log2}");
+                assert_eq!(progress.load(Ordering::Relaxed), w.decoded_leaves().len() as u64, "progress counts every leaf");
+            }
+            // And the public entry point (which now folds in parallel) passes its own
+            // root gate and serves real witnesses.
+            w.build_subtree_cache();
+            assert!(w.subtree_cache_ready(w.size()), "root gate base={base}");
+            let positions: Vec<u64> = w.notes().iter().map(|n| n.position).filter(|&p| p >= w.base_size()).collect();
+            assert!(w.witness_paths_at(&positions, w.size()).iter().all(Option::is_some), "cached witnesses base={base}");
+        }
+    }
+
+    /// A wallet that borrowed the shared tree and then had borrowing withdrawn is left
+    /// with a mirror it cannot repair.
+    ///
+    /// `tree_valid` is cleared by every leaf appended while borrowing, and the ONLY thing
+    /// that sets it true again is `adopt_tip_frontier`, which refuses a frontier that is
+    /// not at exactly this wallet's leaf count. So once the shared tree is not at the
+    /// wallet's size, the wallet stays invalid — and the spend path forgives a wallet
+    /// that IS borrowing while refusing one that merely WAS. That combination is what
+    /// made healthy wallets answer every payment with "still catching up", and it is why
+    /// the borrow flag must not be dropped while the mirror is still invalid.
+    #[test]
+    fn a_wallet_that_stopped_borrowing_cannot_repair_its_own_mirror() {
+        let mine = [77u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+
+        db.set_borrow_tree(true);
+        for b in 0..12u32 {
+            db.ingest_block(&[coinbase_for(address_of(mine), &b.to_le_bytes(), 1_000 + b as u64)], &[]);
+        }
+        assert!(!db.tree_is_valid(), "borrowing leaves the mirror invalid, by design");
+
+        // The only repair route: a frontier at a DIFFERENT size is refused, correctly —
+        // it is not this wallet's tree.
+        let mut other = WalletDb::from_seed([78u8; 32]).unwrap();
+        other.ingest_block(&[coinbase_for(address_of([78u8; 32]), b"x", 1)], &[]);
+        let shorter = other.tip_frontier_state().expect("a non-borrowing tree is valid");
+        assert_ne!(shorter.size, db.size());
+        assert!(!db.adopt_tip_frontier(&shorter), "a frontier at another size must be refused");
+        assert!(!db.tree_is_valid());
+
+        // Withdrawing the flag repairs nothing — the wallet is neither valid nor
+        // borrowing, which is exactly the state the spend path refuses outright.
+        db.set_borrow_tree(false);
+        assert!(!db.tree_is_valid());
+        assert!(!db.is_borrowing());
+
+        // And the way out: a frontier at exactly this size restores it.
+        let mut twin = WalletDb::from_seed(mine).unwrap();
+        for b in 0..12u32 {
+            twin.ingest_block(&[coinbase_for(address_of(mine), &b.to_le_bytes(), 1_000 + b as u64)], &[]);
+        }
+        let exact = twin.tip_frontier_state().expect("valid");
+        assert_eq!(exact.size, db.size());
+        assert!(db.adopt_tip_frontier(&exact));
+        assert!(db.tree_is_valid());
+    }
+
+    #[test]
+    fn v8_checkpoint_persists_root_gated_subtree_cache() {
+        let mine = [35u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for b in 0..80u32 {
+            let recipient = if b % 9 == 0 { address_of(mine) } else { address_of([(b % 250 + 1) as u8; 32]) };
+            db.ingest_block(&[coinbase_for(recipient, &b.to_le_bytes(), 1_000 + b as u64)], &[]);
+        }
+        db.build_subtree_cache();
+        assert!(db.subtree_cache_ready(db.size()), "a borrowed tree is not a reason to refuse the cache");
+
+        let blob = db.to_checkpoint();
+        let restored = WalletDb::from_checkpoint(mine, &blob).expect("v8 restores");
+        assert!(restored.subtree_cache_ready(restored.size()), "validated cache survives restart");
+        let positions: Vec<u64> = restored.notes().iter().map(|n| n.position).collect();
+        assert!(restored.witness_paths_at(&positions, restored.size()).iter().all(Option::is_some));
+
+        // Corrupt only the optional cache payload. The whole checkpoint remains
+        // structurally parseable, but the cache root gate must refuse it.
+        let mut ssec = Vec::new();
+        write_subtree_section(&mut ssec, &db.subtree);
+        let mut corrupt = blob;
+        let section_start = corrupt.len() - ssec.len();
+        corrupt[section_start] = 2; // invalid active flag: optional section is declined
+        let restored = WalletDb::from_checkpoint(mine, &corrupt).expect("bad optional cache never loses wallet state");
+        assert!(!restored.subtree_cache_ready(restored.size()), "wrong-root cache rejected");
+        assert_eq!(restored.balance(), db.balance());
+    }
+
     /// Rolling the fast-sync base forward (compaction) is representation-only: it must
     /// drop the summarised leaves without changing any witness root, any authentication
     /// path, or the tip anchor — and a checkpoint written from the compacted wallet must
@@ -2846,15 +4868,6 @@ mod tests {
         }
     }
 
-    /// A note the sweep already passed can be adopted into the warm set, and the witness
-    /// it gets is identical to the one a full replay produces.
-    ///
-    /// This is the miner/pool endgame. Witnesses are only opened as the forward sweep
-    /// reaches each leaf, so a note sitting BELOW `witnessed_upto` can never acquire one
-    /// — it re-pays the whole O(matured − base) replay on every single spend, forever.
-    /// With the notes clustered just above the compaction base and the matured tip
-    /// ~126 K leaves ahead, that was the 22 s-per-note cost on the live wallet.
-    #[test]
     /// The live incident (note@564934): a note parked in `pending_spends` is not
     /// in `notes`, so the old compaction cap ignored it, rolled the base past it,
     /// and `reclaim_expired` later re-inserted it BELOW the base — permanently
@@ -2960,6 +4973,14 @@ mod tests {
         assert!(db.graft_history(&stranger).is_err());
     }
 
+    /// A note the sweep already passed can be adopted into the warm set, and the witness
+    /// it gets is identical to the one a full replay produces.
+    ///
+    /// This is the miner/pool endgame. Witnesses are only opened as the forward sweep
+    /// reaches each leaf, so a note sitting BELOW `witnessed_upto` can never acquire one
+    /// — it re-pays the whole O(matured − base) replay on every single spend, forever.
+    /// With the notes clustered just above the compaction base and the matured tip
+    /// ~126 K leaves ahead, that was the 22 s-per-note cost on the live wallet.
     #[test]
     fn a_note_below_the_sweep_can_be_adopted_and_matches_a_full_replay() {
         let mine = [63u8; 32];
@@ -3034,6 +5055,107 @@ mod tests {
         if let Some(n) = cold {
             assert!(db.witness_path_at(n.position, matured).is_some(), "released note still has a path");
         }
+    }
+
+    /// Can a checkpoint written by a DIFFERENT build of the Orchard stack still be
+    /// restored by this one?
+    ///
+    /// `from_checkpoint` returns `Option` and every caller treats `None` as "start
+    /// over", so a format change here is not an error anyone sees — it is a silent
+    /// full rescan of the whole chain, on every wallet, after an app update. That
+    /// is the single worst regression this product has, and it has shipped before.
+    ///
+    /// Run with `--ignored`: `ckpt_emit` on one build, `ckpt_load` on the other.
+    /// `CKPT_NAME` names the file; `CKPT_DIR` holds them.
+    fn ckpt_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(std::env::var("CKPT_DIR").unwrap_or_else(|_| "/root/zkas/mobile-test/ckpt".into()))
+    }
+
+    /// The wallet both halves build, identically, so the blob is comparable.
+    fn ckpt_fixture() -> (WalletDb, u64) {
+        let mine = [44u8; 32];
+        let mut db = WalletDb::from_seed(mine).unwrap();
+        for b in 0..16u8 {
+            let theirs = coinbase_for(address_of([b.wrapping_add(1); 32]), &[b, 5, 6, 7], 100 + b as u64);
+            if b == 2 || b == 6 || b == 11 {
+                let ours = coinbase_for(address_of(mine), &[b, 4, 4, 4], 2_000 + b as u64);
+                db.ingest_block(&[theirs, ours], &[]);
+            } else {
+                db.ingest_block(&[theirs], &[]);
+            }
+        }
+        let matured = db.size();
+        db.advance_witnesses(matured);
+        (db, matured)
+    }
+
+    #[test]
+    #[ignore]
+    fn ckpt_emit() {
+        let name = std::env::var("CKPT_NAME").expect("CKPT_NAME");
+        let (db, matured) = ckpt_fixture();
+        let blob = db.to_checkpoint();
+        std::fs::create_dir_all(ckpt_dir()).unwrap();
+        std::fs::write(ckpt_dir().join(format!("{name}.bin")), &blob).unwrap();
+        // The facts a restore must reproduce, recorded beside the blob.
+        let roots: Vec<String> = db
+            .notes()
+            .iter()
+            .filter(|n| n.position < matured)
+            .map(|n| {
+                let p = db.witness_path_at(n.position, matured).expect("live path");
+                let r = p.root(ExtractedNoteCommitment::from(n.note.commitment()));
+                format!("{}:{}", n.position, r.to_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>())
+            })
+            .collect();
+        let facts = format!(
+            "version={}\nnotes={}\nsize={}\nwitnessed_upto={}\nwitnesses={}\nroots={}\n",
+            blob[0], db.notes().len(), db.size(), db.witnessed_upto, db.witnesses.len(), roots.join(",")
+        );
+        std::fs::write(ckpt_dir().join(format!("{name}.facts")), &facts).unwrap();
+        println!("[{name}] wrote {} byte checkpoint (v{})", blob.len(), blob[0]);
+        println!("[{name}] {facts}");
+    }
+
+    #[test]
+    #[ignore]
+    fn ckpt_load() {
+        let name = std::env::var("CKPT_NAME").expect("CKPT_NAME");
+        let mine = [44u8; 32];
+        let mut checked = 0;
+        for e in std::fs::read_dir(ckpt_dir()).expect("ckpt dir") {
+            let p = e.unwrap().path();
+            if p.extension().map(|x| x != "bin").unwrap_or(true) {
+                continue;
+            }
+            let blob = std::fs::read(&p).unwrap();
+            let facts = std::fs::read_to_string(p.with_extension("facts")).unwrap();
+            let want = |k: &str| -> String {
+                facts.lines().find(|l| l.starts_with(&format!("{k}="))).unwrap()[k.len() + 1..].to_string()
+            };
+            let restored = WalletDb::from_checkpoint(mine, &blob)
+                .unwrap_or_else(|| panic!("[{name}] REFUSED the checkpoint in {p:?} — every wallet would rescan from zero"));
+            assert_eq!(restored.notes().len().to_string(), want("notes"), "note count from {p:?}");
+            assert_eq!(restored.size().to_string(), want("size"), "size from {p:?}");
+            assert_eq!(restored.witnessed_upto.to_string(), want("witnessed_upto"), "witnessed_upto from {p:?}");
+            assert_eq!(restored.witnesses.len().to_string(), want("witnesses"), "witness count from {p:?}");
+            // The roots are the real test: same tree, same hashing, same money.
+            let matured: u64 = want("size").parse().unwrap();
+            let got: Vec<String> = restored
+                .notes()
+                .iter()
+                .filter(|n| n.position < matured)
+                .map(|n| {
+                    let pa = restored.witness_path_at(n.position, matured).expect("restored path");
+                    let r = pa.root(ExtractedNoteCommitment::from(n.note.commitment()));
+                    format!("{}:{}", n.position, r.to_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>())
+                })
+                .collect();
+            assert_eq!(got.join(","), want("roots"), "witness roots differ for {p:?}");
+            println!("[{name}] restored {p:?} — notes/size/witnesses/roots all identical");
+            checked += 1;
+        }
+        assert!(checked > 0, "no checkpoints found to verify");
     }
 
     /// The v5 checkpoint persists the per-note witnesses, so a restored wallet spends with
@@ -3204,6 +5326,7 @@ mod tests {
             proof: vec![],
             binding_sig: [0u8; sizes::SIG],
             burn: None,
+            anchor_block: None,
         };
 
         // First acceptance appends its commitment; the duplicate appends nothing.
@@ -3223,6 +5346,40 @@ mod tests {
     /// balance, owned-note positions, the tip anchor, and — the strongest check —
     /// the exact spend witness, all without re-scanning the chain. This is what lets
     /// `zkas-walletd` resume after a restart instead of rescanning from birthday.
+    /// The spent-nullifier section round-trips **as a set**, whatever order it was
+    /// written in.
+    ///
+    /// This pins the invariant that let the sort go: `from_checkpoint` inserts each
+    /// entry into a `HashSet`, so two wallets that saw the same nullifiers in different
+    /// orders must restore identically. If anyone ever reintroduces an ordering
+    /// requirement — a content hash, a checksum-based backup, a byte-equality assert —
+    /// this test still passes, so read the comment in `to_checkpoint` before assuming
+    /// a canonical encoding is available.
+    #[test]
+    fn spent_nullifiers_roundtrip_as_a_set_regardless_of_insertion_order() {
+        let mine = [5u8; 32];
+        let mut a = WalletDb::from_seed(mine).unwrap();
+        let mut b = WalletDb::from_seed(mine).unwrap();
+
+        // The same nullifiers, inserted in opposite orders.
+        let nfs: Vec<[u8; 32]> = (0u8..64).map(|i| [i.wrapping_mul(7).wrapping_add(3); 32]).collect();
+        for nf in nfs.iter() {
+            a.spent_nullifiers.insert(*nf);
+        }
+        for nf in nfs.iter().rev() {
+            b.spent_nullifiers.insert(*nf);
+        }
+
+        let ra = WalletDb::from_checkpoint(mine, &a.to_checkpoint()).expect("restore a");
+        let rb = WalletDb::from_checkpoint(mine, &b.to_checkpoint()).expect("restore b");
+
+        assert_eq!(ra.spent_nullifiers.len(), nfs.len(), "every nullifier survives the round trip");
+        assert_eq!(ra.spent_nullifiers, rb.spent_nullifiers, "insertion order is semantically invisible");
+        for nf in nfs.iter() {
+            assert!(ra.spent_nullifiers.contains(nf), "nullifier missing after restore");
+        }
+    }
+
     #[test]
     fn checkpoint_roundtrips_state_and_witness() {
         let mine = [5u8; 32];
@@ -3334,7 +5491,9 @@ mod tests {
         assert!(db.history.is_empty() && db.pending_spends.is_empty());
         let hsec_len = 8; // row count
         let psec_len = 8 + 8; // last_daa + record count
-        let suffix_len = tip.len() + (8 + wsec.len()) + (8 + hsec_len) + (8 + psec_len);
+        let mut ssec = Vec::new();
+        write_subtree_section(&mut ssec, &db.subtree);
+        let suffix_len = tip.len() + (8 + wsec.len()) + (8 + hsec_len) + (8 + psec_len) + (8 + ssec.len());
         let mut v3 = v4[..v4.len() - suffix_len].to_vec();
         v3[0] = CHECKPOINT_VERSION_V3;
 
@@ -3361,7 +5520,14 @@ mod tests {
         a.ingest_block(&blk, &[]);
         b.ingest_block(&blk, &[]);
         assert_eq!(a.anchor(), b.anchor(), "post-restore appends agree");
-        assert_eq!(a.anchor(), { db.ingest_block(&blk, &[]); db.anchor() }, "and match the never-restarted wallet");
+        assert_eq!(
+            a.anchor(),
+            {
+                db.ingest_block(&blk, &[]);
+                db.anchor()
+            },
+            "and match the never-restarted wallet"
+        );
     }
 
     /// **Protocol fast-sync equivalence.** A wallet that starts from a node-supplied
@@ -3589,7 +5755,7 @@ mod circuit_tests {
 
     #[test]
     fn wallet_discovers_and_spends_coinbase_note_at_nonzero_position() {
-        let pk = ProvingKey::build();
+        let pk = ProvingKey::build(crate::verify::CIRCUIT_VERSION);
         let miner = [21u8; 32];
         let net = [0x5au8; 32];
         let ctx = b"zkas-walletdb-e2e";
@@ -3621,7 +5787,7 @@ mod circuit_tests {
         let merkle_path = db.witness_path(owned.position).expect("wallet builds a witness path on demand");
         let recipient = ShieldedKeys::from_seed([42u8; 32]).unwrap().address();
         let output_value = 7_000u64;
-        let wire = build_spend_bundle(&pk, &keys, owned.note, merkle_path, recipient, output_value, &net, ctx, rand::rngs::OsRng)
+        let wire = build_spend_bundle(&pk, &keys, owned.note, merkle_path, recipient, output_value, &net, ctx, rand::rng())
             .expect("wallet builds a real spend from its own witness");
 
         // Consensus accepts it: proof verifies, and it spends against the anchor
@@ -3675,7 +5841,8 @@ mod circuit_tests {
         let sel: Vec<_> = db.notes().iter().map(|o| (o.note.clone(), o.position)).collect();
         let inputs: Vec<_> = sel.into_iter().map(|(note, pos)| (note, db.witness_path(pos).unwrap())).collect();
         let recipient = address_bytes_from_seed([42u8; 32]).unwrap();
-        let payload = build_wallet_payment(miner, inputs, recipient, 5_000, 1_000, &net, ctx, true, [0u8; 512]).expect("multi-note payment builds");
+        let payload = build_wallet_payment(miner, inputs, recipient, 5_000, 1_000, &net, ctx, true, [0u8; 512])
+            .expect("multi-note payment builds");
         let wire = ShieldedBundle::from_bytes(&payload).expect("payload decodes to a bundle");
 
         // Two real spends that actually verify against the shared anchor.
@@ -3761,6 +5928,150 @@ mod circuit_tests {
         assert_eq!(db.balance(), (8_000 - paid_total - fee) as u128, "change = in - paid - fee");
     }
 
+    /// Moving a synced wallet from the hosted service to the on-device engine.
+    ///
+    /// The receipt carries no leaf stream at all, so the imported wallet holds a note
+    /// that sits *below* everything it can see. A frontier alone could never witness
+    /// such a note — that is exactly the restriction `from_frontier` documents — so if
+    /// the spend path below still rebuilds, the witnesses really did travel.
+    #[test]
+    fn scan_receipt_moves_a_synced_wallet_without_its_leaf_stream() {
+        let mine = [71u8; 32];
+        let other = [72u8; 32];
+        let genesis = [0xcdu8; 32];
+
+        let mut hosted = WalletDb::from_seed(mine).unwrap();
+        let m1 = cb(address_bytes_from_seed(mine).unwrap(), b"rcpt||0", 12_000);
+        let meta1 = BlockMeta { coinbase_txid: [0x11; 32], txids: vec![], timestamp_ms: 1_000, daa_score: 100 };
+        hosted.ingest_block_with_meta(&[m1], &[], Some(&meta1));
+        // Pure tree growth to somebody else, so our note ends up well below the tip.
+        for i in 0..5u8 {
+            let o = cb(address_bytes_from_seed(other).unwrap(), &[b'x', i], 5_000);
+            let meta = BlockMeta {
+                coinbase_txid: [0x22; 32],
+                txids: vec![],
+                timestamp_ms: 2_000,
+                daa_score: 101 + i as u64,
+            };
+            hosted.ingest_block_with_meta(&[o], &[], Some(&meta));
+        }
+        hosted.advance_witnesses(hosted.size());
+        assert_eq!(hosted.balance(), 12_000);
+        let pos = hosted.notes()[0].position;
+
+        let receipt = hosted.to_scan_receipt(genesis, 105).expect("a fully witnessed wallet exports");
+        assert!(receipt.len() < 8_000, "a one-note receipt is kilobytes, got {}", receipt.len());
+
+        // The phone: same key, no leaf stream, no scan.
+        let (mut phone, meta) = WalletDb::from_scan_receipt(mine, genesis, &receipt).expect("receipt imports");
+        assert_eq!(meta.scanned_daa, 105, "the importer resumes where the exporter stopped");
+        assert_eq!(meta.anchor_leaves, hosted.size());
+        assert_eq!(phone.balance(), hosted.balance(), "the imported wallet sees the same money");
+        assert!(
+            phone.to_checkpoint().len() < hosted.to_checkpoint().len(),
+            "the public leaf stream did NOT travel"
+        );
+
+        // A receipt from another chain is refused outright.
+        assert!(
+            WalletDb::from_scan_receipt(mine, [0x99u8; 32], &receipt).is_none(),
+            "a receipt naming a different genesis is refused"
+        );
+        // So is a tampered one.
+        let mut bad = receipt.clone();
+        let n = bad.len();
+        bad[n - 1] ^= 0xff;
+        assert!(
+            WalletDb::from_scan_receipt(mine, genesis, &bad).map_or(true, |(w, _)| w.balance() == 0),
+            "a note whose witness does not root to the anchor is dropped, never trusted"
+        );
+
+        // And it can still spend: both ingest one more block, and the imported wallet
+        // reproduces the same anchor as the wallet that scanned the whole chain.
+        let o = cb(address_bytes_from_seed(other).unwrap(), b"after", 5_000);
+        let meta7 = BlockMeta { coinbase_txid: [0x33; 32], txids: vec![], timestamp_ms: 3_000, daa_score: 106 };
+        hosted.ingest_block_with_meta(&[o.clone()], &[], Some(&meta7));
+        phone.ingest_block_with_meta(&[o], &[], Some(&meta7));
+        hosted.advance_witnesses(hosted.size());
+        phone.advance_witnesses(phone.size());
+
+        let n = phone.notes().iter().find(|n| n.position == pos).expect("note survived the move");
+        let cm = ExtractedNoteCommitment::from(n.note.commitment());
+        let want = hosted.witness_path(pos).expect("hosted path");
+        let got = phone.witness_path(pos).expect("imported wallet still has a spend path");
+        assert_eq!(got.root(cm), want.root(cm), "imported witness roots to the same anchor");
+    }
+
+    /// The deposit-attribution bug exactly as an exchange reported it: ONE transaction
+    /// paying TWO of the same wallet's diversified addresses.
+    ///
+    /// Such a transaction is a single row — there is one txid — and the row's `amount`
+    /// was the sum while its `recipient` was whichever note decrypted first. An exchange
+    /// crediting customers by invoice address therefore credited one customer with both
+    /// deposits and the other with none, and no amount of re-reading the history could
+    /// recover the split: the daemon had thrown it away. `credits` is that split, and it
+    /// has to survive a restart or the next checkpoint load loses it again.
+    #[test]
+    fn two_diversified_deposits_in_one_tx_are_attributed_separately() {
+        let payer = [51u8; 32];
+        let exchange = [52u8; 32];
+        let net = [0x7au8; 32];
+        let ctx = b"zkas-walletdb-credits";
+
+        let mut p = WalletDb::from_seed(payer).unwrap();
+        let mut x = WalletDb::from_seed(exchange).unwrap();
+
+        // Two customers, two invoice addresses, one wallet and one balance.
+        let alice = x.address_bytes_at(1);
+        let bob = x.address_bytes_at(2);
+        assert_ne!(alice, bob, "diversified addresses differ");
+
+        let mine = cb(address_bytes_from_seed(payer).unwrap(), b"credits||0", 20_000);
+        let meta1 = BlockMeta { coinbase_txid: [0xa1; 32], txids: vec![], timestamp_ms: 1_000, daa_score: 10 };
+        p.ingest_block_with_meta(&[mine.clone()], &[], Some(&meta1));
+        x.ingest_block_with_meta(&[mine], &[], Some(&meta1));
+
+        // One transaction, both invoices.
+        let inputs = vec![(p.notes()[0].note.clone(), p.witness_path(p.notes()[0].position).unwrap())];
+        let payload = crate::wallet::build::build_wallet_payment_multi(
+            payer,
+            inputs,
+            &[(alice, 3_000, [0u8; 512]), (bob, 7_000, [0u8; 512])],
+            1_000,
+            &net,
+            ctx,
+            true,
+        )
+        .expect("two-payee payment builds");
+        let wire = ShieldedBundle::from_bytes(&payload).unwrap();
+
+        let meta2 = BlockMeta { coinbase_txid: [0xb1; 32], txids: vec![[0xd1; 32]], timestamp_ms: 2_000, daa_score: 20 };
+        x.ingest_block_with_meta(&[], &[&wire], Some(&meta2));
+
+        assert_eq!(x.balance(), 10_000, "both deposits land in the one balance");
+        assert_eq!(x.history().len(), 1, "one transaction is still one row");
+        let row = &x.history()[0];
+        assert_eq!(row.kind, HistoryKind::Received);
+        assert_eq!(row.amount, 10_000, "the row still totals the transaction");
+
+        // What was lost before: which address got what.
+        let mut got: Vec<([u8; 43], u64)> = row.credits.iter().map(|c| (c.recipient, c.value)).collect();
+        got.sort_by_key(|&(_, v)| v);
+        assert_eq!(
+            got,
+            vec![(alice, 3_000), (bob, 7_000)],
+            "each diversified address is credited with its own deposit, not the sum"
+        );
+        assert_eq!(row.credits.iter().map(|c| c.value).sum::<u64>(), row.amount, "credits account for the whole row");
+
+        // v10 round-trip: a restart must not throw the breakdown away again.
+        let blob = x.to_checkpoint();
+        assert_eq!(blob[0], CHECKPOINT_VERSION, "written at the current checkpoint version");
+        let back = WalletDb::from_checkpoint(exchange, &blob).expect("v10 checkpoint restores");
+        assert_eq!(back.history().len(), 1);
+        assert_eq!(back.history()[0].credits, row.credits, "credits survive the checkpoint");
+    }
+
     /// End-to-end chain-derived history: mint → OVK send with a memo → receive.
     /// The sender's row recovers the recipient/amount/memo via its own OVK; the
     /// receiver's row carries the amount+memo from IVK decryption; a checkpoint
@@ -3802,7 +6113,7 @@ mod circuit_tests {
             true,
             memo,
         )
-        .expect("payment builds");
+        .expect("non-recoverable payment builds");
         let wire = ShieldedBundle::from_bytes(&payload).unwrap();
 
         // Mirror walletd: the spent note is PARKED at submit time. The Sent row
@@ -3812,12 +6123,26 @@ mod circuit_tests {
         a.mark_spent(a.notes()[0].position, [0xcc; 32], 15);
         assert_eq!(a.balance(), 0, "submitted note leaves the balance immediately");
         assert_eq!(a.pending_spends().len(), 1);
+        // The balance-dip fix: walletd records amount + fee right after parking, so
+        // the change (8_000 - 5_000 - 1_000) is published instead of reading as 0
+        // until the change note is decrypted on-chain. Never part of `balance()`.
+        a.note_pending_outflow([0xcc; 32], 6_000);
+        assert_eq!(a.pending_change(), 2_000, "change owed back is known at submit");
+        assert_eq!(a.balance(), 0, "pending change is not spendable balance");
+        // The 0-conf preview of the same tx must contribute NOTHING for the sender
+        // (its change is already carried by `pending_change`) ...
+        let own = a.preview_block(&[], &[&wire]);
+        assert_eq!((own.incoming, own.outgoing), (0, 0), "own accounted spend previews as no movement");
+        // ... while the recipient still sees the payment arriving.
+        let theirs = b.preview_block(&[], &[&wire]);
+        assert_eq!((theirs.incoming, theirs.outgoing), (5_000, 0));
 
         let meta2 = BlockMeta { coinbase_txid: [0xbb; 32], txids: vec![[0xcc; 32]], timestamp_ms: 2_000, daa_score: 20 };
         a.ingest_block_with_meta(&[], &[&wire], Some(&meta2));
         b.ingest_block_with_meta(&[], &[&wire], Some(&meta2));
         assert!(a.pending_spends().is_empty(), "observed nullifier confirms the pending spend");
         assert_eq!(a.balance(), 2_000, "change recovered");
+        assert_eq!(a.pending_change(), 0, "confirmed spend: the change is a real note now, not pending");
 
         // Sender: a Sent row with the OVK-recovered recipient, amount and memo.
         assert_eq!(a.history().len(), 2);
@@ -3864,6 +6189,41 @@ mod circuit_tests {
         assert_eq!(sent.kind, HistoryKind::Sent);
         assert_eq!(sent.amount, 3_000, "net-outflow fallback still prices the send right");
         assert_eq!(sent.recipient, None, "without the OVK not even the sender can recover the recipient");
+
+        // A later watch-only rescan sees the same transaction through the compact
+        // archive. It lacks the full bundle's fee/OVK ciphertext, but it MUST still
+        // index our spend from its nullifier and the change it decrypts.
+        let mut compact = WalletDb::from_seed(miner).unwrap();
+        compact.ingest_block_compact_with_meta(
+            &[cb(address_bytes_from_seed(miner).unwrap(), b"compact||0", 8_000)],
+            &[],
+            Some(&meta1),
+        );
+        let inputs = vec![(compact.notes()[0].note.clone(), compact.witness_path(compact.notes()[0].position).unwrap())];
+        let payload = crate::wallet::build::build_wallet_payment(
+            miner,
+            inputs,
+            address_bytes_from_seed(friend).unwrap(),
+            5_000,
+            1_000,
+            &net,
+            ctx,
+            true,
+            [0u8; 512],
+        )
+        .expect("compact-history payment builds");
+        let compact_wire = ShieldedBundle::from_bytes(&payload).unwrap();
+        let compact_records = compact_wire.actions.iter().map(crate::wallet::scan::CompactActionRecord::from_wire).collect();
+        compact.ingest_block_compact_with_meta(&[], &[compact_records], Some(&meta2));
+        let compact_sent = compact.history().last().unwrap();
+        assert_eq!(compact_sent.kind, HistoryKind::Sent);
+        assert_eq!(compact_sent.amount, 6_000, "compact history records exact net outflow");
+        assert!(compact_sent.amount_is_net_outflow, "client must know this includes the unrecoverable fee");
+        assert!(!compact_sent.fee_known, "compact archive has no value_balance");
+        assert_eq!(compact_sent.recipient, None, "compact archive cannot recover recipient");
+        let compact_restored = WalletDb::from_checkpoint(miner, &compact.to_checkpoint()).unwrap();
+        let compact_sent = compact_restored.history().last().unwrap();
+        assert!(compact_sent.amount_is_net_outflow && !compact_sent.fee_known, "compact-history semantics survive restart");
     }
 
     /// The vanishing-balance regression (live report 2026-07-18): a submitted
@@ -3892,6 +6252,15 @@ mod circuit_tests {
         db.mark_spent(pos, [0xcc; 32], 110);
         assert_eq!(db.balance(), 6_000);
         assert_eq!(db.pending_spends().len(), 1);
+        // Sending 3_000 (incl. fee) out of the 4_000 note owes 1_000 back as change.
+        db.note_pending_outflow([0xcc; 32], 3_000);
+        assert_eq!(db.pending_change(), 1_000);
+        // An outflow for a txid with nothing parked, or one that consumes the whole
+        // note, records nothing.
+        db.note_pending_outflow([0xdd; 32], 1);
+        db.note_pending_outflow([0xcc; 32], 4_000);
+        assert_eq!(db.pending_change(), 0, "no leftover ⇒ no pending change");
+        db.note_pending_outflow([0xcc; 32], 3_000);
 
         // The parked note and the clock survive a checkpoint round-trip (v7).
         let blob = db.to_checkpoint();
@@ -3899,6 +6268,11 @@ mod circuit_tests {
         assert_eq!(db.pending_spends().len(), 1, "pending spends persist across restart");
         assert_eq!(db.last_daa(), 110);
         assert_eq!(db.balance(), 6_000);
+        // The change figure is display-only and deliberately NOT in the checkpoint
+        // (no format bump for it): it reverts to the preview-derived path on restart.
+        assert_eq!(db.pending_change(), 0, "pending change is not persisted");
+        db.note_pending_outflow([0xcc; 32], 3_000);
+        assert_eq!(db.pending_change(), 1_000);
 
         // Too fresh to give up on: nothing reclaimed.
         assert!(db.reclaim_expired(120, 3_600).is_empty());
@@ -3914,6 +6288,7 @@ mod circuit_tests {
         assert_eq!(back, vec![([0xcc; 32], 4_000)], "the lost spend's note is handed back");
         assert_eq!(db.balance(), 10_000, "no money vanished");
         assert!(db.pending_spends().is_empty());
+        assert_eq!(db.pending_change(), 0, "a reclaimed spend owes no change");
         assert_eq!(db.notes()[0].position, pos, "reclaimed note returns in position order");
     }
 

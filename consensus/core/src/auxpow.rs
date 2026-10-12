@@ -46,6 +46,10 @@ use serde::{Deserialize, Serialize};
 /// coinbase payload. "ZKas Merged Mining".
 pub const MERGE_MINE_MAGIC: [u8; 4] = *b"ZKMM";
 
+/// Post-fork merge-mining tag (`Params::security_fork_activation`): followed by the hex of
+/// [`AuxPow::bound_commitment`], which binds the genesis and the nonce-free header hash.
+pub const MERGE_MINE_MAGIC_V1: [u8; 4] = *b"ZKM1";
+
 /// Hard cap on [`AuxPow::coinbase_merkle_branch`] length. The branch has one entry
 /// per level of the parent's transaction Merkle tree, so a parent with `n`
 /// transactions needs `ceil(log2(n))` entries: 64 admits a parent with 2^64
@@ -57,13 +61,34 @@ pub const MERGE_MINE_MAGIC: [u8; 4] = *b"ZKMM";
 /// it. Rejecting an over-long branch is free and cannot refuse an honest block.
 pub const MAX_COINBASE_MERKLE_BRANCH: usize = 64;
 
+/// Largest serialized aux witness a decode edge will accept.
+///
+/// Nothing bounded the witness's total size: not `parent_coinbase` (unbounded inputs with unbounded
+/// signature scripts, unbounded outputs), not the aux parent's parent hashes. The only ceiling was
+/// the ~1 GiB p2p/RPC message limit.
+///
+/// What makes that worse than an ordinary oversized-message problem is the native path.
+/// `check_pow_gated` tries native proof-of-work FIRST and returns the moment it passes, so for a
+/// natively mined block the witness is never looked at by consensus at all — yet it is stored
+/// verbatim with the header, kept forever, and re-serialized to every peer that requests the block.
+/// So a miner can attach hundreds of megabytes of junk to a block it is *paid* for, with no extra
+/// work and no consensus rule broken, and every node keeps it. The headers cache made that worse
+/// still by accounting the witness at a fraction of its real size (see `Header::estimate_mem_bytes`).
+///
+/// Enforced at the decode edges, where an unusable witness is DROPPED and the header kept, so this
+/// never costs a valid block: an honest natively mined block survives with its junk removed, and an
+/// aux-mined block that genuinely needs the witness simply fails proof-of-work and is retried. A real
+/// Kaspa coinbase plus a 64-deep branch is a few kilobytes, so this sits orders of magnitude above
+/// anything honest.
+pub const MAX_AUX_POW_SERIALIZED_LEN: usize = 256 * 1024;
+
 /// The proof that a ZKas block was mined on top of a parent kHeavyHash block.
 ///
 /// Travels alongside the ZKas header (it is deliberately *not* part of the
 /// header hash `H_fc`, so the commitment stays stable). Derives borsh only, to
 /// match [`Transaction`] and be storable / wire-serializable.
 // `Header` implements neither `PartialEq` nor `Eq`, so `AuxPow` cannot derive them.
-#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuxPow {
     /// The parent block header carrying the real kHeavyHash proof-of-work. Its
@@ -83,7 +108,113 @@ pub struct AuxPow {
     pub coinbase_merkle_branch: Vec<Hash>,
 }
 
+/// How deeply `AuxPow` may nest before decoding gives up.
+///
+/// `AuxPow` holds a [`Header`], which holds an `Option<Box<AuxPow>>`, so the two types are mutually
+/// recursive with NO depth bound anywhere, against a 1 GiB message ceiling — roughly 250 bytes per
+/// level, so millions of levels. Derived borsh decoding recurses per level (stack overflow, which
+/// the panic hook cannot even log), and `MemSizeEstimator` and the `Box` drop chain walk the same
+/// chain afterwards.
+///
+/// Consensus never reads the nested field: `parent_pow` hashes only the parent's header fields
+/// (`hashing::header` does not touch `aux_pow`) and `verify_binding` reads only the coinbase, the
+/// branch and the merkle root. So it is pure attack surface.
+///
+/// This is a LIMIT rather than a flat rejection on purpose. Merged mining is active from genesis on
+/// mainnet, the witness is produced by an external bridge whose code is not in this repo, and
+/// nesting would have left no trace if it ever occurred — nothing reads it. Rejecting any nesting
+/// would therefore be a tightening on a consensus-active path with no way to confirm, from here,
+/// that no historical witness trips it; and because the witness is load-bearing for an aux-mined
+/// block's proof of work, getting that wrong does not fail cleanly — it silently stops a fresh sync
+/// at some block years back. A depth of 4 accepts anything a real producer could plausibly emit
+/// while bounding the recursion to a constant.
+pub const MAX_AUX_POW_NESTING: u32 = 4;
+
+thread_local! {
+    static AUX_POW_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Hand-written so the nesting depth above is enforced DURING decoding.
+///
+/// Stripping the nested field after the fact would not help: the stack overflow happens while borsh
+/// is still descending.
+/// Releases the nesting counter on EVERY exit path, an unwind included.
+///
+/// A bare decrement after the decode is skipped by a panic inside borsh — an allocation failure, or
+/// any future `.expect` in a nested `deserialize_reader`. The counter is thread-local and these
+/// decode on long-lived rayon workers, so one leak would permanently reject every later witness on
+/// that worker as "nested too deep", with nothing in the logs to explain it. Release builds unwind
+/// (no `panic` setting in `[profile.release]`), so that path is reachable. Same shape as walletd's
+/// `ProvingGuard`.
+struct AuxDepthGuard;
+
+impl AuxDepthGuard {
+    fn enter() -> (Self, u32) {
+        let depth = AUX_POW_DEPTH.with(|d| {
+            let next = d.get().saturating_add(1);
+            d.set(next);
+            next
+        });
+        (Self, depth)
+    }
+}
+
+impl Drop for AuxDepthGuard {
+    fn drop(&mut self) {
+        AUX_POW_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+impl BorshDeserialize for AuxPow {
+    fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
+        let (_depth_guard, depth) = AuxDepthGuard::enter();
+        if depth > MAX_AUX_POW_NESTING {
+            return Err(borsh::io::Error::new(
+                borsh::io::ErrorKind::InvalidData,
+                format!("aux witness nested deeper than {MAX_AUX_POW_NESTING}"),
+            ));
+        }
+        Ok(AuxPow {
+            parent_header: Header::deserialize_reader(reader)?,
+            parent_coinbase: Transaction::deserialize_reader(reader)?,
+            coinbase_merkle_branch: Vec::<Hash>::deserialize_reader(reader)?,
+        })
+    }
+}
+
 impl AuxPow {
+    /// Structural bounds that every decode edge must apply before a witness is stored, relayed or
+    /// hashed, so the rules live in one place instead of being re-derived per edge.
+    ///
+    /// `parents_by_level` is validated by [`CompressedParents`]' own borsh decoding and nesting
+    /// depth by [`MAX_AUX_POW_NESTING`], so neither is repeated here. What this adds is the Merkle
+    /// branch length: no honest parent needs more than [`MAX_COINBASE_MERKLE_BRANCH`] levels (the
+    /// branch is log2 of the parent block's transaction count), the field is otherwise bounded only
+    /// by the 1 GiB message ceiling, and the witness is stored with the header forever. The p2p edge
+    /// already enforced exactly this bound before the rule moved here, so no block carrying a longer
+    /// branch could ever have propagated.
+    pub fn validate_structure(&self) -> Result<(), String> {
+        if self.coinbase_merkle_branch.len() > MAX_COINBASE_MERKLE_BRANCH {
+            return Err(format!(
+                "coinbase merkle branch too long: {} > {}",
+                self.coinbase_merkle_branch.len(),
+                MAX_COINBASE_MERKLE_BRANCH
+            ));
+        }
+        // Total serialized size. The per-field caps above and the nesting bound in
+        // `BorshDeserialize` do not bound this: `parent_coinbase` alone can carry unbounded inputs,
+        // signature scripts and outputs. See `MAX_AUX_POW_SERIALIZED_LEN` for why a witness that
+        // consensus never even reads is still worth refusing.
+        match borsh::object_length(self) {
+            Ok(len) if len > MAX_AUX_POW_SERIALIZED_LEN => {
+                return Err(format!("aux witness too large: {len} > {MAX_AUX_POW_SERIALIZED_LEN} bytes"));
+            }
+            Ok(_) => {}
+            Err(e) => return Err(format!("aux witness is not serializable: {e}")),
+        }
+        Ok(())
+    }
+
     /// Extract the single commitment tagged by [`MERGE_MINE_MAGIC`] in the parent
     /// coinbase payload. Returns `None` unless the magic occurs **exactly once** and is
     /// followed by a full [`COMMITMENT_HEX_LEN`] lowercase-hex encoding of the 32-byte
@@ -94,19 +225,74 @@ impl AuxPow {
     /// UTF-8. Real 32-byte block hashes are almost never valid UTF-8, so raw bytes
     /// cannot be carried there; the 64-char hex encoding always can.
     pub fn committed_hash(&self) -> Option<Hash> {
-        let payload = self.parent_coinbase.payload.as_slice();
+        Self::payload_commitment(self.parent_coinbase.payload.as_slice(), &MERGE_MINE_MAGIC)
+    }
+
+    /// The single post-fork (`ZKM1`) commitment in the parent coinbase, same uniqueness and
+    /// well-formedness rules as [`Self::committed_hash`].
+    pub fn committed_hash_v1(&self) -> Option<Hash> {
+        Self::payload_commitment(self.parent_coinbase.payload.as_slice(), &MERGE_MINE_MAGIC_V1)
+    }
+
+    /// Whether `payload` carries a well-formed, unique merge-mining commitment under EITHER tag,
+    /// i.e. whether a block with this coinbase could serve as somebody's aux parent. From the
+    /// security fork a ZKas coinbase must not: that is what stops one ZKas solution from also
+    /// counting as the proof-of-work of a second ZKas block. Uses the same scanner as the parent
+    /// check so the two can never drift apart.
+    pub fn payload_carries_commitment(payload: &[u8]) -> bool {
+        Self::payload_commitment(payload, &MERGE_MINE_MAGIC).is_some() || Self::payload_commitment(payload, &MERGE_MINE_MAGIC_V1).is_some()
+    }
+
+    /// The post-fork value an aux parent commits to: a hash binding this chain's genesis to the
+    /// header hash with the nonce zeroed (`hash_override_nonce_time(header, 0, header.timestamp)`).
+    /// The nonce is excluded so that it can afterwards be set to [`Self::nonce_binding`] of the
+    /// parent; every other header field, the timestamp included, stays bound.
+    pub fn bound_commitment(genesis: Hash, nonce_free_header_hash: Hash) -> Hash {
+        use kaspa_hashes::HasherBase;
+        let mut hasher = kaspa_hashes::BlockHash::new();
+        hasher.update(b"zkas_aux_bind1").update(genesis).update(nonce_free_header_hash);
+        hasher.finalize()
+    }
+
+    /// The nonce a post-fork aux-accepted block must carry: the first 8 bytes (LE) of its parent
+    /// header's hash. Recomputed from the parent's fields, never taken from a cached hash. Because
+    /// the full block hash covers the nonce, the block hash then fixes the parent, so one block has
+    /// exactly one witness and one level.
+    pub fn nonce_binding(parent_header: &Header) -> u64 {
+        let h = hashing::header::hash(parent_header).as_bytes();
+        u64::from_le_bytes(h[..8].try_into().expect("32-byte hash"))
+    }
+
+    /// Post-fork structural binding: the parent coinbase commits (`ZKM1`, exactly once) to
+    /// [`Self::bound_commitment`] and is Merkle-included under the parent header.
+    pub fn verify_binding_v1(&self, genesis: Hash, nonce_free_header_hash: Hash) -> bool {
+        self.committed_hash_v1() == Some(Self::bound_commitment(genesis, nonce_free_header_hash)) && self.verify_coinbase_inclusion()
+    }
+
+    /// Miner/test helper for the post-fork form: `prefix || ZKM1 || hex(commitment) || suffix`.
+    pub fn embed_commitment_v1(prefix: &[u8], commitment: Hash, suffix: &[u8]) -> Vec<u8> {
+        let hex = encode_hex32(&commitment.as_bytes());
+        let mut out = Vec::with_capacity(prefix.len() + MERGE_MINE_MAGIC_V1.len() + hex.len() + suffix.len());
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(&MERGE_MINE_MAGIC_V1);
+        out.extend_from_slice(&hex);
+        out.extend_from_slice(suffix);
+        out
+    }
+
+    fn payload_commitment(payload: &[u8], magic: &[u8; 4]) -> Option<Hash> {
         let mut found: Option<Hash> = None;
         // Scan every position the 4-byte magic could start at. Requiring a unique
         // occurrence (across the whole payload) is what blocks the two-commitment
         // ambiguity attack, so we must count *all* magics, not stop at the first.
         let mut i = 0usize;
-        while i + MERGE_MINE_MAGIC.len() <= payload.len() {
-            if payload[i..i + MERGE_MINE_MAGIC.len()] == MERGE_MINE_MAGIC {
+        while i + magic.len() <= payload.len() {
+            if payload[i..i + magic.len()] == *magic {
                 // A second magic anywhere ⇒ ambiguous ⇒ reject.
                 if found.is_some() {
                     return None;
                 }
-                let start = i + MERGE_MINE_MAGIC.len();
+                let start = i + magic.len();
                 let end = start + COMMITMENT_HEX_LEN;
                 if end > payload.len() {
                     // Magic present but truncated commitment ⇒ malformed ⇒ reject.

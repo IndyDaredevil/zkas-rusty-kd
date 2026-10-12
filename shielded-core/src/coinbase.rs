@@ -120,7 +120,7 @@ pub fn coinbase_note_commitment(desc: &CoinbaseNoteDesc, value: u64) -> Result<E
     let rho: Rho = Option::from(Rho::from_bytes(&desc.rho)).ok_or(CoinbaseNoteError::BadRho)?;
     let rseed: RandomSeed = Option::from(RandomSeed::from_bytes(desc.rseed, &rho)).ok_or(CoinbaseNoteError::BadRseed)?;
     let note: Note =
-        Option::from(Note::from_parts(recipient, NoteValue::from_raw(value), rho, rseed)).ok_or(CoinbaseNoteError::BadNote)?;
+        Option::from(Note::from_parts(recipient, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2)).ok_or(CoinbaseNoteError::BadNote)?;
     Ok(ExtractedNoteCommitment::from(note.commitment()))
 }
 
@@ -162,7 +162,7 @@ mod tests {
         let rseed: RandomSeed = Option::from(RandomSeed::from_bytes(canon32(2), &rho)).unwrap();
         let subsidy = 5_000_000_000u64;
 
-        let note: Note = Option::from(Note::from_parts(recipient, NoteValue::from_raw(subsidy), rho, rseed)).unwrap();
+        let note: Note = Option::from(Note::from_parts(recipient, NoteValue::from_raw(subsidy), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
         let expected = ExtractedNoteCommitment::from(note.commitment());
 
         let desc = CoinbaseNoteDesc { recipient: recipient.to_raw_address_bytes(), rho: canon32(1), rseed: canon32(2) };
@@ -200,7 +200,7 @@ mod tests {
         // The derived (rho, rseed) reconstruct a valid, spendable Orchard note...
         let rho: Rho = Option::from(Rho::from_bytes(&desc.rho)).unwrap();
         let rseed: RandomSeed = Option::from(RandomSeed::from_bytes(desc.rseed, &rho)).unwrap();
-        let note: Note = Option::from(Note::from_parts(recipient, NoteValue::from_raw(value), rho, rseed)).unwrap();
+        let note: Note = Option::from(Note::from_parts(recipient, NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
         // ...whose commitment equals the consensus recompute of the same desc+value.
         assert_eq!(
             coinbase_note_commitment(&desc, value).unwrap().to_bytes(),

@@ -147,7 +147,7 @@ impl ShieldedAccount {
         let keys = ShieldedKeys::from_seed(self.seed).ok_or(PaymentError::BadRecipient)?;
         let change_addr = keys.address();
 
-        let pk = ProvingKey::build();
+        let pk = ProvingKey::build(crate::verify::CIRCUIT_VERSION);
         let wire = build_payment_bundle(
             &pk,
             &keys,
@@ -159,13 +159,20 @@ impl ShieldedAccount {
             fee,
             network_domain,
             tx_context,
-            rand::rngs::OsRng,
+            rand::rng(),
         )
         .map_err(|e| PaymentError::Build(format!("{e:?}")))?;
 
         // The note's spend is now in flight; park it so it is not offered again
         // (txid unknown at build time — the caller submits the wire bytes).
-        self.db.mark_spent(selected.position, [0u8; 32], 0);
+        //
+        // Park it against the wallet's own DAA clock, never against 0. `reclaim_expired`
+        // skips a spend whose origin is 0 — deliberately, because a wallet with no clock
+        // cannot measure an expiry — so parking at 0 here meant that if the caller's
+        // submit failed, or the transaction was simply never mined, the note was parked
+        // for good: balance gone, nothing to un-park it, and no error to say so.
+        let origin = self.db.last_daa();
+        self.db.mark_spent(selected.position, [0u8; 32], origin);
         Ok(wire.to_bytes())
     }
 }

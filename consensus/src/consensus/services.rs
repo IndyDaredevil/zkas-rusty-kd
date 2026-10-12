@@ -134,6 +134,15 @@ impl ConsensusServices {
             params.dev_fee_recipient,
             params.dev_fee_accrual_activation,
             params.dev_fee_payout_interval,
+            // Miner accrual exists to stop one Orchard note per block; a transparent-coinbase network
+            // (simnet) keeps upstream's per-block outputs.
+            if params.shielded_coinbase {
+                params.security_fork_activation
+            } else {
+                kaspa_consensus_core::config::params::ForkActivation::never()
+            },
+            params.miner_accrual_payout_interval,
+            params.dev_fee_end_activation,
         );
 
         let mass_calculator =
@@ -152,7 +161,8 @@ impl ConsensusServices {
             params.toccata_activation,
             params.mass_per_sig_op,
             params.genesis.hash.as_bytes(),
-        );
+        )
+        .with_security_fork_activation(params.security_fork_activation);
 
         let pruning_point_manager = PruningPointManager::new(
             params.pruning_depth(),
@@ -191,6 +201,7 @@ impl ConsensusServices {
             params.skip_proof_of_work,
             params.toccata_activation,
             params.merged_mining_activation,
+            params.security_fork_activation,
             is_consensus_exiting,
         ));
 

@@ -45,7 +45,13 @@ impl TransactionValidator {
         if !tx.outputs.is_empty() {
             return Err(TxRuleError::InvalidShieldedTransaction("shielded transaction must have no transparent outputs"));
         }
-        let bundle = ShieldedBundle::from_bytes(&tx.payload)
+        // DAA-independent on purpose (this stage has no context): accept a bundle that decodes in
+        // either the pre-fork or the security-fork format. The exact format for the carrying
+        // block's DAA score is enforced in header context (`check_shielded_format_in_header_context`),
+        // so for every byte string a block's validity is what the pre-fork code decided until the
+        // activation score, and the new format's decision from it.
+        let bundle = ShieldedBundle::from_bytes_at(&tx.payload, true)
+            .or_else(|_| ShieldedBundle::from_bytes_at(&tx.payload, false))
             .map_err(|_| TxRuleError::InvalidShieldedTransaction("malformed Orchard bundle in payload"))?;
         if bundle.actions.is_empty() {
             return Err(TxRuleError::InvalidShieldedTransaction("shielded bundle has no actions"));
@@ -62,6 +68,24 @@ impl TransactionValidator {
         // never propagate over the mempool or be mined. Re-enable by flipping the master switch.
         if bundle.burn.is_some() && !kaspa_shielded_core::burn::BRIDGE_ENABLED {
             return Err(TxRuleError::InvalidShieldedTransaction("bridge peg-out is disabled"));
+        }
+        // A burn may never declare more than the bundle proved is leaving the pool.
+        //
+        // This bound existed in exactly one place — inside the state transition, as a block-FATAL
+        // `BurnExceedsValueBalance` that disqualifies the block which MERGES the transaction. Nothing
+        // context-free rejected it, so the carrying block entered the DAG and then permanently
+        // disqualified every candidate chain block that merged it: a one-transaction, permanent
+        // selected-chain halt, and precisely the liveness rule the virtual processor states at
+        // length ("a shielded transaction that is invalid in accepted-order context is DROPPED,
+        // never a reason to disqualify the block that merges it").
+        //
+        // Checked here, where it belongs: a pure function of the transaction bytes, so such a
+        // transaction never propagates and no block carrying one is ever accepted. A no-op today,
+        // since any burn at all is refused above — the point is that it stays safe once it is not.
+        if let Some((burn_value, _)) = bundle.burn {
+            if i128::from(burn_value) > i128::from(bundle.value_balance) {
+                return Err(TxRuleError::InvalidShieldedTransaction("declared burn exceeds the bundle's value balance"));
+            }
         }
         Ok(())
     }
@@ -88,7 +112,14 @@ impl TransactionValidator {
             return Err(TxRuleError::CoinbaseNonZeroMassCommitment);
         }
 
-        let outputs_limit = self.ghostdag_k as u64 + 2;
+        // k + 1 DAA blues, one aggregated red reward, the miner accrual slot paid out on a payout
+        // block (security fork: a block whose every reward opens a new streak, on a payout boundary,
+        // emits one note per reward plus the carried slot), and (with a dev recipient) the dev note:
+        // k + 4. Before the security fork consensus still capped this at k + 2, which made a payout
+        // block of 19 blues + a red + the dev note unmineable; that pre-fork limit is kept, by DAA
+        // score, in body validation in context. This isolation bound is only a size bound: the
+        // coinbase must equal the expected coinbase exactly, so it can never carry an extra output.
+        let outputs_limit = self.ghostdag_k as u64 + 4;
         if tx.outputs.len() as u64 > outputs_limit {
             return Err(TxRuleError::CoinbaseTooManyOutputs(tx.outputs.len(), outputs_limit));
         }
@@ -499,6 +530,7 @@ mod tests {
             proof: vec![],
             binding_sig: [0u8; sizes::SIG],
             burn: Some((20, [0xA1; sizes::FIELD])),
+            anchor_block: None,
         };
         let tx = Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, bundle.to_bytes());
 
@@ -508,6 +540,69 @@ mod tests {
         } else {
             assert_match!(res, Err(TxRuleError::InvalidShieldedTransaction("bridge peg-out is disabled")));
         }
+    }
+
+    /// H-1 (final consensus review): the anchor-block format is judged by the carrying block's DAA
+    /// score, never in isolation. Before the activation a block's validity for both bit-3 byte forms
+    /// must be what the pre-fork parser decided (flag alone: body-valid, refused later by the
+    /// verifier; flag plus field: malformed), and the opposite from the activation.
+    #[test]
+    fn anchor_block_format_is_decided_in_header_context_by_daa() {
+        use crate::processes::transaction_validator::tx_validation_in_header_context::LockTimeArg;
+        use kaspa_consensus_core::config::params::ForkActivation;
+        use kaspa_shielded_core::bundle::{ActionWire, BUNDLE_FLAG_ANCHOR_BLOCK, ShieldedBundle, sizes};
+        let sample = || ShieldedBundle {
+            actions: vec![ActionWire {
+                nullifier: [1u8; sizes::FIELD],
+                rk: [0u8; sizes::FIELD],
+                cmx: [0u8; sizes::FIELD],
+                cv_net: [0u8; sizes::FIELD],
+                ephemeral_key: [0u8; sizes::FIELD],
+                enc_ciphertext: [0u8; sizes::ENC_CIPHERTEXT],
+                out_ciphertext: [0u8; sizes::OUT_CIPHERTEXT],
+                spend_auth_sig: [0u8; sizes::SIG],
+            }],
+            flags: 0b11,
+            value_balance: 0,
+            anchor: [0u8; sizes::FIELD],
+            proof: vec![0u8; 8],
+            binding_sig: [0u8; sizes::SIG],
+            burn: None,
+            anchor_block: None,
+        };
+
+        let params = MAINNET_PARAMS.clone();
+        let tv = |fork: ForkActivation| {
+            TransactionValidator::new_for_tests(
+                params.max_tx_inputs,
+                params.max_tx_outputs,
+                params.max_signature_script_len(),
+                params.max_script_public_key_len,
+                params.coinbase_payload_script_public_key_max_len,
+                params.coinbase_maturity(),
+                params.ghostdag_k(),
+                Default::default(),
+            )
+            .with_security_fork_activation(fork)
+        };
+        let tx_of = |b: &ShieldedBundle| Transaction::new(TX_VERSION_SHIELDED, vec![], vec![], 0, SUBNETWORK_ID_NATIVE, 0, b.to_bytes());
+        let mut flag_only = sample();
+        flag_only.flags |= BUNDLE_FLAG_ANCHOR_BLOCK;
+        let flag_only = tx_of(&flag_only);
+        let mut named = sample();
+        named.set_anchor_block([7u8; 32]);
+        let named = tx_of(&named);
+
+        let fork_at_100 = tv(ForkActivation::new(100));
+        // The context-free stage accepts both shapes and decides nothing about the format.
+        for t in [&flag_only, &named] {
+            assert!(fork_at_100.check_shielded_in_isolation(t).is_ok());
+        }
+        let ctx = |v: &TransactionValidator, t: &Transaction, daa: u64| v.validate_tx_in_header_context(t, LockTimeArg::Finalized, daa);
+        assert!(ctx(&fork_at_100, &flag_only, 99).is_ok(), "pre-fork: flag alone is body-valid, exactly as before");
+        assert!(ctx(&fork_at_100, &named, 99).is_err(), "pre-fork: flag plus field is malformed, exactly as before");
+        assert!(ctx(&fork_at_100, &flag_only, 100).is_err(), "post-fork: the field is required");
+        assert!(ctx(&fork_at_100, &named, 100).is_ok(), "post-fork: the field is the format");
     }
 
     #[test]

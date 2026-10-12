@@ -13,8 +13,8 @@
 mod merged;
 mod solver;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
@@ -60,6 +60,17 @@ struct Args {
     /// parent for testing.
     #[arg(long, default_value_t = false)]
     merged: bool,
+
+    /// Network whose consensus parameters decide the merge-mining form (mainnet, testnet,
+    /// devnet, simnet).
+    #[arg(long, default_value = "mainnet")]
+    network: String,
+
+    /// Override the security-fork activation DAA score (for a test network started with an
+    /// override-params file). From it, merged blocks use the genesis-bound commitment and the
+    /// parent-derived nonce.
+    #[arg(long)]
+    security_fork_daa: Option<u64>,
 }
 
 #[tokio::main]
@@ -118,7 +129,24 @@ async fn main() {
             let built = {
                 let header = header.clone();
                 let stop = stop.clone();
-                tokio::task::spawn_blocking(move || merged::build_aux_pow(&header, threads, &stop)).await.expect("aux worker panicked")
+                let net = match args.network.as_str() {
+                    "testnet" => kaspa_consensus_core::network::NetworkType::Testnet,
+                    "devnet" => kaspa_consensus_core::network::NetworkType::Devnet,
+                    "simnet" => kaspa_consensus_core::network::NetworkType::Simnet,
+                    _ => kaspa_consensus_core::network::NetworkType::Mainnet,
+                };
+                let params = kaspa_consensus_core::config::params::Params::from(net);
+                // The override is for test networks only; on mainnet the compiled score decides.
+                let bound = match args.security_fork_daa.filter(|_| net != kaspa_consensus_core::network::NetworkType::Mainnet) {
+                    Some(d) => header.daa_score >= d,
+                    None => params.security_fork_activation.is_active(header.daa_score),
+                };
+                let genesis = params.genesis.hash;
+                tokio::task::spawn_blocking(move || {
+                    if bound { merged::build_aux_pow_bound(&header, genesis, threads, &stop) } else { merged::build_aux_pow(&header, threads, &stop) }
+                })
+                .await
+                .expect("aux worker panicked")
             };
             deadline.abort();
             let Some((fc_header, aux)) = built else { continue };

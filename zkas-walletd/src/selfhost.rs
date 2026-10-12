@@ -53,6 +53,13 @@ pub struct SelfHostConfig {
     pub wallet_secret: Option<String>,
     /// Permit the tokenless "default" wallet (single-user self-host convenience).
     pub allow_default_token: bool,
+    /// Runtime resource policy supplied by the standalone CLI or embedding node.
+    pub resources: crate::ResourceLimits,
+    /// Stop after this long with no wallet API request. A self-hosted daemon is the
+    /// one most likely to be left exposed and forgotten, so the bound matters most
+    /// here — but it stays opt-in, because a daemon that vanishes mid-sync would be
+    /// its own kind of surprise.
+    pub idle_timeout: Option<std::time::Duration>,
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -170,6 +177,7 @@ pub async fn run_selfhost(cfg: SelfHostConfig, shutdown: tokio::sync::oneshot::R
     print_pairing(&pairing_uri(&cfg, &token, fp.as_deref()));
 
     let daemon = crate::Config {
+        enable_multiparty: false,
         rpc_server: cfg.rpc_server,
         listen: cfg.listen,
         wallet_dir: cfg.wallet_dir,
@@ -184,6 +192,13 @@ pub async fn run_selfhost(cfg: SelfHostConfig, shutdown: tokio::sync::oneshot::R
         // Same default as the CLI: a self-hosted wallet that mines fragments exactly
         // like a treasury, and the ceiling leaves an ordinary wallet untouched.
         auto_consolidate: Some(crate::AUTO_CONSOLIDATE_DEFAULT),
+        build_shared_tree: true,
+        node_socks_proxy: None,
+        // A self-host is the owner's own daemon: custodial endpoints stay enabled.
+        allow_custodial: true,
+        max_concurrent_proves: crate::default_max_concurrent_proves(),
+        resources: cfg.resources,
+        idle_timeout: cfg.idle_timeout,
     };
     crate::serve(daemon, shutdown).await
 }

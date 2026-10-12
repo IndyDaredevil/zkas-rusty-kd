@@ -15,9 +15,8 @@ use kaspa_p2p_lib::{
     convert::{header::HeaderFormat, header::Versioned, model::trusted::TrustedDataEntry},
     make_message,
     pb::{
-        RequestNextHeadersMessage, RequestNextPruningPointAndItsAnticoneBlocksMessage,
-        RequestNextPruningPointShieldedChunkMessage, RequestNextPruningPointSmtChunkMessage,
-        RequestNextPruningPointUtxoSetChunkMessage, kaspad_message::Payload,
+        RequestNextHeadersMessage, RequestNextPruningPointAndItsAnticoneBlocksMessage, RequestNextPruningPointShieldedChunkMessage,
+        RequestNextPruningPointSmtChunkMessage, RequestNextPruningPointUtxoSetChunkMessage, kaspad_message::Payload,
     },
 };
 use std::sync::Arc;
@@ -390,7 +389,10 @@ impl<'a, 'b> ShieldedStream<'a, 'b> {
                     })
                 }
                 Some(Payload::UnexpectedPruningPoint(_)) => Err(ProtocolError::ConsensusError(ConsensusError::UnexpectedPruningPoint)),
-                _ => Err(ProtocolError::UnexpectedMessage(stringify!(Payload::ShieldedMetadata), msg.payload.as_ref().map(|v| v.into()))),
+                _ => Err(ProtocolError::UnexpectedMessage(
+                    stringify!(Payload::ShieldedMetadata),
+                    msg.payload.as_ref().map(|v| v.into()),
+                )),
             },
             Ok(None) => Err(ProtocolError::ConnectionClosed),
             Err(_) => Err(ProtocolError::Timeout(DEFAULT_TIMEOUT)),
@@ -434,8 +436,7 @@ impl<'a, 'b> ShieldedStream<'a, 'b> {
 
         let mut out = Vec::with_capacity(payload.nullifiers.len());
         for nf in payload.nullifiers {
-            let bytes: [u8; 32] =
-                nf.as_slice().try_into().map_err(|_| ProtocolError::Other("nullifier must be exactly 32 bytes"))?;
+            let bytes: [u8; 32] = nf.as_slice().try_into().map_err(|_| ProtocolError::Other("nullifier must be exactly 32 bytes"))?;
             out.push(bytes);
             self.nullifier_count += 1;
         }
@@ -444,10 +445,7 @@ impl<'a, 'b> ShieldedStream<'a, 'b> {
 
         if self.nullifier_count < self.expected_count && self.chunks_received.is_multiple_of(SMT_FLOW_CONTROL_WINDOW) {
             self.router
-                .enqueue(make_message!(
-                    Payload::RequestNextPruningPointShieldedChunk,
-                    RequestNextPruningPointShieldedChunkMessage {}
-                ))
+                .enqueue(make_message!(Payload::RequestNextPruningPointShieldedChunk, RequestNextPruningPointShieldedChunkMessage {}))
                 .await?;
         }
 

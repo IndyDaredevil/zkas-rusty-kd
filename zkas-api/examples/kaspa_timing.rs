@@ -19,11 +19,12 @@
 //! offline (see kaspa_timing_analyze.py).
 
 use kaspa_p2p_lib::{
-    Adaptor, ConnectionInitializer, KaspadMessagePayloadType, Router, common::ProtocolError,
+    Adaptor, ConnectionInitializer, KaspadMessagePayloadType, Router,
+    common::ProtocolError,
     dequeue_with_timeout, make_message,
     pb::{
-        AddressesMessage, KaspadMessage, PingMessage, PongMessage, ReadyMessage, RequestAddressesMessage,
-        VerackMessage, VersionMessage, kaspad_message::Payload,
+        AddressesMessage, KaspadMessage, PingMessage, PongMessage, ReadyMessage, RequestAddressesMessage, VerackMessage,
+        VersionMessage, kaspad_message::Payload,
     },
 };
 use std::{

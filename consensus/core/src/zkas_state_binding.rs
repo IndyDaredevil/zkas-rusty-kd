@@ -168,37 +168,41 @@ mod tests {
     #[test]
     #[ignore]
     fn gen_guest_hash_vectors() {
-        use crate::tx::{Transaction, TransactionOutput, ScriptPublicKey};
         use crate::subnets::SUBNETWORK_ID_COINBASE;
+        use crate::tx::{ScriptPublicKey, Transaction, TransactionOutput};
         // Coinbase: version 1, one output, R at payload[16..48].
         let mut payload = Vec::new();
         payload.extend_from_slice(&123u64.to_le_bytes());
         payload.extend_from_slice(&456u64.to_le_bytes());
         payload.extend_from_slice(&[0x5a; 32]);
-        payload.extend_from_slice(&[0xde,0xad,0xbe,0xef]);
-        let spk = ScriptPublicKey::new(0, vec![0xaa,0xbb,0xcc].into());
+        payload.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let spk = ScriptPublicKey::new(0, vec![0xaa, 0xbb, 0xcc].into());
         let out = TransactionOutput::new(5000, spk);
         let cb = Transaction::new(0, vec![], vec![out], 7, SUBNETWORK_ID_COINBASE, 9, payload.clone());
         let txh = crate::hashing::tx::hash(&cb);
         println!("COINBASE_TX_HASH={}", txh);
         println!("COINBASE_MASS={}", cb.storage_mass());
         print!("SUBNETWORK_COINBASE=");
-        for b in SUBNETWORK_ID_COINBASE.as_bytes() { print!("{:02x}", b); }
+        for b in SUBNETWORK_ID_COINBASE.as_bytes() {
+            print!("{:02x}", b);
+        }
         println!();
 
         let header = crate::header::Header::new_finalized(
             1,
-            vec![vec![crate::Hash::from_bytes([0x01;32])]].try_into().unwrap(),
+            vec![vec![crate::Hash::from_bytes([0x01; 32])]].try_into().unwrap(),
             txh, // hash_merkle_root = coinbase (single tx)
-            crate::Hash::from_bytes([0x02;32]),
-            crate::Hash::from_bytes([0x03;32]),
-            234, 23, 567, 42,
+            crate::Hash::from_bytes([0x02; 32]),
+            crate::Hash::from_bytes([0x03; 32]),
+            234,
+            23,
+            567,
+            42,
             5.into(),
             99,
-            crate::Hash::from_bytes([0x04;32]),
+            crate::Hash::from_bytes([0x04; 32]),
         );
         println!("HEADER_HASH={}", crate::hashing::header::hash(&header));
         println!("HEADER_BLUE_WORK={:x}", 5u128);
     }
-
 }

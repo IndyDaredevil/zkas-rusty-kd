@@ -16,7 +16,6 @@ pub use kaspa_hashes::Hash;
 pub mod acceptance_data;
 pub mod api;
 pub mod auxpow;
-pub mod zkas_state_binding;
 pub mod block;
 pub mod blockhash;
 pub mod blockstatus;
@@ -38,6 +37,7 @@ pub mod subnets;
 pub mod trusted;
 pub mod tx;
 pub mod utxo;
+pub mod zkas_state_binding;
 
 /// Integer type for accumulated PoW of blue blocks. We expect no more than
 /// 2^128 work in a single block (btc has ~2^80), and no more than 2^64
@@ -147,3 +147,8 @@ mod tests {
         assert_eq!(hasher.finish(), 4);
     }
 }
+
+/// Raised when this node's live nullifier set does not hash to the snapshot its committed state
+/// root covers (checked at startup). Such a node would judge double-spends differently from the
+/// network, so block templates are refused while it is set. Repair is a resync.
+pub static SHIELDED_STATE_DIVERGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

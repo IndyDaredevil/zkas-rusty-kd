@@ -58,9 +58,8 @@ pub struct Args {
     /// Directory for consensus-divergence reports. `Some("")` means "use the default
     /// location under appdir". See `kaspa_consensus::processes::shielded_diag`.
     pub consensus_diag: Option<String>,
-    /// File of pinned anchor→source-block mappings. See
-    /// `kaspa_consensus::processes::shielded::load_anchor_overrides`.
-    pub shielded_anchor_overrides: Option<String>,
+    pub verify_shielded_history: bool,
+    pub shielded_history: Option<bool>,
     pub reset_db: bool,
     #[serde(rename = "outpeers")]
     pub outbound_target: usize,
@@ -127,7 +126,8 @@ impl Default for Args {
             async_threads: num_cpus::get(),
             utxoindex: false,
             consensus_diag: None,
-            shielded_anchor_overrides: None,
+            verify_shielded_history: false,
+            shielded_history: None,
             reset_db: false,
             outbound_target: 8,
             inbound_limit: 128,
@@ -187,13 +187,14 @@ impl Args {
         config.enable_unsynced_mining = self.enable_unsynced_mining;
         config.enable_mainnet_mining = self.enable_mainnet_mining;
         config.is_archival = self.archival;
+        config.shielded_history = self.shielded_history;
         // TODO: change to `config.enable_sanity_checks = self.sanity` when we reach stable versions
         config.enable_sanity_checks = true;
         config.user_agent_comments.clone_from(&self.user_agent_comments);
         config.user_agent_rules.clone_from(&self.ua_rule);
         config.block_template_cache_lifetime = self.block_template_cache_lifetime;
         config.p2p_listen_address = self.listen.unwrap_or(ContextualNetAddress::unspecified());
-        config.externalip = self.externalip.map(|v| v.normalize(config.default_p2p_port()));
+        config.externalip = self.externalip.map(|v| v.normalize(config.default_listen_p2p_port()));
         config.ram_scale = self.ram_scale;
         config.retention_period_days = self.retention_period_days;
 
@@ -326,7 +327,7 @@ pub fn cli() -> Command {
                 .value_name("IP[:PORT]")
                 .require_equals(true)
                 .value_parser(clap::value_parser!(ContextualNetAddress))
-                .help("Add an interface:port to listen for connections (default all interfaces port: 16811, testnet: 16821)."),
+                .help("Add an interface:port to listen for connections (default all interfaces port: 16111, testnet: 16821)."),
         )
         .arg(
             Arg::new("outpeers")
@@ -367,19 +368,6 @@ pub fn cli() -> Command {
         )
         .arg(arg!(--utxoindex "Enable the UTXO index").env("KASPAD_UTXOINDEX"))
         .arg(
-            Arg::new("shielded-anchor-overrides")
-                .long("shielded-anchor-overrides")
-                .value_name("file")
-                .require_equals(true)
-                .env("ZKAS_SHIELDED_ANCHOR_OVERRIDES")
-                .help(
-                    "Pin shielded anchor->source-block mappings from a file (zkas-anchor-dump format). \
-                     The anchor index is order-dependent and not derivable from the canonical chain, so a \
-                     node syncing from scratch can resolve an anchor differently from the chain and reject \
-                     a valid block. Pinning the chain's mappings repairs that without changing any rule.",
-                ),
-        )
-        .arg(
             Arg::new("consensus-diag")
                 .long("consensus-diag")
                 .value_name("dir")
@@ -391,6 +379,35 @@ pub fn cli() -> Command {
                     "Write a JSON report explaining every block this node rejects for a consensus disagreement \
                      (default: <appdir>/consensus-diag). Use this instead of adding temporary log lines when a \
                      node refuses to sync past a block the network accepted.",
+                ),
+        )
+        .arg(
+            Arg::new("shielded-history")
+                .long("shielded-history")
+                .value_name("on|off")
+                .num_args(0..=1)
+                .default_missing_value("on")
+                .value_parser(["on", "off"])
+                .require_equals(true)
+                .help(
+                    "Fetch shielded note history below the pruning point from peers (default: ON for \
+                     every node). IBD transfers a frontier and a nullifier MuHash, which are aggregates \
+                     and cannot yield anyone's notes, so without this a node serves wallets history only \
+                     from its pruning point forward and balances read as silently partial. The archive is \
+                     ~500 MB at ~1M blocks and survives pruning, so a pruned node can serve complete \
+                     history — which is why this is no longer tied to --archival. Pass \
+                     --shielded-history=off for a node that will never serve wallets.",
+                ),
+        )
+        .arg(
+            Arg::new("verify-shielded-history")
+                .long("verify-shielded-history")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "On startup, replay the whole shielded scan archive and check it reproduces this node's \
+                     PoW-anchored frontier. Use after restoring an archive with zkas-scan-import: an archive \
+                     that is truncated, stale or from another chain makes wallets report wrong balances \
+                     silently, and this is what turns that into an answer. Reports only; deletes nothing.",
                 ),
         )
         .arg(
@@ -585,7 +602,8 @@ impl Args {
             enable_mainnet_mining: arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", defaults.enable_mainnet_mining),
             utxoindex: arg_match_unwrap_or::<bool>(&m, "utxoindex", defaults.utxoindex),
             consensus_diag: m.get_one::<String>("consensus-diag").cloned(),
-            shielded_anchor_overrides: m.get_one::<String>("shielded-anchor-overrides").cloned(),
+            verify_shielded_history: m.get_one::<bool>("verify-shielded-history").cloned().unwrap_or(false),
+            shielded_history: m.get_one::<String>("shielded-history").map(|v| v != "off"),
             testnet: arg_match_unwrap_or::<bool>(&m, "testnet", defaults.testnet),
             testnet_suffix: arg_match_unwrap_or::<u32>(&m, "netsuffix", defaults.testnet_suffix),
             devnet: arg_match_unwrap_or::<bool>(&m, "devnet", defaults.devnet),
@@ -686,7 +704,7 @@ mod tests {
                                             automatically disabled if the --connect or --proxy options are used
                                             without also specifying listen interfaces via --listen
       --listen=                             Add an interface/port to listen for connections (default all interfaces
-                                            port: 16811, testnet: 16821)
+                                            port: 16111, testnet: 16821)
       --outpeers=                           Target number of outbound peers (default: 8)
       --maxinpeers=                         Max number of inbound peers (default: 117)
       --enablebanning                       Enable banning of misbehaving peers

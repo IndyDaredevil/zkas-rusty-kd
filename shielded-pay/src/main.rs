@@ -29,19 +29,21 @@
 //! `consensus::…::real_shielded_spend_through_mined_block`). The client itself is
 //! network-agnostic; once the note is ~10 minutes deep, the spend is accepted.
 
+use std::io::Read;
+
 use clap::{Parser, Subcommand};
 use kaspa_addresses::{Address, Prefix, Version};
-use kaspa_consensus_core::tx::{Transaction, TX_VERSION_SHIELDED};
+use kaspa_consensus_core::tx::{TX_VERSION_SHIELDED, Transaction};
 use kaspa_grpc_client::GrpcClient;
-use kaspa_rpc_core::{api::rpc::RpcApi, notify::mode::NotificationMode, RpcHash, RpcShieldedChainBlock, RpcTransaction};
+use kaspa_rpc_core::{RpcHash, RpcShieldedChainBlock, RpcTransaction, api::rpc::RpcApi, notify::mode::NotificationMode};
 use kaspa_shielded_core::bundle::expected_wire_len;
-use kaspa_shielded_core::tree::FrontierState;
 use kaspa_shielded_core::coinbase::derive_coinbase_note_desc;
-use kaspa_shielded_core::message::{sign_message, verify_message, FVK_LEN, SIG_LEN};
+use kaspa_shielded_core::message::{FVK_LEN, SIG_LEN, sign_message, verify_message};
 use kaspa_shielded_core::orchard_recipient_bytes;
-use kaspa_shielded_core::wallet::build::{build_singleleaf_coinbase_spend, build_wallet_payment};
-use kaspa_shielded_core::wallet::address_bytes_from_seed;
+use kaspa_shielded_core::tree::FrontierState;
 use kaspa_shielded_core::wallet::CompactActionRecord;
+use kaspa_shielded_core::wallet::address_bytes_from_seed;
+use kaspa_shielded_core::wallet::build::{build_singleleaf_coinbase_spend, build_wallet_payment};
 use kaspa_shielded_core::walletdb::WalletDb;
 use kaspa_shielded_wallet::{payment_tx, payment_tx_context};
 
@@ -154,6 +156,10 @@ enum Cmd {
         /// Test convenience: the 32-byte seed is `[byte; 32]`. Prefer `--seed-hex`.
         #[arg(long)]
         seed_byte: Option<u8>,
+        /// Read the 64-hex-character seed from standard input. This is mutually
+        /// exclusive with --seed-hex and --seed-byte.
+        #[arg(long)]
+        seed_stdin: bool,
         /// Network prefix: mainnet | testnet | devnet | simnet (scopes the signature).
         #[arg(long, default_value = "mainnet")]
         network: String,
@@ -233,18 +239,39 @@ fn resolve_seed(seed_hex: Option<String>, seed_byte: Option<u8>) -> [u8; 32] {
             }
             [b; 32]
         }
-        (Some(h), None) => {
-            let h = h.trim();
-            if h.len() != 64 {
-                fatal("--seed-hex must be exactly 32 bytes (64 hex chars)".into());
-            }
-            let bytes: Vec<u8> = (0..64)
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap_or_else(|_| fatal("--seed-hex is not valid hex".into())))
-                .collect();
-            bytes.try_into().expect("checked length 32")
-        }
+        (Some(h), None) => parse_seed_hex(&h).unwrap_or_else(|err| fatal(err)),
     }
+}
+
+fn parse_seed_hex(seed_hex: &str) -> Result<[u8; 32], String> {
+    let seed_hex = seed_hex.trim();
+    if seed_hex.len() != 64 {
+        return Err("--seed-hex must be exactly 32 bytes (64 hex chars)".into());
+    }
+
+    let mut seed = [0u8; 32];
+    for (i, byte) in seed.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&seed_hex[i * 2..i * 2 + 2], 16).map_err(|_| "--seed-hex is not valid hex")?;
+    }
+    Ok(seed)
+}
+
+fn seed_from_reader(mut reader: impl Read) -> Result<[u8; 32], String> {
+    let mut seed_hex = String::new();
+    reader.read_to_string(&mut seed_hex).map_err(|err| format!("failed to read seed from standard input: {err}"))?;
+    parse_seed_hex(&seed_hex)
+}
+
+/// Resolve a signing seed without putting a real seed in the command line. This
+/// input mode deliberately exists only for the offline `sign` subcommand: a
+/// seed read from standard input must never be routed into an RPC-spending path.
+fn resolve_sign_seed(seed_hex: Option<String>, seed_byte: Option<u8>, seed_stdin: bool) -> [u8; 32] {
+    let source_count = usize::from(seed_hex.is_some()) + usize::from(seed_byte.is_some()) + usize::from(seed_stdin);
+    if source_count != 1 {
+        fatal("give exactly one of --seed-hex, --seed-byte, or --seed-stdin".into());
+    }
+
+    if seed_stdin { seed_from_reader(std::io::stdin()).unwrap_or_else(|err| fatal(err)) } else { resolve_seed(seed_hex, seed_byte) }
 }
 
 /// Derive the bech32 shielded address string for a seed on a network. Uses
@@ -334,12 +361,30 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::seed_from_reader;
+
+    #[test]
+    fn reads_a_seed_from_standard_input() {
+        let seed = seed_from_reader(Cursor::new("0a".repeat(32) + "\n")).expect("valid stdin seed");
+        assert_eq!(seed, [0x0a; 32]);
+    }
+
+    #[test]
+    fn rejects_an_invalid_standard_input_seed() {
+        assert!(seed_from_reader(Cursor::new("not-a-seed")).is_err());
+    }
+}
+
 /// Sign a message with a wallet seed, proving control of the wallet's shielded
 /// address. Offline. Prints the address, the message, and the signature hex.
 fn sign(seed: [u8; 32], network: String, message: String) {
     let prefix = prefix_from(&network);
     let tag = prefix.to_string();
-    let signed = sign_message(seed, tag.as_bytes(), message.as_bytes(), rand::rngs::OsRng)
+    let signed = sign_message(seed, tag.as_bytes(), message.as_bytes(), rand10::rng())
         .unwrap_or_else(|| fatal("seed is not a valid Orchard spending key".into()));
 
     let addr = String::from(&Address::new(prefix, Version::ShieldedOrchard, &signed.address));
@@ -536,8 +581,19 @@ async fn balance(rpc_server: String, seed: [u8; 32]) {
     }
 }
 
+/// This tool builds the pre-fork spend format (no named anchor block). From the security fork every
+/// node refuses that format, so refuse up front instead of proving a payment that cannot be mined.
+async fn refuse_after_security_fork(client: &GrpcClient) {
+    let dag = client.get_block_dag_info().await.unwrap_or_else(|e| fatal(format!("get_block_dag_info failed: {e}")));
+    let params = kaspa_consensus_core::config::params::Params::from(dag.network);
+    if params.security_fork_activation.is_active(dag.virtual_daa_score.saturating_add(600)) {
+        fatal("shielded-pay builds the pre-upgrade spend format, which the network no longer accepts; send with zkas-walletd".into());
+    }
+}
+
 async fn send(rpc_server: String, owner_seed: [u8; 32], to: String, amount: u64, fee: u64, anchor_depth: u64) {
     let client = connect(&rpc_server).await;
+    refuse_after_security_fork(&client).await;
 
     let net: [u8; 32] = resolve_genesis(&client).await.as_bytes();
 
@@ -587,10 +643,7 @@ async fn send(rpc_server: String, owner_seed: [u8; 32], to: String, amount: u64,
                 selected.saturating_sub(fee)
             ));
         }
-        fatal(format!(
-            "insufficient matured funds: have {have} across {} matured note(s), need amount+fee={need}",
-            candidates.len()
-        ));
+        fatal(format!("insufficient matured funds: have {have} across {} matured note(s), need amount+fee={need}", candidates.len()));
     }
     log::info!(
         "spending {} matured note(s) totalling {} (change {}) against anchor {}",
@@ -619,6 +672,7 @@ async fn send(rpc_server: String, owner_seed: [u8; 32], to: String, amount: u64,
 
 async fn pay(rpc_server: String, owner_seed: [u8; 32], to: String, fee: u64) {
     let client = connect(&rpc_server).await;
+    refuse_after_security_fork(&client).await;
 
     let dag = client.get_block_dag_info().await.unwrap_or_else(|e| fatal(format!("get_block_dag_info failed: {e}")));
     let genesis = resolve_genesis(&client).await;
@@ -683,7 +737,7 @@ async fn main() {
             // A random seed that is a valid Orchard spending key (retry the rare miss).
             let mut seed = [0u8; 32];
             let address = loop {
-                rand::rngs::OsRng.fill_bytes(&mut seed);
+                { use rand10::Rng as _; rand10::rng().fill_bytes(&mut seed); }
                 if let Some(raw) = address_bytes_from_seed(seed) {
                     break String::from(&Address::new(prefix, Version::ShieldedOrchard, &raw));
                 }
@@ -705,10 +759,8 @@ async fn main() {
             let client = connect(&rpc_server).await;
             // (include_orphan_pool=false, filter_transaction_pool=false) => the
             // transaction pool only (see RpcCoreService::extract_tx_query).
-            let entries = client
-                .get_mempool_entries(false, false)
-                .await
-                .unwrap_or_else(|e| fatal(format!("get_mempool_entries failed: {e}")));
+            let entries =
+                client.get_mempool_entries(false, false).await.unwrap_or_else(|e| fatal(format!("get_mempool_entries failed: {e}")));
             for entry in entries {
                 // `RpcTransaction::id()` recomputes the id from the tx itself.
                 println!("{}", Transaction::try_from(entry.transaction).map(|t| t.id().to_string()).unwrap_or_default());
@@ -720,8 +772,8 @@ async fn main() {
         Cmd::Send { rpc_server, owner_seed_hex, owner_seed_byte, to, amount, fee, anchor_depth } => {
             send(rpc_server, resolve_seed(owner_seed_hex, owner_seed_byte), to, amount, fee, anchor_depth).await;
         }
-        Cmd::Sign { seed_hex, seed_byte, network, message } => {
-            sign(resolve_seed(seed_hex, seed_byte), network, message);
+        Cmd::Sign { seed_hex, seed_byte, seed_stdin, network, message } => {
+            sign(resolve_sign_seed(seed_hex, seed_byte, seed_stdin), network, message);
         }
         Cmd::Verify { address, message, sig } => {
             verify(address, message, sig);

@@ -18,6 +18,7 @@ crate-type = ["cdylib", "lib"]
 kaspa-alloc.workspace = true # This changes the global allocator for all of the next dependencies so should be kept first
 
 kaspa-addresses.workspace = true
+orchard = { package = "zakura-orchard", version = "=2.2.0", default-features = false, features = ["std"] }
 kaspa-addressmanager.workspace = true
 kaspa-build-info.workspace = true
 kaspa-consensus-core.workspace = true
@@ -30,6 +31,8 @@ faster-hex.workspace = true
 kaspa-grpc-server.workspace = true
 kaspa-hashes.workspace = true
 kaspa-shielded-core.workspace = true
+bincode.workspace = true
+blake2b_simd.workspace = true
 kaspa-index-processor.workspace = true
 kaspa-mining.workspace = true
 kaspa-notify.workspace = true

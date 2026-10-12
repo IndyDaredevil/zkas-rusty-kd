@@ -108,6 +108,9 @@ pub(super) struct UtxoProcessingContext<'a> {
     /// the per-block cuts are known — and persisted at commit alongside the shielded
     /// state. Always `0` before dev-fee accrual activates.
     pub dev_accrued: u64,
+    /// Miner reward this block carries forward (security fork; empty before it). Produced with
+    /// the expected coinbase and persisted at commit, like `dev_accrued`.
+    pub miner_accrual: kaspa_consensus_core::coinbase::MinerAccrual,
     /// Per-transaction keep/drop detail, populated only when `--consensus-diag` is on and
     /// read only if this block goes on to fail. Empty otherwise, so the cost is one atomic
     /// load per block with shielded activity.
@@ -133,6 +136,7 @@ impl<'a> UtxoProcessingContext<'a> {
             shielded_scan: Vec::new(),
             shielded_computed: None,
             dev_accrued: 0,
+            miner_accrual: Default::default(),
             diag_decisions: Vec::new(),
             diag_anchors: Vec::new(),
         }
@@ -194,11 +198,14 @@ impl VirtualStateProcessor {
             // context is not monotonic (the threshold can be crossed), but it is only used by script checks,
             // which we skip for selected-parent transactions.
             let validation_flags = if is_selected_parent { TxValidationFlags::SkipScriptChecks } else { TxValidationFlags::Full };
+            let merged_block_daa_score = self.headers_store.get_daa_score(merged_block).unwrap();
+            // The bundle format follows the carrying block's DAA score, as in validation.
+            let merged_format_post_fork = self.security_fork_activation.is_active(merged_block_daa_score);
             let (validated_transactions, inner_multiset) = self.validate_transactions_with_muhash_in_parallel(
                 &txs,
                 &composed_view,
                 pov_daa_score,
-                self.headers_store.get_daa_score(merged_block).unwrap(),
+                merged_block_daa_score,
                 validation_flags,
                 ctx.selected_parent(),
             );
@@ -220,7 +227,7 @@ impl VirtualStateProcessor {
                     // it somehow does not, we DROP that transaction rather than disqualify
                     // the merging block: a single unusable merged tx must never be able to
                     // halt the chain (see the accepted-order drop principle, PLAN §2.4).
-                    if let Some((stx, bundle)) = ShieldedBundle::from_bytes(&validated_tx.tx().payload)
+                    if let Some((stx, bundle)) = ShieldedBundle::from_bytes_at(&validated_tx.tx().payload, merged_format_post_fork)
                         .ok()
                         .and_then(|b| ShieldedTx::from_bundle(&b).ok().map(|stx| (stx, b)))
                     {
@@ -230,10 +237,8 @@ impl VirtualStateProcessor {
                         for a in &bundle.actions {
                             action_bytes.extend_from_slice(&CompactActionRecord::from_wire(a).to_bytes());
                         }
-                        ctx.shielded_scan.push(crate::model::stores::shielded::ShieldedScanTx {
-                            txid: validated_tx.id(),
-                            action_bytes,
-                        });
+                        ctx.shielded_scan
+                            .push(crate::model::stores::shielded::ShieldedScanTx { txid: validated_tx.id(), action_bytes });
                         ctx.shielded_txs.push(stx);
                         shielded_tx_sources.push(merged_block);
                     } else {
@@ -288,7 +293,7 @@ impl VirtualStateProcessor {
             // report describes the decision that was actually made rather than a re-derivation.
             let mut anchor_records: Vec<shielded_diag::AnchorResolution> = Vec::new();
             let outcomes = self.shielded_state_manager.partition_applied(&ctx.shielded_txs, |stx| {
-                let verdict = self.resolve_shielded_anchor(&stx.anchor, selected_parent, block_blue_score, pov_daa_score);
+                let verdict = self.resolve_shielded_anchor(&stx.anchor, stx.anchor_block, selected_parent, block_blue_score, pov_daa_score);
                 if diag && !anchor_records.iter().any(|a| a.anchor == shielded_diag::hex32(&stx.anchor)) {
                     // The sibling scan is the expensive part; only worth it for a resolved anchor.
                     let siblings =
@@ -411,7 +416,10 @@ impl VirtualStateProcessor {
         // so this enforces that the coinbase re-mints only fees the shielded
         // transition actually collects (PLAN §2.6).
         let mergeset_non_daa = self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap();
-        ctx.dev_accrued = self.verify_coinbase_transaction(&txs[0], header.hash, header.daa_score, ctx, &mergeset_non_daa)?;
+        let (dev_accrued, miner_accrual) =
+            self.verify_coinbase_transaction(&txs[0], header.hash, header.daa_score, ctx, &mergeset_non_daa)?;
+        ctx.dev_accrued = dev_accrued;
+        ctx.miner_accrual = miner_accrual;
 
         // Verify the header pruning point
         let reply = self.verify_header_pruning_point(header, ctx.ghostdag_data.to_compact())?;
@@ -505,12 +513,7 @@ impl VirtualStateProcessor {
                 // batch) lets `GetShieldedBlocks` serve the exact applied truth instead
                 // of re-deriving it — killing the divergent-anchor drift — and keeps
                 // history scannable after the body prunes (PLAN §2.9).
-                let accepted = computed
-                    .outcome
-                    .accepted
-                    .iter()
-                    .map(|&i| ctx.shielded_scan[i].clone())
-                    .collect::<Vec<_>>();
+                let accepted = computed.outcome.accepted.iter().map(|&i| ctx.shielded_scan[i].clone()).collect::<Vec<_>>();
                 // Coinbase notes exist only on a shielded-coinbase network; on a
                 // transparent-coinbase network txs[0]'s outputs are UTXOs, not notes.
                 let coinbase_outputs = if self.shielded_coinbase {
@@ -518,12 +521,15 @@ impl VirtualStateProcessor {
                 } else {
                     Vec::new()
                 };
+                let coinbase_commitments =
+                    coinbase_mint.as_ref().map(|m| m.notes.iter().map(|n| n.commitment.to_bytes()).collect()).unwrap_or_default();
                 computed.scan_block = Some(crate::model::stores::shielded::ShieldedScanBlockData {
                     blue_score: ctx.ghostdag_data.blue_score,
                     daa_score: header.daa_score,
                     timestamp: header.timestamp,
                     coinbase_txid: txs[0].id(),
                     coinbase_outputs,
+                    coinbase_commitments,
                     accepted,
                 });
                 ctx.shielded_computed = Some(computed);
@@ -581,12 +587,16 @@ impl VirtualStateProcessor {
             let parent_accrued = self.shielded_state_manager.dev_accrued_at(ctx.selected_parent()).unwrap() as i128;
             let this_accrued = ctx.dev_accrued as i128;
             expected_delta -= this_accrued - parent_accrued;
+            // The miner slot defers and releases value the same way (security fork; both zero before).
+            let parent_slot = self.shielded_state_manager.miner_accrual_at(ctx.selected_parent()).unwrap().amount as i128;
+            let this_slot = ctx.miner_accrual.amount as i128;
+            expected_delta -= this_slot - parent_slot;
             if actual_delta != expected_delta {
                 return Err(InvalidShieldedState(
                     header.hash,
                     format!(
                         "shielded pool delta {actual_delta} != expected subsidy delta {expected_delta} \
-                         (dev accrual {parent_accrued} -> {this_accrued})"
+                         (dev accrual {parent_accrued} -> {this_accrued}, miner accrual {parent_slot} -> {this_slot})"
                     ),
                 ));
             }
@@ -614,7 +624,7 @@ impl VirtualStateProcessor {
         daa_score: u64,
         ctx: &UtxoProcessingContext,
         mergeset_non_daa: &BlockHashSet,
-    ) -> BlockProcessResult<u64> {
+    ) -> BlockProcessResult<(u64, kaspa_consensus_core::coinbase::MinerAccrual)> {
         let ghostdag_data: &GhostdagData = &ctx.ghostdag_data;
         let mergeset_rewards = &ctx.mergeset_rewards;
         // Extract only miner data from the provided coinbase
@@ -622,13 +632,14 @@ impl VirtualStateProcessor {
         // The coinbase must commit to the shielded state root of this block's selected parent
         // (PLAN §2.10). Rebuilding the expected coinbase with that root means a wrong or missing
         // commitment fails the tx-hash comparison below as `BadCoinbaseTransaction`.
-        let shielded_commitment = self.shielded_state_manager.state_root_at(ghostdag_data.selected_parent).unwrap();
+        let shielded_commitment = self.shielded_state_root_at(ghostdag_data.selected_parent).unwrap();
         // Dev-fee accrual carries along the selected-parent chain, exactly like the
         // shielded state root above, and is read from the same block for the same
         // reason: the expected coinbase must be rebuilt from what THIS block's parent
         // committed, not from the tip.
         let parent_daa_score = self.headers_store.get_daa_score(ghostdag_data.selected_parent).unwrap();
         let dev_accrued_parent = self.shielded_state_manager.dev_accrued_at(ghostdag_data.selected_parent).unwrap();
+        let miner_accrual_parent = self.shielded_state_manager.miner_accrual_at(ghostdag_data.selected_parent).unwrap();
         let expected = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -640,6 +651,7 @@ impl VirtualStateProcessor {
                 shielded_commitment,
                 parent_daa_score,
                 dev_accrued_parent,
+                &miner_accrual_parent,
             )
             .unwrap();
         let expected_coinbase = expected.tx;
@@ -652,7 +664,7 @@ impl VirtualStateProcessor {
             self.emit_coinbase_divergence_report(coinbase, &expected_coinbase, block, daa_score, ctx, &shielded_commitment);
             Err(BadCoinbaseTransaction)
         } else {
-            Ok(expected.dev_accrued)
+            Ok((expected.dev_accrued, expected.miner_accrual))
         }
     }
 
@@ -871,6 +883,47 @@ impl VirtualStateProcessor {
         Ok(())
     }
 
+    /// Would the shielded state transition APPLY this transaction, if it were mined now?
+    ///
+    /// Answers with the transition's own rules rather than a re-derivation: the same
+    /// `partition_applied` and the same anchor resolver block validation runs. A
+    /// re-implementation here that drifted would be worse than no check at all, because the
+    /// mempool would start refusing transactions consensus is happy with.
+    ///
+    /// `Ok(())` for anything it cannot evaluate — a malformed payload is the bundle
+    /// verifier's business, not this function's, and failing closed on a parse error would
+    /// reject transactions on a code path that never had an opinion about them.
+    pub(super) fn check_mempool_shielded_appliable(
+        &self,
+        tx: &kaspa_consensus_core::tx::Transaction,
+        selected_parent: Hash,
+        blue_score: u64,
+        pov_daa_score: u64,
+    ) -> TxResult<()> {
+        let Ok(bundle) =
+            kaspa_shielded_core::bundle::ShieldedBundle::from_bytes_at(&tx.payload, self.security_fork_activation.is_active(pov_daa_score))
+        else {
+            return Ok(());
+        };
+        let Ok(stx) = kaspa_shielded_core::state::ShieldedTx::from_bundle(&bundle) else {
+            return Ok(());
+        };
+        // `blue_score` is the VIRTUAL's, supplied by the caller — the context a transaction
+        // admitted now would actually be judged in.
+        //
+        // Deriving it here from the selected parent was wrong twice: it is lower than the
+        // virtual's by the whole mergeset, so anchors aged more strictly than the block that
+        // will carry them; and a store error fell back to 0, which would have made every
+        // anchor look immature and refused every shielded transaction on the node.
+        let outcomes = self.shielded_state_manager.partition_applied(std::slice::from_ref(&stx), |stx| {
+            self.resolve_shielded_anchor(&stx.anchor, stx.anchor_block, selected_parent, blue_score, pov_daa_score).is_final
+        });
+        match outcomes.first().and_then(|o| o.drop_reason()) {
+            None => Ok(()),
+            Some(reason) => Err(TxRuleError::InvalidShieldedTransaction(reason)),
+        }
+    }
+
     /// Populates the mempool transaction with maximally found UTXO entry data and proceeds to validation if all found
     pub(super) fn validate_mempool_transaction_in_utxo_context(
         &self,
@@ -879,8 +932,39 @@ impl VirtualStateProcessor {
         pov_daa_score: u64,
         args: &TransactionValidationArgs,
         selected_parent: Hash,
+        virtual_blue_score: u64,
     ) -> TxResult<()> {
         self.populate_mempool_transaction_in_utxo_context(mutable_tx, utxo_view)?;
+
+        // Refuse a shielded spend the state transition would DROP.
+        //
+        // Admission never consulted the finalized nullifier set or the anchor index, so a
+        // spend of an already-spent note, or one proving against an anchor that is not (and
+        // may never be) final, was admitted, relayed and included in a block template. It
+        // then mined into a block and was dropped during the transition. Two consequences,
+        // both observed:
+        //
+        //   * The sender gets a txid and N confirmations for a transaction that moved
+        //     nothing. Anyone crediting on block inclusion — the standard integration
+        //     everywhere else — credits value that never arrived.
+        //   * A dropped spend pays NO fee (it is filtered out before the transition, so
+        //     nothing leaves the sender). Re-offering an already-spent note is therefore
+        //     free, repeatable block space, and every node Halo 2-verifies it. Normal spam
+        //     economics do not apply because there is nothing to charge.
+        //
+        // The predicate is exactly the transition's own — `partition_applied` with the same
+        // anchor resolver block validation uses — so the mempool cannot disagree with
+        // consensus about what is appliable. It is evaluated against the current selected
+        // parent, which is the best available stand-in for the block that would carry it.
+        //
+        // This is RELAY policy, and deliberately one-directional: refusing here removes a
+        // transaction that consensus would have dropped anyway, and can never make the node
+        // accept something consensus rejects. A verdict can also change with the chain — a
+        // nullifier can be reverted by a reorg, an anchor matures as blocks accumulate — so
+        // a refusal is not permanent and the transaction stays resubmittable.
+        if mutable_tx.tx.is_shielded() {
+            self.check_mempool_shielded_appliable(&mutable_tx.tx, selected_parent, virtual_blue_score, pov_daa_score)?;
+        }
 
         // Calc the contextual storage mass
         let contextual_mass = self

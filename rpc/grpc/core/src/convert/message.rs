@@ -221,7 +221,7 @@ from!(item: RpcResult<&kaspa_rpc_core::GetSinkResponse>, protowire::GetSinkRespo
 });
 
 from!(item: &kaspa_rpc_core::GetShieldedTreeStateRequest, protowire::GetShieldedTreeStateRequestMessage, {
-    Self { block_hash: item.block_hash.map(|h| h.to_string()).unwrap_or_default() }
+    Self { block_hash: item.block_hash.map(|h| h.to_string()).unwrap_or_default(), below_daa_score: item.below_daa_score.unwrap_or(0) }
 });
 from!(item: RpcResult<&kaspa_rpc_core::GetShieldedTreeStateResponse>, protowire::GetShieldedTreeStateResponseMessage, {
     Self {
@@ -230,12 +230,14 @@ from!(item: RpcResult<&kaspa_rpc_core::GetShieldedTreeStateResponse>, protowire:
         size: item.size,
         leaf: item.leaf.to_string(),
         ommers: item.ommers.iter().map(|h| h.to_string()).collect(),
+        history_from_daa_score: item.history_from_daa_score,
+        history_complete: item.history_complete,
         error: None,
     }
 });
 
 from!(item: &kaspa_rpc_core::GetShieldedBlocksRequest, protowire::GetShieldedBlocksRequestMessage, {
-    Self { start_hash: item.start_hash.to_string(), limit: item.limit }
+    Self { start_hash: item.start_hash.to_string(), limit: item.limit, metadata_only: item.metadata_only }
 });
 from!(item: &kaspa_rpc_core::RpcShieldedChainBlock, protowire::RpcShieldedChainBlock, {
     Self {
@@ -246,7 +248,11 @@ from!(item: &kaspa_rpc_core::RpcShieldedChainBlock, protowire::RpcShieldedChainB
         coinbase_outputs: item
             .coinbase_outputs
             .iter()
-            .map(|o| protowire::RpcShieldedCoinbaseOutput { script_public_key: o.script_public_key.to_rpc_hex(), value: o.value })
+            .map(|o| protowire::RpcShieldedCoinbaseOutput {
+                script_public_key: o.script_public_key.to_rpc_hex(),
+                value: o.value,
+                commitment: o.commitment.map(|c| c.to_vec()).unwrap_or_default(),
+            })
             .collect(),
         accepted_actions: item.accepted_actions.iter().map(|b| b.to_rpc_hex()).collect(),
         accepted_txids: item.accepted_txids.iter().map(|t| t.to_string()).collect(),
@@ -300,6 +306,8 @@ from!(item: RpcResult<&kaspa_rpc_core::GetShieldedCoinbaseRewardsResponse>, prot
         scanned_blocks: item.scanned_blocks,
         reorged: item.reorged,
         sink_blue_score: item.sink_blue_score,
+        pending_recipient: item.pending_recipient.clone(),
+        pending_value: item.pending_value,
         error: None,
     }
 });
@@ -823,7 +831,10 @@ try_from!(item: &protowire::GetSinkResponseMessage, RpcResult<kaspa_rpc_core::Ge
 });
 
 try_from!(item: &protowire::GetShieldedTreeStateRequestMessage, kaspa_rpc_core::GetShieldedTreeStateRequest, {
-    Self { block_hash: if item.block_hash.is_empty() { None } else { Some(RpcHash::from_str(&item.block_hash)?) } }
+    Self {
+        block_hash: if item.block_hash.is_empty() { None } else { Some(RpcHash::from_str(&item.block_hash)?) },
+        below_daa_score: (item.below_daa_score != 0).then_some(item.below_daa_score),
+    }
 });
 try_from!(item: &protowire::GetShieldedTreeStateResponseMessage, RpcResult<kaspa_rpc_core::GetShieldedTreeStateResponse>, {
     Self {
@@ -832,11 +843,15 @@ try_from!(item: &protowire::GetShieldedTreeStateResponseMessage, RpcResult<kaspa
         size: item.size,
         leaf: RpcHash::from_str(&item.leaf)?,
         ommers: item.ommers.iter().map(|s| RpcHash::from_str(s)).collect::<Result<Vec<_>, _>>()?,
+        // A peer that predates these fields sends proto defaults (0, false). `false` is the
+        // safe reading: never let an old node's silence pass as a promise of full history.
+        history_from_daa_score: item.history_from_daa_score,
+        history_complete: item.history_complete,
     }
 });
 
 try_from!(item: &protowire::GetShieldedBlocksRequestMessage, kaspa_rpc_core::GetShieldedBlocksRequest, {
-    Self { start_hash: RpcHash::from_str(&item.start_hash)?, limit: item.limit }
+    Self { start_hash: RpcHash::from_str(&item.start_hash)?, limit: item.limit, metadata_only: item.metadata_only }
 });
 try_from!(item: &protowire::RpcShieldedChainBlock, kaspa_rpc_core::RpcShieldedChainBlock, {
     Self {
@@ -848,7 +863,18 @@ try_from!(item: &protowire::RpcShieldedChainBlock, kaspa_rpc_core::RpcShieldedCh
             .coinbase_outputs
             .iter()
             .map(|o| {
-                Ok(kaspa_rpc_core::RpcShieldedCoinbaseOutput { script_public_key: Vec::from_rpc_hex(&o.script_public_key)?, value: o.value })
+                let commitment = if o.commitment.is_empty() {
+                    None
+                } else if o.commitment.len() == 32 {
+                    Some(o.commitment.as_slice().try_into().expect("checked commitment length"))
+                } else {
+                    return Err("shielded coinbase commitment must be 32 bytes".into());
+                };
+                Ok(kaspa_rpc_core::RpcShieldedCoinbaseOutput {
+                    script_public_key: Vec::from_rpc_hex(&o.script_public_key)?,
+                    value: o.value,
+                    commitment,
+                })
             })
             .collect::<Result<Vec<_>, Self::Error>>()?,
         accepted_actions: item.accepted_actions.iter().map(|b| Vec::from_rpc_hex(b)).collect::<Result<Vec<_>, _>>()?,
@@ -906,6 +932,8 @@ try_from!(item: &protowire::GetShieldedCoinbaseRewardsResponseMessage, RpcResult
         scanned_blocks: item.scanned_blocks,
         reorged: item.reorged,
         sink_blue_score: item.sink_blue_score,
+        pending_recipient: item.pending_recipient.clone(),
+        pending_value: item.pending_value,
     }
 });
 
@@ -1380,25 +1408,36 @@ mod tests {
                 SubmitBlockResponseMessage { reject_reason: RejectReason::None as i32, reject_detail: String::new(), error: None },
             ),
             Test::new(
-                Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::BlockInvalid), reject_detail: String::new() }),
+                Ok(SubmitBlockResponse {
+                    report: SubmitBlockReport::Reject(SubmitBlockRejectReason::BlockInvalid),
+                    reject_detail: String::new(),
+                }),
                 SubmitBlockResponseMessage {
-                    reject_reason: RejectReason::BlockInvalid as i32, reject_detail: String::new(),
+                    reject_reason: RejectReason::BlockInvalid as i32,
+                    reject_detail: String::new(),
                     error: Some(protowire::RpcError {
                         message: RpcError::SubmitBlockError(SubmitBlockRejectReason::BlockInvalid).to_string(),
                     }),
                 },
             ),
             Test::new(
-                Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::IsInIBD), reject_detail: String::new() }),
+                Ok(SubmitBlockResponse {
+                    report: SubmitBlockReport::Reject(SubmitBlockRejectReason::IsInIBD),
+                    reject_detail: String::new(),
+                }),
                 SubmitBlockResponseMessage {
-                    reject_reason: RejectReason::IsInIbd as i32, reject_detail: String::new(),
+                    reject_reason: RejectReason::IsInIbd as i32,
+                    reject_detail: String::new(),
                     error: Some(protowire::RpcError {
                         message: RpcError::SubmitBlockError(SubmitBlockRejectReason::IsInIBD).to_string(),
                     }),
                 },
             ),
             Test::new(
-                Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(SubmitBlockRejectReason::RouteIsFull), reject_detail: String::new() }),
+                Ok(SubmitBlockResponse {
+                    report: SubmitBlockReport::Reject(SubmitBlockRejectReason::RouteIsFull),
+                    reject_detail: String::new(),
+                }),
                 SubmitBlockResponseMessage {
                     reject_reason: RejectReason::None as i32, // This rpc core reject reason has no matching protowire variant
                     reject_detail: String::new(),

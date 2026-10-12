@@ -49,6 +49,8 @@ pub struct ShieldedTx {
     /// and the remaining `fee - burn.v` is paid to the miner as an ordinary fee. A burn may
     /// therefore never exceed `fee` — otherwise it would move value the bundle never authorised.
     pub burn: Option<crate::burn::ExitReceipt>,
+    /// The block the spend names as the producer of `anchor` (security fork); `None` before it.
+    pub anchor_block: Option<[u8; 32]>,
 }
 
 /// Error extracting a [`ShieldedTx`] from an on-wire [`ShieldedBundle`].
@@ -67,6 +69,16 @@ pub enum BundleExtractError {
     /// `check_shielded_in_isolation`; this is the defense-in-depth guard at the extractor, so a
     /// burn can never become an applied effect even if it reached here.
     BridgeDisabled,
+    /// A bundle declared a burn larger than the value it proved is leaving the pool.
+    ///
+    /// Enforced at this constructor so the bound is an invariant of [`ShieldedTx`] rather than an
+    /// agreement between two crates: `check_shielded_in_isolation` compares against
+    /// `bundle.value_balance` while the state transition compares against `tx.fee`, and those
+    /// coincide only because `fee` is derived from `value_balance` right here. The state
+    /// transition's own check is block-FATAL — it disqualifies the block that MERGES the
+    /// transaction — so one future change to fee derivation would re-arm a one-transaction
+    /// permanent selected-chain halt.
+    BurnExceedsValueBalance,
 }
 
 impl ShieldedTx {
@@ -98,12 +110,17 @@ impl ShieldedTx {
             // extractor honest as a second line of defense (see [`crate::burn::BRIDGE_ENABLED`]).
             Some(_) if !crate::burn::BRIDGE_ENABLED => return Err(BundleExtractError::BridgeDisabled),
             Some((v, recipient)) => {
+                // The bound, established where the type is built and against the same quantity the
+                // context-free isolation rule uses. See `BurnExceedsValueBalance`.
+                if i128::from(v) > i128::from(bundle.value_balance) {
+                    return Err(BundleExtractError::BurnExceedsValueBalance);
+                }
                 let n = *bundle.nullifiers().next().ok_or(BundleExtractError::BurnWithoutSpend)?;
                 Some(crate::burn::ExitReceipt { v, recipient, n })
             }
             None => None,
         };
-        Ok(ShieldedTx { nullifiers, commitments, fee: bundle.value_balance as u64, anchor: bundle.anchor, burn })
+        Ok(ShieldedTx { nullifiers, commitments, fee: bundle.value_balance as u64, anchor: bundle.anchor, burn, anchor_block: bundle.anchor_block })
     }
 }
 
@@ -377,6 +394,7 @@ mod tests {
     fn tx(nfs: &[u8], cmxs: &[u32], fee: u64) -> ShieldedTx {
         ShieldedTx {
             burn: None,
+            anchor_block: None,
             nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
             commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
             fee,
@@ -423,17 +441,15 @@ mod tests {
         bundle.flags |= BUNDLE_FLAG_BURN;
         bundle.burn = Some((20, [0xA1; 32]));
 
-        let expected = if crate::burn::BRIDGE_ENABLED {
-            BundleExtractError::BurnWithoutSpend
-        } else {
-            BundleExtractError::BridgeDisabled
-        };
+        let expected =
+            if crate::burn::BRIDGE_ENABLED { BundleExtractError::BurnWithoutSpend } else { BundleExtractError::BridgeDisabled };
         assert_eq!(ShieldedTx::from_bundle(&bundle).unwrap_err(), expected);
     }
 
     fn burn_tx(nfs: &[u8], cmxs: &[u32], value_balance: u64, burn_v: u64, tag: u8) -> ShieldedTx {
         ShieldedTx {
             burn: Some(crate::burn::ExitReceipt { v: burn_v, recipient: [tag; 32], n: [tag.wrapping_add(0x90); 32] }),
+            anchor_block: None,
             nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
             commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
             fee: value_balance,
@@ -698,6 +714,7 @@ mod tests {
         let bundle = ShieldedBundle {
             actions: vec![action(1, 100), action(2, 101)],
             burn: None,
+            anchor_block: None,
             flags: 0b11,
             value_balance: 7,
             anchor: [0; 32],
@@ -712,8 +729,16 @@ mod tests {
 
     #[test]
     fn extract_rejects_minting_value_balance() {
-        let bundle =
-            ShieldedBundle { actions: vec![], flags: 0, value_balance: -1, anchor: [0; 32], proof: vec![], binding_sig: [0; 64], burn: None };
+        let bundle = ShieldedBundle {
+            actions: vec![],
+            flags: 0,
+            value_balance: -1,
+            anchor: [0; 32],
+            proof: vec![],
+            binding_sig: [0; 64],
+            burn: None,
+            anchor_block: None,
+        };
         assert!(matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::MintingValueBalance)));
     }
 
@@ -721,8 +746,16 @@ mod tests {
     fn extract_rejects_non_canonical_commitment() {
         let mut bad = action(1, 0);
         bad.cmx = [0xff; 32]; // not a canonical Pallas base-field element
-        let bundle =
-            ShieldedBundle { actions: vec![bad], flags: 0, value_balance: 0, anchor: [0; 32], proof: vec![], binding_sig: [0; 64], burn: None };
+        let bundle = ShieldedBundle {
+            actions: vec![bad],
+            flags: 0,
+            value_balance: 0,
+            anchor: [0; 32],
+            proof: vec![],
+            binding_sig: [0; 64],
+            burn: None,
+            anchor_block: None,
+        };
         assert!(matches!(ShieldedTx::from_bundle(&bundle), Err(BundleExtractError::NonCanonicalCommitment)));
     }
 
@@ -772,7 +805,7 @@ mod circuit_e2e {
 
     #[test]
     fn coinbase_note_is_spent_end_to_end() {
-        let pk = ProvingKey::build();
+        let pk = ProvingKey::build(crate::verify::CIRCUIT_VERSION);
         let keys = ShieldedKeys::from_seed([5u8; 32]).unwrap();
         let net = [0x77u8; 32];
 
@@ -780,7 +813,7 @@ mod circuit_e2e {
         let value = 10_000u64;
         let rho = Option::<Rho>::from(Rho::from_bytes(&canon(1))).unwrap();
         let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(2), &rho)).unwrap();
-        let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(value), rho, rseed)).unwrap();
+        let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(value), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
 
         // Consensus recomputes the coinbase note commitment from its public
         // description + value, and it must equal the wallet's own note commitment.
@@ -808,7 +841,7 @@ mod circuit_e2e {
         let recipient = ShieldedKeys::from_seed([6u8; 32]).unwrap().address();
         let output_value = 8_000u64;
         let ctx = b"e2e";
-        let wire = build_spend_bundle(&pk, &keys, note, merkle_path, recipient, output_value, &net, ctx, rand::rngs::OsRng).unwrap();
+        let wire = build_spend_bundle(&pk, &keys, note, merkle_path, recipient, output_value, &net, ctx, rand::rng()).unwrap();
 
         // The consensus verifier accepts the real bundle, and it spends against the
         // coinbase anchor with the expected public fee.

@@ -316,6 +316,16 @@ pub struct OverrideParams {
     /// AuxPoW proof (Option-2 dual acceptance).
     pub merged_mining_activation: Option<ForkActivation>,
 
+    /// See [`Params::security_fork_activation`]. Overridable so a private test network can choose
+    /// the score it crosses.
+    pub security_fork_activation: Option<ForkActivation>,
+
+    /// See [`Params::miner_accrual_payout_interval`].
+    pub miner_accrual_payout_interval: Option<u64>,
+
+    /// See [`Params::dev_fee_end_activation`].
+    pub dev_fee_end_activation: Option<ForkActivation>,
+
     /// Whether the coinbase mints its reward into the shielded pool (private-by-default
     /// networks) rather than as a transparent output. Overridable so tests can exercise
     /// the shielded pipeline on a small-pruning simnet base (which is otherwise
@@ -354,6 +364,9 @@ impl From<Params> for OverrideParams {
             crescendo_activation: Some(p.crescendo_activation),
             toccata_activation: Some(p.toccata_activation),
             merged_mining_activation: Some(p.merged_mining_activation),
+            security_fork_activation: Some(p.security_fork_activation),
+            miner_accrual_payout_interval: Some(p.miner_accrual_payout_interval),
+            dev_fee_end_activation: Some(p.dev_fee_end_activation),
             shielded_coinbase: Some(p.shielded_coinbase),
         }
     }
@@ -490,10 +503,39 @@ pub struct Params {
     /// deterministic even though a DAG block's score can jump by more than one.
     pub dev_fee_payout_interval: u64,
 
+    /// DAA score from which the dev fee is zero: every rewarded block's whole subsidy goes to its
+    /// miner, and the first block at or past the score pays out whatever dev fee is still accrued as
+    /// one final note (nothing is stranded or burned; total issuance is unchanged). Judged by the
+    /// DAA score of the block whose coinbase pays the rewards. Mainnet: the security fork block
+    /// ([`ZKAS_DEV_FEE_END_DAA`]).
+    pub dev_fee_end_activation: ForkActivation,
+
+    /// Security fork: DAA-score interval at which the miner accrual slot is paid out, by the same
+    /// crossing rule as [`Self::dev_fee_payout_interval`]. About 100 seconds of blocks: a pool that
+    /// mines every block mints one reward note per interval instead of one per block (99% fewer),
+    /// while a miner waits at most this long for its reward to be minted.
+    pub miner_accrual_payout_interval: u64,
+
     /// Merged-mining (AuxPoW) activation DAA score. Before this score a block must
     /// clear the native kHeavyHash PoW; at/after it a block may instead carry a valid
     /// AuxPoW proof whose parent kHeavyHash clears our target (Option-2 dual acceptance).
     pub merged_mining_activation: ForkActivation,
+
+    /// The 2026-10 security fork. From this DAA score, all at once:
+    /// - a shielded spend names its anchor block (`anchor_block`, sighash-covered) and the anchor
+    ///   must be that block's own tree root, a matured selected-chain ancestor;
+    /// - the shielded state root is `zkas_state_root1`: the v0 root plus `dev_accrued`, the anchor
+    ///   window and the miner accrual slot, so a syncing node can verify everything it imports;
+    /// - miner rewards accrue in one carried slot, paid out on a payout-script switch or every
+    ///   `miner_accrual_payout_interval` (shielded-coinbase networks only);
+    /// - an aux parent commits the long, genesis-bound form over the nonce-free header hash, carries
+    ///   no legacy commitment, and an aux-accepted block's nonce must equal the truncated parent
+    ///   hash; a ZKas coinbase may not carry a merge-mining commitment;
+    /// - the coinbase output size bound is k + 4 (k + 1 blues, a red reward, the slot payout, the
+    ///   dev note);
+    /// - a shielded bundle decodes in the anchor-block format (decided per carrying block's DAA).
+    /// Mainnet: [`ZKAS_SECURITY_FORK_DAA`].
+    pub security_fork_activation: ForkActivation,
 
     /// ZKas launch difficulty schedule — number of blocks (blue-score units) at the
     /// start of the chain during which difficulty is **pinned** to the genesis target
@@ -658,6 +700,17 @@ impl Params {
         self.blockrate.finality_depth
     }
 
+    /// From which DAA score a ZKas coinbase may carry no merge-mining commitment: `2 * finality_depth`
+    /// before the security fork. Starting at the fork itself left a gap: a pre-fork block A could carry
+    /// the bound commitment of a post-fork block B and be mined natively, and B then used A as its aux
+    /// parent, so one solution paid both. With the lead, an A that may still carry the commitment sits
+    /// more than `2 * finality_depth` DAA below every post-fork block. A post-fork chain block can merge
+    /// only blocks in the future of its finality point (`finality_depth` blue score back), which lies
+    /// fewer than `2 * finality_depth` DAA below it unless half the blocks in that span were red.
+    pub fn coinbase_commitment_ban_activation(&self) -> ForkActivation {
+        self.security_fork_activation.early_by(2 * self.finality_depth())
+    }
+
     /// Shielded-spend anchor maturity in blue-score units (PLAN §2.5): how deep a
     /// mined shielded note must be before it can be spent (~10 min at 10 BPS).
     pub fn shielded_anchor_depth(&self) -> u64 {
@@ -725,6 +778,10 @@ impl Params {
         self.net.default_p2p_port()
     }
 
+    pub fn default_listen_p2p_port(&self) -> u16 {
+        self.net.default_listen_p2p_port()
+    }
+
     pub fn default_rpc_port(&self) -> u16 {
         self.net.default_rpc_port()
     }
@@ -789,7 +846,10 @@ impl Params {
             shielded_coinbase_seed_activation: self.shielded_coinbase_seed_activation,
             dev_fee_accrual_activation: self.dev_fee_accrual_activation,
             dev_fee_payout_interval: self.dev_fee_payout_interval,
+            miner_accrual_payout_interval: overrides.miner_accrual_payout_interval.unwrap_or(self.miner_accrual_payout_interval),
+            dev_fee_end_activation: overrides.dev_fee_end_activation.unwrap_or(self.dev_fee_end_activation),
             merged_mining_activation: overrides.merged_mining_activation.unwrap_or(self.merged_mining_activation),
+            security_fork_activation: overrides.security_fork_activation.unwrap_or(self.security_fork_activation),
 
             // Consensus-critical launch schedule; not exposed as a CLI override.
             low_difficulty_start_blocks: self.low_difficulty_start_blocks,
@@ -856,12 +916,41 @@ pub const ZKAS_DEV_FEE_RECIPIENT: [u8; 43] = [
 /// [`ZKAS_DEV_FEE_RECIPIENT`].
 pub const ZKAS_DEV_FEE_PERMILLE: u64 = 50;
 
+/// Mainnet DAA score of the security fork (`security_fork_activation`). Set 2026-10-11 at mainnet DAA
+/// 6,638,072 (09:33 UTC), measured rate ~0.945 DAA/s: ~15 October 2026 ~15:00 UTC. 500 mod 1,000
+/// so it is not a dev-payout block. The merge-mining tag ban starts `2 * finality_depth` earlier
+/// (6,897,100, ~14 October ~13:40 UTC), so every node and pool must run this release by then. Replaces
+/// the 8,700,500 of 23767efa and the 7,000,500 of 1e684932 (neither tagged or released): a node built
+/// from either splits here.
+pub const ZKAS_SECURITY_FORK_DAA: u64 = 6_983_500;
+
+/// Mainnet DAA score from which the dev fee is zero: the security fork itself, one activation.
+/// The first block at or past it pays the carried dev balance as one final note; afterwards no dev
+/// output exists and miners keep the whole subsidy.
+///
+/// Why exactly at F and not elsewhere:
+/// - before F, the split at the end would be unprotected (identical transaction format on both
+///   sides, so transactions replay); at F the security fork already separates the two chains;
+/// - after F, the old rollout constraint applied (F + pruning_depth + finality_depth before the end, so
+///   `zkas_state_root1` binds the carried balance); at F nothing is carried past the boundary at all:
+///   every post-fork block has `dev_accrued == 0`, which the pruning-point import enforces by rule.
+///   A pruning point below F still carries an unbound balance (the v0 root does not cover it), exactly
+///   as before this change: a lying IBD peer can make a syncing node refuse the next payout block
+///   (here possibly the final-note block). Sync new nodes from peers we run until the pruning point
+///   passes F.
+pub const ZKAS_DEV_FEE_END_DAA: u64 = ZKAS_SECURITY_FORK_DAA;
+
 pub const MAINNET_PARAMS: Params = Params {
     // ZKas is a distinct network with its own genesis; it MUST NOT advertise or
     // dial Kaspa's DNS seeders (doing so would waste connections on genesis-mismatch
-    // rejects and leak our nodes into Kaspa's peer graph). Until ZKas seeders are
-    // deployed (task #28), mainnet bootstraps via explicit --connect/--addpeer.
-    dns_seeders: &[],
+    // rejects and leak our nodes into Kaspa's peer graph).
+    //
+    // `seed.zkas.info` is resolved with a plain A-record lookup (`to_socket_addrs`,
+    // components/connectionmanager/src/lib.rs) and every address it returns is dialled on
+    // the default p2p port, so it works as a static list of A records today and becomes a
+    // crawling seeder the day one is put behind the same name - no node release needed.
+    // Only consulted when no --connect peer is given (kaspad/src/daemon.rs).
+    dns_seeders: &["seed.zkas.info"],
     net: NetworkId::new(NetworkType::Mainnet),
     genesis: GENESIS,
     timestamp_deviation_tolerance: TIMESTAMP_DEVIATION_TOLERANCE,
@@ -951,14 +1040,19 @@ pub const MAINNET_PARAMS: Params = Params {
     // ~17 minutes at 1 BPS: short enough that the dev fund is never far behind,
     // long enough to cut per-block dev notes by three orders of magnitude.
     dev_fee_payout_interval: 1_000,
+    // About 100 seconds of blocks (see Params::miner_accrual_payout_interval).
+    miner_accrual_payout_interval: 100,
+    dev_fee_end_activation: ForkActivation::new(ZKAS_DEV_FEE_END_DAA),
     // LAUNCH VALUE (decided 2026-07-22, reset bundle): merged mining active from
     // genesis. This is ZKas's production model — the chain merge-mines Kaspa from
     // block 0 (~20-25 KAS blocks/h in production), so aux-PoW acceptance is a launch
     // feature, not a future fork. Keeping it `always()` also exercises the aux path
     // from genesis and needs no activation DAA. (Earlier revisions carried a
     // "REVERT to day-14" note from when this was a demo value — that no longer
-    // applies; the fresh-genesis reset makes always() the intended, correct value.)
+    // applies; since the July 2026 mainnet launch (fresh genesis), always() is the
+    // intended, correct value. This is historical context, not a planned change.)
     merged_mining_activation: ForkActivation::always(),
+    security_fork_activation: ForkActivation::new(ZKAS_SECURITY_FORK_DAA),
 
     // ZKas launch difficulty: the low-difficulty bootstrap schedule is DISABLED on mainnet
     // (both 0), so the chain launches under pure upstream KIP-0004 DAA from genesis — the
@@ -983,14 +1077,15 @@ pub const MAINNET_PARAMS: Params = Params {
 };
 
 pub const TESTNET_PARAMS: Params = Params {
-    dns_seeders: &[
-        // This DNS seeder is run by Tiram
-        "seeder1-tn.kaspad.net",
-        // This DNS seeder is run by -gerri-
-        "dnsseeder-kaspa-testnet.x-con.at",
-        // This DNS seeder is run by supertypo
-        "n-testnet-10.kaspa.ws",
-    ],
+    // testnet-10 mirrors MAINNET's ZKas feature set (shielded coinbase, Toccata, multi-
+    // producer anchors, dev fee, 1 BPS emission) so a solo miner exercises real ZKas
+    // consensus. Differs from mainnet only in: network id, TESTNET_GENESIS (easy PoW for
+    // CPU solo mining), empty seeders (run standalone), and merged-mining-from-genesis.
+    // No ZKas testnet seeders exist yet. These MUST NOT be Kaspa's testnet seeders
+    // (inherited here until 2026-08-31): since 64beca1 the connection manager actually
+    // dials every address a seeder returns, so a ZKas testnet node would spam Kaspa's
+    // testnet with genesis-mismatch handshakes and leak itself into their peer graph.
+    dns_seeders: &[],
     net: NetworkId::with_suffix(NetworkType::Testnet, 10),
     genesis: TESTNET_GENESIS,
     timestamp_deviation_tolerance: TIMESTAMP_DEVIATION_TOLERANCE,
@@ -1001,7 +1096,7 @@ pub const TESTNET_PARAMS: Params = Params {
     min_difficulty_window_size: MIN_DIFFICULTY_WINDOW_SIZE,
     coinbase_payload_script_public_key_max_len: 150,
     max_coinbase_payload_len: 204,
-    shielded_coinbase: false,
+    shielded_coinbase: true,
 
     // Limit the cost of calculating compute/transient/storage masses
     max_tx_inputs: 1000,
@@ -1021,43 +1116,47 @@ pub const TESTNET_PARAMS: Params = Params {
     block_lane_limits: BlockLaneLimits { lanes_per_block: DEFAULT_LANES_PER_BLOCK_LIMIT, gas_per_lane: DEFAULT_GAS_PER_LANE_LIMIT },
 
     storage_mass_parameter: STORAGE_MASS_PARAMETER,
-    // deflationary_phase_daa_score is the DAA score after which the pre-deflationary period
-    // switches to the deflationary period. This number is calculated as follows:
-    // We define a year as 365.25 days
-    // Half a year in seconds = 365.25 / 2 * 24 * 60 * 60 = 15778800
-    // The network was down for three days shortly after launch
-    // Three days in seconds = 3 * 24 * 60 * 60 = 259200
-    deflationary_phase_daa_score: 15778800 - 259200,
-    pre_deflationary_phase_base_subsidy: 50000000000,
+    // 1-BPS-from-genesis emission (same as mainnet): smooth halving applies from block 0,
+    // no flat pre-deflationary plateau.
+    deflationary_phase_daa_score: 0,
+    pre_deflationary_phase_base_subsidy: Bps::<1>::pre_deflationary_phase_base_subsidy(),
     skip_proof_of_work: false,
     max_block_level: 250,
     pruning_proof_m: 1000,
 
-    blockrate: BlockrateParams::new::<10>(),
+    blockrate: BlockrateParams::new::<1>(),
 
-    pre_crescendo_target_time_per_block: 1000,
+    pre_crescendo_target_time_per_block: Bps::<1>::target_time_per_block(),
 
     // 18:30 UTC, March 6, 2025
-    crescendo_activation: ForkActivation::new(88_657_000),
+    crescendo_activation: ForkActivation::always(),
 
     // ~16:00 UTC, May 18, 2026
-    toccata_activation: ForkActivation::new(467_579_632),
-    shielded_anchor_multi_activation: ForkActivation::never(),
+    toccata_activation: ForkActivation::always(),
+    shielded_anchor_multi_activation: ForkActivation::always(),
     shielded_coinbase_seed_activation: ForkActivation::never(),
-    dev_fee_accrual_activation: ForkActivation::never(),
+    dev_fee_accrual_activation: ForkActivation::always(),
     // ~17 minutes at 1 BPS: short enough that the dev fund is never far behind,
     // long enough to cut per-block dev notes by three orders of magnitude.
     dev_fee_payout_interval: 1_000,
+    // About 100 seconds of blocks (see Params::miner_accrual_payout_interval).
+    miner_accrual_payout_interval: 100,
+    // Testnet runs mainnet's post-fork rules from genesis, so pools and integrators can test the bound
+    // (`ZKM1`) merge-mining form, the miner accrual slot and named anchor blocks before mainnet reaches
+    // `ZKAS_SECURITY_FORK_DAA`: the security fork and the dev-fee end (on the fork block, as on mainnet)
+    // are active from block 0. Testnet has no seeders and no shared history, so this re-cuts nothing.
+    dev_fee_end_activation: ForkActivation::always(),
     // On testnet, merged mining is available from genesis for testing.
     merged_mining_activation: ForkActivation::always(),
+    security_fork_activation: ForkActivation::always(),
 
     // Launch difficulty schedule disabled on testnet.
     low_difficulty_start_blocks: 0,
     difficulty_ramp_blocks: 0,
 
-    // No dev fee on this network.
-    dev_fee_permille: 0,
-    dev_fee_recipient: None,
+    // Dev fee mirrors mainnet so the coinbase (miner note + dev note) is identical to production.
+    dev_fee_permille: ZKAS_DEV_FEE_PERMILLE,
+    dev_fee_recipient: Some(ZKAS_DEV_FEE_RECIPIENT),
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -1111,7 +1210,11 @@ pub const SIMNET_PARAMS: Params = Params {
     // ~17 minutes at 1 BPS: short enough that the dev fund is never far behind,
     // long enough to cut per-block dev notes by three orders of magnitude.
     dev_fee_payout_interval: 1_000,
+    // About 100 seconds of blocks (see Params::miner_accrual_payout_interval).
+    miner_accrual_payout_interval: 1_000,
+    dev_fee_end_activation: ForkActivation::never(),
     merged_mining_activation: ForkActivation::always(),
+    security_fork_activation: ForkActivation::always(),
 
     // Launch difficulty schedule disabled on simnet.
     low_difficulty_start_blocks: 0,
@@ -1171,7 +1274,10 @@ pub const DEVNET_PARAMS: Params = Params {
     pre_crescendo_target_time_per_block: TenBps::target_time_per_block(),
 
     crescendo_activation: ForkActivation::always(),
-    toccata_activation: ForkActivation::never(),
+    // Toccata from genesis, as on every other ZKas network. With it never active a devnet node
+    // advertised P2P protocol 9, peers registered the v8 flow set, which has no shielded-state
+    // flows, and a fresh node's shielded IBD request went unanswered and retried forever.
+    toccata_activation: ForkActivation::always(),
     shielded_anchor_multi_activation: ForkActivation::new(200),
     // F-02 is held for upgrade 2 (it forces every wallet client to ship a gated
     // scanner). Devnet therefore models UPGRADE 1 exactly: multi-producer anchors +
@@ -1182,7 +1288,11 @@ pub const DEVNET_PARAMS: Params = Params {
     // ~17 minutes at 1 BPS: short enough that the dev fund is never far behind,
     // long enough to cut per-block dev notes by three orders of magnitude.
     dev_fee_payout_interval: 20,
+    // About 100 seconds of blocks (see Params::miner_accrual_payout_interval).
+    miner_accrual_payout_interval: 1_000,
+    dev_fee_end_activation: ForkActivation::never(),
     merged_mining_activation: ForkActivation::always(),
+    security_fork_activation: ForkActivation::new(1_500),
 
     // Pin difficulty to the (easy) genesis target for the first 50k blocks so the
     // short devnet demo chain stays CPU-mineable throughout (mirrors mainnet's launch
@@ -1202,6 +1312,47 @@ pub const DEVNET_PARAMS: Params = Params {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// kaspad refuses to start when `max_shielded_anchor_age >= finality_depth` (an anchor window
+    /// deeper than the chain segment a fast-synced node holds below its pruning point). Every shipped
+    /// network must pass that check, and the mainnet security fork must keep its rollout constraints.
+    #[test]
+    fn shipped_networks_keep_the_anchor_window_inside_finality() {
+        for p in [MAINNET_PARAMS, TESTNET_PARAMS, SIMNET_PARAMS, DEVNET_PARAMS] {
+            assert!(p.max_shielded_anchor_age() < p.finality_depth(), "{:?}", p.net);
+            assert!(p.blockrate.shielded_anchor_depth < p.max_shielded_anchor_age(), "{:?}", p.net);
+        }
+        // The mainnet security fork: set, after the coinbase-tag ban lead, not on a dev-payout block, and
+        // the dev-fee end on the same block (never before it: that split would be replay-unprotected;
+        // never inside the fork's binding gap: see `ZKAS_DEV_FEE_END_DAA`).
+        let m = MAINNET_PARAMS;
+        let f = m.security_fork_activation.daa_score();
+        assert_eq!(f, ZKAS_SECURITY_FORK_DAA);
+        assert!(!m.security_fork_activation.is_active(f - 1) && m.security_fork_activation.is_active(f));
+        assert_eq!(m.dev_fee_end_activation.daa_score(), f, "the dev fee ends with the security fork");
+        assert!(m.dev_fee_accrual_activation.daa_score() < f, "a balance is carried up to the end and paid once");
+        // Testnet is mainnet after the fork, from genesis: the bound merge-mining form, the accrual slot,
+        // named anchors, the own-coinbase tag ban, and no dev output.
+        let t = TESTNET_PARAMS;
+        assert!(t.security_fork_activation.is_active(0) && t.dev_fee_end_activation.is_active(0));
+        assert!(t.coinbase_commitment_ban_activation().is_active(0) && t.merged_mining_activation.is_active(0));
+        assert!(t.toccata_activation.is_active(0) && t.shielded_coinbase);
+        assert_ne!(f % m.dev_fee_payout_interval, 0, "the fork block must not be a dev payout block");
+        assert_eq!(m.coinbase_commitment_ban_activation().daa_score(), f - 2 * m.finality_depth());
+        // The miner accrual payout interval is about 100 seconds of blocks on every network.
+        for p in [MAINNET_PARAMS, TESTNET_PARAMS, SIMNET_PARAMS, DEVNET_PARAMS] {
+            let secs = p.miner_accrual_payout_interval * p.target_time_per_block() / 1000;
+            assert_eq!(secs, 100, "{:?}", p.net);
+        }
+    }
+
+    #[test]
+    fn override_params_deserializes_security_fork_activation() {
+        let o: OverrideParams = serde_json::from_str(r#"{"security_fork_activation":150}"#).unwrap();
+        let p = DEVNET_PARAMS.override_params(o);
+        assert!(!p.security_fork_activation.is_active(149));
+        assert!(p.security_fork_activation.is_active(150));
+    }
 
     #[test]
     fn override_params_deserializes_toccata_activation() {

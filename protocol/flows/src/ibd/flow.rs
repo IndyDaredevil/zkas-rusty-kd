@@ -7,10 +7,11 @@ use futures::future::{Either, join_all, select, try_join_all};
 use itertools::Itertools;
 use kaspa_consensus_core::{
     BlockHashSet,
-    api::BlockValidationFuture,
+    api::{BlockValidationFuture, ShieldedHistoryVerdict},
     block::Block,
     config::params::{ForkActivation, Params},
     header::Header,
+    merkle::calc_hash_merkle_root,
     pruning::{PruningPointProof, PruningPointsList, PruningProofMetadata},
     trusted::TrustedBlock,
     tx::Transaction,
@@ -20,6 +21,7 @@ use kaspa_core::{debug, info, time::unix_now, warn};
 use kaspa_hashes::Hash;
 use kaspa_muhash::MuHash;
 use kaspa_p2p_lib::{
+    PeerKey,
     IncomingRoute, Router,
     common::ProtocolError,
     convert::{
@@ -41,6 +43,10 @@ use std::{
 use tokio::time::sleep;
 
 use super::{HeadersChunk, IBD_BATCH_SIZE, PruningPointUtxosetChunkStream, progress::ProgressReporter};
+use std::collections::HashSet;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 type BlockBody = Vec<Transaction>;
 
 /// Flow for managing IBD - Initial Block Download
@@ -66,6 +72,51 @@ impl Flow for IbdFlow {
     }
 }
 
+/// Set once shielded history has been obtained, so no further peer is ever asked.
+static SHIELDED_HISTORY_BACKFILL_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Which peers have been asked for shielded history this process, by identity — NOT a count.
+///
+/// A single global attempt was too few and unlimited retries were far too many. A peer on a build
+/// without `RequestShieldedHistory` closes the connection rather than ignoring it, so each ask
+/// costs one dropped link: retrying per-IBD walked the entire peer set (459 attempts / 28 minutes
+/// observed, node frozen at 0 UTXO-validated blocks), while one attempt per PROCESS spent itself
+/// on whichever peer happened to be first — measured, an incapable one — and the node then never
+/// tried again although a capable peer was available.
+///
+/// Keyed by peer identity because a counter is not enough: a failed ask ends the IBD, the node
+/// reconnects to the SAME peer, and a counter happily spends the whole budget on it. Observed
+/// 2026-08-08 on a node with exactly one peer, logging "3 of 8 peers asked" — three drops of the
+/// one link, a miniature of the storm the guard exists to prevent.
+static SHIELDED_HISTORY_ASKED_PEERS: Mutex<Option<HashSet<PeerKey>>> = Mutex::new(None);
+
+/// Peer budget for the history backfill; see [`SHIELDED_HISTORY_ASKED_PEERS`].
+const SHIELDED_HISTORY_MAX_PEERS: usize = 8;
+
+/// Receiver-side ceiling on records in ONE shielded-history chunk.
+///
+/// Twice the server's own `HISTORY_CHUNK_BLOCKS` (4,000), so an honest peer — including a future one
+/// with a larger chunk size — is unaffected, while the unbounded case disappears. A hostile sender
+/// has no obligation to honour the server-side cap, and the ingest writes before it verifies.
+const MAX_HISTORY_CHUNK_RECORDS: usize = 8_000;
+
+/// One serialized history record: a chain block's record holds its whole mergeset's accepted actions,
+/// so this sits well above a full mergeset of shielded-heavy blocks, and far below what lets one
+/// record dominate memory.
+const MAX_HISTORY_RECORD_BYTES: usize = 32 * 1024 * 1024;
+
+/// One history chunk's serialized records in total, checked before any is decoded.
+const MAX_HISTORY_CHUNK_BYTES: usize = 256 * 1024 * 1024;
+
+/// A chunk that is not the last must carry at least this many records. An honest server fills every
+/// chunk but the last (`max_blocks + 1` records); without a floor a peer could drip one record per
+/// round trip, just inside the dequeue timeout, and hold the sync for days.
+const MIN_HISTORY_CHUNK_RECORDS: usize = 1_000;
+
+/// The whole backfill, fetch and verification together. Mainnet takes 10-60 minutes; a peer that
+/// stretches it past this is dropped and the next one is asked.
+const MAX_HISTORY_BACKFILL_DURATION: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
+
 pub enum IbdType {
     Sync {
         highest_known_syncer_chain_hash: Hash,
@@ -75,7 +126,9 @@ pub enum IbdType {
         is_pp_anticone_synced: bool,
     },
     DownloadHeadersProof,
-    PruningCatchUp { highest_known_syncer_chain_hash: Hash },
+    PruningCatchUp {
+        highest_known_syncer_chain_hash: Hash,
+    },
 }
 
 struct QueueChunkOutput {
@@ -98,6 +151,12 @@ impl IbdFlow {
     }
 
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
+        // The backfill below runs inside `ibd()`, and a node enters IBD only when it is behind.
+        // A node that was synced BEFORE its build learned to backfill (a miner's in-process node
+        // upgraded in place, 2026-09-17: log full of accepted blocks, never a history line, wallet
+        // refused forever) never IBDs again, so it never asked. Ask here too, once the node is
+        // synced and the history is still incomplete; same peer budget, same one-ask-per-peer.
+        self.backfill_if_synced_and_incomplete().await;
         while let Ok(relay_block) = self.relay_receiver.recv().await {
             if let Some(_guard) = self.ctx.try_set_ibd_running(self.router.key(), relay_block.header.daa_score) {
                 info!("IBD started with peer {}", self.router);
@@ -115,6 +174,61 @@ impl IbdFlow {
         Ok(())
     }
 
+    /// Fetch the pre-pruning-point shielded history from this peer when the node is already
+    /// synced but still serves partial history — the case `ibd()` never reaches. Runs on this
+    /// flow's own route, so it cannot interleave with an IBD on another peer's route; it is
+    /// skipped while any IBD is running, since IBD renumbers the same chain index.
+    async fn backfill_if_synced_and_incomplete(&mut self) {
+        if !self.ctx.config.wants_shielded_history() || SHIELDED_HISTORY_BACKFILL_DONE.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.ctx.is_ibd_running() {
+            return;
+        }
+        let session = self.ctx.consensus().session().await;
+        if !self.ctx.is_nearly_synced(&session).await {
+            return; // the IBD path handles a node that still has to sync
+        }
+        match session.async_get_shielded_history_status().await {
+            Ok((_, true)) => {
+                SHIELDED_HISTORY_BACKFILL_DONE.store(true, Ordering::SeqCst);
+                return;
+            }
+            Ok((_, false)) => {}
+            Err(_) => return,
+        }
+        let should_ask = {
+            let mut guard = SHIELDED_HISTORY_ASKED_PEERS.lock().unwrap();
+            let asked = guard.get_or_insert_with(HashSet::new);
+            asked.len() < SHIELDED_HISTORY_MAX_PEERS && asked.insert(self.router.key())
+        };
+        if !should_ask {
+            return;
+        }
+        info!("shielded history: this node is synced but holds partial history; asking {} to backfill it", self.router);
+        // The base before this attempt: anything a failed attempt wrote below it is unproven and is
+        // discarded, whatever the failure was (a peer that times out or disconnects mid-stream used
+        // to leave its records in the live index for good).
+        let base_before = session.async_get_shielded_history_base().await;
+        match self.backfill_shielded_history(&session).await {
+            Ok(()) => SHIELDED_HISTORY_BACKFILL_DONE.store(true, Ordering::SeqCst),
+            Err(e) => {
+                match session.async_purge_shielded_history_below(base_before).await {
+                    Ok(n) if n > 0 => warn!("archival: discarded {n} unproven scan records from the failed backfill"),
+                    Ok(_) => {}
+                    Err(purge_err) => warn!("archival: could not discard the failed backfill's records ({purge_err})"),
+                }
+                let asked = SHIELDED_HISTORY_ASKED_PEERS.lock().unwrap().as_ref().map_or(0, |s| s.len());
+                let floor = session.async_get_shielded_history_status().await.map(|(daa, _)| daa).unwrap_or(0);
+                warn!(
+                    "archival: shielded history backfill did not complete from {} ({e}); {} of {} peers asked; \
+                     this node serves shielded history from DAA {floor} (incomplete) for now",
+                    self.router, asked, SHIELDED_HISTORY_MAX_PEERS
+                );
+            }
+        }
+    }
+
     async fn ibd(&mut self, relay_block: Block) -> Result<(), ProtocolError> {
         let mut session = self.ctx.consensus().session().await;
 
@@ -128,7 +242,13 @@ impl IbdFlow {
             )
             .await?;
         match ibd_type {
-            IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_smt_stable, is_shielded_stable, is_pp_anticone_synced } => {
+            IbdType::Sync {
+                highest_known_syncer_chain_hash,
+                is_utxo_stable,
+                is_smt_stable,
+                is_shielded_stable,
+                is_pp_anticone_synced,
+            } => {
                 let pruning_point = session.async_pruning_point().await;
 
                 info!("syncing ahead from current pruning point");
@@ -237,6 +357,80 @@ impl IbdFlow {
             }
         }
 
+        // An archival node must hold ALL note history, not just the range it validated itself.
+        // Every IBD path leaves it holding scan records only from the pruning point forward
+        // (`PruningPointShieldedMetadata` carries the frontier and a nullifier MuHash — aggregates
+        // that cannot yield notes), so a wallet querying it would see a silently partial balance.
+        //
+        // This runs for ALL IBD types deliberately: a fresh node always takes
+        // `DownloadHeadersProof`, which is precisely the case the backfill exists for. Placing it
+        // inside the `Sync` arm — as it first was — meant it never fired for a new node.
+        //
+        // Failure is logged, not fatal: the node is fully valid and correctly validating without
+        // it; it just cannot serve pre-pruning-point wallet history until a later IBD retries.
+        //
+        // Bounded across peers rather than one shot. A peer without `RequestShieldedHistory`
+        // CLOSES THE CONNECTION instead of ignoring it, so an ask costs a dropped link — but
+        // stopping after one ask meant an incapable first peer permanently denied this node its
+        // history (observed: the first peer closed the connection and nothing retried). See
+        // [`SHIELDED_HISTORY_ASKED_PEERS`].
+        //
+        // The eventual fix is a protocol-version gate so the request is never sent to a peer that
+        // cannot serve it. That needs `PROTOCOL_VERSION` bumped to 11 plus a `v11` flow registry
+        // AND an explicit `10 => v10::register(...)` arm in `handle_handshake` — without that arm
+        // every pre-bump peer is rejected with `VersionMismatch` instead of merely lacking the
+        // feature. It also only pays once v11 peers exist, so the peer budget is what makes the
+        // feature work on today's mixed network.
+        // A node that already holds verified history from genesis (restarted after a completed
+        // backfill, or one that built its whole index itself) has nothing to fetch. Asking anyway
+        // logged "a fresh node holds none" on every restart and spent one ask — a dropped link on
+        // a peer without the feature — for an empty chunk.
+        let already_complete = self.ctx.config.wants_shielded_history()
+            && !SHIELDED_HISTORY_BACKFILL_DONE.load(Ordering::SeqCst)
+            && matches!(session.async_get_shielded_history_status().await, Ok((_, true)));
+        if already_complete {
+            debug!("shielded history: already complete from genesis; not asking {} for a backfill", self.router);
+            SHIELDED_HISTORY_BACKFILL_DONE.store(true, Ordering::SeqCst);
+        }
+        // Ask this peer only if it is one we have not already asked, and only while under the
+        // peer budget. Both conditions are evaluated once, under the lock, so a concurrent IBD
+        // cannot slip a second ask to the same peer through.
+        let should_ask = self.ctx.config.wants_shielded_history()
+            && !SHIELDED_HISTORY_BACKFILL_DONE.load(Ordering::SeqCst)
+            && {
+                let mut guard = SHIELDED_HISTORY_ASKED_PEERS.lock().unwrap();
+                let asked = guard.get_or_insert_with(HashSet::new);
+                asked.len() < SHIELDED_HISTORY_MAX_PEERS && asked.insert(self.router.key())
+            };
+        if should_ask {
+            let base_before = session.async_get_shielded_history_base().await;
+            match self.backfill_shielded_history(&session).await {
+                Ok(()) => {
+                    SHIELDED_HISTORY_BACKFILL_DONE.store(true, Ordering::SeqCst);
+                }
+                Err(e) => {
+                    // See `backfill_if_synced_and_incomplete`: a failed attempt leaves nothing behind.
+                    match session.async_purge_shielded_history_below(base_before).await {
+                        Ok(n) if n > 0 => warn!("archival: discarded {n} unproven scan records from the failed backfill"),
+                        Ok(_) => {}
+                        Err(purge_err) => warn!("archival: could not discard the failed backfill's records ({purge_err})"),
+                    }
+                    let asked = SHIELDED_HISTORY_ASKED_PEERS.lock().unwrap().as_ref().map_or(0, |s| s.len());
+                    // Name the floor the node is left with, so an operator reading this line
+                    // knows what wallets will see rather than only that something failed.
+                    let floor = session.async_get_shielded_history_status().await.map(|(daa, _)| daa).unwrap_or(0);
+                    warn!(
+                        "archival: shielded history backfill did not complete from {} ({e}); {} of {} \
+                         peers asked. Peers on a build without shielded-history support close the \
+                         connection on this request. Wallet history below the pruning point is \
+                         unavailable until a peer that supports it is reached — this node serves \
+                         shielded history from DAA {floor} (incomplete) for now.",
+                        self.router, asked, SHIELDED_HISTORY_MAX_PEERS
+                    );
+                }
+            }
+        }
+
         // Sync missing bodies in the past of syncer sink (virtual selected parent)
         self.sync_missing_block_bodies(&session, negotiation_output.syncer_virtual_selected_parent).await?;
 
@@ -314,12 +508,20 @@ impl IbdFlow {
                 let is_shielded_stable = consensus.async_is_pruning_shielded_stable().await;
 
                 return match (syncer_skew, is_utxo_stable && is_smt_stable && is_shielded_stable && is_pp_anticone_synced) {
-                    (SyncerSkew::Aligned, _) => {
-                        Ok(IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_smt_stable, is_shielded_stable, is_pp_anticone_synced })
-                    }
-                    (SyncerSkew::Lagging, true) => {
-                        Ok(IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_smt_stable, is_shielded_stable, is_pp_anticone_synced })
-                    }
+                    (SyncerSkew::Aligned, _) => Ok(IbdType::Sync {
+                        highest_known_syncer_chain_hash,
+                        is_utxo_stable,
+                        is_smt_stable,
+                        is_shielded_stable,
+                        is_pp_anticone_synced,
+                    }),
+                    (SyncerSkew::Lagging, true) => Ok(IbdType::Sync {
+                        highest_known_syncer_chain_hash,
+                        is_utxo_stable,
+                        is_smt_stable,
+                        is_shielded_stable,
+                        is_pp_anticone_synced,
+                    }),
                     (SyncerSkew::Lagging, false) => Err(ProtocolError::Other(
                         "Local node is in a transitional state requiring external data to stabilize, but the syncer lags behind and is unable to provide said data",
                     )),
@@ -327,7 +529,13 @@ impl IbdFlow {
                         if consensus.async_get_block_status(syncer_pruning_point).await.is_some_and(|b| b.has_block_body()) {
                             // While a leading syncer skew often indicates the need for catchup, in this case
                             // the node is just missing a segment in the future of its current pruning point, that is available to the syncer
-                            Ok(IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_smt_stable, is_shielded_stable, is_pp_anticone_synced })
+                            Ok(IbdType::Sync {
+                                highest_known_syncer_chain_hash,
+                                is_utxo_stable,
+                                is_smt_stable,
+                                is_shielded_stable,
+                                is_pp_anticone_synced,
+                            })
                         } else {
                             Ok(IbdType::PruningCatchUp { highest_known_syncer_chain_hash })
                         }
@@ -807,6 +1015,257 @@ impl IbdFlow {
     /// into the live global set); if it differs, the import proceeds only when no
     /// validated chain blocks sit above the pruning point, and the seeded state
     /// must match the commitment.
+    /// Backfill the shielded scan archive below this node's base, so an archival node really
+    /// holds ALL history rather than only what it validated itself.
+    ///
+    /// A headers-proof sync writes scan records only from the pruning point forward, and
+    /// `PruningPointShieldedMetadata` carries aggregates (frontier, nullifier MuHash) that cannot
+    /// yield notes. Without this an `--archival` node silently serves partial wallet history —
+    /// a restored seed shows a too-low balance with no error.
+    ///
+    /// Server-driven: this node cannot enumerate the range itself (its index is re-based to 0 at
+    /// its own pruning point, and its header segment stops far above genesis), so it names an
+    /// anchor and the peer walks its own selected chain downward.
+    ///
+    /// Consensus-safe by construction: the scan archive is never read by validation, so even a
+    /// dishonest peer cannot fork this node — the cost of bad data is bounded to wallet serving,
+    /// which is why the range is verified before history is advertised as complete.
+    async fn backfill_shielded_history(&mut self, consensus: &ConsensusProxy) -> Result<(), ProtocolError> {
+        use kaspa_p2p_lib::pb::RequestShieldedHistoryMessage;
+
+        const MAX_BLOCKS_PER_CHUNK: u32 = 4_000;
+        let mut anchor = consensus.async_get_shielded_history_base().await;
+        // Verified against the CURRENT pruning point: its frontier and nullifier accumulator are
+        // PoW-bound and always retained. The base before the backfill is the same block on a fresh
+        // node, but on a node synced long ago it is an old pruning point whose accumulator the pruner
+        // deleted, so verifying there always came out `Unverifiable` and every backfill was purged.
+        let verify_base = consensus.async_pruning_point().await;
+        let (mut total_idx, mut total_rec, mut rounds) = (0u64, 0u64, 0u32);
+        // The floor wallets see while this runs. On a first sync this whole fetch plus its
+        // verification runs BEFORE block bodies are synced, so the node reports NOT synced and
+        // its block count does not move for the duration — without saying so here, that reads as
+        // a stalled sync (reported 2026-09: "why is it so long").
+        let floor = consensus.async_get_shielded_history_status().await.map(|(daa, _)| daa).unwrap_or(0);
+        info!(
+            "shielded history: fetching note history below {anchor} from {} — a fresh node holds \
+             none, so wallets would otherwise see a partial balance. Block-body sync waits for this \
+             and its verification, so a first sync reports NOT synced meanwhile; wallets connecting \
+             now see shielded history only from DAA {floor}",
+            self.router
+        );
+        let started = std::time::Instant::now();
+        // The peer's GENESIS-based index of our base, learned from the first chunk: exactly the
+        // number of chain blocks below it, i.e. the whole job. Each chunk's lowest index is what
+        // is still left, which is what makes a percentage and an ETA possible here.
+        let mut total_chain_blocks: Option<u64> = None;
+        let mut reached_genesis = false;
+
+        loop {
+            self.router
+                .enqueue(make_message!(
+                    Payload::RequestShieldedHistory,
+                    RequestShieldedHistoryMessage { anchor_hash: anchor.as_bytes().to_vec(), max_blocks: MAX_BLOCKS_PER_CHUNK }
+                ))
+                .await?;
+
+            let chunk_started = std::time::Instant::now();
+            let msg = dequeue_with_timeout!(self.incoming_route, Payload::ShieldedHistoryChunk)?;
+            if msg.entries.is_empty() {
+                info!("archival: peer has no further shielded history below {anchor}");
+                break;
+            }
+            // The server caps its OWN output at `HISTORY_CHUNK_BLOCKS`, but a hostile sender ignores
+            // its own cap and the receiver imposed nothing: the only bound was the 1 GiB p2p message
+            // ceiling, on a channel that accepts gzip, with every record written to RocksDB before
+            // any verification runs and never reclaimed by the pruner.
+            if msg.entries.len() > MAX_HISTORY_CHUNK_RECORDS {
+                return Err(ProtocolError::OtherOwned(format!(
+                    "peer sent {} shielded history records in one chunk, above the {MAX_HISTORY_CHUNK_RECORDS} ceiling",
+                    msg.entries.len()
+                )));
+            }
+
+            let mut chunk_bytes = 0usize;
+            for e in &msg.entries {
+                if e.data.len() > MAX_HISTORY_RECORD_BYTES {
+                    return Err(ProtocolError::OtherOwned(format!(
+                        "peer sent a {}-byte shielded history record, above the {MAX_HISTORY_RECORD_BYTES} ceiling",
+                        e.data.len()
+                    )));
+                }
+                chunk_bytes += e.data.len();
+            }
+            if chunk_bytes > MAX_HISTORY_CHUNK_BYTES {
+                return Err(ProtocolError::OtherOwned(format!(
+                    "peer sent {chunk_bytes} bytes of shielded history in one chunk, above the {MAX_HISTORY_CHUNK_BYTES} ceiling"
+                )));
+            }
+            if !msg.done && msg.entries.len() < MIN_HISTORY_CHUNK_RECORDS {
+                return Err(ProtocolError::OtherOwned(format!(
+                    "peer sent a short shielded history chunk ({} records) that is not the last; refusing a drip feed",
+                    msg.entries.len()
+                )));
+            }
+            if started.elapsed() > MAX_HISTORY_BACKFILL_DURATION {
+                return Err(ProtocolError::OtherOwned(format!(
+                    "shielded history backfill from this peer exceeded {:?}; asking another peer",
+                    MAX_HISTORY_BACKFILL_DURATION
+                )));
+            }
+
+            let mut records = Vec::with_capacity(msg.entries.len());
+            for e in &msg.entries {
+                let data: kaspa_consensus_core::api::ShieldedChainBlockData = bincode::deserialize(&e.data)
+                    .map_err(|err| ProtocolError::OtherOwned(format!("malformed shielded history record: {err}")))?;
+                // The peer's GENESIS-based chain index rides with each record. It cannot be
+                // inferred locally: this node's own index is re-based to 0 at its pruning point,
+                // so the two numbering spaces do not align.
+                records.push((e.chain_index, data));
+            }
+            records.sort_by_key(|(i, _)| *i);
+            let lowest = records.first().map(|(_, r)| r.hash).unwrap_or(anchor);
+            // Chain blocks still below the lowest record of this chunk (its index counts from 0
+            // at genesis), so this is what remains to fetch after the chunk lands.
+            let remaining = records.first().map(|(i, _)| *i).unwrap_or(0);
+            let total = *total_chain_blocks.get_or_insert(msg.anchor_index);
+
+            let (idx, rec) = consensus.async_backfill_shielded_history(anchor, msg.anchor_index, records).await?;
+            total_idx += idx;
+            total_rec += rec;
+            rounds += 1;
+
+            // Progress, not silence. This moves ~460k records over ~116 round trips while the
+            // node does nothing else; with only a start and an end line, a run that wrote NOTHING
+            // for 34 minutes looked exactly like one that was working. Reporting what was
+            // actually WRITTEN is what makes that failure visible at a glance — and a percentage
+            // with an ETA is what tells an operator it is a long job rather than a stuck one.
+            let done_blocks = total.saturating_sub(remaining);
+            let progress = if total > 0 && done_blocks > 0 {
+                let pct = done_blocks as f64 * 100.0 / total as f64;
+                let eta = started.elapsed().as_secs_f64() * remaining as f64 / done_blocks as f64;
+                format!(" — {pct:.0}% ({remaining} of {total} chain blocks left), about {eta:.0}s left")
+            } else {
+                String::new()
+            };
+            info!(
+                "archival: shielded history chunk {rounds}: +{rec} records (+{idx} index) in {:?}, total {total_rec} (at {lowest}){progress}",
+                chunk_started.elapsed()
+            );
+
+            if msg.done {
+                info!("archival: reached genesis after {rounds} rounds");
+                reached_genesis = true;
+                break;
+            }
+            // A chunk that stored nothing means our state is not advancing. Continuing would walk
+            // to genesis writing nothing and then report success — the exact 34-minute no-op this
+            // path used to perform. Stop loudly instead.
+            if idx == 0 && rec == 0 {
+                return Err(ProtocolError::OtherOwned(format!(
+                    "shielded history chunk below {anchor} (peer index {}) stored nothing; refusing to spin",
+                    msg.anchor_index
+                )));
+            }
+            // If the walk stops descending, stop — otherwise this loops forever on one block.
+            if lowest == anchor {
+                warn!("archival: shielded history stopped descending at {anchor} after {rounds} rounds; stopping");
+                break;
+            }
+            anchor = lowest;
+        }
+
+        info!(
+            "shielded history: received {total_rec} block records ({total_idx} index entries) in {:.1}s; verifying \
+             against the chain's own committed state before serving any of it",
+            started.elapsed().as_secs_f64()
+        );
+        if !reached_genesis {
+            // The loop stopped short (peer ran out, or stopped descending). Say where that leaves
+            // wallets, in the same terms the RPC reports (`history_from_daa_score`).
+            let floor = consensus.async_get_shielded_history_status().await.map(|(daa, _)| daa).unwrap_or(0);
+            warn!(
+                "shielded history: fetch stopped short of genesis; this node serves shielded history from DAA {floor} \
+                 (incomplete) until a later IBD retries"
+            );
+        }
+
+        // Verify before this history is served to anyone.
+        //
+        // Nothing above this point checked the peer's work. The scan archive is never read by
+        // validation, so a dishonest peer cannot fork this node — but it can make every wallet
+        // querying it report a wrong balance and a wrong history, with no symptom the user could
+        // notice. Replaying the range reproduces this node's own PoW-anchored frontier only if
+        // the peer supplied exactly the right leaves in exactly the right order, so omission,
+        // reordering, fabrication and truncation are all caught by one comparison.
+        //
+        // Cost is dominated by re-reading the archive, not by the tree: appending is ~0.1 us/leaf
+        // (~2.2M leaves today), while the replay also does one store read per chain block (~1.07M).
+        // Unconditional anyway — it runs once per process, after a backfill that took far longer,
+        // and the alternative is serving wallets history nobody ever checked.
+        if total_rec > 0 {
+            match consensus.async_verify_shielded_history(verify_base).await {
+                Ok(ShieldedHistoryVerdict::Verified { blocks, leaves }) => {
+                    // Say what this proves, not just that it passed: the replayed leaves reproduce
+                    // a frontier this node learned from PoW, never from the peer that sent them.
+                    info!(
+                        "shielded history: VERIFIED — {leaves} note commitments over {blocks} blocks replay exactly \
+                         to this node's proof-of-work-committed state. History is complete from genesis and safe \
+                         to serve to wallets."
+                    );
+                }
+                Ok(ShieldedHistoryVerdict::Mismatch { reason }) => {
+                    // Discard what this peer gave us. Safe, not drastic: the node returns to the
+                    // history it can prove, which is exactly where it started.
+                    let discarded = match consensus.async_purge_shielded_history_below(verify_base).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            // Could not undo. Say so loudly and precisely — the archive is now
+                            // holding unverified records and no log line further up says that.
+                            warn!(
+                                "archival: shielded history from {} FAILED verification ({reason}) AND could not be \
+                                 discarded ({e}); the archive holds UNVERIFIED records below {verify_base}. Re-verify \
+                                 with --verify-shielded-history.",
+                                self.router
+                            );
+                            return Err(ProtocolError::OtherOwned(format!("shielded history failed verification: {reason}")));
+                        }
+                    };
+                    warn!(
+                        "archival: shielded history from {} FAILED verification ({reason}); discarded {discarded} scan records",
+                        self.router
+                    );
+                    return Err(ProtocolError::OtherOwned(format!("shielded history failed verification: {reason}")));
+                }
+                // Unproven history is no longer kept. Retaining it was a permanent wedge: the index
+                // then anchored every later attempt at a peer-chosen base, and `Unverifiable` also
+                // marked the backfill done, so no honest peer was ever asked again. Discard it and
+                // report failure; a later IBD retries with another peer.
+                Ok(ShieldedHistoryVerdict::Unverifiable { reason }) => {
+                    let discarded = consensus.async_purge_shielded_history_below(verify_base).await.unwrap_or(0);
+                    warn!("archival: shielded history could NOT be verified ({reason}); discarded {discarded} unproven scan records");
+                    return Err(ProtocolError::OtherOwned(format!("shielded history could not be verified: {reason}")));
+                }
+                Err(e) => {
+                    let discarded = consensus.async_purge_shielded_history_below(verify_base).await.unwrap_or(0);
+                    warn!("archival: shielded history verification did not run ({e}); discarded {discarded} unproven scan records");
+                    return Err(ProtocolError::OtherOwned(format!("shielded history verification did not run: {e}")));
+                }
+            }
+        }
+        // One closing line in the terms wallets and the RPC use, whatever path led here: the
+        // Unverifiable/Err arms above leave the index reaching genesis but `history_complete`
+        // false, and that is exactly the state a wallet's node check will report back.
+        match consensus.async_get_shielded_history_status().await {
+            Ok((_, true)) => info!("shielded history: backfill finished — complete from genesis; wallets may connect to this node"),
+            Ok((floor, false)) => warn!(
+                "shielded history: backfill finished but history is NOT complete (serving from DAA {floor}); wallets born \
+                 before that see a partial balance"
+            ),
+            Err(_) => {}
+        }
+        Ok(())
+    }
+
     async fn sync_new_shielded_state(&mut self, consensus: &ConsensusProxy, pruning_point: Hash) -> Result<(), ProtocolError> {
         use super::streams::ShieldedStream;
         use kaspa_p2p_lib::pb::RequestPruningPointShieldedStateMessage;
@@ -814,7 +1273,25 @@ impl IbdFlow {
         // F-02: determine the PoW-committed shielded state root for this pruning point.
         let binding = self.shielded_pp_commitment(consensus, pruning_point).await?;
 
-        if let Some(&(child, committed)) = binding.as_ref() {
+        // Fail CLOSED when no proof-of-work binding can be determined.
+        //
+        // This used to warn and carry on, which dropped all three protections below at once — the
+        // "local root already matches, skip the import" short-circuit, the "descendants are already
+        // validated, refuse to clear" guard, and `verify_import_binding` itself (a `None` expected
+        // root means it is never called) — and then still wiped the global nullifier set
+        // unconditionally. Worse, the PEER chooses this branch: `extract_state_root` returns `None`
+        // for a coinbase payload shorter than 48 bytes, and the peer supplies that coinbase, so a
+        // ten-byte payload bought a fully unverified import on an otherwise healthy node.
+        //
+        // IBD now aborts and retries (possibly against another peer) rather than adopting a shielded
+        // state that nothing attests to.
+        let Some(&(child, committed)) = binding.as_ref() else {
+            return Err(ProtocolError::OtherOwned(format!(
+                "no PoW coinbase binding for pruning point {pruning_point} (the selected child's coinbase carries no state-root \
+                 commitment); refusing an unverified shielded import"
+            )));
+        };
+        {
             // F-15: if the locally held state root at the pruning point already equals the
             // PoW-committed root, the local state IS the committed state (the root binds the
             // frontier, supply totals, burns and the nullifier-set accumulator) — skip the
@@ -823,12 +1300,21 @@ impl IbdFlow {
             // the seeded PP-time set into it, freezing spends of unspent notes), a crash
             // between seed and stable-flag write, and the default-true flag on a network with
             // no shielded activity.
-            let local_root = consensus
-                .async_get_shielded_state_root(pruning_point)
-                .await
-                .map_err(|e| ProtocolError::OtherOwned(format!("local shielded state root at pruning point {pruning_point}: {e}")))?;
-            if local_root == committed {
-                info!("local shielded state at pruning point {} already matches the PoW-committed root; skipping re-import", pruning_point);
+            // A node that holds no shielded state at the pruning point yet (a fresh node after the
+            // security fork has no anchor window there, so the v1 root cannot be computed) simply
+            // does not match: it imports below, and the import is bound to `committed` regardless.
+            let local_root = match consensus.async_get_shielded_state_root(pruning_point).await {
+                Ok(root) => Some(root),
+                Err(e) => {
+                    info!("no local shielded state root at pruning point {pruning_point} ({e}); importing");
+                    None
+                }
+            };
+            if local_root == Some(committed) {
+                info!(
+                    "local shielded state at pruning point {} already matches the PoW-committed root; skipping re-import",
+                    pruning_point
+                );
                 consensus.async_set_pruning_shielded_stable().await;
                 return Ok(());
             }
@@ -840,27 +1326,22 @@ impl IbdFlow {
             // committed root (handled above), so reaching here means the local state is corrupt
             // AND has validated descendants — no in-place re-import can repair that, and
             // clearing would trade a detectable wedge for silent state loss.
-            if consensus.async_get_block_status(child).await.is_some_and(|s| s == kaspa_consensus_core::blockstatus::BlockStatus::StatusUTXOValid)
+            if consensus
+                .async_get_block_status(child)
+                .await
+                .is_some_and(|s| s == kaspa_consensus_core::blockstatus::BlockStatus::StatusUTXOValid)
             {
                 return Err(ProtocolError::OtherOwned(format!(
                     "local shielded state at pruning point {pruning_point} does not match the PoW-committed root, but chain \
                      blocks above it are already validated; refusing to clear live shielded state — a full resync is required"
                 )));
             }
-        } else {
-            // The pruning point has no selected child in the local DAG yet (or its coinbase
-            // carries no commitment). This fallback exists only while the chain tip is within
-            // one block of the pruning point; the import then proceeds unverified, as before.
-            warn!(
-                "could not determine a PoW coinbase binding for pruning point {}; proceeding with an UNVERIFIED shielded import",
-                pruning_point
-            );
         }
 
-        // F-15: the real clear (global nullifier set + pruning-point snapshots + stable flag,
-        // atomically) — only here, immediately before the re-seed, and only after the
-        // no-validated-descendants check above.
-        consensus.async_clear_pruning_shielded_stores().await;
+        // The clear is no longer issued here. It is staged in the same write as the verified seed
+        // (Consensus::import_pruning_point_shielded), so a peer that stalls, lies or disconnects
+        // mid-transfer leaves the local state exactly as it was. Only the verified-empty path
+        // below clears on its own.
 
         info!("downloading the pruning point shielded state from {}", self.router);
 
@@ -887,6 +1368,8 @@ impl IbdFlow {
                     )));
                 }
             }
+            // Verified empty: drop whatever stale local state brought us here, then mark stable.
+            consensus.async_clear_pruning_shielded_stores().await;
             consensus.async_set_pruning_shielded_stable().await;
             info!("pruning point {} has no shielded state to import", pruning_point);
             return Ok(());
@@ -900,8 +1383,9 @@ impl IbdFlow {
         let (tx, rx) = tokio::sync::mpsc::channel::<Vec<[u8; 32]>>(2);
 
         let consensus_for_import = consensus.clone();
-        let builder_handle =
-            tokio::task::spawn_blocking(move || consensus_for_import.import_pruning_point_shielded(pruning_point, md, expected_state_root, rx));
+        let builder_handle = tokio::task::spawn_blocking(move || {
+            consensus_for_import.import_pruning_point_shielded(pruning_point, md, expected_state_root, rx)
+        });
 
         while let Some(chunk) = stream.next_chunk().await? {
             tx.send(chunk).await.map_err(|_| ProtocolError::Other("streaming shielded importer stopped unexpectedly"))?;
@@ -926,7 +1410,11 @@ impl IbdFlow {
     /// commitment slot; the caller then falls back to the legacy unverified
     /// import. Any actual misbehaviour (wrong block, merkle-root mismatch, no
     /// coinbase) is a `ProtocolError`.
-    async fn shielded_pp_commitment(&mut self, consensus: &ConsensusProxy, pruning_point: Hash) -> Result<Option<(Hash, [u8; 32])>, ProtocolError> {
+    async fn shielded_pp_commitment(
+        &mut self,
+        consensus: &ConsensusProxy,
+        pruning_point: Hash,
+    ) -> Result<Option<(Hash, [u8; 32])>, ProtocolError> {
         let Some(children) = consensus.async_get_block_children(pruning_point).await else { return Ok(None) };
         let hst = consensus.async_get_headers_selected_tip().await;
         let mut selected_child = None;
@@ -965,12 +1453,31 @@ impl IbdFlow {
         if block.is_header_only() {
             return Err(ProtocolError::OtherOwned(format!("sent header of {} where expected block with body", block.hash())));
         }
-        let local_header = consensus.async_get_header(child).await?;
-        if block.header.hash_merkle_root != local_header.hash_merkle_root {
-            return Err(ProtocolError::OtherOwned(format!("block {} hash_merkle_root does not match the locally stored header", child)));
+        // `Block::hash()` returns the header's own hash, recomputed from the wire fields, so the
+        // check above already pins EVERY header field — `hash_merkle_root` included. Comparing that
+        // field against the locally stored header was therefore a tautology: it compared the verified
+        // header against itself and bound nothing whatsoever about `block.transactions`.
+        //
+        // These transactions never pass through the body processor on this path, so the coinbase
+        // below — and with it the `state_root` that `verify_import_binding` checks the entire shielded
+        // import against — was the peer's free choice. A sync peer could serve the genuine header of
+        // `child` with a fabricated coinbase, and the import's whole defence collapsed into
+        // `md.state_root == md.state_root`.
+        //
+        // Recompute the root over the transactions, exactly as `check_hash_merkle_root` does, so the
+        // coinbase is bound to the proof-of-work that committed this header.
+        let calculated_merkle_root = calc_hash_merkle_root(block.transactions.iter());
+        if calculated_merkle_root != block.header.hash_merkle_root {
+            return Err(ProtocolError::OtherOwned(format!(
+                "block {child} transactions do not reproduce its hash_merkle_root (computed {calculated_merkle_root}, header commits \
+                 {})",
+                block.header.hash_merkle_root
+            )));
         }
-        let coinbase =
-            block.transactions.first().ok_or_else(|| ProtocolError::OtherOwned(format!("block {} has no coinbase transaction", child)))?;
+        let coinbase = block
+            .transactions
+            .first()
+            .ok_or_else(|| ProtocolError::OtherOwned(format!("block {} has no coinbase transaction", child)))?;
         Ok(kaspa_consensus_core::zkas_state_binding::extract_state_root(&coinbase.payload).map(|root| (child, root)))
     }
 

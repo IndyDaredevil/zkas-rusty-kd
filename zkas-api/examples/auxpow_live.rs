@@ -12,13 +12,20 @@
 use kaspa_addresses::{Address, Prefix, Version};
 use kaspa_consensus_core::block::Block;
 use kaspa_p2p_lib::{
-    Adaptor, ConnectionInitializer, KaspadMessagePayloadType, Router, common::ProtocolError,
+    Adaptor, ConnectionInitializer, KaspadMessagePayloadType, Router,
+    common::ProtocolError,
     convert::header::{HeaderFormat, Versioned},
     dequeue_with_timeout, make_message,
-    pb::{Hash as PbHash, KaspadMessage, PongMessage, ReadyMessage, RequestRelayBlocksMessage,
-        VerackMessage, VersionMessage, kaspad_message::Payload},
+    pb::{
+        Hash as PbHash, KaspadMessage, PongMessage, ReadyMessage, RequestRelayBlocksMessage, VerackMessage, VersionMessage,
+        kaspad_message::Payload,
+    },
 };
-use std::{collections::HashMap, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::sync::mpsc::{Sender, channel};
 
 fn kaspa_address(s: &[u8]) -> Option<Address> {
@@ -30,7 +37,9 @@ fn kaspa_address(s: &[u8]) -> Option<Address> {
     }
 }
 
-struct Listen { tx: Sender<KaspadMessage> }
+struct Listen {
+    tx: Sender<KaspadMessage>,
+}
 #[tonic::async_trait]
 impl ConnectionInitializer for Listen {
     async fn initialize_connection(&self, router: Arc<Router>) -> Result<(), ProtocolError> {
@@ -46,13 +55,22 @@ impl ConnectionInitializer for Listen {
         router.start();
         let peer: VersionMessage = dequeue_with_timeout!(vr, Payload::Version, Duration::from_secs(8))?;
         router.enqueue(make_message!(Payload::Verack, VerackMessage {})).await?;
-        router.enqueue(make_message!(Payload::Version, VersionMessage {
-            protocol_version: peer.protocol_version, services: peer.services,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
-            address: None, id: Vec::from(uuid::Uuid::new_v4().as_bytes()),
-            user_agent: "/zkas-auxpow-probe/".into(), disable_relay_tx: false, subnetwork_id: None,
-            network: peer.network.clone(),
-        })).await?;
+        router
+            .enqueue(make_message!(
+                Payload::Version,
+                VersionMessage {
+                    protocol_version: peer.protocol_version,
+                    services: peer.services,
+                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+                    address: None,
+                    id: Vec::from(uuid::Uuid::new_v4().as_bytes()),
+                    user_agent: "/zkas-auxpow-probe/".into(),
+                    disable_relay_tx: false,
+                    subnetwork_id: None,
+                    network: peer.network.clone(),
+                }
+            ))
+            .await?;
         let _: VerackMessage = dequeue_with_timeout!(ar, Payload::Verack, Duration::from_secs(8))?;
         router.enqueue(make_message!(Payload::Ready, ReadyMessage {})).await?;
         let _: ReadyMessage = dequeue_with_timeout!(rr, Payload::Ready, Duration::from_secs(8))?;
@@ -62,8 +80,12 @@ impl ConnectionInitializer for Listen {
             while let Some(m) = live.recv().await {
                 if let Some(Payload::InvRelayBlock(inv)) = &m.payload {
                     if let Some(h) = &inv.hash {
-                        let _ = r2.enqueue(make_message!(Payload::RequestRelayBlocks,
-                            RequestRelayBlocksMessage { hashes: vec![PbHash { bytes: h.bytes.clone() }] })).await;
+                        let _ = r2
+                            .enqueue(make_message!(
+                                Payload::RequestRelayBlocks,
+                                RequestRelayBlocksMessage { hashes: vec![PbHash { bytes: h.bytes.clone() }] }
+                            ))
+                            .await;
                     }
                 } else if let Some(Payload::Ping(p)) = &m.payload {
                     let _ = r2.enqueue(make_message!(Payload::Pong, PongMessage { nonce: p.nonce })).await;
@@ -81,7 +103,10 @@ async fn main() {
     let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(30);
     let (tx, mut rx) = channel::<KaspadMessage>(512);
     let a = Adaptor::client_only(Default::default(), Arc::new(Listen { tx }), Default::default());
-    if let Err(e) = a.connect_peer(node.clone()).await { eprintln!("connect failed: {e}"); return; }
+    if let Err(e) = a.connect_peer(node.clone()).await {
+        eprintln!("connect failed: {e}");
+        return;
+    }
     println!("connected {node}, watching relayed blocks {secs}s\n");
     let (mut seen, mut aux_n) = (0usize, 0usize);
     let mut by_kaspa: HashMap<String, usize> = HashMap::new();
@@ -109,8 +134,11 @@ async fn main() {
         println!("No AuxPoW witness seen — these blocks are natively mined (kHeavyHash),");
         println!("so there is no embedded Kaspa coinbase to read.");
     } else {
-        let mut v: Vec<_> = by_kaspa.into_iter().collect(); v.sort_by_key(|(_,n)| std::cmp::Reverse(*n));
+        let mut v: Vec<_> = by_kaspa.into_iter().collect();
+        v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
         println!("Kaspa payout addresses in AuxPoW witnesses:");
-        for (a,n) in v { println!("  {n:>3}  {a}"); }
+        for (a, n) in v {
+            println!("  {n:>3}  {a}");
+        }
     }
 }

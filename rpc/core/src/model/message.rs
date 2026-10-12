@@ -476,12 +476,20 @@ pub struct GetShieldedTreeStateRequest {
     /// Optional explicit chain block to checkpoint at; `None` = the node's
     /// finality point. Pass the pruning point to anchor a full-history scan.
     pub block_hash: Option<RpcHash>,
+    /// With `block_hash == None`: serve the nearest retained frontier at-or-before the last
+    /// selected-chain block whose DAA score is strictly below this value — the node
+    /// binary-searches its chain index, so a wallet places a birthday anywhere in history
+    /// with one call. A node that predates this field ignores it and answers with the
+    /// finality point; callers detect that by `daa_score >= below_daa_score`.
+    #[serde(default)]
+    pub below_daa_score: Option<u64>,
 }
 
 impl Serializer for GetShieldedTreeStateRequest {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &2, writer)?;
+        store!(u16, &3, writer)?;
         store!(Option<RpcHash>, &self.block_hash, writer)?;
+        store!(Option<u64>, &self.below_daa_score, writer)?;
         Ok(())
     }
 }
@@ -490,7 +498,8 @@ impl Deserializer for GetShieldedTreeStateRequest {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
         let version = load!(u16, reader)?;
         let block_hash = if version >= 2 { load!(Option<RpcHash>, reader)? } else { None };
-        Ok(Self { block_hash })
+        let below_daa_score = if version >= 3 { load!(Option<u64>, reader)? } else { None };
+        Ok(Self { block_hash, below_daa_score })
     }
 }
 
@@ -506,29 +515,50 @@ pub struct GetShieldedTreeStateResponse {
     pub size: u64,
     pub leaf: RpcHash,
     pub ommers: Vec<RpcHash>,
+    /// DAA score of the OLDEST block this node can serve shielded history for.
+    ///
+    /// A wallet whose birthday is below this cannot be fully scanned here, and any balance
+    /// this node reports for it is partial. Zero on a node that can serve from genesis.
+    pub history_from_daa_score: u64,
+    /// Whether this node can enumerate shielded history all the way to genesis.
+    ///
+    /// `false` does NOT mean the node is broken — it means it fast-synced and has not
+    /// backfilled, which is the default state of a fresh node. It means a wallet must not
+    /// treat a balance from it as final unless the wallet's birthday is above
+    /// [`Self::history_from_daa_score`].
+    pub history_complete: bool,
 }
 
 impl Serializer for GetShieldedTreeStateResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        // Version 2 adds the history-coverage fields. Bumped rather than appended silently so a
+        // reader can tell "this node did not report coverage" from "coverage is zero".
+        store!(u16, &2, writer)?;
         store!(RpcHash, &self.block_hash, writer)?;
         store!(u64, &self.daa_score, writer)?;
         store!(u64, &self.size, writer)?;
         store!(RpcHash, &self.leaf, writer)?;
         store!(Vec<RpcHash>, &self.ommers, writer)?;
+        store!(u64, &self.history_from_daa_score, writer)?;
+        store!(bool, &self.history_complete, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for GetShieldedTreeStateResponse {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let block_hash = load!(RpcHash, reader)?;
         let daa_score = load!(u64, reader)?;
         let size = load!(u64, reader)?;
         let leaf = load!(RpcHash, reader)?;
         let ommers = load!(Vec<RpcHash>, reader)?;
-        Ok(Self { block_hash, daa_score, size, leaf, ommers })
+        // A v1 peer sends nothing here. Decode as "coverage unknown", and deliberately as
+        // NOT complete: a caller must never read an old node's silence as a promise of full
+        // history — that is the same silent-partial failure these fields exist to end.
+        let (history_from_daa_score, history_complete) =
+            if version >= 2 { (load!(u64, reader)?, load!(bool, reader)?) } else { (0, false) };
+        Ok(Self { block_hash, daa_score, size, leaf, ommers, history_from_daa_score, history_complete })
     }
 }
 
@@ -545,23 +575,30 @@ pub struct GetShieldedBlocksRequest {
     pub start_hash: RpcHash,
     /// Max chain blocks returned (0 = server default).
     pub limit: u64,
+    /// Return only chain metadata (hash/blue/DAA/timestamp). This is used by
+    /// wallet birthday discovery and avoids shipping coinbase/actions that are
+    /// immediately discarded. Older nodes ignore the flag and return full pages.
+    #[serde(default)]
+    pub metadata_only: bool,
 }
 
 impl Serializer for GetShieldedBlocksRequest {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
         store!(RpcHash, &self.start_hash, writer)?;
         store!(u64, &self.limit, writer)?;
+        store!(bool, &self.metadata_only, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for GetShieldedBlocksRequest {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let start_hash = load!(RpcHash, reader)?;
         let limit = load!(u64, reader)?;
-        Ok(Self { start_hash, limit })
+        let metadata_only = if version >= 2 { load!(bool, reader)? } else { false };
+        Ok(Self { start_hash, limit, metadata_only })
     }
 }
 
@@ -572,6 +609,11 @@ impl Deserializer for GetShieldedBlocksRequest {
 pub struct RpcShieldedCoinbaseOutput {
     pub script_public_key: Vec<u8>,
     pub value: u64,
+    /// Optional consensus-computed note commitment. It is carried by gRPC as a
+    /// new protobuf field; legacy binary RPC serialization deliberately omits it
+    /// so old peers remain wire-compatible and wallets retain derivation fallback.
+    #[serde(default)]
+    pub commitment: Option<[u8; 32]>,
 }
 
 impl Serializer for RpcShieldedCoinbaseOutput {
@@ -588,7 +630,7 @@ impl Deserializer for RpcShieldedCoinbaseOutput {
         let _version = load!(u16, reader)?;
         let script_public_key = load!(Vec<u8>, reader)?;
         let value = load!(u64, reader)?;
-        Ok(Self { script_public_key, value })
+        Ok(Self { script_public_key, value, commitment: None })
     }
 }
 
@@ -869,29 +911,42 @@ pub struct GetShieldedCoinbaseRewardsResponse {
     /// The sink's blue score at reply time, so a caller can hold back a maturity
     /// margin and ingest only payments a safe depth below the tip.
     pub sink_blue_score: u64,
+    /// Security fork: the recipient the sink's miner accrual slot will pay, if it is one of the
+    /// requested recipients; empty otherwise. Rewards accrue there instead of being minted per block
+    /// and arrive as one note at the next payout, so a caller crediting miners shows this as pending
+    /// rather than reading the gap as a missed reward.
+    #[serde(default)]
+    pub pending_recipient: Vec<u8>,
+    /// The amount carried in that slot (0 when `pending_recipient` is empty).
+    #[serde(default)]
+    pub pending_value: u64,
 }
 
 impl Serializer for GetShieldedCoinbaseRewardsResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
         serialize!(Vec<RpcShieldedCoinbaseReward>, &self.rewards, writer)?;
         store!(RpcHash, &self.next_cursor, writer)?;
         store!(u64, &self.scanned_blocks, writer)?;
         store!(bool, &self.reorged, writer)?;
         store!(u64, &self.sink_blue_score, writer)?;
+        store!(Vec<u8>, &self.pending_recipient, writer)?;
+        store!(u64, &self.pending_value, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for GetShieldedCoinbaseRewardsResponse {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let rewards = deserialize!(Vec<RpcShieldedCoinbaseReward>, reader)?;
         let next_cursor = load!(RpcHash, reader)?;
         let scanned_blocks = load!(u64, reader)?;
         let reorged = load!(bool, reader)?;
         let sink_blue_score = load!(u64, reader)?;
-        Ok(Self { rewards, next_cursor, scanned_blocks, reorged, sink_blue_score })
+        let (pending_recipient, pending_value) =
+            if version >= 2 { (load!(Vec<u8>, reader)?, load!(u64, reader)?) } else { (Vec::new(), 0) };
+        Ok(Self { rewards, next_cursor, scanned_blocks, reorged, sink_blue_score, pending_recipient, pending_value })
     }
 }
 

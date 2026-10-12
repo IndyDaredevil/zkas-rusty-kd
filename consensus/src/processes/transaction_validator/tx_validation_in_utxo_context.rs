@@ -28,22 +28,26 @@ const CHECK_SCRIPTS_PARALLELISM_THRESHOLD: usize = 1;
 /// rules. The signatures are checked against the ZKas shielded sighash,
 /// which binds them to this exact bundle and transaction.
 #[cfg(feature = "shielded-circuit")]
-fn verify_shielded_bundle(tx: &Transaction, network_domain: &[u8; 32]) -> TxResult<()> {
-    let bundle = ShieldedBundle::from_bytes(&tx.payload)
+fn verify_shielded_bundle(tx: &Transaction, network_domain: &[u8; 32], security_fork_active: bool) -> TxResult<()> {
+    let bundle = ShieldedBundle::from_bytes_at(&tx.payload, security_fork_active)
         .map_err(|_| TxRuleError::InvalidShieldedTransaction("malformed Orchard bundle in payload"))?;
     let ctx = tx.shielded_sighash_context();
     // The sighash binds the bundle's signatures to this chain (network_domain) and
     // this transaction (ctx), so a valid bundle cannot be replayed onto another
     // network or lifted into a different transaction.
     let sighash = kaspa_shielded_core::verify::sighash(&bundle, network_domain, &ctx);
-    kaspa_shielded_core::verify::verify_bundle(&bundle, &sighash).map_err(|e| TxRuleError::InvalidShieldedBundle(format!("{e:?}")))
+    use kaspa_shielded_core::verify::BundleVerifyError as E;
+    kaspa_shielded_core::verify::verify_bundle(&bundle, &sighash).map_err(|e| match e {
+        E::ProofInvalid | E::BindingSigInvalid | E::SpendAuthSigInvalid(_) => TxRuleError::InvalidShieldedProof(format!("{e:?}")),
+        other => TxRuleError::InvalidShieldedBundle(format!("{other:?}")),
+    })
 }
 
 /// A build without the `shielded-circuit` feature cannot verify Halo 2 proofs, so
 /// it must not accept shielded transactions at all (accepting an unverified
 /// bundle would be a consensus-critical inflation hole). Reject them outright.
 #[cfg(not(feature = "shielded-circuit"))]
-fn verify_shielded_bundle(_tx: &Transaction, _network_domain: &[u8; 32]) -> TxResult<()> {
+fn verify_shielded_bundle(_tx: &Transaction, _network_domain: &[u8; 32], _security_fork_active: bool) -> TxResult<()> {
     Err(TxRuleError::InvalidShieldedTransaction("node built without shielded-circuit: cannot verify shielded bundles"))
 }
 
@@ -61,6 +65,36 @@ pub enum TxValidationFlags {
 }
 
 impl TransactionValidator {
+    /// [`verify_shielded_bundle`], answered from cache when this exact transaction has been
+    /// verified before.
+    ///
+    /// The verdict is immutable — see `shielded_verify_cache` for why the txid is a sound
+    /// key — so a hit is as authoritative as a fresh proof check. Only the boolean is
+    /// stored; the error text is rebuilt on a cached failure, which costs nothing and keeps
+    /// the cache one machine word per entry.
+    /// [`Self::verify_shielded_bundle_cached`] for a transaction offered outside any block, judged in
+    /// the format of `daa_score` (the virtual's). See `ConsensusApi::preverify_shielded_transaction`.
+    pub fn preverify_shielded_bundle(&self, tx: &Transaction, daa_score: u64) -> TxResult<()> {
+        self.verify_shielded_bundle_cached(tx, daa_score)
+    }
+
+    fn verify_shielded_bundle_cached(&self, tx: &Transaction, block_daa_score: u64) -> TxResult<()> {
+        let id = tx.id();
+        if self.shielded_verify_cache.get(&id).is_some_and(|ok| ok == 1) {
+            return Ok(());
+        }
+        let result = verify_shielded_bundle(tx, &self.shielded_network_domain, self.security_fork_activation.is_active(block_daa_score));
+        // Only successes are cached. A cached failure was never consulted again in practice
+        // (a garbage sender mints a fresh txid per attempt) and every one of them evicted a
+        // resident success from this count-bounded, randomly evicting cache, which then made
+        // each template build re-verify the mempool. Repeat offers are already deduplicated by
+        // the relay flow and penalised via `InvalidShieldedProof`.
+        if result.is_ok() {
+            self.shielded_verify_cache.insert(id, 1);
+        }
+        result
+    }
+
     pub fn validate_populated_transaction_and_get_fee(
         &self,
         tx: &(impl VerifiableTransaction + Sync),
@@ -77,10 +111,22 @@ impl TransactionValidator {
         // is the bundle's public value balance (the amount leaving the shielded
         // pool, which the miner collects). For transparent txs the fee is in - out.
         let fee = if tx.tx().is_shielded() {
-            let bundle = ShieldedBundle::from_bytes(&tx.tx().payload)
+            let bundle = ShieldedBundle::from_bytes_at(&tx.tx().payload, self.security_fork_activation.is_active(block_daa_score))
                 .map_err(|_| TxRuleError::InvalidShieldedTransaction("malformed Orchard bundle in payload"))?;
             if bundle.value_balance < 0 {
                 return Err(TxRuleError::InvalidShieldedTransaction("shielded fee (value balance) must be non-negative"));
+            }
+            // Security fork: from the activation a spend must name its anchor block; before it the
+            // extension is not part of the format. Judged at the DAA score of the block that
+            // carries the transaction, so every node draws the line at the same block.
+            match (self.security_fork_activation.is_active(block_daa_score), bundle.anchor_block.is_some()) {
+                (true, false) => {
+                    return Err(TxRuleError::InvalidShieldedTransaction("shielded spend must name its anchor block after the security fork"));
+                }
+                (false, true) => {
+                    return Err(TxRuleError::InvalidShieldedTransaction("anchor block field is not valid before the security fork"));
+                }
+                _ => {}
             }
             bundle.value_balance as u64
         } else {
@@ -104,7 +150,7 @@ impl TransactionValidator {
                 // cryptography here, in the same "expensive checks, once" phase as
                 // script verification (skipped on selected-parent replay).
                 if tx.tx().is_shielded() {
-                    verify_shielded_bundle(tx.tx(), &self.shielded_network_domain)?;
+                    self.verify_shielded_bundle_cached(tx.tx(), block_daa_score)?;
                 }
             }
             TxValidationFlags::SkipScriptChecks => {}

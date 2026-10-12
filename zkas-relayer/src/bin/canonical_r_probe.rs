@@ -76,11 +76,8 @@ async fn main() {
         let cb = client.get_block(cand, true).await.unwrap_or_else(|e| fatal(&format!("get_block({cand}): {e}")));
         let payload = cb.transactions.first().unwrap_or_else(|| fatal("merged block has no coinbase")).payload.clone();
         let blue_work_be = cb.header.blue_work.to_be_bytes().to_vec();
-        let leaf = miner_payload_leaf(MinerPayloadLeafInput {
-            block_hash: &cand,
-            blue_work_be_bytes: &blue_work_be,
-            payload: &payload,
-        });
+        let leaf =
+            miner_payload_leaf(MinerPayloadLeafInput { block_hash: &cand, blue_work_be_bytes: &blue_work_be, payload: &payload });
         if proof.miner_payload_leaves.contains(&leaf) {
             member = Some((cand, payload, blue_work_be));
             break;

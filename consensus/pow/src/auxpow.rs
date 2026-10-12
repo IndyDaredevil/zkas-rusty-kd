@@ -69,20 +69,63 @@ pub fn check_pow_dual(header: &Header, aux: Option<&AuxPow>) -> (bool, Uint256) 
 ///
 /// Before activation the aux witness is ignored entirely. Returns `(passed, pow)` as
 /// in [`check_pow_dual`]; `pow` is the work value used for block-level math.
-pub fn check_pow_gated(header: &Header, aux: Option<&AuxPow>, merged_mining_active: bool) -> (bool, Uint256) {
+pub fn check_pow_gated(header: &Header, aux: Option<&AuxPow>, rule: impl Into<AuxRule>) -> (bool, Uint256) {
     let (native_ok, native_pow) = State::new(header).check_pow(header.nonce);
     if native_ok {
         return (true, native_pow);
     }
-    if merged_mining_active {
-        if let Some(a) = aux {
-            let target = Uint256::from_compact_target_bits(header.bits);
-            if verify_aux_pow(a, header.hash, target) {
-                return (true, parent_pow(a));
+    if let Some(a) = aux {
+        let target = Uint256::from_compact_target_bits(header.bits);
+        let accepted = match rule.into() {
+            AuxRule::Off => false,
+            AuxRule::Legacy => verify_aux_pow(a, header.hash, target),
+            AuxRule::Bound(genesis) => {
+                // Security fork: the parent commits the genesis-bound, nonce-free header hash, and
+                // this block's nonce is the parent's hash. The full block hash covers the nonce, so
+                // it fixes the parent: one block, one witness, one level. And a ZKas block cannot
+                // be the parent, because its coinbase may carry no commitment (body rule).
+                //
+                // The parent must not ALSO carry a legacy `ZKMM` commitment: otherwise one solution
+                // could back a pre-fork block (legacy rule) and a post-fork block (this rule) for the
+                // blocks that straddle the activation score.
+                let nonce_free = kaspa_consensus_core::hashing::header::hash_override_nonce_time(header, 0, header.timestamp);
+                header.nonce == AuxPow::nonce_binding(&a.parent_header)
+                    && a.committed_hash().is_none()
+                    && a.verify_binding_v1(genesis, nonce_free)
+                    && parent_pow(a) <= target
             }
+        };
+        if accepted {
+            return (true, parent_pow(a));
         }
     }
     (false, native_pow)
+}
+
+/// Which merge-mining rule applies to a header: none (before merged mining), the original
+/// `ZKMM‖hex(H_fc)` binding, or the security-fork binding bound to `genesis`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuxRule {
+    Off,
+    Legacy,
+    Bound(Hash),
+}
+
+impl From<bool> for AuxRule {
+    fn from(merged_mining_active: bool) -> Self {
+        if merged_mining_active { AuxRule::Legacy } else { AuxRule::Off }
+    }
+}
+
+impl AuxRule {
+    /// The rule for a header with DAA score `daa_score`.
+    pub fn for_header(merged_mining_active: bool, security_fork_active: bool, genesis: Hash) -> Self {
+        match (merged_mining_active, security_fork_active) {
+            (false, _) => AuxRule::Off,
+            (true, false) => AuxRule::Legacy,
+            (true, true) => AuxRule::Bound(genesis),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -93,7 +136,7 @@ mod tests {
     use kaspa_consensus_core::merkle::calc_hash_merkle_root;
     use kaspa_consensus_core::subnets::{SUBNETWORK_ID_COINBASE, SUBNETWORK_ID_NATIVE};
     use kaspa_consensus_core::tx::Transaction;
-    use kaspa_consensus_core::{hashing, BlueWorkType};
+    use kaspa_consensus_core::{BlueWorkType, hashing};
     use kaspa_hashes::{Hash, ZERO_HASH};
     use kaspa_merkle::merkle_hash;
 
@@ -119,6 +162,97 @@ mod tests {
             0,
             ZERO_HASH,
         )
+    }
+
+    /// Fuzz the merge-mining rules over random parent coinbases: 0-3 legacy (`ZKMM`) and 0-3 bound
+    /// (`ZKM1`) commitments at random positions, each to the right or a wrong value, between junk.
+    /// Bound rule: accept iff exactly one well-formed `ZKM1` naming this block's genesis-bound
+    /// nonce-free hash AND the parent is not usable under the legacy rule (it does not carry exactly
+    /// one `ZKMM`; L-4). Legacy rule (pre-fork, must stay exactly as before): accept iff exactly one
+    /// `ZKMM` naming the block hash, whatever else is there. The property L-4 exists for is checked
+    /// directly: no parent is ever accepted by both rules.
+    #[test]
+    fn fuzz_aux_rules_accept_exactly_the_specified_parents() {
+        let genesis = Hash::from_u64_word(0x6e6e);
+        let mut x: u64 = 0xdead_beef_cafe_f00d;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n.max(1)
+        };
+        // Junk never contains 'Z', so it cannot fake or break a tag on its own.
+        let junk = |r: &mut dyn FnMut(u64) -> u64, n: u64| -> Vec<u8> { (0..r(n)).map(|_| b'a' + r(25) as u8).collect() };
+        let (mut bound_ok, mut legacy_ok, mut both_tried) = (0, 0, 0);
+        for case in 0..400u64 {
+            let fc0 = zkas_header(1_000 + case, EASY_BITS);
+            let nonce_free = kaspa_consensus_core::hashing::header::hash_override_nonce_time(&fc0, 0, fc0.timestamp);
+            let right_v1 = AuxPow::bound_commitment(genesis, nonce_free);
+            let n_legacy = rnd(4);
+            let n_v1 = rnd(4);
+            let (mut legacy_right, mut v1_right) = (0, 0);
+            let mut payload = junk(&mut rnd, 30);
+            let mut pieces: Vec<(bool, Hash)> = vec![];
+            for _ in 0..n_legacy {
+                let right = rnd(2) == 0;
+                pieces.push((false, if right { fc0.hash } else { Hash::from_u64_word(rnd(u64::MAX)) }));
+            }
+            for _ in 0..n_v1 {
+                let right = rnd(2) == 0;
+                pieces.push((true, if right { right_v1 } else { AuxPow::bound_commitment(Hash::from_u64_word(rnd(9) + 1), nonce_free) }));
+            }
+            // Shuffle the pieces.
+            for i in (1..pieces.len()).rev() {
+                let j = rnd(i as u64 + 1) as usize;
+                pieces.swap(i, j);
+            }
+            for (v1, h) in &pieces {
+                if *v1 {
+                    payload = AuxPow::embed_commitment_v1(&payload, *h, &junk(&mut rnd, 8));
+                    v1_right += (*h == right_v1) as u32;
+                } else {
+                    payload = AuxPow::embed_commitment(&payload, *h, &junk(&mut rnd, 8));
+                    legacy_right += (*h == fc0.hash) as u32;
+                }
+            }
+            let cb = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, payload.clone());
+            let (parent, branch) = mine_parent(std::slice::from_ref(&cb), EASY_BITS);
+            let aux = AuxPow { parent_header: parent.clone(), parent_coinbase: cb, coinbase_merkle_branch: branch };
+
+            assert_eq!(AuxPow::payload_carries_commitment(&payload), n_legacy == 1 || n_v1 == 1, "case {case}: detector");
+
+            // Legacy rule on the block as hashed (its own nonce 0).
+            let mut legacy_got = None;
+            if !State::new(&fc0).check_pow(fc0.nonce).0 {
+                let expect = n_legacy == 1 && legacy_right == 1;
+                let got = check_pow_gated(&fc0, Some(&aux), AuxRule::Legacy).0;
+                assert_eq!(got, expect, "case {case}: legacy rule (legacy {n_legacy}/{legacy_right}, v1 {n_v1})");
+                legacy_ok += got as u32;
+                legacy_got = Some(got);
+            }
+            // Bound rule on the block with the parent-derived nonce.
+            let mut fc = fc0.clone();
+            fc.nonce = AuxPow::nonce_binding(&parent);
+            fc.finalize();
+            if !State::new(&fc).check_pow(fc.nonce).0 {
+                let expect = n_v1 == 1 && v1_right == 1 && n_legacy != 1;
+                let got = check_pow_gated(&fc, Some(&aux), AuxRule::Bound(genesis)).0;
+                assert_eq!(got, expect, "case {case}: bound rule (legacy {n_legacy}, v1 {n_v1}/{v1_right})");
+                bound_ok += got as u32;
+                if let Some(l) = legacy_got {
+                    both_tried += 1;
+                    assert!(!(l && got), "case {case}: one parent backs a legacy AND a bound block");
+                }
+                // A wrong nonce never passes, whatever the parent.
+                let mut wrong = fc.clone();
+                wrong.nonce ^= 1;
+                wrong.finalize();
+                if !State::new(&wrong).check_pow(wrong.nonce).0 {
+                    assert!(!check_pow_gated(&wrong, Some(&aux), AuxRule::Bound(genesis)).0, "case {case}: nonce must name the parent");
+                }
+            }
+        }
+        assert!(bound_ok > 5 && legacy_ok > 5 && both_tried > 20, "the fuzz reached accepting parents: bound {bound_ok}, legacy {legacy_ok}, both {both_tried}");
     }
 
     fn coinbase_committing(commitment: Hash) -> Transaction {
@@ -185,6 +319,74 @@ mod tests {
         }
         parent.nonce = nonce;
         (parent, branch)
+    }
+
+    fn coinbase_committing_v1(commitment: Hash) -> Transaction {
+        let payload = AuxPow::embed_commitment_v1(&[0xaa, 0xbb], commitment, &[0xcc]);
+        Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, payload)
+    }
+
+    /// Security fork: one parent backs exactly one block, and one block has exactly one witness.
+    #[test]
+    fn bound_rule_pins_parent_and_genesis() {
+        let genesis = Hash::from_u64_word(0x6e6e);
+        for seed in 1..200u64 {
+            let mut fc = zkas_header(seed, EASY_BITS);
+            let nonce_free = kaspa_consensus_core::hashing::header::hash_override_nonce_time(&fc, 0, fc.timestamp);
+            let cb = coinbase_committing_v1(AuxPow::bound_commitment(genesis, nonce_free));
+            let (parent, branch) = mine_parent(std::slice::from_ref(&cb), EASY_BITS);
+            fc.nonce = AuxPow::nonce_binding(&parent);
+            fc.finalize();
+            if State::new(&fc).check_pow(fc.nonce).0 {
+                continue; // the forced nonce happens to be natively valid; pick a block that needs the witness
+            }
+            let aux = AuxPow { parent_header: parent.clone(), parent_coinbase: cb.clone(), coinbase_merkle_branch: branch.clone() };
+            assert!(check_pow_gated(&fc, Some(&aux), AuxRule::Bound(genesis)).0, "a correctly bound witness passes");
+            assert!(!check_pow_gated(&fc, Some(&aux), AuxRule::Legacy).0, "the legacy rule does not read the ZKM1 form");
+            assert!(!check_pow_gated(&fc, Some(&aux), AuxRule::Bound(Hash::from_u64_word(1))).0, "another chain's genesis fails");
+
+            // A second, independently mined parent committing the same block: its hash, hence the
+            // required nonce, differs, so it cannot back this block.
+            let mut other = parent.clone();
+            other.timestamp += 1;
+            let state = State::new(&other);
+            let mut n = 0u64;
+            while state.calculate_pow(n) > target(EASY_BITS) {
+                n += 1;
+            }
+            other.nonce = n;
+            if AuxPow::nonce_binding(&other) != fc.nonce {
+                let aux2 = AuxPow { parent_header: other, parent_coinbase: cb.clone(), coinbase_merkle_branch: branch.clone() };
+                assert!(!check_pow_gated(&fc, Some(&aux2), AuxRule::Bound(genesis)).0, "a second parent cannot back the same block");
+            }
+
+            // A legacy ZKMM witness over the full hash is refused under the bound rule.
+            let legacy_cb = coinbase_committing(fc.hash);
+            let (lp, lb) = mine_parent(std::slice::from_ref(&legacy_cb), EASY_BITS);
+            let legacy = AuxPow { parent_header: lp, parent_coinbase: legacy_cb, coinbase_merkle_branch: lb };
+            assert!(!check_pow_gated(&fc, Some(&legacy), AuxRule::Bound(genesis)).0, "legacy form refused after the fork");
+
+            // A parent coinbase carrying BOTH tags cannot back a post-fork block (L-4: one solution,
+            // a pre-fork block and a post-fork block straddling the score).
+            let mut dual_payload = coinbase_committing_v1(AuxPow::bound_commitment(genesis, nonce_free)).payload;
+            dual_payload.extend_from_slice(&coinbase_committing(Hash::from_u64_word(seed ^ 0x55)).payload);
+            let dual_cb = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, dual_payload);
+            let (dp, db) = mine_parent(std::slice::from_ref(&dual_cb), EASY_BITS);
+            let mut fc2 = fc.clone();
+            fc2.nonce = AuxPow::nonce_binding(&dp);
+            fc2.finalize();
+            if !State::new(&fc2).check_pow(fc2.nonce).0 {
+                let dual = AuxPow { parent_header: dp, parent_coinbase: dual_cb, coinbase_merkle_branch: db };
+                assert!(!check_pow_gated(&fc2, Some(&dual), AuxRule::Bound(genesis)).0, "a dual-tagged parent is refused");
+            }
+
+            // The commitment detector sees both tags, which the coinbase ban relies on.
+            assert!(AuxPow::payload_carries_commitment(&cb.payload));
+            assert!(AuxPow::payload_carries_commitment(&coinbase_committing(fc.hash).payload));
+            assert!(!AuxPow::payload_carries_commitment(b"ZKM1 not hex, ZKMMshort"));
+            return;
+        }
+        panic!("no seed produced a header that needs its witness");
     }
 
     #[test]

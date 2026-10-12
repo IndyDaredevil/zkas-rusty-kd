@@ -17,7 +17,15 @@
 //! `incrementalmerkletree` and will pin them to audited commits before launch
 //! (PLAN §5, non-negotiable #4).
 
+/// The Pasta curve implementation this crate's note arithmetic is defined over.
+///
+/// Re-exported so callers can name `pallas::Point` — e.g. to hand the scan path
+/// ephemeral keys they already decompressed — without taking their own dependency
+/// and risking a second, incompatible version of the curve in the tree.
+pub use pasta_curves;
+
 pub mod account;
+pub mod anchor_window;
 pub mod attestation;
 pub mod bundle;
 pub mod burn;
@@ -26,13 +34,14 @@ pub mod commitment;
 pub mod message;
 pub mod nullifier;
 pub mod payment_check;
+pub mod payproof;
 pub mod state;
 pub mod tree;
 pub mod turnstile;
 pub mod verify;
-pub mod witness_chain;
 pub mod wallet;
 pub mod walletdb;
+pub mod witness_chain;
 
 // The human-facing wallet facade (keys -> zkas: address -> scan -> pay).
 pub use account::{PaymentError, ShieldedAccount, orchard_recipient_bytes};

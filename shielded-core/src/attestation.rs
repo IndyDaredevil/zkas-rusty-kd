@@ -100,13 +100,7 @@ pub fn encode_attestation(
 }
 
 /// Byte-level encoder, split out so tests can exercise it with hand-built parts.
-fn encode_parts(
-    receipt: &ExitReceipt,
-    r: &[u8; 32],
-    leaf_index: u32,
-    state: &ShieldedStateRef,
-    branch: &[u8],
-) -> Vec<u8> {
+fn encode_parts(receipt: &ExitReceipt, r: &[u8; 32], leaf_index: u32, state: &ShieldedStateRef, branch: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN + branch.len());
     out.push(ATTESTATION_V2);
     out.extend_from_slice(&receipt.v.to_le_bytes());
@@ -162,17 +156,17 @@ mod tests {
         assert_eq!(
             hex(&bytes),
             concat!(
-                "02",                                                                 // version
-                "404b4c0000000000",                                                   // v = 5_000_000 LE
-                "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",   // recipient
-                "1111111111111111111111111111111111111111111111111111111111111111",   // n
-                "4c803ec34ec41afe760122a9e84802fa93d41e38bb84f5d369a9616a8f91dfc7",   // r (state root)
-                "00000000",                                                           // leaf_index = 0
-                "1111111111111111111111111111111111111111111111111111111111111111",   // anchor
-                "2222222222222222222222222222222222222222222222222222222222222222",   // nullifier_root
-                "00ca9a3b000000000000000000000000",                                   // coinbase = 1e9, u128 LE
-                "39300000000000000000000000000000",                                   // fees = 12_345, u128 LE
-                "8d3b19448c8d4dd0a44fd1f75b82ff606ef048f2b121c95aeef6953a17ff271f",   // sibling = leaf 1
+                "02",                                                               // version
+                "404b4c0000000000",                                                 // v = 5_000_000 LE
+                "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1", // recipient
+                "1111111111111111111111111111111111111111111111111111111111111111", // n
+                "4c803ec34ec41afe760122a9e84802fa93d41e38bb84f5d369a9616a8f91dfc7", // r (state root)
+                "00000000",                                                         // leaf_index = 0
+                "1111111111111111111111111111111111111111111111111111111111111111", // anchor
+                "2222222222222222222222222222222222222222222222222222222222222222", // nullifier_root
+                "00ca9a3b000000000000000000000000",                                 // coinbase = 1e9, u128 LE
+                "39300000000000000000000000000000",                                 // fees = 12_345, u128 LE
+                "8d3b19448c8d4dd0a44fd1f75b82ff606ef048f2b121c95aeef6953a17ff271f", // sibling = leaf 1
             )
         );
     }
@@ -184,8 +178,7 @@ mod tests {
         let st = state();
         let bytes = encode_attestation(&acc, 1, &st).unwrap();
 
-        let expected_r =
-            shielded_state_root(&st.anchor, &st.nullifier_root, st.cumulative_coinbase, st.cumulative_fees, &acc.root());
+        let expected_r = shielded_state_root(&st.anchor, &st.nullifier_root, st.cumulative_coinbase, st.cumulative_fees, &acc.root());
         assert_eq!(&bytes[73..105], &expected_r, "encoded r must be the derived state root");
     }
 
@@ -202,17 +195,9 @@ mod tests {
                 let bytes = encode_attestation(&acc, i, &state()).expect("in range");
                 assert_eq!(bytes.len(), HEADER_LEN + acc.depth() * 32, "n={n} i={i}");
                 // The branch the guest will replay must verify against the accumulator root.
-                assert!(BurnAccumulator::verify_branch(
-                    &acc.receipts()[i as usize],
-                    i,
-                    &bytes[HEADER_LEN..],
-                    &acc.root()
-                ));
+                assert!(BurnAccumulator::verify_branch(&acc.receipts()[i as usize], i, &bytes[HEADER_LEN..], &acc.root()));
             }
-            assert_eq!(
-                encode_attestation(&acc, n, &state()),
-                Err(AttestationError::LeafOutOfRange { index: n, len: n as usize })
-            );
+            assert_eq!(encode_attestation(&acc, n, &state()), Err(AttestationError::LeafOutOfRange { index: n, len: n as usize }));
         }
     }
 }

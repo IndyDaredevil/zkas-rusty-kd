@@ -4,16 +4,18 @@ A REST daemon that turns the ZKas shielded pool into an ordinary-looking wallet 
 It scans the chain, recognises notes belonging to the keys it holds, keeps the Merkle
 witnesses a shielded spend needs, and builds/proves/submits payments.
 
-It backs three very different consumers, and the distinction matters for custody:
+It backs four consumers, and the distinction matters for custody **and** privacy:
 
-| Consumer | Endpoints | Who holds the spend key |
-| --- | --- | --- |
-| Web / mobile wallet (`wallet.zkas.info`) | `prepare` → `submit` | **the device** — daemon has the viewing key only |
-| Desktop wallet | embedded in-process (`lib.rs`) | the app |
-| Mining pool / payout service | `send`, `send_many`, `consolidate` | **the daemon** (custodial) |
+| Consumer | How it runs | Who holds the spend key | Who sees the viewing key |
+| --- | --- | --- | --- |
+| Hosted web / mobile wallet (`wallet.zkas.info`) | our server; `watch` → `prepare` → `submit` | **the device** | the server (it can watch, not spend) |
+| Desktop wallet | **embedded in-process** (`lib.rs`) on loopback | the app, on the user's machine | nobody but the user |
+| Android wallet, *Run on this phone* | **embedded in-process** via the `zkas-walletd-mobile` UniFFI library (`firecash/zkas-signer`), on loopback; syncs compact blocks from any node's gRPC | the phone | nobody but the user — the node serves blocks and sees an IP (or not, over Tor) |
+| Mining pool / payout service | `send`, `send_many`, `consolidate` | **the daemon** (custodial) | the operator |
 
-`main.rs` is only flag parsing; the daemon is a library (`lib.rs`) so the desktop
-wallet can embed it.
+`main.rs` is only flag parsing; the daemon is a library (`lib.rs`) so the desktop and
+Android apps can embed it. The embedded daemon speaks the same REST API on
+`127.0.0.1:<port>`, so a wallet UI does not change between hosted and local.
 
 ---
 
@@ -116,6 +118,17 @@ lower `fee` does not save money — it just gets corrected.
 | `--auto-consolidate MAX_NOTES` | `500` | **On by default.** Keeps custodial wallets under `MAX_NOTES` by merging their oldest notes in the background. Wallets below the ceiling are never touched. See §4. |
 | `--no-auto-consolidate` | `false` | Turn background consolidation off entirely. |
 | `--proof-threads N` | *(every core)* | **Throttle**, not a tuning knob: caps the threads Halo2 proving may use, so the daemon can't starve a co-located node. Lowering it makes payments slower. See §4. |
+| `--runtime-threads N` | `2 × CPU cores` | Tokio workers for HTTP, RPC and coordination. |
+| `--max-concurrent-proves N` | `min(2, cores)` | Global proof admission limit. |
+| `--sync-wallets N` | `cores − 1` (1–8) | Maximum concurrent wallet scans; live free memory can reduce it further. |
+| `--sync-wallet-memory-mb MIB` | `512` | Memory budget charged to each concurrent scan. |
+| `--load-wallets N`, `--warm-wallets N` | hardware-derived, `1` | Concurrent checkpoint loads and cold witness warmups. |
+| `--page-decode-threads N` | `cores − 2` (1–8) | Shared block-page decoder threads. |
+| `--page-cache-entries N`, `--page-cache-ttl SECONDS` | `64`, `10` | Shared decoded page cache size and lifetime. |
+| `--active-sync-window SECONDS` | `90` | Continue background sync this long after a wallet request. |
+| `--idle-evict SECONDS` | `1800` | Remove an idle wallet checkpoint from RAM (not disk). |
+| `--max-resident-wallets N` | derived from `MemAvailable` | Hard cap on loaded wallets. |
+| `--subtree-free-floor-mb MIB` | `1200` | Defer optional subtree-index construction below this free-memory floor. |
 | `--diagnose` | `false` | Offline: print each wallet's note/base/**stranded-note** report, then exit. Run with the daemon stopped. |
 | `--graft TOKEN:/path/older.scan` | — | Offline: repair a stranded wallet from an older snapshot of itself. Daemon stopped. |
 
@@ -160,11 +173,11 @@ curl -X POST -H "X-Wallet-Token: $TOK" http://127.0.0.1:8501/api/wallet/create
 | `POST` | `/api/wallet/create` | New wallet. **Returns the seed once** — store it. |
 | `POST` | `/api/wallet/import` | Import a seed. Accepts a `birthday` (DAA or date) to skip replaying earlier chain. |
 | `POST` | `/api/wallet/watch` | Register **watch-only** from a full viewing key. Cannot spend. |
-| `GET` | `/api/wallet/address` | Shielded `zkas:` receive address. |
+| `GET` | `/api/wallet/address` | Shielded `zkas:` receive address. `?index=N` returns the wallet's N-th **diversified** address — a distinct address paying into the same wallet, found by the same scan (see §6b). |
 | `GET` | `/api/wallet/reveal` | Reveal the seed (gated). |
 | `GET` | `/api/wallet/balance` | Balance + sync status (see §5). |
-| `GET` | `/api/wallet/history` | Chain-derived history. Opt-in — see `settings`. |
-| `POST` | `/api/wallet/settings` | Toggle recoverable history (OVK) etc. |
+| `GET` | `/api/wallet/history` | Chain-derived history (mints, receipts, own sends with recipient/amount/memo). Always recorded. |
+| `POST` | `/api/wallet/settings` | Kept for old clients; history can no longer be turned off (`recoverable_history` is always `true`). |
 | `POST` | `/api/wallet/rescan` | Retire the checkpoint and rescan from birthday. |
 
 ### Paying (custodial — daemon holds the seed)
@@ -192,6 +205,36 @@ worthless until the seed-holder signs it. See `docs/NON_CUSTODIAL_WALLET.md`.
 | `POST` | `/api/wallet/sign` | Prove address control without spending. |
 | `POST` | `/api/verify` | Verify such a signature. |
 | `GET` | `/api/status` | Daemon/chain status. |
+
+### Admin / operator
+
+Two operator endpoints pre-build the O(depth) witness caches so that consolidations and
+old-note spends do not pay a full O(chain) climb the first time. Both are authenticated
+with `X-Wallet-Token` like every other call; they change no funds and are safe to call
+repeatedly. Use them after a fresh start, a long backfill, or when a wallet with old
+notes is about to consolidate — rather than letting the first spend absorb the cost. See
+also the perf model in §4.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/admin/warm_chain_tree` | Drive the **shared chain tree** forward (up to a 90 s budget per call) and start its subtree-cache build off-lock. Once the cache is built, every wallet the shared tree covers witnesses in O(depth). |
+| `POST` | `/api/admin/warm_wallet` | Build **this token's** wallet subtree cache now and persist it, so a restart reloads it warm. For a wallet the shared tree cannot serve (its notes predate the tree's base). |
+
+`warm_chain_tree` returns progress, not a finished cache — the build runs in the
+background:
+
+```jsonc
+{ "leaves_before": 2061000, "leaves_after": 2061450, "leaves_gained": 450,
+  "caught_up": true,                 // tree reached the node tip within this call
+  "subtree_cache_ready": false,      // true once the background build has installed
+  "subtree_cache_state": "started",  // "ready" | "building" | "started"
+  "chunks": 3, "chain_tip_daa": 2061450, "seconds": 41.2 }
+```
+
+Call it again to advance further or to retry a build that reported `stream moved`
+(state stays `building`/`started` until it installs, then `ready`). `warm_wallet` builds
+inline and returns `{ subtree_cache_ready, notes, matured, seconds }`. A `warm_chain_tree`
+that `caught_up` with `subtree_cache_ready: true` needs no follow-up.
 
 ### Examples
 
@@ -376,15 +419,37 @@ unchanged and never pays for this. Concurrency is bounded by cores **and** free 
 (`PROOF_MEM_PER_EXTRA_MB`), so a squeezed box degrades to the sequential path rather
 than running out of memory.
 
-### Threading: what is and isn't configurable
+### Runtime resource controls
 
 | Knob | Where | Default | Configurable at runtime |
 | --- | --- | --- | --- |
 | Halo2 proving threads | rayon global pool | every core | **`--proof-threads N`** (or `RAYON_NUM_THREADS`) |
-| Threads per proof when grouped | `PROOF_THREADS_EACH` | 2 | no — rebuild |
-| Concurrent chunk proofs | `proof_concurrency()` | cores ÷ 2, memory-capped | no — automatic |
-| Tokio worker threads | `main.rs` | 8 | no — rebuild |
-| Wallet sync concurrency | `SYNC_CONCURRENCY` | 3 | no — rebuild |
+| Proof admission | prepare semaphore | min(2, cores) | **`--max-concurrent-proves N`** |
+| Tokio worker threads | runtime | 2 × cores | **`--runtime-threads N`** |
+| Wallet sync concurrency | sync scheduler | cores − 1, memory-capped | **`--sync-wallets N`**, **`--sync-wallet-memory-mb MIB`** |
+| Checkpoint load / cold warm concurrency | semaphores | hardware-derived / 1 | **`--load-wallets N`**, **`--warm-wallets N`** |
+| Shared page decode threads | dedicated rayon pool | cores − 2 | **`--page-decode-threads N`** |
+| Shared block-page cache | one fetch serves every wallet on the same page | hardware-derived | **`--page-cache-entries N`**, **`--page-cache-ttl SECS`** |
+| Resident wallet ceiling | evicts idle wallets, checkpoint flushed first | hardware-derived | **`--max-resident-wallets N`**, **`--idle-evict SECS`** |
+| Active-sync window | only wallets touched this recently are swept | hardware-derived | **`--active-sync-window SECS`** |
+| Subtree-cache memory floor | skips cache builds when the kernel reports memory tight | hardware-derived | **`--subtree-free-floor-mb MIB`** |
+
+Two of these matter more than their names suggest:
+
+**`--page-cache-entries` / `--page-cache-ttl` size a shared cache, not a per-wallet one.**
+Wallets are swept in cursor order specifically so laggards land on the same page and share
+one fetch and one decode. Many wallets of the same seed — a second device, or a service
+with several tokens over one key — scan the identical blocks, so a cache large enough to
+span the spread between the slowest and fastest wallet turns N fetches into one. Raise the
+TTL if your wallets arrive minutes apart.
+
+**`--max-resident-wallets` is bounded by RAM, not by CPU.** Each resident wallet holds its
+own view; the cap is what stops a public daemon with thousands of tokens from swapping.
+Raising it past what memory supports is the one setting here that can make a box slower.
+
+The sync round itself has a fixed time budget rather than a flag: a wallet that overruns
+finishes on its own while the next round proceeds without it, so one pathological wallet
+cannot hold up the rest.
 
 **`--proof-threads` only ever costs you time.** Total CPU work is fixed at ~2.4
 core-seconds per note spent; the flag just decides how many cores divide it:
@@ -401,7 +466,7 @@ On a pool machine also running a node, `--proof-threads $(( $(nproc) - 2 ))` buy
 headroom at a known, bounded latency cost. Do not set it hoping for a speedup — there
 isn't one, and proving is the thing a user is waiting on.
 
-Note the Tokio worker count (8) is separate and does **not** bound proving: proofs run on
+The Tokio worker count is separate and does **not** bound proving: proofs run on
 `spawn_blocking` threads and inside the rayon pool, not on async workers.
 
 ### Sizing
@@ -409,7 +474,7 @@ Note the Tokio worker count (8) is separate and does **not** bound proving: proo
 - **Cache memory:** ~4 B per leaf of span, but building forces that wallet's decoded leaf
   stream to materialise — together ~**11 MB per 200 K-leaf wallet** (32 B/leaf stored +
   32 B/leaf decoded). Gated on live free memory: a build is deferred while
-  `MemAvailable` is under `SUBTREE_CACHE_FREE_FLOOR_MB` (1 200 MB) and retried on a later
+  `MemAvailable` is under `--subtree-free-floor-mb` (default 1 200 MB) and retried on a later
   pass. This replaced a fixed daemon-wide leaf budget that was both an arbitrary number
   and a *lifetime* counter — once spent, every wallet loaded afterwards was permanently
   stuck on the replay path (observed live: 31 wallets skipped, one then taking 16.1 s to
@@ -437,6 +502,25 @@ Note the Tokio worker count (8) is separate and does **not** bound proving: proo
 - A spend roots at the **matured anchor** (`DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK` = 630
   blue below the sink), so funds must be ~10 minutes old to be spendable. The anchor
   trails the tip *by design* — this is not a sync deficiency.
+- A wallet **never ingests the newest `SYNC_TIP_MARGIN` (200) blue units**. Blocks that
+  close to the sink can still be reorged out, so they are previewed, not applied. A
+  healthy, fully caught-up wallet therefore rests ~200 blocks behind the tip; that is the
+  resting state, not lag.
+- **Spendability is decided by the anchor, not the tip.** `spend_ready` is true when the
+  wallet's view reaches the anchor depth and its commitment tree is usable — so a wallet
+  a few hundred blocks behind can still pay, because the blocks above the anchor
+  contribute nothing a proof consumes. `blocks_behind` reports the gap so a UI can say
+  what is not yet counted.
+- **Progress is published during a scan, not only after it.** A pass republishes its
+  snapshot every couple of seconds, so `scanned_blocks` moves while work is happening
+  instead of jumping when the pass ends.
+- **One wallet cannot stall the others.** A sync round has a time budget; a wallet that
+  overruns keeps working on its own and the next round proceeds without it. Before this,
+  a single wallet with a very large note count could hold the round open and freeze every
+  other wallet on the daemon, including the shared chain tree they all borrow from.
+- `/api/status` answers for a wallet that exists but is not open yet with
+  `loading: true` **and its address** — read from the wallet file, not from loaded state.
+  A wallet that is merely opening must never be mistaken for one the daemon has lost.
 
 ---
 
@@ -602,31 +686,35 @@ being starved — check whether something keeps a payment permanently in flight.
 
 #### The deposit-attribution problem — read before designing anything
 
-**One wallet has exactly one address.** `/api/wallet/address` returns
-`address_at(0, External)` and always the same string; there is no endpoint that mints a
-fresh per-customer address. So there are two workable designs, and one of them does not
-scale:
+A wallet has one key but **unlimited addresses**. `GET /api/wallet/address?index=N` returns
+the wallet's N-th Orchard *diversified* address (index 0 is the address the endpoint always
+returned). Every diversified address pays into the same wallet and is found by the same
+scan — trial decryption is keyed on the incoming viewing key, which does not depend on the
+diversifier — and each received note carries the diversified address it was paid to, which
+its history row reports as `recipient`. On-chain the addresses are unlinkable: nobody but
+the wallet can tell that two of them belong to the same key.
+
+Two designs, one of which does not scale:
 
 | Design | How | Verdict |
 | --- | --- | --- |
-| **One wallet per customer** | a token per customer, each its own `.scan` file | **Does not scale.** Every wallet syncs independently; 350 loaded wallets already strain a 4-core box. Fine for hundreds, not for hundreds of thousands. |
-| **One deposit wallet + memo** | every customer gets the same address plus a unique memo/payment-id | **Use this.** The XRP/XLM destination-tag pattern. One wallet, one scan. |
+| **One wallet, one diversified address per customer** | `address?index=<customer id>` at signup; attribute deposits by `recipient` in `/api/wallet/history` | **Use this.** The standard exchange model — a per-customer address, nothing for the customer to type. One wallet, one scan, one seed. |
+| **One wallet per customer** | a token per customer (`/api/wallet/create`), each its own seed and `.scan` file, swept to a hot wallet | Works, but every customer is a separate scan and a separate seed to back up, and each sweep is a proving job. Fine for hundreds of customers; past that it is the design above with extra cost. |
 
-Memos survive on the receive side and are readable per transaction:
+Per-customer addresses, end to end:
 
 ```bash
-# enable the readable record first — off by default
-curl -X POST -H "X-Wallet-Token: $TOK" -H 'Content-Type: application/json' \
-  -d '{"recoverable_history":true}' http://127.0.0.1:8501/api/wallet/settings
+# at signup: give customer 4711 their own deposit address (store the index with the customer)
+curl -H "X-Wallet-Token: $TOK" "http://127.0.0.1:8501/api/wallet/address?index=4711"
 
-curl -s -H "X-Wallet-Token: $TOK" http://127.0.0.1:8501/api/wallet/history \
-  | jq '.[] | select(.kind=="received") | {txid, amount, memo}'
+# credit deposits: every received row names the diversified address it was paid to
+curl -s -H "X-Wallet-Token: $TOK" "http://127.0.0.1:8501/api/wallet/history?limit=500" \
+  | jq '.rows[] | select(.kind=="received") | {txid, daaScore, amountZkas, recipient}'
 ```
 
-Memos are up to 512 bytes and are **encrypted to the recipient** — nobody but your wallet
-sees them on-chain. Two caveats: a customer who forgets the memo produces an
-unattributable deposit (have a manual reconciliation path, as XRP exchanges do), and
-`recoverable_history` must be on or no memo is recorded to read back.
+Index is a `u32`; use your internal customer id or a counter and persist the mapping —
+the daemon does not remember which indexes you handed out (deriving is deterministic, so
+nothing is lost either way). Withdrawals: pay the customer's address like any other.
 
 #### Recommended exchange configuration
 
@@ -661,6 +749,37 @@ Poll `/api/status`. Two fields matter and they are not the same:
 | --- | --- |
 | `balance` | everything the wallet has seen |
 | `spendable` | notes past the maturity anchor — what a withdrawal can actually use |
+
+#### A txid in a block is not a payment
+
+This is the one that can cost real money, and it inverts the assumption every other
+chain has trained into integrators.
+
+A shielded spend can be **mined, carry a txid, appear in a block with any number of
+confirmations, and still have moved nothing.** If its anchor is not yet mature, or its
+nullifier was already spent, the spend is *dropped* during the state transition rather
+than the block being rejected. The block stays valid, the chain advances, no value moves,
+and the fee is not charged.
+
+This is deliberate. Rejecting the block instead would mean a spend already embedded in a
+mined block could make every block that merges it invalid — which halted the chain once,
+and is why the drop exists.
+
+Two consequences for an exchange:
+
+1. **Never credit from block or txid inclusion.** Not `getBlock`, not a txid lookup, not
+   "N confirmations". A confirmation count says the *block* is buried; it says nothing
+   about whether the spend inside it executed.
+2. **Credit from the applied set.** The daemon's `spendable` figure is exactly that — it
+   counts only notes that survived the state transition *and* matured, which is why the
+   rule below is "credit on `spendable`". Following it is sufficient; you do not need to
+   read the chain yourself.
+
+If you do read the chain directly (`GetShieldedBlocks`) rather than trusting the daemon,
+you must add settlement depth yourself: those records are authoritative about what was
+*applied*, but a block near the tip can still be reorged out. The daemon treats anything
+within **`SYNC_TIP_MARGIN` (200 blue units) of the sink** as preview-only and refuses to
+ingest it. Reading the applied set at the tip trades a drop risk for a reorg risk.
 
 **Credit on `spendable`, not `balance`.** A note needs ~10 minutes
 (`DEFAULT_ANCHOR_DEPTH + ANCHOR_SLACK` blue blocks) before it can be spent. Crediting on
@@ -735,6 +854,11 @@ of the same wallet. Keep `.scan.bak` files.
 If proving is running, the payment is progressing; make sure your proxy read timeout is
 long enough (§1). Do **not** iteratively restart the daemon to debug — each restart
 re-storms sync.
+
+**First consolidation / old-note spend is slow** — the O(depth) witness cache is cold.
+Pre-warm it instead of letting the spend pay for it: `POST /api/admin/warm_chain_tree`
+(shared tree, covers most wallets), and `POST /api/admin/warm_wallet` for a wallet whose
+notes predate the shared tree's base. Poll until `subtree_cache_ready: true`.
 
 **Never rescan casually.** `rescan` rebuilds from the node's pruning point; against a
 *pruned* node that silently loses history. Both production nodes are archival for this

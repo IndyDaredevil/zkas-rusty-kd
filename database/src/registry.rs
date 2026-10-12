@@ -127,6 +127,41 @@ pub enum DatabaseStorePrefixes {
     /// prefix has no such problem: a missing key reads as zero, which is exactly
     /// the right answer for every block mined before dev-fee accrual activates.
     ShieldedDevAccrued = 90,
+    /// Blue score of each block that produced an in-window anchor below the pruning point,
+    /// seeded from `PruningPointShieldedMetadata` during shielded IBD.
+    ///
+    /// Exists because anchor finality needs the source's blue score and a fast-synced node has
+    /// no ghostdag data below its pruning point — so the anchor→source mapping alone leaves
+    /// every such anchor judged non-final, which disqualifies the first block above the pruning
+    /// point that spends against one. A fresh prefix rather than a field on an existing value:
+    /// these stores are bincode-encoded and growing a written value type makes every existing
+    /// row undecodable, and a missing key here reads as "not attested", which is exactly the
+    /// fail-closed answer for a node that was never given the data.
+    ShieldedAnchorSourceScore = 91,
+    /// `bool`, set the first time a shielded-history backfill writes chain-index entries
+    /// below this node's own validated range. Never cleared: it records that part of the
+    /// index came from a peer rather than from this node's own validation.
+    ShieldedHistoryBackfilled = 92,
+    /// `Hash` of the base block a shielded-history replay was VERIFIED against (the
+    /// PoW-anchored frontier it reproduced). Written only in the `Verified` arm.
+    ShieldedHistoryVerifiedBase = 93,
+    /// Deferred GC queue for the anchor indexes: `blue_score(BE) || anchor || block`
+    /// keys enqueued when a block's snapshots are pruned, drained once the entry is
+    /// provably outside both the spend window and the IBD anchor export
+    /// (see `gc_aged_anchors`). Without it the anchor indexes grow one row per chain
+    /// block forever.
+    ShieldedAnchorGcQueue = 94,
+    /// Security fork: the anchor window (retained bucket chain hashes) as of each chain block at or
+    /// after the activation. Pruned below the pruning point with the other per-block snapshots.
+    ShieldedAnchorWindow = 95,
+    /// Security fork: each post-activation chain block's window entry (its own tree root and blue
+    /// score). Kept below the pruning point so the window can be exported to a syncing node, and
+    /// garbage-collected with the anchor indexes.
+    ShieldedWindowEntry = 96,
+    ShieldedMinerAccrual = 97,
+    /// `Hash` of the lowest block this node indexed itself, recorded when a shielded-history backfill
+    /// first writes below it. Everything under it is peer-supplied.
+    ShieldedHistoryOwnBase = 98,
 
     // ---- Separator ----
     /// Reserved as a separator

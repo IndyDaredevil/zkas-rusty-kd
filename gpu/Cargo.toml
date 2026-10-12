@@ -1,0 +1,18 @@
+[package]
+name = "gpucheck"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "gpucheck"
+path = "src/main.rs"
+
+[dependencies]
+pasta_curves = { package = "zakura-pasta-curves", version = "=2.2.0" }
+group = "0.14"
+rand = "0.10"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1

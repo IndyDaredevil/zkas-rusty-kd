@@ -45,8 +45,10 @@ const SOMPI_PER_ZKAS: u64 = 100_000_000;
 /// Blocks per second. The chain relaunched at 1 BPS (v0.2.0); the halving and
 /// countdown math below is in blocks, so it must track this.
 const BPS: u64 = 1;
-/// Blocks per halving ≈ 3 months (90d · 86400s · BPS).
-const HALVING_INTERVAL_BLOCKS: u64 = 90 * 86_400 * BPS;
+// No halving-interval constant lives here on purpose. The emission schedule is a
+// decayed monthly table floored by a perpetual tail, evaluated by consensus in
+// `CoinbaseManager::calc_block_subsidy`; a local "blocks per halving" figure was a
+// second, wrong source of truth for it. See `next_emission_step`.
 /// Keep enough history for a real trailing-hour pulse while limiting the public
 /// live-feed response separately.
 const RECENT_CAP: usize = 6_000;
@@ -192,10 +194,7 @@ fn load_tx_index(path: &str) -> (std::collections::HashMap<String, TxLoc>, VecDe
         let mut f = line.split('\t');
         let (Some(id), Some(bh), Some(bs), Some(bt)) = (f.next(), f.next(), f.next(), f.next()) else { continue };
         let (Ok(blue_score), Ok(block_time)) = (bs.parse::<u64>(), bt.parse::<u64>()) else { continue };
-        if map
-            .insert(id.to_string(), TxLoc { block_hash: bh.to_string(), blue_score, block_time })
-            .is_none()
-        {
+        if map.insert(id.to_string(), TxLoc { block_hash: bh.to_string(), blue_score, block_time }).is_none() {
             order.push_back(id.to_string());
         }
     }
@@ -394,13 +393,19 @@ async fn follow(state: Arc<AppState>) {
     let cutoff_ms = now_secs().saturating_sub(24 * 60 * 60) * 1_000;
     while work_backfill.len() + backfill.len() < WORK_HISTORY_CAP {
         let Some(cursor) = work_cursor else { break };
-        if cursor == RpcHash::default() { break; }
-        let Ok(block) = state.client.get_block(cursor, false).await else { break; };
+        if cursor == RpcHash::default() {
+            break;
+        }
+        let Ok(block) = state.client.get_block(cursor, false).await else {
+            break;
+        };
         work_cursor = block.verbose_data.as_ref().map(|v| v.selected_parent_hash);
         let difficulty = block.verbose_data.as_ref().map(|v| v.difficulty).unwrap_or(0.0);
         let old_enough = block.header.timestamp <= cutoff_ms;
         work_backfill.push(WorkPoint { timestamp: block.header.timestamp, difficulty });
-        if old_enough { break; }
+        if old_enough {
+            break;
+        }
     }
     work_backfill.reverse();
 
@@ -430,7 +435,9 @@ async fn follow(state: Arc<AppState>) {
             {
                 let mut work = state.work_history.write().await;
                 work.push_back(WorkPoint { timestamp: b.header.timestamp, difficulty: summary.difficulty });
-                while work.len() > WORK_HISTORY_CAP { work.pop_front(); }
+                while work.len() > WORK_HISTORY_CAP {
+                    work.pop_front();
+                }
             }
             recent.push_front(summary);
             if recent.len() > RECENT_CAP {
@@ -440,7 +447,9 @@ async fn follow(state: Arc<AppState>) {
         for point in &work_backfill {
             let mut work = state.work_history.write().await;
             work.push_back(point.clone());
-            while work.len() > WORK_HISTORY_CAP { work.pop_front(); }
+            while work.len() > WORK_HISTORY_CAP {
+                work.pop_front();
+            }
         }
     }
     // Index the seeded blocks too, so a just-restarted API can still serve the
@@ -489,7 +498,9 @@ async fn follow(state: Arc<AppState>) {
             {
                 let mut work = state.work_history.write().await;
                 work.push_back(WorkPoint { timestamp: block.header.timestamp, difficulty: summary.difficulty });
-                while work.len() > WORK_HISTORY_CAP { work.pop_front(); }
+                while work.len() > WORK_HISTORY_CAP {
+                    work.pop_front();
+                }
             }
             {
                 let mut recent = state.recent.write().await;
@@ -683,9 +694,7 @@ async fn info_nodes(State(s): State<Arc<AppState>>) -> impl IntoResponse {
                      is_self: bool| {
         let country = ip.and_then(geo::lookup);
         let placed = country.map(|c| {
-            let slot = per_country
-                .entry(c.code.clone())
-                .or_insert_with(|| (c.name.clone(), (c.lat, c.lon), 0));
+            let slot = per_country.entry(c.code.clone()).or_insert_with(|| (c.name.clone(), (c.lat, c.lon), 0));
             slot.2 += 1;
             let seed = u64::from_str_radix(&id, 16).unwrap_or_else(|_| id.len() as u64);
             (c, scatter(c.lat, c.lon, seed, slot.2 - 1))
@@ -725,7 +734,11 @@ async fn info_nodes(State(s): State<Arc<AppState>>) -> impl IntoResponse {
             Some(std::net::IpAddr::V6(_)) => ipv6 += 1,
             None => {}
         }
-        if p.is_outbound { outbound += 1 } else { inbound += 1 }
+        if p.is_outbound {
+            outbound += 1
+        } else {
+            inbound += 1
+        }
         *agents.entry(p.user_agent.clone()).or_default() += 1;
         // The node reports `time_connected` as milliseconds ELAPSED since the
         // connection was established, not as a timestamp.
@@ -764,8 +777,7 @@ async fn info_nodes(State(s): State<Arc<AppState>>) -> impl IntoResponse {
         cb.cmp(&ca).then_with(|| a["code"].as_str().unwrap_or("").cmp(b["code"].as_str().unwrap_or("")))
     });
 
-    let mut user_agents: Vec<Value> =
-        agents.into_iter().map(|(agent, count)| json!({ "agent": agent, "count": count })).collect();
+    let mut user_agents: Vec<Value> = agents.into_iter().map(|(agent, count)| json!({ "agent": agent, "count": count })).collect();
     user_agents.sort_by(|a, b| {
         let (ca, cb) = (a["count"].as_u64().unwrap_or(0), b["count"].as_u64().unwrap_or(0));
         cb.cmp(&ca).then_with(|| a["agent"].as_str().unwrap_or("").cmp(b["agent"].as_str().unwrap_or("")))
@@ -888,19 +900,32 @@ async fn scan_merged(state: Arc<AppState>) {
 /// `kaspa` is present only when that peer's own address answered a Kaspa p2p
 /// handshake. `checked=false` means the sweep has not reached it yet, which is not
 /// the same as a negative result and must not be rendered as one.
+/// Attribution written by the off-node ZKMM pipeline (see `zkmm_indexer` +
+/// `zkmm_join.sh`): keyed by full peer IP, the Kaspa payout address(es) that peer's
+/// merge-mined blocks committed to, with block counts. Re-read each request (tiny
+/// file); absent/stale is fine — the fields just come back null.
+fn load_attribution() -> serde_json::Value {
+    std::fs::read_to_string("/root/firecash/attribution.json").ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null)
+}
+
 async fn info_merged(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     let peers = match s.client.get_connected_peer_info().await {
         Ok(r) => r.peer_info,
         Err(e) => return err(e.to_string()),
     };
     let scan = s.merged.read().await;
+    let attr = load_attribution();
+    let attr_nodes = attr.get("nodes").cloned().unwrap_or(Value::Null);
 
     let rows: Vec<Value> = peers
         .iter()
         .map(|p| {
             let id = short_id(&p.id.to_string());
-            let ip = p.address.ip.to_string().parse::<std::net::IpAddr>().ok();
+            let ip_str = p.address.ip.to_string();
+            let ip = ip_str.parse::<std::net::IpAddr>().ok();
             let country = ip.and_then(geo::lookup);
+            // Inferred merge-mining attribution for THIS peer, by full IP.
+            let mm = attr_nodes.get(&ip_str).cloned();
             json!({
                 "id": id,
                 "country": country.map(|c| c.code.clone()),
@@ -917,6 +942,9 @@ async fn info_merged(State(s): State<Arc<AppState>>) -> impl IntoResponse {
                 "reachable": scan.reachable.contains(&id),
                 "kaspa": scan.found.get(&id),
                 "kaspaAddress": scan.found.get(&id).and_then(|v| v.first()).map(|f| f.address.clone()),
+                // Inferred from ZKMM-tag ↔ first-relayer join (see /map-merged-mining
+                // note). `null` until this peer's merge-mined blocks are observed.
+                "mergeMined": mm,
             })
         })
         .collect();
@@ -928,6 +956,8 @@ async fn info_merged(State(s): State<Arc<AppState>>) -> impl IntoResponse {
         "merged": merged_count,
         "checked": scan.checked.len(),
         "ports": merged::KASPA_PORTS,
+        "attribution": attr.get("updatedAt"),
+        "attributionMatched": attr.get("matched"),
         "nodes": rows,
     }))
     .into_response()
@@ -967,6 +997,10 @@ fn coinbase_manager() -> CoinbaseManager {
         p.dev_fee_recipient,
         p.dev_fee_accrual_activation,
         p.dev_fee_payout_interval,
+        // Same gating as consensus (`services.rs`); only the subsidy schedule is read here.
+        if p.shielded_coinbase { p.security_fork_activation } else { kaspa_consensus_core::config::params::ForkActivation::never() },
+        p.miner_accrual_payout_interval,
+        p.dev_fee_end_activation,
     )
 }
 
@@ -1016,20 +1050,103 @@ async fn info_blockreward(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({ "blockreward": agg.emission_per_block_fc })).into_response()
 }
 
+/// How far ahead to look for the next emission step before reporting that there
+/// isn't one. Two years covers the tail step-down at real month 24; beyond that
+/// the schedule is flat forever and a countdown would be a fiction.
+const EMISSION_SEARCH_HORIZON_BLOCKS: u64 = 2 * 365 * 86_400 * BPS;
+
+/// The next DAA score at which the block subsidy actually goes DOWN, or `None` if
+/// it does not change again within the horizon.
+///
+/// `calc_block_subsidy` is monotonically non-increasing in DAA score, so the first
+/// decrease can be found by bisection instead of walking tens of millions of scores.
+/// Asking consensus is the point: the schedule is a decaying table read at a scaled
+/// month index and then floored by a two-step perpetual tail, and any reimplementation
+/// here would be a second source of truth that drifts from the chain.
+fn next_emission_step(cbm: &CoinbaseManager, daa_score: u64) -> Option<(u64, u64)> {
+    let current = cbm.calc_block_subsidy(daa_score);
+    let horizon = daa_score.saturating_add(EMISSION_SEARCH_HORIZON_BLOCKS);
+    if cbm.calc_block_subsidy(horizon) >= current {
+        return None;
+    }
+    let (mut lo, mut hi) = (daa_score, horizon); // subsidy(lo) == current > subsidy(hi)
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if cbm.calc_block_subsidy(mid) < current {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Some((hi, cbm.calc_block_subsidy(hi)))
+}
+
+/// When the block reward next steps down, and by how much.
+///
+/// Named "halving" for the endpoint's original callers, but ZKas does not halve in
+/// one visible event: the curve decays through the monthly table four times faster
+/// than Kaspa's, so a step lands every ~7.6 days and takes twelve steps to halve.
+/// The previous implementation counted 90-day intervals of BLUE score from zero and
+/// reported the current reward divided by two — wrong counter, wrong period, wrong
+/// amount, and it ignored the perpetual tail floor entirely, so it promised a
+/// reduction on a schedule where reductions had stopped.
 async fn info_halving(State(s): State<Arc<AppState>>) -> impl IntoResponse {
-    let (blue_score, subsidy) = {
-        let agg = s.shielded.read().await;
-        (agg.blue_score, agg.emission_per_block_fc)
+    // Consensus keys emission off DAA score, not blue score. They differ by the red
+    // blocks the DAG merged — thousands apart on a live chain — so using blue score
+    // silently reports the wrong point on the curve.
+    let daa_score = match s.client.get_block_dag_info().await {
+        Ok(d) => d.virtual_daa_score,
+        Err(e) => return err(e.to_string()),
     };
-    let next_h = ((blue_score / HALVING_INTERVAL_BLOCKS) + 1) * HALVING_INTERVAL_BLOCKS;
-    let blocks_left = next_h.saturating_sub(blue_score);
+    let cbm = coinbase_manager();
+    let current_sompi = cbm.calc_block_subsidy(daa_score);
+    let current = current_sompi as f64 / SOMPI_PER_ZKAS as f64;
+
+    let Some((next_daa, next_sompi)) = next_emission_step(&cbm, daa_score) else {
+        // The curve has decayed into the perpetual tail: the reward is pinned at the
+        // floor and does not fall again. Saying "in ~N days" here would be inventing
+        // an event. Nulls, so a client shows nothing rather than a stale countdown.
+        return Json(json!({
+            "nextHalvingTimestamp": Value::Null,
+            "nextHalvingDate": "no further reductions scheduled",
+            "nextHalvingAmount": current,
+            "currentAmount": current,
+            "reductionPending": false,
+            "atTailFloor": true,
+        }))
+        .into_response();
+    };
+
+    let blocks_left = next_daa.saturating_sub(daa_score);
     let secs_left = blocks_left / BPS;
-    let ts = now_secs() + secs_left;
-    let days = secs_left / 86400;
+    let next = next_sompi as f64 / SOMPI_PER_ZKAS as f64;
+    let cut_pct = if current_sompi > 0 { (1.0 - next_sompi as f64 / current_sompi as f64) * 100.0 } else { 0.0 };
+
+    // Hours matter here. A step lands every ~7.6 days, so "in ~0 days" is the normal
+    // reading for most of the final day and reads as broken.
+    let when = if secs_left >= 172_800 {
+        format!("in ~{} days", secs_left / 86_400)
+    } else if secs_left >= 7_200 {
+        format!("in ~{} hours", secs_left / 3_600)
+    } else if secs_left >= 120 {
+        format!("in ~{} minutes", secs_left / 60)
+    } else {
+        "in under a minute".to_string()
+    };
+
     Json(json!({
-        "nextHalvingTimestamp": ts,
-        "nextHalvingDate": format!("in ~{days} days"),
-        "nextHalvingAmount": subsidy / 2.0,
+        // Original keys, with values that are now true.
+        "nextHalvingTimestamp": now_secs() + secs_left,
+        "nextHalvingDate": when,
+        "nextHalvingAmount": next,
+        // What the reduction actually is, so a client need not guess.
+        "currentAmount": current,
+        "reductionPercent": (cut_pct * 100.0).round() / 100.0,
+        "reductionPending": true,
+        "atTailFloor": false,
+        "nextReductionDaaScore": next_daa,
+        "blocksRemaining": blocks_left,
+        "daaScore": daa_score,
     }))
     .into_response()
 }
@@ -1138,10 +1255,8 @@ async fn info_pulse(State(s): State<Arc<AppState>>, Query(query): Query<PulseQue
     }
     // Selected-parent backfill contains only blue-chain blocks, but consecutive
     // DAA scores account for the full DAG (including parallel/red blocks).
-    let dag_blocks_15m = daa_15m.iter().max().zip(daa_15m.iter().min())
-        .map(|(max, min)| max.saturating_sub(*min)).unwrap_or(0);
-    let dag_blocks_1h = daa_1h.iter().max().zip(daa_1h.iter().min())
-        .map(|(max, min)| max.saturating_sub(*min)).unwrap_or(0);
+    let dag_blocks_15m = daa_15m.iter().max().zip(daa_15m.iter().min()).map(|(max, min)| max.saturating_sub(*min)).unwrap_or(0);
+    let dag_blocks_1h = daa_1h.iter().max().zip(daa_1h.iter().min()).map(|(max, min)| max.saturating_sub(*min)).unwrap_or(0);
     // Coinbase is one transaction per DAG block. Add non-coinbase transactions
     // observed in the window without double-counting the selected-chain coinbases.
     let non_coinbase_1h = transactions_1h.saturating_sub(daa_1h.len() as u64);
@@ -1171,9 +1286,13 @@ async fn info_pulse(State(s): State<Arc<AppState>>, Query(query): Query<PulseQue
     let mut work_sum = vec![0.0_f64; work_bins];
     let mut work_count = vec![0_u64; work_bins];
     for point in work.iter() {
-        if point.timestamp > work_now_ms { continue; }
+        if point.timestamp > work_now_ms {
+            continue;
+        }
         let age = work_now_ms - point.timestamp;
-        if age >= work_window_seconds * 1_000 { continue; }
+        if age >= work_window_seconds * 1_000 {
+            continue;
+        }
         let bin = work_bins - 1 - ((age / (work_bin_seconds * 1_000)) as usize).min(work_bins - 1);
         if point.difficulty > 0.0 && point.difficulty.is_finite() {
             work_sum[bin] += point.difficulty;
@@ -1181,12 +1300,22 @@ async fn info_pulse(State(s): State<Arc<AppState>>, Query(query): Query<PulseQue
         }
     }
     for i in 0..work_bins {
-        if work_count[i] > 0 { work_sum[i] /= work_count[i] as f64; }
+        if work_count[i] > 0 {
+            work_sum[i] /= work_count[i] as f64;
+        }
     }
-    let fallback_difficulty = work_sum.iter().rev().copied().find(|d| *d > 0.0)
+    let fallback_difficulty = work_sum
+        .iter()
+        .rev()
+        .copied()
+        .find(|d| *d > 0.0)
         .or_else(|| recent.iter().find(|b| b.difficulty > 0.0).map(|b| b.difficulty))
         .unwrap_or(0.0);
-    for value in &mut work_sum { if *value <= 0.0 { *value = fallback_difficulty; } }
+    for value in &mut work_sum {
+        if *value <= 0.0 {
+            *value = fallback_difficulty;
+        }
+    }
     let work_hashrate: Vec<f64> = work_sum.iter().map(|d| d * 2.0).collect();
 
     Json(json!({
@@ -1309,10 +1438,8 @@ async fn transaction_by_id(State(s): State<Arc<AppState>>, Path(id): Path<String
         if let Ok(txid) = id.parse::<RpcHash>() {
             if let Ok(entry) = s.client.get_mempool_entry(txid, false, false).await {
                 let tx = &entry.transaction;
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
+                let now_ms =
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
                 let outputs = detail_outputs(tx, &id, "");
                 return Json(json!({
                     "subnetwork_id": tx.subnetwork_id.to_string(),
@@ -1590,4 +1717,65 @@ async fn main() {
         tokio::net::TcpListener::bind(&cli.listen).await.unwrap_or_else(|e| fatal(format!("failed to bind {}: {e}", cli.listen)));
     log::info!("ZKas explorer API listening on http://{}", cli.listen);
     axum::serve(listener, app).await.unwrap_or_else(|e| fatal(format!("server error: {e}")));
+}
+
+#[cfg(test)]
+mod emission_tests {
+    use super::*;
+
+    /// The schedule the chain actually runs, pinned so a UI countdown cannot drift
+    /// from it again. ZKas traverses Kaspa's monthly subsidy table four times faster
+    /// (a halving every 3 months rather than 12), which puts a step every
+    /// `2629800 * 3 / 12` = 657,450 seconds — ~7.61 days at 1 BPS — each cutting the
+    /// reward by ~5.6%, NOT halving it.
+    #[test]
+    fn steps_land_every_seven_and_a_half_days_and_are_not_halvings() {
+        let cbm = coinbase_manager();
+        let daa = 1_276_152; // a real mainnet score
+        let (next_daa, next_sompi) = next_emission_step(&cbm, daa).expect("curve is still decaying here");
+
+        assert_eq!(next_daa % 657_450, 0, "steps fall on table-index boundaries");
+        assert!(next_daa > daa && next_daa - daa <= 657_450, "the next step is within one interval");
+
+        let current = cbm.calc_block_subsidy(daa);
+        assert!(next_sompi < current, "a step reduces the reward");
+        // One twelfth of a halving: 2^(-1/12) ≈ 0.9439.
+        let ratio = next_sompi as f64 / current as f64;
+        assert!((0.94..0.95).contains(&ratio), "a step cuts ~5.6%, got {:.4}", 1.0 - ratio);
+        assert!(next_sompi > current / 2, "a step is emphatically not a halving");
+    }
+
+    /// Consecutive steps are exactly one interval apart, so "every ~7.6 days" is a
+    /// claim the schedule actually supports.
+    #[test]
+    fn consecutive_steps_are_one_interval_apart() {
+        let cbm = coinbase_manager();
+        let (first, _) = next_emission_step(&cbm, 1_276_152).unwrap();
+        let (second, _) = next_emission_step(&cbm, first).unwrap();
+        assert_eq!(second - first, 657_450);
+    }
+
+    /// Once the decaying curve sinks to the perpetual tail the reward stops falling.
+    /// A countdown must go quiet rather than promise a reduction that never arrives —
+    /// the failure the old 90-day interval produced forever.
+    #[test]
+    fn no_step_is_reported_once_emission_reaches_the_tail_floor() {
+        let cbm = coinbase_manager();
+        // Far past the month-24 tail step-down, where the floor is flat forever.
+        let deep = 40 * 365 * 86_400;
+        assert!(next_emission_step(&cbm, deep).is_none());
+        assert_eq!(cbm.calc_block_subsidy(deep), cbm.calc_block_subsidy(deep + 5 * 365 * 86_400));
+    }
+
+    /// Bisection is only valid because the schedule never rises.
+    #[test]
+    fn emission_never_increases() {
+        let cbm = coinbase_manager();
+        let mut previous = u64::MAX;
+        for month in 0..60u64 {
+            let subsidy = cbm.calc_block_subsidy(month * 657_450);
+            assert!(subsidy <= previous, "emission rose at index {month}");
+            previous = subsidy;
+        }
+    }
 }

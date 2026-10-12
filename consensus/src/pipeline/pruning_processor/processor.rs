@@ -41,7 +41,7 @@ use kaspa_hashes::{Hash, ZERO_HASH};
 use kaspa_muhash::MuHash;
 use kaspa_utils::iter::IterExtensions;
 use parking_lot::RwLockUpgradableReadGuard;
-use rocksdb::WriteBatch;
+use rocksdb::{WriteBatch, WriteOptions};
 use std::{
     collections::{VecDeque, hash_map::Entry::Vacant},
     ops::Deref,
@@ -256,6 +256,37 @@ impl PruningProcessor {
         }
     }
 
+    /// Drop body tips that virtual can never merge again (not in the future of the
+    /// pruning point). The same rule the non-archival prune path applies inline; kept
+    /// as a separate step so archival nodes - which skip data pruning entirely - still
+    /// perform this piece of bookkeeping. Takes the pruning write lock briefly, exactly
+    /// like the inline version, so it cannot race a concurrent virtual advance.
+    fn prune_unmergeable_tips(&self, new_pruning_point: Hash) {
+        let _prune_guard = self.pruning_lock.blocking_write();
+        let reachability_read = self.reachability_store.read();
+        let mut batch = WriteBatch::default();
+        let mut tips_write = self.body_tips_store.write();
+        let pruned_tips = tips_write
+            .get()
+            .unwrap()
+            .read()
+            .iter()
+            .copied()
+            .filter(|&h| !reachability_read.try_is_dag_ancestor_of(new_pruning_point, h).unwrap())
+            .collect_vec();
+        if pruned_tips.is_empty() {
+            return;
+        }
+        tips_write.prune_tips_with_writer(BatchDbWriter::new(&mut batch), &pruned_tips).unwrap();
+        self.db.write(batch).unwrap();
+        info!(
+            "Archival tip cleanup: pruned {} unmergeable side-branch tips: {}...{}",
+            pruned_tips.len(),
+            pruned_tips.iter().take(5.min(pruned_tips.len().div_ceil(2))).reusable_format(", "),
+            pruned_tips.iter().rev().take(5.min(pruned_tips.len() / 2)).reusable_format(", ")
+        );
+    }
+
     fn advance_pruning_utxoset(&self, utxoset_position: Hash, new_pruning_point: Hash) -> bool {
         // If the latest pruning point is the result of an IBD catchup, it is guaranteed that the headers selected tip
         // is pruning_depth on top of it
@@ -307,6 +338,17 @@ impl PruningProcessor {
 
     fn prune(&self, new_pruning_point: Hash, retention_period_root: Hash) {
         if self.config.is_archival {
+            // An archival node keeps all DATA, but the body-tips set is live consensus
+            // bookkeeping, not history: by the prunality argument below, a tip outside
+            // future(pruning_point) can never be merged by virtual again, on any node
+            // type. Skipping this cleanup along with data pruning (the inherited
+            // behaviour: this early return sits above the tip-pruning step) left such
+            // tips in the set FOREVER on archival nodes. Observed live (issue #6): a
+            // disqualified 2026-07-31 side-branch tip, ~2.7M blocks behind virtual, was
+            // still tipHashes[0] a month later on every archival node - polluting
+            // getBlockDagInfo for every wallet/explorer and pinning anchored
+            // estimateNetworkHashesPerSecond calls to a difficulty era from July.
+            self.prune_unmergeable_tips(new_pruning_point);
             warn!("The node is configured as an archival node -- avoiding data pruning. Note this might lead to heavy disk usage.");
             return;
         }
@@ -425,6 +467,17 @@ impl PruningProcessor {
                 .copied()
                 .filter(|&h| !reachability_read.try_is_dag_ancestor_of(new_pruning_point, h).unwrap())
                 .collect_vec();
+            // Drain the anchor GC queue while we hold the pruning lock anyway. Entries
+            // are only deleted once 2x max_shielded_anchor_age below the new pruning
+            // point - outside every window a spend or the IBD anchor export can name.
+            let pp_blue = self.headers_store.get_compact_header_data(new_pruning_point).unwrap().blue_score;
+            let gc = self
+                .shielded_state_manager
+                .gc_aged_anchors(&mut batch, pp_blue, self.config.params.max_shielded_anchor_age, 50_000)
+                .unwrap();
+            if gc > 0 {
+                info!("Anchor index GC: dropped {gc} aged anchor rows (bounded by the pruning window)");
+            }
             tips_write.prune_tips_with_writer(BatchDbWriter::new(&mut batch), &pruned_tips).unwrap();
             if !pruned_tips.is_empty() {
                 info!(
@@ -473,6 +526,15 @@ impl PruningProcessor {
         let mut queue = VecDeque::<Hash>::from_iter(reachability_read.get_children(ORIGIN).unwrap().iter().copied());
         let (mut counter, mut traversed) = (0, 0);
         info!("Header and Block pruning: starting traversal from: {} (genesis: {})", queue.iter().reusable_format(", "), genesis);
+        // The bulk per-block deletes below are idempotent and this traversal always
+        // restarts from ORIGIN, so they do not need WAL durability: a crash simply
+        // leaves those blocks to be re-pruned on the next run. Writing them WAL-less
+        // removes the per-block WAL commit storm on the first prune after IBD (an
+        // ENOSPC / getBlockTemplate-wedge contributor). WriteBatch stays atomic
+        // regardless of the WAL, and every control-state write in prune() (pruning
+        // point, tips, meta) keeps its WAL below.
+        let mut prune_wopts = WriteOptions::default();
+        prune_wopts.disable_wal(true);
         while let Some(current) = queue.pop_front() {
             if reachability_read.try_is_dag_ancestor_of(retention_period_root, current).unwrap() {
                 continue;
@@ -528,14 +590,15 @@ impl PruningProcessor {
                 // A sparse frontier checkpoint is kept so `GetShieldedTreeState` still has
                 // fast-sync anchors down here, and past pruning points always keep theirs.
                 // The compact scan archive and the global nullifier set are never touched.
+                let compact_header = self.headers_store.get_compact_header_data(current).optional().unwrap();
                 let keep_checkpoint = keep_headers.contains(&current)
-                    || self
-                        .headers_store
-                        .get_compact_header_data(current)
-                        .optional()
-                        .unwrap()
-                        .is_some_and(|h| h.daa_score % SHIELDED_FRONTIER_CHECKPOINT_INTERVAL == 0);
-                self.shielded_state_manager.prune_block_snapshots(&mut batch, current, keep_checkpoint).unwrap();
+                    || compact_header.is_some_and(|h| h.daa_score % SHIELDED_FRONTIER_CHECKPOINT_INTERVAL == 0);
+                // The blue score is snapshotted into the anchor GC queue here because the
+                // header is about to be pruned and the age of this block's anchor rows
+                // would otherwise be unrecoverable (see `gc_aged_anchors`).
+                self.shielded_state_manager
+                    .prune_block_snapshots(&mut batch, current, keep_checkpoint, compact_header.map(|h| h.blue_score))
+                    .unwrap();
 
                 if let Some(&affiliated_proof_level) = keep_relations.get(&current) {
                     if statuses_write.get(current).optional().unwrap().is_some_and(|s| s.is_valid()) {
@@ -596,8 +659,8 @@ impl PruningProcessor {
                 let reachability_write = staging_reachability.commit(&mut batch).unwrap();
                 staging_reachability_relations.commit(&mut batch).unwrap();
 
-                // Flush the batch to the DB
-                self.db.write(batch).unwrap();
+                // Flush the batch to the DB (WAL-less; see prune_wopts above)
+                self.db.write_opt(batch, &prune_wopts).unwrap();
 
                 // Calling the drops explicitly after the batch is written in order to avoid possible errors.
                 drop(reachability_write);

@@ -20,27 +20,47 @@ use kaspa_consensus_core::BlockHashSet;
 use kaspa_consensus_core::tx::Transaction;
 use kaspa_database::prelude::{CachePolicy, DB, StoreError, StoreResult};
 use kaspa_hashes::Hash;
+use kaspa_shielded_core::ExtractedNoteCommitment;
 use kaspa_shielded_core::coinbase::{coinbase_note, derive_coinbase_note_desc};
 use kaspa_shielded_core::nullifier::{MemNullifierSet, NullifierBytes, NullifierConflictResolver, NullifierSet};
-#[cfg(test)]
 use kaspa_shielded_core::state::CoinbaseNote;
 use kaspa_shielded_core::state::{BlockShieldedOutcome, CoinbaseMint, ShieldedStateError, ShieldedTx, apply_chain_block_to};
 use kaspa_shielded_core::tree::{FrontierState, GlobalTree, NoteCommitmentTree, TreeStateError};
 use kaspa_shielded_core::turnstile::SupplyLedger;
+use kaspa_shielded_core::wallet::CompactActionRecord;
 
 use rocksdb::WriteBatch;
 
+use kaspa_math::Uint3072;
 use kaspa_muhash::MuHash;
 
+use crate::model::stores::shielded::{DbAnchorGcQueueStore, DbAnchorWindowStore};
 use crate::model::stores::shielded::{
-    AnchorProducersStoreReader, DbAnchorProducersStore,
-    AnchorBlockStoreReader, DbAnchorBlockStore, DbNullifierDiffStore, DbNullifierSetStore, DbShieldedNullifierMuHashStore,
-    BurnReceipts, DbShieldedBurnStore, DbShieldedDevAccruedStore, DbShieldedScanBlockStore, DbShieldedSupplyStore,
-    DbShieldedTreeStore,
-    NullifierDiffStoreReader, NullifierSetStore, NullifierSetStoreReader, ShieldedBurnStoreReader,
-    ShieldedNullifierMuHashStoreReader, ShieldedScanBlockData, ShieldedScanBlockStoreReader, ShieldedSupplyStoreReader,
-    ShieldedTreeStoreReader, SupplyTotals,
+    AnchorBlockStoreReader, AnchorProducersStoreReader, BurnReceipts, DbAnchorBlockStore, DbAnchorProducersStore,
+    DbNullifierDiffStore, DbNullifierSetStore, DbShieldedAnchorSourceScoreStore, DbShieldedBurnStore, DbShieldedDevAccruedStore,
+    DbShieldedMinerAccrualStore,
+    DbShieldedNullifierMuHashStore,
+    DbShieldedScanBlockStore, DbShieldedSupplyStore, DbShieldedTreeStore, NullifierDiffStoreReader, NullifierSetStore,
+    NullifierSetStoreReader, ShieldedBurnStoreReader, ShieldedNullifierMuHashStoreReader, ShieldedScanBlockData,
+    ShieldedScanBlockStoreReader, ShieldedSupplyStoreReader, ShieldedTreeStoreReader, SupplyTotals,
 };
+
+/// Receiver-side ceiling on the two peer-supplied anchor vectors in pruning-point metadata.
+///
+/// Neither had any bound: the only limit was the 1 GiB p2p message size, and each entry becomes two
+/// RocksDB rows staged into one in-memory `WriteBatch`, so a single metadata frame could exhaust
+/// memory and disk. The honest set is bounded by `max_shielded_anchor_age` — 27,000 blocks at 1 BPS
+/// — so this sits roughly 9x above any real value. It is a DoS ceiling, not a consensus rule; a
+/// network running at a far higher block rate would need it raised.
+pub const MAX_IMPORTED_IN_WINDOW_ANCHORS: usize = 1 << 18;
+
+/// Receiver-side ceiling on imported burn receipts.
+///
+/// `recompute_state_root` builds a Merkle accumulator over this vector *before* the root comparison
+/// can reject it, so an unbounded length is unbounded work. While the bridge is disabled the honest
+/// value is empty and any non-empty vector is rejected outright; this bound covers the case after it
+/// is enabled.
+pub const MAX_IMPORTED_BURN_RECEIPTS: usize = 1 << 20;
 
 /// A computed (not-yet-persisted) shielded transition for one chain block.
 ///
@@ -157,6 +177,93 @@ pub struct PruningPointShieldedMetadata {
     /// `bincode::deserialize` allows trailing bytes, so an older peer simply ignores it.
     #[serde(default)]
     pub dev_accrued: u64,
+
+    /// Blue score of each block named as a source in [`Self::in_window_anchors`].
+    ///
+    /// Without this a fast-synced node still cannot use those anchors, and
+    /// [`Self::in_window_anchors`] alone does not fix the bug it was added for.
+    /// `is_shielded_anchor_final` needs two things: WHICH block produced the root (the
+    /// mapping, transferred above) and WHETHER that block is a matured chain ancestor. The
+    /// second is read from `ghostdag_store.get_blue_score(source)` — and for a source below
+    /// the pruning point, a fast-synced node has no ghostdag data at all, so the lookup fails
+    /// and the anchor is judged non-final exactly as if it had never been transferred.
+    ///
+    /// `params.rs` asserts the opposite — that an in-window anchor's source "always has
+    /// ghostdag/reachability data on every synced node (full, pruned or IBD-seeded)" because
+    /// `max_shielded_anchor_age < pruning_depth - finality_depth`. That reasoning measures the
+    /// anchor's age from the TIP. A node in IBD validates blocks sitting AT its pruning point,
+    /// so their anchors reach BELOW it by construction. Measured on mainnet 2026-08-08:
+    /// pruning point blue score 993,600; the first disqualified block 993,652 (+52); its
+    /// anchor's source 990,606 — 2,994 BELOW the pruning point, at a perfectly legal age of
+    /// 3,046 inside the `[600, 27000]` window. The node dropped the spend, omitted its
+    /// 24,578,600 fee from the coinbase it expected, and disqualified the block; every later
+    /// block inherited. That is the whole failure.
+    ///
+    /// Ancestry needs no transfer: the server builds this walking its OWN selected chain below
+    /// the pruning point, and the pruning point is PoW-committed and on the syncee's chain too,
+    /// so every source here is a selected-chain ancestor of every block above it.
+    ///
+    /// Not fail-open (audit F-04): an anchor whose source is absent from this set is still
+    /// judged non-final. It only lets a node use anchors the serving peer explicitly attested,
+    /// bounded to the window below the adopted pruning point.
+    ///
+    /// Wire compatibility: appended LAST, so a peer that predates it sends a shorter blob and
+    /// [`Self::from_wire_bytes`] falls back — the same positional-bincode discipline
+    /// `dev_accrued` needed. Empty means "peer cannot attest", which fails closed.
+    #[serde(default)]
+    pub in_window_anchor_source_scores: Vec<(Hash, u64)>,
+    /// Security fork: the anchor-log entries from the first at or below the oldest usable anchor
+    /// source up to the pruning point, ascending by blue score. A syncing node replays them onto
+    /// [`Self::window_prefix`] and must reproduce the log committed in `zkas_state_root1`, so these
+    /// pairs are proven, not trusted. Empty for a pre-fork pruning point. Trailing, like every field
+    /// added before it (see [`Self::from_wire_bytes`]).
+    #[serde(default)]
+    pub window_entries: Vec<kaspa_shielded_core::anchor_window::WindowEntry>,
+    /// Security fork: the miner accrual slot carried by the pruning point, bound by
+    /// `zkas_state_root1`. Empty for a pre-fork pruning point. Same generation as
+    /// `window_entries` (both new with the fork), so the pre-window layout covers older peers.
+    #[serde(default)]
+    pub miner_accrual: kaspa_consensus_core::coinbase::MinerAccrual,
+    /// Security fork: the anchor log just below the first of `window_entries`. Replaying the entries
+    /// onto it must give the log `zkas_state_root1` commits at the pruning point. Empty when the log
+    /// starts inside the window (the transition after the fork).
+    #[serde(default)]
+    pub window_prefix: kaspa_shielded_core::anchor_window::AnchorLog,
+}
+
+/// The layout before `window_entries`: the current struct minus its trailing field.
+#[derive(serde::Deserialize)]
+struct PreWindowPruningPointShieldedMetadata {
+    frontier: FrontierState,
+    supply: SupplyTotals,
+    nullifier_muhash: MuHash,
+    #[serde(default)]
+    burns: BurnReceipts,
+    state_root: [u8; 32],
+    #[serde(default)]
+    in_window_anchors: Vec<([u8; 32], Hash)>,
+    #[serde(default)]
+    dev_accrued: u64,
+    #[serde(default)]
+    in_window_anchor_source_scores: Vec<(Hash, u64)>,
+}
+
+impl From<PreWindowPruningPointShieldedMetadata> for PruningPointShieldedMetadata {
+    fn from(v: PreWindowPruningPointShieldedMetadata) -> Self {
+        Self {
+            frontier: v.frontier,
+            supply: v.supply,
+            nullifier_muhash: v.nullifier_muhash,
+            burns: v.burns,
+            state_root: v.state_root,
+            in_window_anchors: v.in_window_anchors,
+            dev_accrued: v.dev_accrued,
+            in_window_anchor_source_scores: v.in_window_anchor_source_scores,
+            window_entries: Vec::new(),
+            miner_accrual: Default::default(),
+            window_prefix: Default::default(),
+        }
+    }
 }
 
 /// The pre-accrual wire layout, kept only so [`PruningPointShieldedMetadata::from_wire_bytes`]
@@ -184,7 +291,58 @@ impl From<LegacyPruningPointShieldedMetadata> for PruningPointShieldedMetadata {
             state_root: v.state_root,
             in_window_anchors: v.in_window_anchors,
             dev_accrued: 0,
+            in_window_anchor_source_scores: Vec::new(),
+            window_entries: Vec::new(),
+            miner_accrual: Default::default(),
+            window_prefix: Default::default(),
         }
+    }
+}
+
+/// The layout as of `dev_accrued` but before `in_window_anchor_source_scores`, so a peer that
+/// carries the accrual but not the scores still decodes. Must stay byte-identical to the current
+/// struct minus the trailing field — this is the third wire generation, and each one only works
+/// because the new field went on the END.
+#[derive(serde::Deserialize)]
+struct PreAnchorScoresPruningPointShieldedMetadata {
+    frontier: FrontierState,
+    supply: SupplyTotals,
+    nullifier_muhash: MuHash,
+    #[serde(default)]
+    burns: BurnReceipts,
+    state_root: [u8; 32],
+    #[serde(default)]
+    in_window_anchors: Vec<([u8; 32], Hash)>,
+    #[serde(default)]
+    dev_accrued: u64,
+}
+
+impl From<PreAnchorScoresPruningPointShieldedMetadata> for PruningPointShieldedMetadata {
+    fn from(v: PreAnchorScoresPruningPointShieldedMetadata) -> Self {
+        Self {
+            frontier: v.frontier,
+            supply: v.supply,
+            nullifier_muhash: v.nullifier_muhash,
+            burns: v.burns,
+            state_root: v.state_root,
+            in_window_anchors: v.in_window_anchors,
+            dev_accrued: v.dev_accrued,
+            // Empty, not a guess: the peer never claimed any blue scores, so nothing is
+            // attested and every in-window anchor keeps failing closed.
+            in_window_anchor_source_scores: Vec::new(),
+            window_entries: Vec::new(),
+            miner_accrual: Default::default(),
+            window_prefix: Default::default(),
+        }
+    }
+}
+
+/// The slot as the commitment function takes it.
+pub fn miner_accrual_ref(slot: &kaspa_consensus_core::coinbase::MinerAccrual) -> kaspa_shielded_core::commitment::MinerAccrualRef<'_> {
+    kaspa_shielded_core::commitment::MinerAccrualRef {
+        script_version: slot.script_public_key.version(),
+        script: slot.script_public_key.script(),
+        amount: slot.amount,
     }
 }
 
@@ -201,11 +359,17 @@ impl PruningPointShieldedMetadata {
     /// the accrual to zero — which is the correct value for any chain that has not yet
     /// activated accrual, i.e. exactly the chains an older peer can be serving.
     pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, String> {
+        // Newest layout first, then each older one in turn. Order matters and must stay
+        // newest-to-oldest: an older layout is a strict prefix of a newer one, and
+        // `bincode::deserialize` ignores trailing bytes — so trying an old layout first would
+        // succeed against a NEW blob and silently discard the fields it does not know.
         match bincode::deserialize::<Self>(bytes) {
             Ok(md) => Ok(md),
-            Err(primary) => bincode::deserialize::<LegacyPruningPointShieldedMetadata>(bytes)
+            Err(primary) => bincode::deserialize::<PreWindowPruningPointShieldedMetadata>(bytes)
                 .map(Into::into)
-                .map_err(|_| format!("malformed shielded pruning-point metadata: {primary}")),
+                .or_else(|_| bincode::deserialize::<PreAnchorScoresPruningPointShieldedMetadata>(bytes).map(Into::into))
+                .or_else(|_| bincode::deserialize::<LegacyPruningPointShieldedMetadata>(bytes).map(Into::into))
+                .map_err(|_: bincode::Error| format!("malformed shielded pruning-point metadata: {primary}")),
         }
     }
 
@@ -293,10 +457,30 @@ impl From<StoreError> for ShieldedManagerError {
 /// Mixing the block hash in makes the root unique per block. There is no circularity:
 /// a block's coinbase commits its parent's shielded state, never its own notes.
 pub fn build_coinbase_mint(coinbase_tx: &Transaction, block_hash: Option<Hash>) -> Result<CoinbaseMint, ShieldedManagerError> {
-    let txid = coinbase_tx.id();
-    let mut notes = Vec::with_capacity(coinbase_tx.outputs.len());
-    for (i, out) in coinbase_tx.outputs.iter().enumerate() {
-        let script = out.script_public_key.script();
+    let outputs: Vec<(&[u8], u64)> =
+        coinbase_tx.outputs.iter().map(|out| (out.script_public_key.script(), out.value)).collect();
+    Ok(CoinbaseMint::new(coinbase_notes_from_outputs(coinbase_tx.id(), &outputs, block_hash)?))
+}
+
+/// The coinbase notes a block mints, derived from the **public output descriptions**
+/// rather than from the coinbase transaction itself.
+///
+/// This is the same derivation [`build_coinbase_mint`] performs, factored out because the
+/// scan archive keeps `(script_public_key bytes, value)` pairs and not the transaction — so
+/// history replay would otherwise have to re-implement the seed rule in a second place. It
+/// must not: a replay that derived even one commitment differently would fail against
+/// honest data and reject a good peer. One function, both callers.
+///
+/// `block_hash` is the F-02 fork gate, decided by the caller against
+/// `shielded_coinbase_seed_activation` — see [`build_coinbase_mint`] for what each value
+/// means and why the choice cannot be defaulted.
+pub fn coinbase_notes_from_outputs(
+    coinbase_txid: Hash,
+    outputs: &[(&[u8], u64)],
+    block_hash: Option<Hash>,
+) -> Result<Vec<CoinbaseNote>, ShieldedManagerError> {
+    let mut notes = Vec::with_capacity(outputs.len());
+    for (i, (script, value)) in outputs.iter().enumerate() {
         if script.len() < 43 {
             return Err(ShieldedManagerError::MalformedCoinbaseNote("coinbase reward script too short for an Orchard address"));
         }
@@ -306,15 +490,29 @@ pub fn build_coinbase_mint(coinbase_tx: &Transaction, block_hash: Option<Hash>) 
         if let Some(h) = block_hash {
             seed.extend_from_slice(&h.as_bytes());
         }
-        seed.extend_from_slice(&txid.as_bytes());
+        seed.extend_from_slice(&coinbase_txid.as_bytes());
         seed.extend_from_slice(&(i as u32).to_le_bytes());
         let desc = derive_coinbase_note_desc(recipient, &seed);
-        let note = coinbase_note(&desc, out.value).map_err(|_| {
+        let note = coinbase_note(&desc, *value).map_err(|_| {
             ShieldedManagerError::MalformedCoinbaseNote("coinbase reward recipient is not a canonical Orchard address")
         })?;
         notes.push(note);
     }
-    Ok(CoinbaseMint::new(notes))
+    Ok(notes)
+}
+
+/// Why a history replay stopped — and the distinction the caller acts on.
+///
+/// [`ReplayError::Source`] means the replay could not read its own input; the range is
+/// **unverified**, which is not the same as failed, and discarding history on it would delete
+/// good data because a local disk read hiccuped. [`ReplayError::Data`] means the leaves
+/// themselves are wrong, which is a real rejection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayError {
+    /// The iterator could not supply a block (missing record, index gap, read error).
+    Source(String),
+    /// A leaf was non-canonical or the tree refused it.
+    Data(TreeStateError),
 }
 
 /// A finalized nullifier set layered over the persisted global set plus the
@@ -333,61 +531,10 @@ impl NullifierSet for LayeredNullifierSet<'_> {
     }
 }
 
-static ANCHOR_OVERRIDE_MAP: std::sync::OnceLock<std::collections::HashMap<[u8; 32], Hash>> = std::sync::OnceLock::new();
-
-/// Anchor→source-block mappings pinned from an external file, consulted BEFORE the local index.
-///
-/// # Why this is necessary
-///
-/// `anchor_block` maps a shielded tree root to a block, and `persist` writes it last-write-wins.
-/// Sibling blocks can carry a byte-identical root (measured on mainnet: canonical `da8dfb9d` and
-/// orphan `e6f50b47` share size, leaf and all 8 ommers), so the entry a node ends up with depends
-/// on the order it happened to validate them — orphans included. `is_shielded_anchor_final` then
-/// rejects a non-canonical source, so two nodes with identical canonical state legitimately
-/// disagree about whether a spend applied, and therefore about a block's coinbase.
-///
-/// That makes this index consensus-relevant state that is NOT derivable from the canonical chain.
-/// A node syncing from scratch rebuilds it from the blocks it happens to see and cannot reproduce
-/// the entry an orphan won on the live chain. Measured on mainnet: of 39,228 anchors known to both
-/// a live node and a fresh sync, 34 disagreed — every one of them chain=orphan / fresh=canonical,
-/// and one of those 34 wedges every fresh node at DAA 371,851 permanently.
-///
-/// Pinning the chain's own mappings is the repair. It changes no validation rule: the predicate is
-/// untouched, only the index it reads is corrected to what the chain actually used.
-///
-/// The overrides must live OUTSIDE `anchor_block` and take precedence over it. Seeding the store
-/// instead would not work — a syncing node validates the canonical producer of a contested root
-/// before it reaches the block that spends against it, and `persist` would overwrite the seeded
-/// entry with its own value long before it mattered.
-fn anchor_overrides() -> &'static std::collections::HashMap<[u8; 32], Hash> {
-    ANCHOR_OVERRIDE_MAP.get_or_init(Default::default)
-}
-
-/// Load pinned anchor mappings. Call once at startup, before consensus starts.
-///
-/// Accepts the `zkas-anchor-dump` format: `<anchor-hex>\t<block-hash>[\t<flag>]` per line, `#`
-/// comments and blank lines ignored. Returns how many mappings were pinned.
-pub fn load_anchor_overrides(path: &std::path::Path) -> Result<usize, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let mut map = std::collections::HashMap::new();
-    for (n, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut it = line.split('\t');
-        let (Some(a), Some(b)) = (it.next(), it.next()) else {
-            return Err(format!("{}:{}: expected <anchor>\\t<block>", path.display(), n + 1));
-        };
-        let mut anchor = [0u8; 32];
-        faster_hex::hex_decode(a.as_bytes(), &mut anchor).map_err(|e| format!("{}:{}: bad anchor: {e}", path.display(), n + 1))?;
-        let block: Hash = b.parse().map_err(|_| format!("{}:{}: bad block hash '{b}'", path.display(), n + 1))?;
-        map.insert(anchor, block);
-    }
-    let n = map.len();
-    ANCHOR_OVERRIDE_MAP.set(map).map_err(|_| "anchor overrides already loaded".to_string())?;
-    Ok(n)
-}
+// The external anchor-override mechanism was removed (2026-09): the multi-producer anchor
+// resolution (`anchor_producer_blocks`, active on mainnet) makes the last-write-wins index
+// order-independent, so no external pin is needed; and bulk-pinning a dump was measured to
+// corrupt shielded state (the index is time-dependent). See GitHub issue #11.
 
 /// Why one shielded transaction was kept or dropped.
 ///
@@ -425,12 +572,19 @@ pub struct ShieldedStateManager {
     tree_store: DbShieldedTreeStore,
     supply_store: DbShieldedSupplyStore,
     dev_accrued_store: DbShieldedDevAccruedStore,
+    miner_accrual_store: DbShieldedMinerAccrualStore,
     nullifier_muhash: DbShieldedNullifierMuHashStore,
     anchor_block: DbAnchorBlockStore,
+    /// Deferred age-based GC queue for the two anchor indexes; see [`Self::gc_aged_anchors`].
+    anchor_gc: DbAnchorGcQueueStore,
     /// Every producer of each root — the reorg-safe replacement for `anchor_block`.
     anchor_producers: DbAnchorProducersStore,
     scan_block: DbShieldedScanBlockStore,
     burn_store: DbShieldedBurnStore,
+    /// Peer-attested blue scores for in-window anchor sources below the pruning point.
+    anchor_source_scores: DbShieldedAnchorSourceScoreStore,
+    /// Security fork: per-block anchor window and window entries.
+    anchor_window: DbAnchorWindowStore,
 }
 
 impl ShieldedStateManager {
@@ -445,17 +599,275 @@ impl ShieldedStateManager {
             tree_store: DbShieldedTreeStore::new(Arc::clone(&db), cache_policy),
             supply_store: DbShieldedSupplyStore::new(Arc::clone(&db), cache_policy),
             dev_accrued_store: DbShieldedDevAccruedStore::new(Arc::clone(&db), cache_policy),
+            miner_accrual_store: DbShieldedMinerAccrualStore::new(Arc::clone(&db), cache_policy),
             nullifier_muhash: DbShieldedNullifierMuHashStore::new(Arc::clone(&db), cache_policy),
             anchor_block: DbAnchorBlockStore::new(Arc::clone(&db), cache_policy),
+            anchor_gc: DbAnchorGcQueueStore::new(Arc::clone(&db), cache_policy),
             anchor_producers: DbAnchorProducersStore::new(Arc::clone(&db), cache_policy),
             scan_block: DbShieldedScanBlockStore::new(Arc::clone(&db), cache_policy),
-            burn_store: DbShieldedBurnStore::new(db, cache_policy),
+            burn_store: DbShieldedBurnStore::new(Arc::clone(&db), cache_policy),
+            anchor_source_scores: DbShieldedAnchorSourceScoreStore::new(Arc::clone(&db), cache_policy),
+            anchor_window: DbAnchorWindowStore::new(db, cache_policy),
         }
+    }
+
+    /// The anchor window as of `block`, `None` if this node holds none (a pre-fork block, or a
+    /// post-fork block below the pruning point).
+    pub fn window_at(&self, block: Hash) -> StoreResult<Option<kaspa_shielded_core::anchor_window::AnchorLog>> {
+        self.anchor_window.window(block)
+    }
+
+    /// A post-fork chain block's own log entry, `None` if absent.
+    pub fn window_entry(&self, block: Hash) -> StoreResult<Option<kaspa_shielded_core::anchor_window::WindowEntry>> {
+        self.anchor_window.entry(block)
+    }
+
+    /// A post-fork chain block's own log entry with the log state right before it. Kept below the
+    /// pruning point (GC'd with the anchor indexes) so an export can attach the state below its window
+    /// from its lowest entry alone.
+    pub fn window_entry_with_log(
+        &self,
+        block: Hash,
+    ) -> StoreResult<Option<(kaspa_shielded_core::anchor_window::WindowEntry, kaspa_shielded_core::anchor_window::AnchorLog)>> {
+        self.anchor_window.entry_with_log(block)
+    }
+
+    /// Stage a post-fork block's window and entry in the block-commit batch.
+    pub fn persist_window(
+        &self,
+        batch: &mut WriteBatch,
+        block: Hash,
+        window: kaspa_shielded_core::anchor_window::AnchorLog,
+        entry: kaspa_shielded_core::anchor_window::WindowEntry,
+        log_before: kaspa_shielded_core::anchor_window::AnchorLog,
+    ) -> StoreResult<()> {
+        self.anchor_window.set_entry_batch(batch, block, entry, log_before)?;
+        self.anchor_window.set_window_batch(batch, block, window)
+    }
+
+    /// Stage only a log entry with the log state before it (used when seeding imported, PoW-verified
+    /// entries).
+    pub fn persist_window_entry(
+        &self,
+        batch: &mut WriteBatch,
+        block: Hash,
+        entry: kaspa_shielded_core::anchor_window::WindowEntry,
+        log_before: kaspa_shielded_core::anchor_window::AnchorLog,
+    ) -> StoreResult<()> {
+        self.anchor_window.set_entry_batch(batch, block, entry, log_before)
+    }
+
+    /// Stage only a window (used when seeding the pruning point's window on import).
+    pub fn persist_window_only(
+        &self,
+        batch: &mut WriteBatch,
+        block: Hash,
+        window: kaspa_shielded_core::anchor_window::AnchorLog,
+    ) -> StoreResult<()> {
+        self.anchor_window.set_window_batch(batch, block, window)
+    }
+
+    /// The post-fork state root (`zkas_state_root1`) as of `block`. The caller decides the version
+    /// from `block`'s own DAA score. A post-fork block without a window row is a store
+    /// inconsistency and is reported as one rather than read as an empty window.
+    pub fn state_root_v1_at(&self, block: Hash, is_genesis: bool) -> StoreResult<[u8; 32]> {
+        let root0 = self.state_root_at(block)?;
+        // Genesis never passes through block commit, so it has no window row; its window is the empty
+        // window, exactly as its frontier, supply and accumulator are the empty defaults. Any other
+        // post-fork block without a row is an inconsistency.
+        let window = match self.anchor_window.window(block)? {
+            Some(w) => w,
+            None if is_genesis => Default::default(),
+            None => {
+                return Err(kaspa_database::prelude::StoreError::DataInconsistency(format!(
+                    "post-fork block {block} has no anchor window"
+                )));
+            }
+        };
+        let slot = self.miner_accrual_store.get(block)?;
+        Ok(kaspa_shielded_core::commitment::shielded_state_root_v1(
+            &root0,
+            self.dev_accrued_store.get(block)?,
+            &window.commitment(),
+            miner_accrual_ref(&slot),
+        ))
+    }
+
+    /// Peer-attested blue score of an in-window anchor source, or `None` if nothing was
+    /// attested. See [`DbShieldedAnchorSourceScoreStore`]; `None` must fail closed.
+    pub fn attested_source_blue_score(&self, source: Hash) -> StoreResult<Option<u64>> {
+        self.anchor_source_scores.get(source)
     }
 
     /// Read-only access to the compact scan archive (for `GetShieldedBlocks`).
     pub fn scan_block(&self, block: Hash) -> StoreResult<Option<ShieldedScanBlockData>> {
         self.scan_block.get(block)
+    }
+
+    /// Persist a scan record obtained from a peer's history backfill.
+    ///
+    /// Distinct from [`Self::persist`], which writes the record a node produced itself while
+    /// validating. Backfilled records describe blocks BELOW this node's pruning point that it
+    /// will never validate, so there is no local computation to compare them against
+    /// block-by-block. Soundness comes from the caller's end-of-stream check: replaying every
+    /// backfilled `cmx` into an empty tree must reproduce the frontier already held at the
+    /// pruning point, which is PoW-anchored. Until that check passes the records are not
+    /// advertised as complete.
+    ///
+    /// Never read by consensus — the archive only ever serves `GetShieldedBlocks` — so even a
+    /// bogus record cannot influence validation.
+    pub fn persist_backfilled_scan(&self, batch: &mut WriteBatch, block: Hash, data: ShieldedScanBlockData) -> StoreResult<()> {
+        self.scan_block.set_batch(batch, block, data)
+    }
+
+    /// Drop a backfilled range after a failed verification.
+    pub fn delete_backfilled_scan(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
+        self.scan_block.delete_batch(batch, block)
+    }
+
+    /// Persist a note-commitment tree frontier at `block` as a fast-sync / verification anchor.
+    ///
+    /// Distinct from [`Self::persist`], which writes the frontier a node computed while
+    /// VALIDATING a block. This writes one reconstructed by replaying the compact scan archive,
+    /// for blocks below the pruning point that this node never validated.
+    ///
+    /// # SAFETY — ordering is the whole argument
+    ///
+    /// A replayed frontier is only as trustworthy as the archive it was replayed from, and that
+    /// archive arrived from a peer. Writing one before the replay has been checked end-to-end
+    /// against a PoW-anchored frontier would leave a poisoned anchor behind on exactly the path
+    /// that is supposed to reject bad history — and every later verification, local or served,
+    /// would be measured against it. Callers MUST buffer checkpoints and write them only after a
+    /// `Verified` verdict. `verify_shielded_history` is the only caller and does exactly that.
+    ///
+    /// Idempotent: re-verifying rewrites identical values, since the frontier is a pure function
+    /// of the leaf prefix.
+    ///
+    /// # Interaction with the pruner
+    ///
+    /// [`Self::prune_block_snapshots`] deletes a block's frontier unless the pruner marks it a
+    /// checkpoint, and it decides that from `daa_score % SHIELDED_FRONTIER_CHECKPOINT_INTERVAL`
+    /// — a rule these index-spaced checkpoints do not satisfy, and one that reads a header a
+    /// backfilled block does not have. That does not collide today: the pruner reaches blocks by
+    /// walking REACHABILITY up from `ORIGIN`, and backfill writes only the selected-chain index
+    /// and scan records, so a block whose history was backfilled is not in the reachability tree
+    /// and the traversal never visits it.
+    ///
+    /// If that ever changes, the failure is benign — losing these frontiers returns the node to
+    /// the old behaviour of being unable to anchor a peer's verification, and re-running
+    /// `--verify-shielded-history` restores them. It is not a correctness risk: nothing in
+    /// validation reads them.
+    pub fn persist_replayed_frontier(&self, batch: &mut WriteBatch, block: Hash, frontier: FrontierState) -> StoreResult<()> {
+        self.tree_store.set_batch(batch, block, frontier)
+    }
+
+    /// Replay a backfilled history range into an empty tree and return the resulting frontier.
+    ///
+    /// This is what makes history backfill trustless. `GlobalTree::append` is pure append-only,
+    /// so the frontier is a deterministic function of the leaf sequence: replaying every `cmx`
+    /// from genesis up to (and including) `blocks` must reproduce EXACTLY the frontier this node
+    /// already holds at its pruning point — a value it did not learn from the backfilling peer,
+    /// and which is PoW-anchored (the pruning point's selected child commits
+    /// `shielded_state_root(pruning_point)` in its coinbase, bound by `hash_merkle_root`).
+    ///
+    /// A peer that fabricates, omits, reorders or truncates records cannot produce a matching
+    /// frontier, so the check is cryptographic rather than reputational. `blocks` must be in
+    /// ascending chain order (oldest first) — the same order the tree was originally built in.
+    ///
+    /// Leaves come from the coinbase mint first, then the accepted actions in consensus applied
+    /// order, mirroring how `compute` built the tree at validation time.
+    ///
+    /// `coinbase_leaves` is supplied by the caller because the coinbase note seed is FORK
+    /// DEPENDENT (see [`build_coinbase_mint`]): pre-fork it is `txid || index`, post-fork
+    /// `block_hash || txid || index`. A replay that used the wrong rule for a block's height
+    /// would derive different commitments and fail against honest data, so the activation
+    /// decision stays with the caller that owns the params.
+    pub fn replay_history_frontier(
+        blocks: &[kaspa_consensus_core::api::ShieldedChainBlockData],
+        coinbase_leaves: impl Fn(&kaspa_consensus_core::api::ShieldedChainBlockData) -> Vec<[u8; 32]>,
+    ) -> Result<FrontierState, TreeStateError> {
+        match Self::replay_frontier_streaming(blocks.iter().map(|b| Ok((coinbase_leaves(b), b.accepted_actions.clone())))) {
+            Ok((frontier, _)) => Ok(frontier),
+            Err(ReplayError::Data(e)) => Err(e),
+            // Unreachable: an in-memory slice cannot fail to yield an item.
+            Err(ReplayError::Source(_)) => Err(TreeStateError::Inconsistent),
+        }
+    }
+
+    /// The replay itself, over a **stream** of `(coinbase leaves, accepted action blobs)` in
+    /// ascending chain order. Returns the resulting frontier and the number of leaves appended.
+    ///
+    /// Streaming rather than slice-based because verifying a real chain means replaying the whole
+    /// archive — ~1.98M actions and ~293 MB of records today — and materialising that to check it
+    /// would cost more memory than the node uses for everything else. The tree keeps only its
+    /// frontier, so this runs in constant space regardless of chain length.
+    ///
+    /// Each item is a `Result` so a caller reading from disk can abort on a missing or corrupt
+    /// record instead of silently replaying a short range and reporting a mismatch that is
+    /// really its own read error.
+    pub fn replay_frontier_streaming(
+        blocks: impl IntoIterator<Item = Result<(Vec<[u8; 32]>, Vec<Vec<u8>>), String>>,
+    ) -> Result<(FrontierState, u64), ReplayError> {
+        Self::replay_frontier_streaming_capturing::<()>(blocks.into_iter().map(|b| b.map(|(c, a)| (None, c, a))), |_, _| {})
+    }
+
+    /// [`Self::replay_frontier_streaming`] that also hands the caller the frontier as it stood
+    /// after each block it labels — the raw material for tree-frontier checkpoints below the
+    /// pruning point.
+    ///
+    /// # Why this exists
+    ///
+    /// Verifying backfilled history already computes every intermediate frontier and then throws
+    /// them away. That is why a backfilled node can never anchor anyone else's verification:
+    /// `verify_shielded_history` needs `frontier_at(base)`, and a node that learned its history
+    /// from a peer holds frontiers only at (and above) its own pruning point. So history could be
+    /// copied endlessly and still only ever be *checkable* against the handful of nodes that
+    /// validated it themselves. Capturing the frontiers this pass already produces is what makes
+    /// a backfilled node a first-class source.
+    ///
+    /// Each stream item may carry an opaque label; `on_checkpoint(label, frontier)` fires after
+    /// that block's leaves are appended, for items whose label is `Some`. The caller chooses the
+    /// spacing (by labelling only the blocks it wants) and — critically — chooses *when to
+    /// persist*: a checkpoint captured here is only as good as the replay that produced it, so
+    /// nothing may be written until the whole replay has been checked against a PoW-anchored
+    /// frontier. See `verify_shielded_history`.
+    pub fn replay_frontier_streaming_capturing<L>(
+        blocks: impl IntoIterator<Item = Result<(Option<L>, Vec<[u8; 32]>, Vec<Vec<u8>>), String>>,
+        mut on_checkpoint: impl FnMut(L, &FrontierState),
+    ) -> Result<(FrontierState, u64), ReplayError> {
+        let mut tree = GlobalTree::default();
+        let mut leaves = 0u64;
+        let append = |tree: &mut GlobalTree, cmx: &[u8; 32], leaves: &mut u64| -> Result<(), ReplayError> {
+            let c = ExtractedNoteCommitment::from_bytes(cmx);
+            if c.is_none().into() {
+                return Err(ReplayError::Data(TreeStateError::NonCanonicalNode));
+            }
+            tree.append(c.unwrap()).map_err(|_| ReplayError::Data(TreeStateError::Inconsistent))?;
+            *leaves += 1;
+            Ok(())
+        };
+        for block in blocks {
+            let (label, coinbase, accepted) = block.map_err(ReplayError::Source)?;
+            // Coinbase mint first, then accepted actions in consensus applied order — the
+            // order `compute` appended them in at validation time. Any other order yields a
+            // different frontier from identical data.
+            for cmx in &coinbase {
+                append(&mut tree, cmx, &mut leaves)?;
+            }
+            for actions in &accepted {
+                for rec in actions.chunks_exact(CompactActionRecord::SERIALIZED_LEN) {
+                    let mut cmx = [0u8; 32];
+                    cmx.copy_from_slice(&rec[32..64]);
+                    append(&mut tree, &cmx, &mut leaves)?;
+                }
+            }
+            // After this block's leaves, never between them: a frontier is only meaningful at a
+            // block boundary, which is the only place `frontier_at` can ever be asked about.
+            if let Some(label) = label {
+                on_checkpoint(label, &tree.to_state());
+            }
+        }
+        Ok((tree.to_state(), leaves))
     }
 
     /// Read-only access to the nullifier store (for validation / queries).
@@ -474,6 +886,15 @@ impl ShieldedStateManager {
     /// the shielded state root still matches the chain (it reads the snapshot), while
     /// `partition_applied` — which consults the GLOBAL store — starts accepting spends whose
     /// nullifiers are already spent. That is exactly the observed failure, so measure it.
+    /// Whether `set` hashes to the nullifier accumulator snapshot committed at `block`.
+    pub fn set_matches_snapshot(&self, set: &[[u8; 32]], block: Hash) -> StoreResult<bool> {
+        let mut acc = MuHash::new();
+        for nf in set {
+            acc.add_element(nf);
+        }
+        Ok(acc.finalize() == self.load_nullifier_muhash(block)?.finalize())
+    }
+
     pub fn global_set_matches_snapshot(&self, block: Hash) -> StoreResult<(bool, usize)> {
         let mut acc = MuHash::new();
         let mut count = 0usize;
@@ -490,12 +911,35 @@ impl ShieldedStateManager {
         Ok(self.load_tree(block)?.anchor().to_bytes())
     }
 
+    /// The tree root `block` itself produced, or `None` if this node holds no frontier for it
+    /// (below its pruning point on a fast-synced node, or never validated).
+    pub fn own_anchor_of(&self, block: Hash) -> StoreResult<Option<[u8; 32]>> {
+        Ok(self
+            .tree_store
+            .get_present(block)?
+            .map(|state| GlobalTree::from_state(&state).expect("persisted shielded frontier is corrupt").anchor().to_bytes()))
+    }
+
     /// The global note-commitment tree **frontier** as of a given chain block — the
     /// checkpoint a light wallet fast-syncs from (`WalletDb::from_frontier`): it scans
     /// only blocks after this block, yet still witnesses its notes against the live
     /// tip. Returns the empty-tree frontier for blocks with no shielded state.
     pub fn frontier_at(&self, block: Hash) -> StoreResult<FrontierState> {
         self.tree_store.get(block)
+    }
+
+    /// Test helper: drop a block's window entry, as age-based GC does.
+    #[cfg(test)]
+    pub fn delete_window_entry_for_test(&self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()> {
+        self.anchor_window.delete_entry_batch(batch, block)
+    }
+
+    /// The frontier this node actually holds for `block`, `None` when it holds none. Unlike
+    /// [`Self::frontier_at`] a missing row is not read as the empty tree: below the pruning point only
+    /// sparse checkpoints keep a row, and serving the empty frontier there starts a wallet's tree at
+    /// size 0 in the middle of the chain.
+    pub fn frontier_present(&self, block: Hash) -> StoreResult<Option<FrontierState>> {
+        self.tree_store.get_present(block)
     }
 
     /// The chain block whose shielded tree root equals `anchor`, if any block ever
@@ -505,11 +949,6 @@ impl ShieldedStateManager {
     /// max_shielded_anchor_age]` (maturity + fail-closed upper bound, audit
     /// F-04/F-05). `None` means the anchor is not a real tree root of any block.
     pub fn anchor_source_block(&self, anchor: &[u8; 32]) -> StoreResult<Option<Hash>> {
-        // A pinned mapping wins over the locally built index. See [`anchor_overrides`] for why
-        // the local index cannot be trusted to agree with the chain.
-        if let Some(pinned) = anchor_overrides().get(anchor) {
-            return Ok(Some(*pinned));
-        }
         self.anchor_block.get(anchor)
     }
 
@@ -527,10 +966,20 @@ impl ShieldedStateManager {
     /// over the stored index; see [`DbAnchorBlockStore::iter_all`] for why this is not derived
     /// per block.
     pub fn anchors_for_blocks(&self, blocks: &BlockHashSet) -> StoreResult<Vec<([u8; 32], Hash)>> {
+        // BOTH indexes, unioned. `anchor_block` is single-valued and last-write-wins, so a root
+        // whose most recent writer is an orphan — or any block outside `blocks` — does not appear
+        // there at all, and the syncee is left with NO mapping for it: `anchor is not a known tree
+        // root`, spend dropped, coinbase short by that fee, block disqualified. Measured
+        // 2026-08-08 on a fresh sync: anchor 9224320b resolved to nothing while the chain
+        // accepted the spend. `anchor_producers` records every producer of every root, which is
+        // precisely what the multi-producer upgrade added and what this export never read.
+        //
+        // Deduplicated because the same pair is normally in both.
+        let mut seen: std::collections::HashSet<([u8; 32], Hash)> = std::collections::HashSet::new();
         let mut out = Vec::with_capacity(blocks.len());
-        for entry in self.anchor_block.iter_all() {
+        for entry in self.anchor_producers.iter_all().chain(self.anchor_block.iter_all()) {
             let (anchor, source) = entry?;
-            if blocks.contains(&source) {
+            if blocks.contains(&source) && seen.insert((anchor, source)) {
                 out.push((anchor, source));
             }
         }
@@ -578,11 +1027,40 @@ impl ShieldedStateManager {
     /// `keep_checkpoint` marks blocks whose frontier survives as a fast-sync anchor for
     /// `GetShieldedTreeState`; pass `true` for pruning points and for the sparse
     /// checkpoints, `false` otherwise.
-    pub fn prune_block_snapshots(&self, batch: &mut WriteBatch, block: Hash, keep_checkpoint: bool) -> StoreResult<()> {
+    pub fn prune_block_snapshots(
+        &self,
+        batch: &mut WriteBatch,
+        block: Hash,
+        keep_checkpoint: bool,
+        blue_score: Option<u64>,
+    ) -> StoreResult<()> {
+        // Queue this block's anchor-index rows for age-based GC. The rows themselves must
+        // NOT be deleted here: a block being pruned sits just below the pruning point,
+        // which is still inside the window the shielded IBD export serves
+        // (`anchors_for_blocks`) and inside `max_shielded_anchor_age` of blocks near the
+        // pruning point — deleting now would break both. The root is read from the
+        // frontier before it is (possibly) dropped below; once the block's header is
+        // pruned its blue score is unrecoverable, which is exactly why it is snapshotted
+        // into the queue key now.
+        if let Some(blue) = blue_score {
+            match self.tree_store.get(block) {
+                Ok(state) => {
+                    if let Ok(tree) = GlobalTree::from_state(&state) {
+                        self.anchor_gc.enqueue_batch(batch, blue, tree.anchor().to_bytes(), block)?;
+                    }
+                }
+                Err(kaspa_database::prelude::StoreError::KeyNotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
         self.supply_store.delete_batch(batch, block)?;
         self.nullifier_muhash.delete_batch(batch, block)?;
         self.burn_store.delete_batch(batch, block)?;
         self.dev_accrued_store.delete_batch(batch, block)?;
+        self.miner_accrual_store.delete_batch(batch, block)?;
+        // The per-block window is a snapshot like the others; the ENTRY is kept (GC'd with the
+        // anchor indexes) because the export for a later pruning point still needs it.
+        self.anchor_window.delete_window_batch(batch, block)?;
         // Per-block nullifier diffs only exist to revert a reorg; below the pruning
         // point no reorg can reach them.
         self.nullifier_diffs.delete_batch(batch, block)?;
@@ -590,6 +1068,44 @@ impl ShieldedStateManager {
             self.tree_store.delete_batch(batch, block)?;
         }
         Ok(())
+    }
+
+    /// Drain the anchor GC queue: delete anchor-index rows whose source block's blue
+    /// score is more than `2 * max_age` below the pruning point's — provably outside
+    /// the spend window (`max_shielded_anchor_age`, fail-closed on a missing entry
+    /// anyway) and outside anything `anchors_for_blocks` can export. The 2x margin is
+    /// deliberate slack over both. `anchor_block` is last-write-wins, so its row is
+    /// only removed when it still points at the aged block — a younger producer of the
+    /// same root keeps the mapping. Returns how many queue entries were processed.
+    ///
+    /// Without this the two anchor indexes grow one row per chain block for the life
+    /// of the chain (~3.1M rows at 36 days old), and the IBD export pays a full-index
+    /// scan per syncing peer. With it they stay bounded by the pruning window.
+    pub fn gc_aged_anchors(&self, batch: &mut WriteBatch, pp_blue_score: u64, max_age: u64, cap: usize) -> StoreResult<usize> {
+        // The log entries share this queue. An export needs the entries from the pruning point down
+        // to the first one at or below `pp - max_age`, plus the log state of the entry under that, so
+        // `2 * max_age` keeps every entry an export (for this or a later pruning point) can need.
+        let margin = max_age.saturating_mul(2);
+        let limit = pp_blue_score.saturating_sub(margin);
+        if limit == 0 {
+            return Ok(0);
+        }
+        let aged = self.anchor_gc.peek_upto(limit, cap);
+        // Producer removals are grouped per root and written once each (see `remove_producers_batch`).
+        let mut removals: std::collections::BTreeMap<[u8; 32], Vec<Hash>> = Default::default();
+        for &(blue, anchor, block) in &aged {
+            if self.anchor_block.get(&anchor)? == Some(block) {
+                self.anchor_block.delete_batch(batch, anchor)?;
+            }
+            removals.entry(anchor).or_default().push(block);
+            self.anchor_window.delete_entry_batch(batch, block)?;
+            self.anchor_source_scores.delete_batch(batch, block)?;
+            self.anchor_gc.delete_batch(batch, blue, anchor, block)?;
+        }
+        for (anchor, blocks) in removals {
+            self.anchor_producers.remove_producers_batch(batch, anchor, &blocks)?;
+        }
+        Ok(aged.len())
     }
 
     /// Dev fee accrued but unpaid as of a chain block. `0` for every block mined
@@ -603,6 +1119,26 @@ impl ShieldedStateManager {
     /// so accrual and the coinbase that consumed it commit together.
     pub fn set_dev_accrued(&self, batch: &mut WriteBatch, block: Hash, accrued: u64) -> StoreResult<()> {
         self.dev_accrued_store.set_batch(batch, block, accrued)
+    }
+
+    /// Miner reward carried by a chain block (security fork). Empty for every pre-fork block and
+    /// for every block that paid its slot out.
+    pub fn miner_accrual_at(&self, block: Hash) -> StoreResult<kaspa_consensus_core::coinbase::MinerAccrual> {
+        self.miner_accrual_store.get(block)
+    }
+
+    /// Record the miner reward a block carries forward, in the block-commit batch. An empty slot
+    /// is the store default and is not written.
+    pub fn set_miner_accrual(
+        &self,
+        batch: &mut WriteBatch,
+        block: Hash,
+        slot: kaspa_consensus_core::coinbase::MinerAccrual,
+    ) -> StoreResult<()> {
+        if slot.is_empty() {
+            return Ok(());
+        }
+        self.miner_accrual_store.set_batch(batch, block, slot)
     }
 
     /// Total value burned out of the pool (bridge peg-out) as of a chain block.
@@ -648,6 +1184,11 @@ impl ShieldedStateManager {
 
     fn load_nullifier_muhash(&self, block: Hash) -> StoreResult<MuHash> {
         self.nullifier_muhash.get(block)
+    }
+
+    /// The nullifier-set accumulator committed (through the state root) as of `block`.
+    pub fn nullifier_muhash_at(&self, block: Hash) -> StoreResult<MuHash> {
+        self.load_nullifier_muhash(block)
     }
 
     /// The canonical shielded state root (PLAN §2.10) as of a given chain block:
@@ -813,14 +1354,22 @@ impl ShieldedStateManager {
         let state_root = PruningPointShieldedMetadata::recompute_state_root(&frontier, &supply, &nullifier_muhash, &burns)
             .map_err(|e| StoreError::DataInconsistency(format!("stored shielded frontier at {block} is corrupt: {e:?}")))?;
         let dev_accrued = self.dev_accrued_store.get(block)?;
+        let miner_accrual = self.miner_accrual_store.get(block)?;
         Ok(Some(PruningPointShieldedMetadata {
             frontier,
             supply,
             nullifier_muhash,
             burns,
             state_root,
+            // Both filled by the caller (`pruning_point_shielded_metadata`), which owns the
+            // selected-chain walk and the ghostdag reads this layer has no business doing.
             in_window_anchors: Vec::new(),
             dev_accrued,
+            in_window_anchor_source_scores: Vec::new(),
+            // Filled by the caller for a post-fork pruning point (selected-chain walk).
+            window_entries: Vec::new(),
+            miner_accrual,
+            window_prefix: Default::default(),
         }))
     }
 
@@ -864,6 +1413,55 @@ impl ShieldedStateManager {
     where
         I: IntoIterator<Item = &'a [u8; 32]>,
     {
+        // 0. The accumulator must arrive in NORMALIZED form (denominator == 1).
+        //
+        //    `MuHash` derives `Deserialize` straight over its (numerator, denominator) pair with no
+        //    validation, and `from_wire_bytes` is a plain bincode decode of the whole struct, so the
+        //    validating `MuHash::deserialize` never runs on peer data. A peer could therefore send
+        //    `{numerator: V*d, denominator: d}` for the honest accumulator V and any d != 1: every
+        //    check below operates on `.clone().finalize()`, which NORMALIZES a copy, so all of them
+        //    pass — and the un-normalized value then hit `try_into` inside the store writer, which
+        //    used to panic. By then `clear_pruning_shielded_stores` had already run, so the node was
+        //    left with no global nullifier set and retried against the same peer forever.
+        if Uint3072::try_from(md.nullifier_muhash.clone()).is_err() {
+            return Err("pruning-point nullifier accumulator is not in normalized form".to_owned());
+        }
+        // 0b. Structural ceilings, applied BEFORE any work proportional to these lengths.
+        //
+        //     None of these vectors had a receiver-side bound; the only limit was the 1 GiB p2p
+        //     message ceiling, on a gzip-capable channel. The two anchor vectors are staged into a
+        //     single in-memory `WriteBatch` (two rows each), and `md.burns` is turned into a Merkle
+        //     accumulator by `recompute_state_root` below — i.e. the work happens before the root
+        //     comparison can reject it. These are denial-of-service ceilings, not consensus rules:
+        //     they sit far above any honest value (the in-window anchor set is bounded by
+        //     `max_shielded_anchor_age`, 27,000 blocks at 1 BPS) and a network at a much higher
+        //     block rate would need them raised.
+        if md.in_window_anchors.len() > MAX_IMPORTED_IN_WINDOW_ANCHORS {
+            return Err(format!(
+                "pruning-point metadata carries {} in-window anchors, above the {MAX_IMPORTED_IN_WINDOW_ANCHORS} ceiling",
+                md.in_window_anchors.len()
+            ));
+        }
+        if md.in_window_anchor_source_scores.len() > MAX_IMPORTED_IN_WINDOW_ANCHORS {
+            return Err(format!(
+                "pruning-point metadata carries {} attested source scores, above the {MAX_IMPORTED_IN_WINDOW_ANCHORS} ceiling",
+                md.in_window_anchor_source_scores.len()
+            ));
+        }
+        //     Burns are additionally provable nonsense while the bridge is off: no burn can be
+        //     mined, so the honest value is empty and anything else is rejected on sight.
+        if !md.burns.receipts.is_empty() && !kaspa_shielded_core::burn::BRIDGE_ENABLED {
+            return Err(format!(
+                "pruning-point metadata carries {} burn receipts while the bridge is disabled; no burn can exist on this chain",
+                md.burns.receipts.len()
+            ));
+        }
+        if md.burns.receipts.len() > MAX_IMPORTED_BURN_RECEIPTS {
+            return Err(format!(
+                "pruning-point metadata carries {} burn receipts, above the {MAX_IMPORTED_BURN_RECEIPTS} ceiling",
+                md.burns.receipts.len()
+            ));
+        }
         // 1. The streamed set must reproduce the committed accumulator (MuHash is a
         //    multiset hash, so transfer order does not matter).
         let mut acc = MuHash::new();
@@ -875,16 +1473,24 @@ impl ShieldedStateManager {
         if acc.finalize() != md.nullifier_muhash.clone().finalize() {
             return Err(format!("streamed nullifier set ({count}) does not reproduce the committed accumulator"));
         }
+        // A spent nullifier always corresponds to a note that was created, so the set can never be
+        // larger than the number of leaves in the note-commitment tree. The transfer-side cap
+        // (`MAX_SHIELDED_NULLIFIER_IMPORT_COUNT`, 2^26 ≈ 2 GiB of raw nullifiers) is far above the
+        // memory of the machines this runs on, while this bound is free and comes from the metadata
+        // the peer already committed to.
+        if count as u64 > md.frontier.size {
+            return Err(format!(
+                "streamed nullifier set ({count}) exceeds the committed note count ({}); a spend implies a note",
+                md.frontier.size
+            ));
+        }
         // 2. The declared state root must be consistent with the transferred parts.
         //    The frontier is peer-controlled: propagate a rebuild failure as an Err
         //    rather than panicking (audit finding F-17).
-        let recomputed =
-            PruningPointShieldedMetadata::recompute_state_root(&md.frontier, &md.supply, &md.nullifier_muhash, &md.burns)
-                .map_err(|e| format!("malformed shielded frontier in pruning-point metadata: {e:?}"))?;
+        let recomputed = PruningPointShieldedMetadata::recompute_state_root(&md.frontier, &md.supply, &md.nullifier_muhash, &md.burns)
+            .map_err(|e| format!("malformed shielded frontier in pruning-point metadata: {e:?}"))?;
         if recomputed != md.state_root {
-            return Err(
-                "declared shielded state root is inconsistent with (frontier, supply, nullifier_muhash, burns)".to_string()
-            );
+            return Err("declared shielded state root is inconsistent with (frontier, supply, nullifier_muhash, burns)".to_string());
         }
         Ok(count)
     }
@@ -927,13 +1533,43 @@ impl ShieldedStateManager {
         // the old rule to the new one. `persist` writes both for self-validated blocks;
         // the import path must match it or the two disagree exactly across the window a
         // syncee cannot self-populate.
-        self.anchor_producers.add_producer_batch(batch, anchor, block)?;
+        //
         // Seed the in-window historical anchors too. Without these the node drops every spend
         // anchored below the pruning point and disqualifies the block that merged it; see
         // [`PruningPointShieldedMetadata::in_window_anchors`].
+        //
+        // The producer lists are assembled here and written whole. A per-pair read-modify-write
+        // reads the DATABASE, not this batch: two pairs sharing a root (sibling producers, the case
+        // the producer index exists for) each read the old row and the second write dropped the
+        // first producer, and after the re-import clear staged in this same batch it read the
+        // not-yet-deleted row and wrote the previous import's producers back.
+        let mut producers: std::collections::BTreeMap<[u8; 32], Vec<Hash>> = std::collections::BTreeMap::new();
+        producers.entry(anchor).or_default().push(block);
         for (hist_anchor, source) in md.in_window_anchors.iter() {
             self.anchor_block.set_batch(batch, *hist_anchor, *source)?;
-            self.anchor_producers.add_producer_batch(batch, *hist_anchor, *source)?;
+            let list = producers.entry(*hist_anchor).or_default();
+            if !list.contains(source) {
+                list.push(*source);
+            }
+        }
+        for (root, list) in producers {
+            self.anchor_producers.set_producers_batch(batch, root, list)?;
+        }
+        // And the blue score of each of those sources. Without this the mappings above resolve
+        // and then fail the maturity check, because a fast-synced node has no ghostdag data
+        // below its pruning point — the mapping alone was never enough.
+        for (source, blue_score) in md.in_window_anchor_source_scores.iter() {
+            self.anchor_source_scores.set_batch(batch, *source, *blue_score)?;
+        }
+        // Queue every seeded pair for age-based GC under its source's blue score, exactly as pruning
+        // queues self-validated blocks. These sources lie below the pruning point, so pruning never
+        // visits them: without this every fast sync would leave its whole window of anchor rows, log
+        // entries and scores behind for good.
+        let scores: std::collections::HashMap<Hash, u64> = md.in_window_anchor_source_scores.iter().copied().collect();
+        for (hist_anchor, source) in md.in_window_anchors.iter() {
+            if let Some(&blue_score) = scores.get(source) {
+                self.anchor_gc.enqueue_batch(batch, blue_score, *hist_anchor, *source)?;
+            }
         }
         if md.supply.cumulative_coinbase > 0 || md.supply.cumulative_fees > 0 {
             self.supply_store.set_batch(batch, block, md.supply)?;
@@ -944,11 +1580,23 @@ impl ShieldedStateManager {
         if md.nullifier_muhash.clone().finalize() != kaspa_muhash::EMPTY_MUHASH {
             self.nullifier_muhash.set_batch(batch, block, md.nullifier_muhash.clone())?;
         }
-        // Dev-fee accrual carried at the pruning point. Zero is the store's default for a
-        // missing key, so a pre-accrual chain (or a peer that predates the field) writes
-        // nothing and behaves exactly as before.
-        if md.dev_accrued > 0 {
-            self.dev_accrued_store.set_batch(batch, block, md.dev_accrued)?;
+        // Dev-fee accrual carried at the pruning point.
+        //
+        // Written UNCONDITIONALLY. Skipping the write when the value is zero relied on zero being
+        // the store's default for a missing key — true for a fresh import, but `clear_for_pruning_
+        // reimport` did not delete this row, so re-seeding the same pruning point with
+        // `dev_accrued == 0` (legitimately, or via the legacy wire layout, which hard-codes 0) left
+        // the PREVIOUS import's non-zero accrual in place. `dev_accrued_at` feeds
+        // `expected_coinbase_transaction`, so every child of the pruning point then computed a
+        // different coinbase and failed `BadCoinbaseTransaction` — the exact wedge the clear exists
+        // to escape, surviving the clear. The row is also deleted there now; this makes the write
+        // total so the two cannot drift apart again.
+        self.dev_accrued_store.set_batch(batch, block, md.dev_accrued)?;
+        // The miner accrual slot, by the same rule: delete-then-write so a re-import cannot inherit a
+        // previous import's slot. Bound to `zkas_state_root1` by the caller before this runs.
+        self.miner_accrual_store.delete_batch(batch, block)?;
+        if !md.miner_accrual.is_empty() {
+            self.miner_accrual_store.set_batch(batch, block, md.miner_accrual.clone())?;
         }
         // The whole append-only global membership set (unbounded, PLAN §2.9).
         for nf in nullifiers {
@@ -991,10 +1639,17 @@ impl ShieldedStateManager {
     /// with the batch — the same semantics behind the F-01 two-batch reorg fix),
     /// so the caller MUST write the batch before any subsequent seed/validation.
     ///
-    /// The per-block nullifier diffs and the anchor→block index are deliberately
-    /// retained: diffs of chain blocks above the pruning point stay valid (the
-    /// re-seeded set is their base state), and the anchor index is append-only by
-    /// design with canonicality re-checked via reachability on every query.
+    /// The per-block nullifier diffs are deliberately retained: diffs of chain blocks above the
+    /// pruning point stay valid (the re-seeded set is their base state).
+    ///
+    /// The anchor indexes and the attested source scores are cleared whole. A
+    /// re-import happens only with no locally validated chain block above the pruning point, so
+    /// every row they hold came from an import, and the seed staged after this rewrites the ones the
+    /// new pruning point needs. Kept, a previous import's unproven pairs (a fake root beside a real
+    /// window block, ZK-01) outlived the very re-import meant to replace them. The anchor-log
+    /// entries stay: each was replayed against a committed log, so none is unproven. The GC queue
+    /// stays too, since its rows are what removes those entries with their age (draining a row whose
+    /// anchor rows are already gone is a no-op).
     pub fn clear_for_pruning_reimport(&self, batch: &mut WriteBatch, pruning_point: Hash) -> StoreResult<()> {
         // The whole global membership set. `iter_all` is a pure RocksDB iterator
         // (no cache), and the deletions are only staged in `batch`, so iterating
@@ -1007,6 +1662,17 @@ impl ShieldedStateManager {
         self.supply_store.delete_batch(batch, pruning_point)?;
         self.nullifier_muhash.delete_batch(batch, pruning_point)?;
         self.burn_store.delete_batch(batch, pruning_point)?;
+        // The dev-fee accrual too. Leaving it behind meant a stale non-zero accrual survived the very
+        // path built to clear state, and since the accrual is outside the PoW-committed state root
+        // neither `verify_pruning_point_shielded` nor `verify_import_binding` could notice. The
+        // pruner already deletes this row (`prune_block_snapshots`); the re-import clear was the
+        // inconsistency.
+        self.dev_accrued_store.delete_batch(batch, pruning_point)?;
+        self.miner_accrual_store.delete_batch(batch, pruning_point)?;
+        self.anchor_window.delete_window_batch(batch, pruning_point)?;
+        self.anchor_block.delete_all_batch(batch)?;
+        self.anchor_producers.delete_all_batch(batch)?;
+        self.anchor_source_scores.delete_all_batch(batch)?;
         Ok(())
     }
 }
@@ -1018,12 +1684,108 @@ mod tests {
     use kaspa_database::prelude::ConnBuilder;
     use kaspa_shielded_core::ExtractedNoteCommitment;
 
+    /// History replay derives coinbase leaves from the archive's `(script, value)` pairs, while
+    /// validation derives them from the coinbase transaction. If those two ever disagree by a
+    /// single byte, replay reproduces a different frontier from identical data — and the verifier
+    /// would reject HONEST peers while a dishonest one is no easier to catch. So they are the same
+    /// function, and this pins that they stay so, on both sides of the F-02 fork boundary.
+    #[test]
+    fn replay_and_validation_derive_identical_coinbase_leaves() {
+        use kaspa_consensus_core::subnets::SUBNETWORK_ID_COINBASE;
+        use kaspa_consensus_core::tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionOutput};
+        use kaspa_shielded_core::wallet::scan::address_bytes_from_seed;
+
+        let recipients = [address_bytes_from_seed([21u8; 32]).unwrap(), address_bytes_from_seed([22u8; 32]).unwrap()];
+        let values = [5_000_000_000u64, 1_234_567u64];
+        let outputs: Vec<TransactionOutput> = recipients
+            .iter()
+            .zip(values.iter())
+            .map(|(r, v)| TransactionOutput::new(*v, ScriptPublicKey::new(0, ScriptVec::from_slice(&r[..]))))
+            .collect();
+        let tx = Transaction::new(0, vec![], outputs, 0, SUBNETWORK_ID_COINBASE, 0, vec![]);
+
+        // The archive keeps only what the scan record keeps: the script bytes and the value.
+        let record_outputs: Vec<(&[u8], u64)> =
+            tx.outputs.iter().map(|o| (o.script_public_key.script(), o.value)).collect();
+
+        for seed_block in [None, Some(Hash::from_bytes([0xab; 32]))] {
+            let from_tx = build_coinbase_mint(&tx, seed_block).expect("validation builds the mint");
+            let from_record = coinbase_notes_from_outputs(tx.id(), &record_outputs, seed_block).expect("replay derives leaves");
+            assert_eq!(from_record.len(), from_tx.notes.len(), "same note count ({seed_block:?})");
+            for (r, v) in from_record.iter().zip(from_tx.notes.iter()) {
+                assert_eq!(r.value, v.value, "same public value ({seed_block:?})");
+                assert_eq!(
+                    r.commitment.to_bytes(),
+                    v.commitment.to_bytes(),
+                    "replay-derived coinbase commitment matches validation byte-for-byte ({seed_block:?})"
+                );
+            }
+        }
+    }
+
     /// The IBD metadata gained `dev_accrued` after the field order was already on the
     /// wire, so both directions of a mixed-version network are pinned here rather than
     /// argued from bincode's documentation: an upgraded node must read a legacy peer's
     /// shorter blob (falling back, accrual 0), and a legacy node must survive an upgraded
     /// peer's longer one (bincode allows trailing bytes). Get either wrong and IBD breaks
     /// during the upgrade window, which is exactly when nobody is watching for it.
+    /// The pruning-point metadata decoder takes peer bytes: it must never panic on any truncation,
+    /// extension or corruption of a real blob, and whatever it accepts must re-encode
+    /// deterministically (decode(encode(x)) == x for the decoded value).
+    #[test]
+    fn fuzz_pruning_point_metadata_decoder_never_panics() {
+        let md = PruningPointShieldedMetadata {
+            frontier: FrontierState::default(),
+            supply: SupplyTotals { cumulative_coinbase: 700, cumulative_fees: 25 },
+            nullifier_muhash: MuHash::new(),
+            burns: BurnReceipts::default(),
+            state_root: [7u8; 32],
+            in_window_anchors: vec![([3u8; 32], Hash::from_bytes([4u8; 32])); 3],
+            dev_accrued: 123_456,
+            in_window_anchor_source_scores: vec![(Hash::from_bytes([4u8; 32]), 990_606); 2],
+            window_entries: (0..5u8)
+                .map(|i| kaspa_shielded_core::anchor_window::WindowEntry { block: [i; 32], parent: [i; 32], root: [i; 32], blue_score: i as u64 })
+                .collect(),
+            miner_accrual: kaspa_consensus_core::coinbase::MinerAccrual {
+                script_public_key: kaspa_consensus_core::tx::ScriptPublicKey::from_vec(0, vec![9u8; 43]),
+                amount: 5,
+            },
+            window_prefix: Default::default(),
+        };
+        let base = md.to_wire_bytes();
+        let mut x: u64 = 0xfeed_face_0bad_f00d;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n.max(1)
+        };
+        for _ in 0..20_000 {
+            let mut b = base.clone();
+            match rnd(4) {
+                0 => b.truncate(rnd(b.len() as u64) as usize),
+                1 => b.extend((0..1 + rnd(64)).map(|_| rnd(256) as u8)),
+                2 => {
+                    for _ in 0..1 + rnd(4) {
+                        let at = rnd(b.len() as u64) as usize;
+                        b[at] = rnd(256) as u8;
+                    }
+                }
+                _ => {
+                    // Corrupt a length prefix region near a vec boundary.
+                    let at = rnd(b.len() as u64) as usize;
+                    for k in at..(at + 8).min(b.len()) {
+                        b[k] = 0xff;
+                    }
+                }
+            }
+            if let Ok(d) = std::panic::catch_unwind(|| PruningPointShieldedMetadata::from_wire_bytes(&b)).expect("decoder must not panic") {
+                let again = PruningPointShieldedMetadata::from_wire_bytes(&d.to_wire_bytes()).expect("re-encoded value decodes");
+                assert_eq!(again.to_wire_bytes(), d.to_wire_bytes());
+            }
+        }
+    }
+
     #[test]
     fn pruning_point_metadata_wire_is_compatible_across_the_accrual_field() {
         let md = PruningPointShieldedMetadata {
@@ -1034,7 +1796,18 @@ mod tests {
             state_root: [7u8; 32],
             in_window_anchors: vec![([3u8; 32], Hash::from_bytes([4u8; 32]))],
             dev_accrued: 123_456,
+            in_window_anchor_source_scores: vec![(Hash::from_bytes([4u8; 32]), 990_606)],
+            window_entries: Vec::new(),
+            miner_accrual: kaspa_consensus_core::coinbase::MinerAccrual {
+                script_public_key: kaspa_consensus_core::tx::ScriptPublicKey::from_vec(0, vec![9u8; 43]),
+                amount: 999,
+            },
+            window_prefix: Default::default(),
         };
+        // What an empty trailing slot costs on the wire, so each older layout can be cut exactly.
+        let slot_len = bincode::serialized_size(&kaspa_consensus_core::coinbase::MinerAccrual::default()).unwrap() as usize;
+        let prefix_len = bincode::serialized_size(&kaspa_shielded_core::anchor_window::AnchorLog::default()).unwrap() as usize;
+        let slot_len = slot_len + prefix_len; // the trailing anchor-log prefix rides after the slot
 
         // Round-trip through the current layout.
         let bytes = md.to_wire_bytes();
@@ -1042,19 +1815,110 @@ mod tests {
         assert_eq!(back.dev_accrued, 123_456);
         assert_eq!(back.supply, md.supply);
         assert_eq!(back.in_window_anchors, md.in_window_anchors);
+        assert_eq!(back.in_window_anchor_source_scores, md.in_window_anchor_source_scores);
+        assert_eq!(back.miner_accrual, md.miner_accrual, "the carried miner slot survives the wire");
 
-        // A legacy peer's blob is the same bytes minus the trailing u64. It must decode,
-        // with the accrual defaulted to zero — correct for any chain that has not activated.
-        let legacy_bytes = &bytes[..bytes.len() - std::mem::size_of::<u64>()];
+        // A peer that has the accrual but not the anchor scores: our blob minus the trailing
+        // vec. Decodes, with no attested scores — which fails closed rather than inventing one.
+        let pre_scores = PruningPointShieldedMetadata {
+            in_window_anchor_source_scores: Vec::new(),
+            nullifier_muhash: md.nullifier_muhash.clone(),
+            burns: md.burns.clone(),
+            window_entries: Vec::new(),
+            miner_accrual: Default::default(),
+            window_prefix: Default::default(),
+            ..md.clone()
+        };
+        let pre_scores_bytes = pre_scores.to_wire_bytes();
+        // Strip the trailing empties (scores, window entries: two u64 length prefixes; then the slot).
+        let truncated = &pre_scores_bytes[..pre_scores_bytes.len() - 2 * std::mem::size_of::<u64>() - slot_len];
+        let from_pre_scores = PruningPointShieldedMetadata::from_wire_bytes(truncated).expect("pre-scores layout decodes");
+        assert!(from_pre_scores.in_window_anchor_source_scores.is_empty(), "no scores claimed means none attested");
+
+        // A peer from before the security fork: our blob minus only the window entries. Its scores
+        // survive and it carries no window, which is the right value for a pre-fork pruning point.
+        let pre_window =
+            PruningPointShieldedMetadata { window_entries: Vec::new(), miner_accrual: Default::default(), ..md.clone() };
+        let pre_window_bytes = pre_window.to_wire_bytes();
+        let truncated_pre_window = &pre_window_bytes[..pre_window_bytes.len() - std::mem::size_of::<u64>() - slot_len];
+        let from_pre_window = PruningPointShieldedMetadata::from_wire_bytes(truncated_pre_window).expect("pre-window layout decodes");
+        assert_eq!(from_pre_window.in_window_anchor_source_scores, md.in_window_anchor_source_scores);
+        assert!(from_pre_window.window_entries.is_empty());
+        assert!(from_pre_window.miner_accrual.is_empty(), "a pre-fork peer carries no miner slot");
+        assert_eq!(from_pre_scores.dev_accrued, 123_456, "the accrual before it still survives");
+        assert_eq!(from_pre_scores.in_window_anchors, md.in_window_anchors);
+
+        // The oldest layout: also minus the accrual u64.
+        let legacy_bytes = &truncated[..truncated.len() - std::mem::size_of::<u64>()];
         let from_legacy = PruningPointShieldedMetadata::from_wire_bytes(legacy_bytes).expect("legacy layout decodes");
         assert_eq!(from_legacy.dev_accrued, 0, "a peer without the field means no accrual, not a failure");
         assert_eq!(from_legacy.state_root, md.state_root, "everything before the new field survives");
+        assert!(from_legacy.in_window_anchor_source_scores.is_empty());
 
-        // And the other direction: a legacy reader sees our longer blob as its own layout
+        // And the other direction: an older reader sees our longer blob as its own layout
         // plus trailing bytes, which bincode ignores.
         let as_legacy: LegacyPruningPointShieldedMetadata =
-            bincode::deserialize(&bytes).expect("older node tolerates the extra field");
+            bincode::deserialize(&bytes).expect("older node tolerates the extra fields");
         assert_eq!(as_legacy.state_root, md.state_root);
+
+        // The trap this ordering exists to avoid: a NEW blob must never be decoded by an OLD
+        // layout in `from_wire_bytes`, because bincode ignores trailing bytes and would silently
+        // drop the very fields the fix depends on — a node would then fail closed exactly as
+        // before, with nothing in the log to say why.
+        assert_eq!(
+            PruningPointShieldedMetadata::from_wire_bytes(&bytes).unwrap().in_window_anchor_source_scores,
+            md.in_window_anchor_source_scores,
+            "newest layout must win when several can decode the same bytes"
+        );
+    }
+
+    /// The fix, at the store level: a source with no local ghostdag data is judged from the
+    /// blue score the pruning-point peer attested, and a source nobody attested still cannot be
+    /// judged at all. `judge_anchor_source` turns the first into a usable anchor and the second
+    /// into the same fail-closed rejection as before; this pins the data layer both rest on.
+    #[test]
+    fn attested_anchor_source_scores_are_seeded_and_absent_ones_stay_unjudgeable() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = ShieldedStateManager::new(db.clone(), CachePolicy::Empty);
+
+        // Real shape of the mainnet failure: pruning point 993,600, spending block 993,652,
+        // anchor source 990,606 — 2,994 BELOW the pruning point, age 3,046, legally in window.
+        let source = Hash::from_bytes([9u8; 32]);
+        let anchor = [11u8; 32];
+        let md = PruningPointShieldedMetadata {
+            frontier: FrontierState::default(),
+            supply: SupplyTotals::default(),
+            nullifier_muhash: MuHash::new(),
+            burns: BurnReceipts::default(),
+            state_root: [0u8; 32],
+            in_window_anchors: vec![(anchor, source)],
+            dev_accrued: 0,
+            in_window_anchor_source_scores: vec![(source, 990_606)],
+            window_entries: Vec::new(),
+            miner_accrual: Default::default(),
+            window_prefix: Default::default(),
+        };
+
+        let mut batch = WriteBatch::default();
+        mgr.seed_pruning_point_shielded(&mut batch, Hash::from_bytes([1u8; 32]), &md, std::iter::empty())
+            .expect("seeding the pruning-point state succeeds");
+        db.write(batch).unwrap();
+
+        assert_eq!(
+            mgr.attested_source_blue_score(source).unwrap(),
+            Some(990_606),
+            "the attested score must survive the import, or the anchor mapping is useless on its own"
+        );
+        assert_eq!(
+            mgr.anchor_source_block(&anchor).unwrap(),
+            Some(source),
+            "the mapping itself still lands (this half already worked)"
+        );
+        assert_eq!(
+            mgr.attested_source_blue_score(Hash::from_bytes([42u8; 32])).unwrap(),
+            None,
+            "an unattested source must read as None so finality still fails CLOSED (F-04)"
+        );
     }
 
     /// Retention must drop the recomputation snapshots while leaving intact the two
@@ -1071,7 +1935,7 @@ mod tests {
 
         let mut batch = WriteBatch::default();
         for b in [pruned, checkpoint] {
-            mgr.tree_store.set_batch(&mut batch, b, FrontierState { size: 5, leaf: Some([9u8; 32]), ommers: vec![] }).unwrap();
+            mgr.tree_store.set_batch(&mut batch, b, FrontierState { size: 1, leaf: Some(cmx(9).to_bytes()), ommers: vec![] }).unwrap();
             mgr.supply_store.set_batch(&mut batch, b, SupplyTotals { cumulative_coinbase: 10, cumulative_fees: 1 }).unwrap();
             mgr.dev_accrued_store.set_batch(&mut batch, b, 77).unwrap();
             mgr.scan_block
@@ -1084,6 +1948,7 @@ mod tests {
                         timestamp: 0,
                         coinbase_txid: b,
                         coinbase_outputs: vec![(vec![9u8; 43], 42)],
+                        coinbase_commitments: Vec::new(),
                         accepted: vec![],
                     },
                 )
@@ -1093,8 +1958,8 @@ mod tests {
         db.write(batch).unwrap();
 
         let mut batch = WriteBatch::default();
-        mgr.prune_block_snapshots(&mut batch, pruned, false).unwrap();
-        mgr.prune_block_snapshots(&mut batch, checkpoint, true).unwrap();
+        mgr.prune_block_snapshots(&mut batch, pruned, false, Some(5)).unwrap();
+        mgr.prune_block_snapshots(&mut batch, checkpoint, true, Some(6)).unwrap();
         db.write(batch).unwrap();
 
         // Recomputation snapshots are gone for both; zero/default is what a missing key reads as.
@@ -1103,13 +1968,90 @@ mod tests {
         assert_eq!(mgr.frontier_at(pruned).unwrap().size, 0, "a non-checkpoint frontier is dropped");
 
         // The checkpoint keeps its frontier so fast-sync still has an anchor down here.
-        assert_eq!(mgr.frontier_at(checkpoint).unwrap().size, 5, "a checkpoint frontier survives");
+        assert_eq!(mgr.frontier_at(checkpoint).unwrap().size, 1, "a checkpoint frontier survives");
 
         // Never dropped: the wallet's scan archive and the global nullifier set.
         for b in [pruned, checkpoint] {
             assert!(mgr.scan_block(b).unwrap().is_some(), "the compact scan archive must survive pruning");
         }
         assert!(mgr.nullifiers.contains(&[5u8; 32]).unwrap(), "a spent nullifier must outlive its block");
+
+        // Pruning ENQUEUED both blocks' anchor rows for age-based GC but deleted nothing:
+        // a just-pruned block is still inside the window the IBD export serves.
+        assert_eq!(mgr.anchor_gc.peek_upto(u64::MAX, 100).len(), 2, "both pruned blocks queue their anchor rows");
+    }
+
+    /// The anchor GC deletes only rows aged 2x `max_age` below the pruning point, and
+    /// never breaks a last-write-wins mapping that a younger block still owns.
+    #[test]
+    fn anchor_gc_drops_only_aged_rows_and_respects_last_write_wins() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = ShieldedStateManager::new(db.clone(), CachePolicy::Empty);
+        let (old_block, young_block) = (Hash::from_bytes([41u8; 32]), Hash::from_bytes([42u8; 32]));
+        let root = [7u8; 32];
+
+        let mut batch = WriteBatch::default();
+        // Both blocks produced the same root (e.g. the younger carried no shielded txs);
+        // the single-valued index points at the YOUNGER writer.
+        mgr.anchor_block.set_batch(&mut batch, root, old_block).unwrap();
+        mgr.anchor_block.set_batch(&mut batch, root, young_block).unwrap();
+        mgr.anchor_producers.add_producer_batch(&mut batch, root, old_block).unwrap();
+        mgr.anchor_producers.add_producer_batch(&mut batch, root, young_block).unwrap();
+        mgr.anchor_gc.enqueue_batch(&mut batch, 100, root, old_block).unwrap();
+        mgr.anchor_gc.enqueue_batch(&mut batch, 500, root, young_block).unwrap();
+        db.write(batch).unwrap();
+
+        // max_age 10: the margin is 2 * max_age = 20, which covers every log entry an export can need.
+        // pp_blue 119: limit 99 -> nothing; pp_blue 130: limit 110 -> only the blue-100 entry qualifies.
+        let mut batch = WriteBatch::default();
+        assert_eq!(mgr.gc_aged_anchors(&mut batch, 119, 10, 1000).unwrap(), 0, "nothing inside the margin is collected");
+        let processed = mgr.gc_aged_anchors(&mut batch, 130, 10, 1000).unwrap();
+        db.write(batch).unwrap();
+        assert_eq!(processed, 1, "only the aged entry is drained");
+
+        // The mapping survives - it points at the younger producer, not the aged one.
+        assert_eq!(mgr.anchor_block.get(&root).unwrap(), Some(young_block), "last-write-wins mapping owned by a younger block survives");
+        assert_eq!(mgr.anchor_producer_blocks(&root).unwrap(), vec![young_block], "only the aged producer row is removed");
+        assert_eq!(mgr.anchor_gc.peek_upto(u64::MAX, 100).len(), 1, "the young queue entry stays");
+
+        // Age the young entry out too: now the mapping itself goes.
+        let mut batch = WriteBatch::default();
+        let processed = mgr.gc_aged_anchors(&mut batch, 100_000, 10, 1000).unwrap();
+        db.write(batch).unwrap();
+        assert_eq!(processed, 1);
+        assert_eq!(mgr.anchor_block.get(&root).unwrap(), None, "an anchor with no live producer is fully dropped");
+        assert!(mgr.anchor_producer_blocks(&root).unwrap().is_empty());
+        assert!(mgr.anchor_gc.peek_upto(u64::MAX, 100).is_empty(), "queue fully drained");
+    }
+
+    /// Siblings of one root that age out in the SAME GC pass are all removed. The pruner's manager is
+    /// uncached, so removing them one staged write each read the stored list every time and the last
+    /// write put the earlier siblings back, while their queue rows were drained: never collected again.
+    #[test]
+    fn anchor_gc_removes_every_aged_sibling_of_a_root_in_one_pass() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = ShieldedStateManager::new(db.clone(), CachePolicy::Empty);
+        let (a, b, c) = (Hash::from_bytes([51u8; 32]), Hash::from_bytes([52u8; 32]), Hash::from_bytes([53u8; 32]));
+        let root = [9u8; 32];
+        let mut batch = WriteBatch::default();
+        mgr.anchor_producers.set_producers_batch(&mut batch, root, vec![a, b, c]).unwrap();
+        mgr.anchor_block.set_batch(&mut batch, root, c).unwrap();
+        mgr.anchor_gc.enqueue_batch(&mut batch, 100, root, a).unwrap();
+        mgr.anchor_gc.enqueue_batch(&mut batch, 101, root, b).unwrap();
+        mgr.anchor_gc.enqueue_batch(&mut batch, 900, root, c).unwrap();
+        db.write(batch).unwrap();
+
+        let mut batch = WriteBatch::default();
+        assert_eq!(mgr.gc_aged_anchors(&mut batch, 130, 10, 1000).unwrap(), 2);
+        db.write(batch).unwrap();
+        assert_eq!(mgr.anchor_producer_blocks(&root).unwrap(), vec![c], "both aged siblings are gone, the young one stays");
+        assert_eq!(mgr.anchor_block.get(&root).unwrap(), Some(c));
+
+        let mut batch = WriteBatch::default();
+        assert_eq!(mgr.gc_aged_anchors(&mut batch, 100_000, 10, 1000).unwrap(), 1);
+        db.write(batch).unwrap();
+        assert!(mgr.anchor_producer_blocks(&root).unwrap().is_empty(), "the row is dropped with its last producer");
+        assert_eq!(mgr.anchor_block.get(&root).unwrap(), None);
     }
 
     fn cmx(n: u32) -> ExtractedNoteCommitment {
@@ -1132,6 +2074,7 @@ mod tests {
     fn stx(nfs: &[u8], cmxs: &[u32], fee: u64) -> ShieldedTx {
         ShieldedTx {
             burn: None,
+            anchor_block: None,
             nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
             commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
             fee,
@@ -1201,11 +2144,8 @@ mod tests {
 
     fn burn_stx(nfs: &[u8], cmxs: &[u32], value_balance: u64, burn_v: u64, tag: u8) -> ShieldedTx {
         ShieldedTx {
-            burn: Some(kaspa_shielded_core::burn::ExitReceipt {
-                v: burn_v,
-                recipient: [tag; 32],
-                n: [tag.wrapping_add(0x90); 32],
-            }),
+            burn: Some(kaspa_shielded_core::burn::ExitReceipt { v: burn_v, recipient: [tag; 32], n: [tag.wrapping_add(0x90); 32] }),
+            anchor_block: None,
             nullifiers: nfs.iter().map(|&n| nf(n)).collect(),
             commitments: cmxs.iter().map(|&c| cmx(c)).collect(),
             fee: value_balance,
@@ -1276,6 +2216,10 @@ mod tests {
             state_root: [0u8; 32],
             in_window_anchors: vec![(hist_anchor, hist_source)],
             dev_accrued: 0,
+            in_window_anchor_source_scores: Vec::new(),
+            window_entries: Vec::new(),
+            miner_accrual: Default::default(),
+            window_prefix: Default::default(),
         };
 
         let mut batch = WriteBatch::default();
@@ -1289,6 +2233,7 @@ mod tests {
         // every spend against it is dropped.
         let producers = mgr.anchor_producer_blocks(&hist_anchor).unwrap();
         assert_eq!(producers, vec![hist_source], "in-window anchor must be seeded into anchor_producers too");
+        // Without a proven blue score nothing is queued (and nothing can be judged final either).
 
         // The pruning point's own root as well.
         let pp_anchor = GlobalTree::from_state(&md.frontier).unwrap().anchor().to_bytes();
@@ -1297,6 +2242,59 @@ mod tests {
             vec![pp],
             "the pruning point's own anchor must resolve under the multi-producer rule"
         );
+    }
+
+    /// A re-import is the clear and the seed in ONE batch. The previous import's peer pairs (a fake
+    /// root beside a real block, ZK-01), their scores and queue rows must not survive it, and a seed
+    /// whose pairs share a root (sibling producers) must keep every producer. Both broke when the seed
+    /// read the old producer row from the database: the second pair overwrote the first, and the
+    /// staged clear was undone by writing the stale row back.
+    #[test]
+    fn reimport_replaces_every_anchor_row_and_keeps_sibling_producers() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = manager(&db);
+        let pp = h(9);
+        let md = |pairs: Vec<([u8; 32], Hash)>, scores: Vec<(Hash, u64)>| PruningPointShieldedMetadata {
+            frontier: FrontierState::default(),
+            supply: SupplyTotals::default(),
+            nullifier_muhash: MuHash::new(),
+            burns: BurnReceipts::default(),
+            state_root: [0u8; 32],
+            in_window_anchors: pairs,
+            dev_accrued: 0,
+            in_window_anchor_source_scores: scores,
+            window_entries: Vec::new(),
+            miner_accrual: Default::default(),
+            window_prefix: Default::default(),
+        };
+        let (fake_root, real_block) = ([0xEE; 32], h(5));
+        let (root, sib_a, sib_b) = ([0x11; 32], h(6), h(7));
+        let mut batch = WriteBatch::default();
+        // The first import also pairs a real root with a block that did not produce it.
+        let lies = md(vec![(fake_root, real_block), (root, real_block)], vec![(real_block, 40)]);
+        mgr.seed_pruning_point_shielded(&mut batch, pp, &lies, std::iter::empty()).unwrap();
+        db.write(batch).unwrap();
+        assert_eq!(mgr.anchor_producer_blocks(&fake_root).unwrap(), vec![real_block], "precondition: the lie is seeded");
+
+        // Re-import from an honest peer: two siblings produced the same root.
+        let honest = md(vec![(root, sib_a), (root, sib_b)], vec![(sib_a, 41), (sib_b, 41)]);
+        let mut batch = WriteBatch::default();
+        mgr.clear_for_pruning_reimport(&mut batch, pp).unwrap();
+        mgr.seed_pruning_point_shielded(&mut batch, pp, &honest, std::iter::empty()).unwrap();
+        db.write(batch).unwrap();
+
+        assert!(mgr.anchor_producer_blocks(&fake_root).unwrap().is_empty(), "the previous import's pair is gone");
+        assert_eq!(mgr.anchor_source_block(&fake_root).unwrap(), None, "from both indexes");
+        assert_eq!(mgr.attested_source_blue_score(real_block).unwrap(), None, "and its attested score");
+        let mut producers = mgr.anchor_producer_blocks(&root).unwrap();
+        producers.sort();
+        let mut expected = vec![sib_a, sib_b];
+        expected.sort();
+        assert_eq!(producers, expected, "every sibling producer of one root is kept, and the previous import's is gone");
+        // The new pairs are queued for GC. The previous queue rows stay: they are what collects the
+        // anchor-log entries a re-import keeps, and draining one whose rows are gone is a no-op.
+        let queued: Vec<_> = mgr.anchor_gc.peek_upto(u64::MAX, usize::MAX).into_iter().map(|(_, _, b)| b).collect();
+        assert!(queued.contains(&sib_a) && queued.contains(&sib_b), "the new pairs are queued for GC");
     }
 
     /// Re-applying a block after a reorg must not duplicate it: the producers list is a set, and
@@ -1676,12 +2674,12 @@ mod tests {
         let mut immature = stx(&[4], &[400], 9);
         immature.anchor = bad_anchor;
         let candidates = vec![
-            stx(&[2], &[200], 5),  // fresh spend — kept
-            stx(&[1], &[201], 5),  // conflicts with the PERSISTED nf(1) — dropped
-            stx(&[2], &[202], 7),  // conflicts with the batch's first tx — dropped
-            immature,              // spend against a non-final anchor — dropped
-            stx(&[], &[203], 0),   // pure-output (no nullifiers): anchor rule exempt — kept
-            stx(&[3], &[204], 2),  // independent spend — kept
+            stx(&[2], &[200], 5), // fresh spend — kept
+            stx(&[1], &[201], 5), // conflicts with the PERSISTED nf(1) — dropped
+            stx(&[2], &[202], 7), // conflicts with the batch's first tx — dropped
+            immature,             // spend against a non-final anchor — dropped
+            stx(&[], &[203], 0),  // pure-output (no nullifiers): anchor rule exempt — kept
+            stx(&[3], &[204], 2), // independent spend — kept
         ];
         let outcomes = mgr.partition_applied(&candidates, |stx| stx.anchor != bad_anchor);
         let keep: Vec<bool> = outcomes.iter().map(|o| o.kept()).collect();
@@ -1747,6 +2745,153 @@ mod tests {
         assert_eq!(pool_after - pool_before, SUBSIDY as u128, "pool must grow by exactly the subsidy");
     }
 
+    /// The capturing replay must emit a frontier for every labelled block, and each captured
+    /// frontier must equal what a replay TRUNCATED at that block produces. That equality is the
+    /// entire reason a checkpoint is trustworthy once the full replay verifies: a checkpoint is a
+    /// prefix of the same verified leaf sequence, not an independent claim.
+    #[test]
+    fn captured_checkpoints_equal_truncated_replays() {
+        // Three blocks, each contributing distinct leaves; label every one.
+        let blocks: Vec<(Vec<[u8; 32]>, Vec<Vec<u8>>)> = (0u32..3)
+            .map(|b| (vec![cmx(b * 10 + 1).to_bytes(), cmx(b * 10 + 2).to_bytes()], Vec::new()))
+            .collect();
+
+        let mut captured: Vec<(usize, FrontierState)> = Vec::new();
+        let (final_frontier, leaves) = ShieldedStateManager::replay_frontier_streaming_capturing(
+            blocks.iter().enumerate().map(|(i, (c, a))| Ok((Some(i), c.clone(), a.clone()))),
+            |i, f| captured.push((i, f.clone())),
+        )
+        .expect("replay of well-formed leaves must succeed");
+
+        assert_eq!(leaves, 6, "two leaves per block over three blocks");
+        assert_eq!(captured.len(), 3, "one checkpoint per labelled block");
+
+        // Each captured frontier must match a replay of just the prefix up to that block.
+        for (i, f) in &captured {
+            let (prefix, _) =
+                ShieldedStateManager::replay_frontier_streaming(blocks[..=*i].iter().map(|(c, a)| Ok((c.clone(), a.clone()))))
+                    .expect("prefix replay must succeed");
+            assert_eq!(&prefix, f, "checkpoint at block {i} must equal the truncated replay");
+        }
+        // And the last checkpoint is the final frontier.
+        assert_eq!(captured.last().unwrap().1, final_frontier);
+    }
+
+    /// Unlabelled blocks must produce NO checkpoint, so the caller controls spacing entirely.
+    #[test]
+    fn unlabelled_blocks_capture_nothing() {
+        let blocks: Vec<(Vec<[u8; 32]>, Vec<Vec<u8>>)> =
+            (0u32..4).map(|b| (vec![cmx(b + 1).to_bytes()], Vec::new())).collect();
+        let mut captured = 0usize;
+        // Label only every 2nd block, mirroring how the verifier spaces checkpoints by index.
+        ShieldedStateManager::replay_frontier_streaming_capturing(
+            blocks.iter().enumerate().map(|(i, (c, a))| Ok(((i % 2 == 0).then_some(i), c.clone(), a.clone()))),
+            |_, _| captured += 1,
+        )
+        .expect("replay must succeed");
+        assert_eq!(captured, 2, "only labelled blocks may emit a checkpoint");
+    }
+
+    /// SAFETY PROPERTY: a replay that FAILS must not leave a usable checkpoint behind.
+    ///
+    /// The capturing replay hands frontiers to the caller as it goes, so it necessarily emits
+    /// some before it discovers the data is bad. What must hold is that it still returns `Err`,
+    /// which is what stops `verify_shielded_history` from reaching its persist branch. If this
+    /// ever returned `Ok` on tampered data, poisoned anchors would be written on exactly the path
+    /// that exists to reject bad history.
+    #[test]
+    fn a_failed_replay_reports_error_so_nothing_is_persisted() {
+        let good = vec![cmx(1).to_bytes()];
+        // A non-canonical Pallas encoding: all-0xff is not a valid base-field element.
+        let bad = vec![[0xffu8; 32]];
+        let mut captured = 0usize;
+        let res = ShieldedStateManager::replay_frontier_streaming_capturing(
+            vec![Ok((Some(0usize), good, Vec::new())), Ok((Some(1usize), bad, Vec::new()))].into_iter(),
+            |_, _| captured += 1,
+        );
+        assert!(matches!(res, Err(ReplayError::Data(_))), "tampered leaves must fail the replay, got {res:?}");
+        // It may have captured the first block's frontier — that is fine and unavoidable. The
+        // guarantee is the Err above: the caller never reaches its write.
+        assert!(captured <= 1, "must not capture past the failure point");
+    }
+
+    /// The backfill verifier must reproduce the exact frontier an honest range builds, and must
+    /// reject any tampering. Without this the whole history-backfill path would be "trust the
+    /// peer", which is precisely what it exists to avoid.
+    ///
+    /// This test had NO `#[test]` attribute — two were stacked on an earlier function — so the one
+    /// assertion standing behind the backfill's trustlessness claim had never executed.
+    #[test]
+    fn history_replay_reproduces_frontier_and_detects_tampering() {
+        use kaspa_consensus_core::api::ShieldedChainBlockData;
+
+        // Build a plausible history: three blocks, each contributing action leaves.
+        let leaf = |n: u8| {
+            let mut c = [0u8; 32];
+            c[0] = n;
+            // Keep it a canonical Pallas base encoding by clearing the high bits.
+            c[31] = 0;
+            c
+        };
+        let block = |leaves: &[u8]| {
+            let mut action_bytes = Vec::new();
+            for &n in leaves {
+                let mut rec = [0u8; CompactActionRecord::SERIALIZED_LEN];
+                rec[32..64].copy_from_slice(&leaf(n));
+                action_bytes.extend_from_slice(&rec);
+            }
+            ShieldedChainBlockData {
+                hash: h(1),
+                blue_score: 0,
+                daa_score: 0,
+                coinbase_txid: h(0),
+                coinbase_outputs: Vec::new(),
+                coinbase_commitments: Vec::new(),
+                accepted_actions: vec![action_bytes],
+                accepted_txids: vec![h(2)],
+                timestamp: 0,
+            }
+        };
+        let no_coinbase = |_: &ShieldedChainBlockData| Vec::new();
+
+        let honest = vec![block(&[1, 2]), block(&[3]), block(&[4, 5])];
+        let expected = ShieldedStateManager::replay_history_frontier(&honest, no_coinbase).unwrap();
+        assert_eq!(expected.size, 5, "five leaves appended across the range");
+
+        // Same leaves, same order => same frontier. (Determinism is what makes the check sound.)
+        let again = ShieldedStateManager::replay_history_frontier(&honest, no_coinbase).unwrap();
+        assert_eq!(again, expected);
+
+        // A peer that OMITS a record cannot match.
+        let omitted = vec![honest[0].clone(), honest[2].clone()];
+        assert_ne!(ShieldedStateManager::replay_history_frontier(&omitted, no_coinbase).unwrap(), expected, "omission must be caught");
+
+        // A peer that REORDERS records cannot match (the tree is order-dependent).
+        let reordered = vec![honest[1].clone(), honest[0].clone(), honest[2].clone()];
+        assert_ne!(
+            ShieldedStateManager::replay_history_frontier(&reordered, no_coinbase).unwrap(),
+            expected,
+            "reordering must be caught"
+        );
+
+        // A peer that FABRICATES a leaf cannot match.
+        let mut tampered = honest.clone();
+        tampered[1] = block(&[99]);
+        assert_ne!(
+            ShieldedStateManager::replay_history_frontier(&tampered, no_coinbase).unwrap(),
+            expected,
+            "fabrication must be caught"
+        );
+
+        // A peer that TRUNCATES the range cannot match.
+        let truncated = vec![honest[0].clone(), honest[1].clone()];
+        assert_ne!(
+            ShieldedStateManager::replay_history_frontier(&truncated, no_coinbase).unwrap(),
+            expected,
+            "truncation must be caught"
+        );
+    }
+
     /// The anchor→block index records a block's tree root so a spend can later be
     /// resolved to its source block (finality/canonicality is then decided by the
     /// virtual processor via reachability + depth, tested at that layer).
@@ -1809,8 +2954,7 @@ mod tests {
         db.write(cb).unwrap();
 
         // The global set is empty and the pruning point's snapshots are gone (the
-        // root reads back as the empty-state root). The anchor→block index is
-        // intentionally retained (append-only; canonicality is re-checked at query).
+        // root reads back as the empty-state root).
         assert_eq!(mgr.nullifiers().count(), 0, "the whole global nullifier set must be deleted");
         assert!(!mgr.nullifiers().contains(&nf(1)).unwrap() && !mgr.nullifiers().contains(&nf(2)).unwrap());
         assert_eq!(mgr.state_root_at(pp).unwrap(), PruningPointShieldedMetadata::empty_state_root(), "pp snapshots cleared");
@@ -1837,5 +2981,100 @@ mod tests {
         // And a spend of nf(1) — unspent on the new chain — is accepted, not frozen.
         let ok = mgr.compute(pp, Some(&coinbase(50, 30)), &[stx(&[1], &[400], 5)]).unwrap();
         assert_eq!(ok.outcome.accepted, vec![0], "previously-frozen note is spendable again after the clean re-seed");
+    }
+
+    /// Retention: anchor GC keeps every log entry (with its log state) within 2 x max_age below the
+    /// pruning point, which covers everything an export needs: the entries down to the first at or
+    /// below `pp - max_age` and the log state of the entry under that. Older entries go.
+    #[test]
+    fn anchor_log_entries_survive_gc_exactly_as_long_as_an_export_needs() {
+        use kaspa_shielded_core::anchor_window::{AnchorLog, WindowEntry};
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = ShieldedStateManager::new(db.clone(), CachePolicy::Empty);
+        let age = 8u64;
+        let mut log = AnchorLog::default();
+        let mut prev = [0u8; 32];
+        let mut batch = WriteBatch::default();
+        let blocks: Vec<(Hash, u64)> = (1..=60u64).map(|i| (Hash::from_u64_word(1_000 + i), i)).collect();
+        for &(b, bs) in &blocks {
+            let e = WindowEntry { block: b.as_bytes(), parent: prev, root: [bs as u8; 32], blue_score: bs };
+            let before = log.clone();
+            log = log.append(&e).unwrap();
+            mgr.persist_window(&mut batch, b, log.clone(), e, before).unwrap();
+            mgr.anchor_gc.enqueue_batch(&mut batch, bs, e.root, b).unwrap();
+            prev = b.as_bytes();
+        }
+        db.write(batch).unwrap();
+        let pp_blue = 50u64;
+        let mut batch = WriteBatch::default();
+        mgr.gc_aged_anchors(&mut batch, pp_blue, age, 10_000).unwrap();
+        db.write(batch).unwrap();
+        let limit = pp_blue - 2 * age;
+        for &(b, bs) in &blocks {
+            let kept = mgr.window_entry_with_log(b).unwrap().is_some();
+            if bs > limit {
+                assert!(kept, "entry at blue {bs} is within 2 x max_age of the pruning point and must be kept");
+            }
+            if bs < limit {
+                assert!(!kept, "entry at blue {bs} is older than 2 x max_age and must be collected");
+            }
+        }
+        // Everything an export at the pruning point needs is still there.
+        let oldest_usable = pp_blue - age;
+        for &(b, bs) in &blocks {
+            if bs + 1 >= oldest_usable && bs <= pp_blue {
+                assert!(mgr.window_entry_with_log(b).unwrap().is_some(), "export needs blue {bs}");
+            }
+        }
+    }
+
+    /// Imported anchor pairs age out like self-validated ones: the import queues each under its proven
+    /// blue score, so once the pruning point is far enough above them GC removes the anchor rows, the
+    /// log entries and the scores. Before that they are all kept.
+    #[test]
+    fn imported_anchor_pairs_are_garbage_collected_when_they_age_out() {
+        use kaspa_shielded_core::anchor_window::{AnchorLog, WindowEntry};
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mgr = manager(&db);
+        let pp = h(90);
+        let pairs: Vec<([u8; 32], Hash, u64)> = (1..=10u64).map(|i| ([i as u8; 32], h(i as u8), 100 + i)).collect();
+        let md = PruningPointShieldedMetadata {
+            frontier: FrontierState::default(),
+            supply: SupplyTotals::default(),
+            nullifier_muhash: MuHash::new(),
+            burns: BurnReceipts::default(),
+            state_root: [0u8; 32],
+            in_window_anchors: pairs.iter().map(|&(a, b, _)| (a, b)).collect(),
+            dev_accrued: 0,
+            in_window_anchor_source_scores: pairs.iter().map(|&(_, b, s)| (b, s)).collect(),
+            window_entries: Vec::new(),
+            miner_accrual: Default::default(),
+            window_prefix: Default::default(),
+        };
+        let mut batch = WriteBatch::default();
+        mgr.seed_pruning_point_shielded(&mut batch, pp, &md, std::iter::empty()).unwrap();
+        // Their log entries, as the processor seeds them alongside.
+        for &(a, b, s) in &pairs {
+            mgr.persist_window_entry(&mut batch, b, WindowEntry { block: b.as_bytes(), parent: [0; 32], root: a, blue_score: s }, AnchorLog::default())
+                .unwrap();
+        }
+        db.write(batch).unwrap();
+        let alive = |b: Hash, a: [u8; 32]| {
+            (mgr.anchor_producer_blocks(&a).unwrap().contains(&b), mgr.window_entry(b).unwrap().is_some(), mgr.attested_source_blue_score(b).unwrap().is_some())
+        };
+        // Still inside 2 x max_age of the pruning point (limit 120 - 20 = 100, below every pair): kept.
+        let mut batch = WriteBatch::default();
+        mgr.gc_aged_anchors(&mut batch, 100 + 2 * 10, 10, 1000).unwrap();
+        db.write(batch).unwrap();
+        for &(a, b, _) in &pairs {
+            assert_eq!(alive(b, a), (true, true, true), "kept while young");
+        }
+        // Far above: all of it goes.
+        let mut batch = WriteBatch::default();
+        mgr.gc_aged_anchors(&mut batch, 10_000, 10, 1000).unwrap();
+        db.write(batch).unwrap();
+        for &(a, b, _) in &pairs {
+            assert_eq!(alive(b, a), (false, false, false), "imported pair at {b} must age out completely");
+        }
     }
 }

@@ -24,3 +24,14 @@ notes-before.json
 notes-after.json
 
 telegram_token.txt
+
+# Internal working notes — kept locally, not published.
+audit/
+CONSENSUS-CHANGES.md
+CONSENSUS-INHERITED.md
+sdk/bindings/typescript/node_modules/
+docs/KASPA-NATIVE-ZK-SHIELDED-POOL.md
+docs/KASPA-PRIVACY-ARCHITECTURES.md
+sdk/docs/RESEARCH.md
+sdk/docs/STATUS.md
+gateway/docs/STATUS.md

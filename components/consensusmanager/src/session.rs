@@ -250,6 +250,10 @@ impl ConsensusSessionOwned {
 
     /// The shielded note-commitment tree frontier at `block`, as raw parts
     /// `(size, last_leaf, ommers)` — the fast-sync checkpoint a light wallet uses.
+    pub async fn async_preverify_shielded_transaction(&self, transaction: Transaction) -> ConsensusResult<()> {
+        self.clone().spawn_blocking(move |c| c.preverify_shielded_transaction(&transaction)).await
+    }
+
     pub async fn async_get_shielded_tree_frontier(&self, block: Hash) -> ConsensusResult<(u64, Option<[u8; 32]>, Vec<[u8; 32]>)> {
         self.clone().spawn_blocking(move |c| c.get_shielded_tree_frontier(block)).await
     }
@@ -267,10 +271,67 @@ impl ConsensusSessionOwned {
         self.clone().spawn_blocking(move |c| c.get_shielded_chain_block_data(block)).await
     }
 
+    /// The miner reward carried by a chain block (security fork). See `ConsensusApi::get_miner_accrual`.
+    pub async fn async_get_miner_accrual(&self, block: Hash) -> ConsensusResult<kaspa_consensus_core::coinbase::MinerAccrual> {
+        self.clone().spawn_blocking(move |c| c.get_miner_accrual(block)).await
+    }
+
     /// The next `limit` selected-chain hashes after `low`, read from the retained chain
     /// index so a pruned node can still enumerate full history. `None` = re-anchor.
     pub async fn async_get_shielded_chain_range(&self, low: Hash, limit: usize) -> ConsensusResult<Option<Vec<Hash>>> {
         self.clone().spawn_blocking(move |c| c.get_shielded_chain_range(low, limit)).await
+    }
+
+    /// Last chain block strictly below `daa` with a retained shielded frontier (binary search
+    /// over the chain index) — places a wallet birthday anywhere in history in one call.
+    pub async fn async_get_shielded_frontier_block_below_daa(&self, daa: u64) -> ConsensusResult<Option<Hash>> {
+        self.clone().spawn_blocking(move |c| c.get_shielded_frontier_block_below_daa(daa)).await
+    }
+
+    /// Serve a peer's shielded-history backfill request (see `get_shielded_history_below`).
+    pub async fn async_get_shielded_history_indexed_below(
+        &self,
+        anchor: Hash,
+        max_blocks: usize,
+    ) -> ConsensusResult<(Vec<(u64, kaspa_consensus_core::api::ShieldedChainBlockData)>, bool, u64)> {
+        self.clone().spawn_blocking(move |c| c.get_shielded_history_indexed_below(anchor, max_blocks)).await
+    }
+
+    /// The oldest chain block this node can enumerate; the backfill anchor.
+    pub async fn async_get_shielded_history_base(&self) -> Hash {
+        self.clone().spawn_blocking(move |c| c.get_shielded_history_base()).await
+    }
+
+    /// `(daa_score_of_oldest_servable_block, complete)` — see
+    /// [`ConsensusApi::get_shielded_history_status`]. Published so a wallet can refuse to
+    /// report a balance this node cannot actually answer for.
+    pub async fn async_get_shielded_history_status(&self) -> ConsensusResult<(u64, bool)> {
+        self.clone().spawn_blocking(move |c| c.get_shielded_history_status()).await
+    }
+
+    /// Ingest a backfilled history chunk (index entries + scan records); see
+    /// `backfill_shielded_history`.
+    pub async fn async_backfill_shielded_history(
+        &self,
+        anchor: Hash,
+        anchor_index: u64,
+        records: Vec<(u64, kaspa_consensus_core::api::ShieldedChainBlockData)>,
+    ) -> ConsensusResult<(u64, u64)> {
+        self.clone().spawn_blocking(move |c| c.backfill_shielded_history(anchor, anchor_index, &records)).await
+    }
+
+    /// Replay the archive against the PoW-anchored frontier at `base` and report; read-only.
+    /// See `verify_shielded_history`.
+    pub async fn async_verify_shielded_history(
+        &self,
+        base: Hash,
+    ) -> ConsensusResult<kaspa_consensus_core::api::ShieldedHistoryVerdict> {
+        self.clone().spawn_blocking(move |c| c.verify_shielded_history(base)).await
+    }
+
+    /// Discard the backfilled range below `base`; see `purge_shielded_history_below`.
+    pub async fn async_purge_shielded_history_below(&self, base: Hash) -> ConsensusResult<u64> {
+        self.clone().spawn_blocking(move |c| c.purge_shielded_history_below(base)).await
     }
 
     pub async fn async_get_sink_timestamp(&self) -> u64 {

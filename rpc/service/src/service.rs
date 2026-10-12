@@ -3,10 +3,12 @@
 use super::collector::{CollectorFromConsensus, CollectorFromIndex};
 use crate::converter::feerate_estimate::{FeeEstimateConverter, FeeEstimateVerboseConverter};
 use crate::converter::{consensus::ConsensusConverter, index::IndexConverter, protocol::ProtocolConverter};
+use crate::shielded_rewards::{RECIPIENT_LEN, match_coinbase_outputs};
 use async_trait::async_trait;
 use kaspa_consensus_core::api::counters::ProcessingCounters;
 use kaspa_consensus_core::daa_score_timestamp::DaaScoreTimestamp;
 use kaspa_consensus_core::errors::block::RuleError;
+use kaspa_consensus_core::tx::{ScriptPublicKey as RpcScriptPublicKey, ScriptVec};
 use kaspa_consensus_core::tx::{TransactionQueryResult, TransactionType};
 use kaspa_consensus_core::utxo::utxo_inquirer::UtxoInquirerError;
 use kaspa_consensus_core::{
@@ -66,9 +68,7 @@ use kaspa_rpc_core::{
     model::*,
     notify::connection::ChannelConnection,
 };
-use crate::shielded_rewards::{RECIPIENT_LEN, match_coinbase_outputs};
 use kaspa_system_info::SystemInfo;
-use kaspa_consensus_core::tx::{ScriptPublicKey as RpcScriptPublicKey, ScriptVec};
 use kaspa_txscript::{extract_script_pub_key_address, pay_to_address_script};
 use kaspa_utils::expiring_cache::ExpiringCache;
 use kaspa_utils::{channel::Channel, triggers::SingleTrigger};
@@ -395,14 +395,36 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         if session.async_is_consensus_in_transitional_ibd_state().await {
             return Err(RpcError::ConsensusInTransitionalIbdState);
         }
+        // Refuse oversized extra data before building: the template cache would otherwise build (and,
+        // for a red-reward template, replace its entry with) a template the length check below refuses.
+        if request.extra_data.len() > self.config.max_coinbase_payload_len {
+            return Err(RpcError::CoinbasePayloadLengthAboveMax(self.config.max_coinbase_payload_len));
+        }
         let script_public_key = kaspa_txscript::pay_to_address_script(&request.pay_address);
         let extra_data = version().as_bytes().iter().chain(once(&(b'/'))).chain(&request.extra_data).cloned().collect::<Vec<_>>();
+        if kaspa_consensus_core::SHIELDED_STATE_DIVERGED.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RpcError::General(
+                "this node's shielded nullifier set failed its self-check; it refuses to build templates until resynced".to_string(),
+            ));
+        }
         let miner_data: MinerData = MinerData::new(script_public_key, extra_data);
         let block_template = self.mining_manager.clone().get_block_template(&session, miner_data).await?;
 
         // Check coinbase tx payload length
         if block_template.block.transactions[COINBASE_TRANSACTION_INDEX].payload.len() > self.config.max_coinbase_payload_len {
             return Err(RpcError::CoinbasePayloadLengthAboveMax(self.config.max_coinbase_payload_len));
+        }
+        // Security fork: a ZKas coinbase may not carry a merge-mining commitment. Refuse the template
+        // here with a clear message rather than hand a pool a block every node will reject.
+        if self.config.params.coinbase_commitment_ban_activation().is_active(block_template.block.header.daa_score)
+            && kaspa_consensus_core::auxpow::AuxPow::payload_carries_commitment(
+                &block_template.block.transactions[COINBASE_TRANSACTION_INDEX].payload,
+            )
+        {
+            return Err(RpcError::General(
+                "extra_data carries a merge-mining commitment (ZKMM/ZKM1); that belongs in the Kaspa coinbase, not the ZKas one"
+                    .to_string(),
+            ));
         }
 
         Ok(GetBlockTemplateResponse {
@@ -455,6 +477,21 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             ));
         }
 
+        // From the security fork (on shielded-coinbase networks) blue rewards pass through the miner
+        // accrual slot: consecutive rewards to one script merge and payouts are deferred to payout
+        // blocks, so no coinbase output of the merging block belongs to this blue alone. Report the
+        // colour and leave the amount out rather than read a neighbour's output.
+        let params = &self.config.params;
+        if params.shielded_coinbase && params.security_fork_activation.is_active(merging_chain_block.header.daa_score) {
+            return Ok(GetBlockRewardInfoResponse::new(
+                header,
+                RpcBlockColor::Blue,
+                Some(confirmation_count),
+                Some(merging_chain_block_hash),
+                None,
+            ));
+        }
+
         let merging_chain_block_ghostdag = session.async_get_ghostdag_data(merging_chain_block_hash).await?;
         let queried_blue_index =
             merging_chain_block_ghostdag.mergeset_blues.iter().position(|hash| *hash == request.hash).ok_or_else(|| {
@@ -497,11 +534,8 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             //
             // Locate it positionally instead — the red reward, when present, sits directly
             // after the blue rewards — and exclude the dev-fee recipient explicitly.
-            let dev_spk = self
-                .config
-                .params
-                .dev_fee_recipient
-                .map(|recipient| RpcScriptPublicKey::new(0, ScriptVec::from_slice(&recipient)));
+            let dev_spk =
+                self.config.params.dev_fee_recipient.map(|recipient| RpcScriptPublicKey::new(0, ScriptVec::from_slice(&recipient)));
             let red_reward_index = queried_ghostdag.mergeset_blues.len();
             if let Some(own_red_reward_output) = queried_coinbase.outputs.get(red_reward_index) {
                 if dev_spk.as_ref() != Some(&own_red_reward_output.script_public_key) {
@@ -698,6 +732,17 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let transaction: Transaction = request.transaction.try_into()?;
         let transaction_id = transaction.id();
         let session = self.consensus_manager.consensus().unguarded_session();
+        // A shielded proof is checked here, outside every consensus lock, before the mempool sees the
+        // transaction: an RPC caller (unlike a relay peer, who is banned for a bad proof) could submit
+        // fresh junk bundles that each cost a full Halo 2 verification while the virtual state lock was
+        // held, delaying every chain update. A success is cached, so the mempool's check is a hit.
+        if transaction.is_shielded() {
+            session.async_preverify_shielded_transaction(transaction.clone()).await.map_err(|err| {
+                let err = RpcError::RejectedTransaction(transaction_id, err.to_string());
+                debug!("{err}");
+                err
+            })?;
+        }
         let orphan = match allow_orphan {
             true => Orphan::Allowed,
             false => Orphan::Forbidden,
@@ -757,15 +802,54 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         // never be reorged (so a wallet can safely base its tree there), and its
         // per-block frontier snapshot is retained. An explicit block (e.g. the
         // pruning point) anchors a full-history scan at correct absolute positions.
-        let block_hash = match request.block_hash {
-            Some(h) => h,
-            None => session.async_finality_point().await,
+        let requested = match (request.block_hash, request.below_daa_score) {
+            (Some(h), _) => h,
+            // Birthday locator: the last chain block strictly below the DAA that still keeps a
+            // frontier. The consensus side binary-searches the chain index (DAA is monotone
+            // along the selected chain) and walks back to a retained checkpoint, so one call
+            // replaces a metadata walk of thousands of pages from genesis.
+            (None, Some(daa)) => match session.async_get_shielded_frontier_block_below_daa(daa).await? {
+                Some(h) => h,
+                None => return Err(RpcError::General(format!("no chain block with a retained shielded frontier below daa {daa}"))),
+            },
+            (None, None) => session.async_finality_point().await,
         };
-        let daa_score = session.async_get_header(block_hash).await?.daa_score;
-        let (size, leaf, ommers) = session.async_get_shielded_tree_frontier(block_hash).await?;
+        // Per-block frontiers exist for every retained block; below the pruning point only
+        // the checkpointed blocks (one per ~1,000) keep one. When the requested block has
+        // none, serve the nearest checkpoint AT OR AFTER it by walking the archive chain
+        // index (it enumerates forward from any archived block). A caller that needs a
+        // frontier at-or-BEFORE a point — a wallet placing a birthday below the pruning
+        // point — asks for a block comfortably earlier than that point (walletd asks two
+        // 2,000-block pages back), so this answer can never overshoot its birthday. The
+        // response names the block actually served; the DAA comes from the header when
+        // retained, else from the archive record.
+        const CHECKPOINT_SEARCH: usize = 2100;
+        let (block_hash, (size, leaf, ommers)) = match session.async_get_shielded_tree_frontier(requested).await {
+            Ok(f) => (requested, f),
+            Err(first_err) => {
+                let mut found = None;
+                if let Some(candidates) = session.async_get_shielded_chain_range(requested, CHECKPOINT_SEARCH).await? {
+                    for h in candidates {
+                        if let Ok(f) = session.async_get_shielded_tree_frontier(h).await {
+                            found = Some((h, f));
+                            break;
+                        }
+                    }
+                }
+                found.ok_or(first_err)?
+            }
+        };
+        let daa_score = match session.async_get_header(block_hash).await {
+            Ok(h) => h.daa_score,
+            Err(_) => session.async_get_shielded_chain_block_data(block_hash).await?.daa_score,
+        };
         let leaf = RpcHash::from_bytes(leaf.unwrap_or_default());
         let ommers = ommers.into_iter().map(RpcHash::from_bytes).collect();
-        Ok(GetShieldedTreeStateResponse { block_hash, daa_score, size, leaf, ommers })
+        // How far back this node can actually answer. Published on the call wallets already
+        // make to anchor a scan, so a wallet learns the node's floor at the moment it decides
+        // where to start — rather than discovering it as a wrong balance later.
+        let (history_from_daa_score, history_complete) = session.async_get_shielded_history_status().await?;
+        Ok(GetShieldedTreeStateResponse { block_hash, daa_score, size, leaf, ommers, history_from_daa_score, history_complete })
     }
 
     async fn get_shielded_blocks_call(
@@ -797,26 +881,83 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         };
         let sink = session.async_get_sink().await;
         let sink_blue_score = session.async_get_ghostdag_data(sink).await?.blue_score;
-        let mut blocks = Vec::new();
-        if !reorged {
-            for hash in added.iter().take(limit) {
-                let d = session.async_get_shielded_chain_block_data(*hash).await?;
-                blocks.push(RpcShieldedChainBlock {
-                    hash: d.hash,
-                    blue_score: d.blue_score,
-                    daa_score: d.daa_score,
-                    coinbase_txid: d.coinbase_txid,
-                    coinbase_outputs: d
-                        .coinbase_outputs
-                        .into_iter()
-                        .map(|(script_public_key, value)| RpcShieldedCoinbaseOutput { script_public_key, value })
-                        .collect(),
-                    accepted_actions: d.accepted_actions,
-                    accepted_txids: d.accepted_txids,
-                    timestamp: d.timestamp,
-                });
-            }
-        }
+        // ONE `spawn_blocking` for the whole page, not one per block.
+        //
+        // Every `session.async_*` call is `spawn_blocking(...).await` — it queues onto
+        // the blocking pool, wakes a thread, and awaits a oneshot back. Paying that per
+        // block, sequentially, made a 1,000-block page cost ~1.75 SECONDS, of which the
+        // wallet then spent ~55 ms ingesting and ~10 ms decrypting. Measured from the
+        // wallet side, the fetch was 96-99% of sync time; the reads themselves are not
+        // what is slow, the thousand round trips to the pool are.
+        //
+        // The work inside is identical and in the same order — this changes only how
+        // many times the runtime is asked to schedule it.
+        let metadata_only = request.metadata_only;
+        let hashes: Vec<RpcHash> = added.iter().take(limit).copied().collect();
+        let blocks = if reorged {
+            Vec::new()
+        } else {
+            session
+                .clone()
+                .spawn_blocking(move |c| -> kaspa_consensus_core::errors::consensus::ConsensusResult<Vec<RpcShieldedChainBlock>> {
+                    let mut out = Vec::with_capacity(hashes.len());
+                    for hash in hashes {
+                        if metadata_only {
+                            // Do not touch the shielded scan archive at all for cursor
+                            // discovery. Full archive records can contain large compact
+                            // action payloads; birthday walks need only canonical header
+                            // metadata.
+                            // Prefer the canonical header (cheap, no archive touch). Below the
+                            // pruning point the header and ghostdag data are gone, but the
+                            // archive record — which a full-history scan reads anyway — carries
+                            // the same hash/blue/daa/timestamp, so a birthday walk can continue
+                            // from genesis instead of dying at the first pruned block. Only the
+                            // metadata is sent; the record's action payload stays here.
+                            let (blue_score, daa_score, timestamp) = match (c.get_header(hash), c.get_ghostdag_data(hash)) {
+                                (Ok(header), Ok(gd)) => (gd.blue_score, header.daa_score, header.timestamp),
+                                _ => {
+                                    let d = c.get_shielded_chain_block_data(hash)?;
+                                    (d.blue_score, d.daa_score, d.timestamp)
+                                }
+                            };
+                            out.push(RpcShieldedChainBlock {
+                                hash,
+                                blue_score,
+                                daa_score,
+                                coinbase_txid: RpcHash::default(),
+                                coinbase_outputs: Vec::new(),
+                                accepted_actions: Vec::new(),
+                                accepted_txids: Vec::new(),
+                                timestamp,
+                            });
+                            continue;
+                        }
+                        let d = c.get_shielded_chain_block_data(hash)?;
+                        let coinbase_outputs = d
+                            .coinbase_outputs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (script_public_key, value))| RpcShieldedCoinbaseOutput {
+                                script_public_key: script_public_key.clone(),
+                                value: *value,
+                                commitment: d.coinbase_commitments.get(i).copied(),
+                            })
+                            .collect();
+                        out.push(RpcShieldedChainBlock {
+                            hash: d.hash,
+                            blue_score: d.blue_score,
+                            daa_score: d.daa_score,
+                            coinbase_txid: d.coinbase_txid,
+                            coinbase_outputs,
+                            accepted_actions: d.accepted_actions,
+                            accepted_txids: d.accepted_txids,
+                            timestamp: d.timestamp,
+                        });
+                    }
+                    Ok(out)
+                })
+                .await?
+        };
         Ok(GetShieldedBlocksResponse { blocks, reorged, sink_blue_score })
     }
 
@@ -843,8 +984,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         };
         let daa_score = session.async_get_header(block_hash).await?.daa_score;
         let blue_score = session.async_get_ghostdag_data(block_hash).await?.blue_score;
-        let (cumulative_coinbase, cumulative_fees, cumulative_burns) =
-            session.async_get_shielded_supply_totals(block_hash).await?;
+        let (cumulative_coinbase, cumulative_fees, cumulative_burns) = session.async_get_shielded_supply_totals(block_hash).await?;
         // The frontier's leaf count is the number of notes ever created, which is
         // read from the same per-block snapshot as the totals — so all the numbers
         // in one response describe exactly one point on the chain.
@@ -885,8 +1025,18 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         const DEFAULT_LIMIT: usize = 500;
         const MAX_LIMIT: usize = 2000;
 
+        // Every recipient is compared against every coinbase output of every scanned block, so
+        // an uncapped list made one anonymous call cost O(blocks x outputs x recipients).
+        const MAX_RECIPIENTS: usize = 256;
+
         if request.recipients.is_empty() {
             return Err(RpcError::General("at least one recipient is required".to_string()));
+        }
+        if request.recipients.len() > MAX_RECIPIENTS {
+            return Err(RpcError::General(format!(
+                "at most {MAX_RECIPIENTS} recipients per call; got {}",
+                request.recipients.len()
+            )));
         }
         if let Some(bad) = request.recipients.iter().find(|r| r.len() != RECIPIENT_LEN) {
             return Err(RpcError::General(format!(
@@ -936,7 +1086,23 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                 scanned_blocks += 1;
             }
         }
-        Ok(GetShieldedCoinbaseRewardsResponse { rewards, next_cursor, scanned_blocks, reorged, sink_blue_score })
+        // The sink's accrual slot, reported only to a caller that asked for its recipient: the
+        // script and amount are public in the coinbases anyway, this just saves summing them.
+        let slot = session.async_get_miner_accrual(sink).await?;
+        let (pending_recipient, pending_value) =
+            match match_coinbase_outputs(&[(slot.script_public_key.script().to_vec(), slot.amount)], &request.recipients).pop() {
+                Some(m) if !slot.is_empty() => (m.recipient, m.value),
+                _ => (Vec::new(), 0),
+            };
+        Ok(GetShieldedCoinbaseRewardsResponse {
+            rewards,
+            next_cursor,
+            scanned_blocks,
+            reorged,
+            sink_blue_score,
+            pending_recipient,
+            pending_value,
+        })
     }
 
     async fn get_sink_blue_score_call(
@@ -1124,7 +1290,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         //
         // TODO: optimize using binary search over the samples to obtain O(m log n) complexity (which is an improvement assuming m << n)
         while header_idx < headers.len() && req_idx < request.daa_scores.len() {
-            let header = headers.get(header_idx).unwrap();
+            let header = &headers[header_idx];
             let curr_daa_score = requested_daa_scores[req_idx];
 
             // Found daa_score in range
@@ -1154,8 +1320,20 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             }
         }
 
-        // Note: it is safe to assume all entries exist in the map since the first sampled header is expected to have daa_score=0
-        let timestamps = request.daa_scores.iter().map(|curr_daa_score| daa_score_timestamp_map[curr_daa_score]).collect();
+        // The oldest sample is genesis only on an archival node. On a pruned node a requested score
+        // can be older than every sample, and indexing the map for it panicked (= process exit,
+        // anonymous RPC). Extrapolate backwards from the oldest sample at the target block time.
+        let oldest = headers.last().ok_or_else(|| RpcError::General("no chain block samples available".to_string()))?;
+        let timestamps = request
+            .daa_scores
+            .iter()
+            .map(|curr_daa_score| match daa_score_timestamp_map.get(curr_daa_score) {
+                Some(ts) => *ts,
+                None => oldest.timestamp.saturating_sub(
+                    oldest.daa_score.saturating_sub(*curr_daa_score).saturating_mul(self.config.target_time_per_block()),
+                ),
+            })
+            .collect();
 
         Ok(GetDaaScoreTimestampEstimateResponse::new(timestamps))
     }

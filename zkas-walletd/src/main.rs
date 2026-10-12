@@ -21,6 +21,16 @@ struct Cli {
     /// Network: mainnet | testnet | devnet | simnet.
     #[arg(long, default_value = "mainnet")]
     network: String,
+    /// Stop the daemon after N minutes with no wallet API request (0 or unset = run
+    /// forever, the default).
+    ///
+    /// Meant for a daemon exposed on a network to pair a phone: it holds the viewing
+    /// keys of every wallet it serves, and it is routinely left running long after the
+    /// payment that needed it. `/health` does not count as use, so an uptime monitor
+    /// cannot hold the door open. In-flight requests finish; the process then exits and
+    /// a supervisor may restart it on demand.
+    #[arg(long, value_name = "MINUTES")]
+    idle_timeout: Option<u64>,
     /// Permit binding a non-loopback address directly (prefer a TLS proxy instead).
     #[arg(long, default_value_t = false)]
     allow_remote: bool,
@@ -35,6 +45,13 @@ struct Cli {
     /// can't read the default wallet. Enable only for a trusted single-user localhost.
     #[arg(long, default_value_t = false)]
     allow_default_token: bool,
+    /// Serve the multi-party bundle endpoints (`/api/bundle/offer|prepare|submit`), so
+    /// two or more parties can settle atomically in ONE Orchard bundle — an NFT sale, a
+    /// swap, an escrow release. Off by default: the coordinator role sees every
+    /// participant's VIEWING key (enough to read their notes, never to spend them), so
+    /// this is a deliberate deployment choice.
+    #[arg(long, default_value_t = false)]
+    enable_multiparty: bool,
     /// Secret used to encrypt wallet seed files at rest (XChaCha20-Poly1305, Argon2
     /// key). May also be set via the `ZKAS_WALLET_SECRET` env var (the legacy
     /// `FIRECASH_WALLET_SECRET` is still honored). If unset, seeds are stored in
@@ -72,6 +89,11 @@ struct Cli {
     /// here; this only decides how many cores divide it.
     #[arg(long, value_name = "N")]
     proof_threads: Option<usize>,
+    /// Tokio worker threads serving HTTP, RPC, and background coordination.
+    /// Default: twice the available CPU count, so CPU-heavy scan tasks cannot
+    /// occupy every runtime worker and starve status/health requests.
+    #[arg(long, value_name = "N")]
+    runtime_threads: Option<usize>,
     /// Offline admin: print each wallet's note/base/STRANDED-note report and exit.
     /// Run with the daemon stopped.
     #[arg(long, default_value_t = false)]
@@ -100,6 +122,65 @@ struct Cli {
     /// and persisted next to the cert).
     #[arg(long)]
     api_token: Option<String>,
+    /// Disable every custodial (seed-holding) endpoint: create, import, send,
+    /// send_many, reveal, consolidate, sign all return 403. The daemon then serves
+    /// ONLY the watch-only model (watch + prepare + submit) and holds no seeds at
+    /// all — the right posture for a hosted multi-tenant deployment (see
+    /// OPERATIONS.md). Off by default so existing self-host/gateway setups are
+    /// unaffected.
+    #[arg(long, default_value_t = false)]
+    no_custodial: bool,
+    /// Cap how many `/api/wallet/prepare` proofs run at once. Each proof saturates
+    /// every core (~2.4 core-seconds per input note), so on a hosted daemon an
+    /// unbounded count is a CPU denial-of-service; excess callers queue briefly,
+    /// then get a retry-friendly 503. Default: min(2, available cores).
+    #[arg(long, value_name = "N")]
+    max_concurrent_proves: Option<usize>,
+    /// Maximum wallet scans advanced concurrently (default: hardware-derived).
+    #[arg(long, value_name = "N")]
+    sync_wallets: Option<usize>,
+    /// Estimated free memory required per concurrent wallet scan.
+    #[arg(long, value_name = "MIB")]
+    sync_wallet_memory_mb: Option<u64>,
+    /// Maximum checkpoints loaded concurrently.
+    #[arg(long, value_name = "N")]
+    load_wallets: Option<usize>,
+    /// Maximum one-time cold witness warmups running concurrently.
+    #[arg(long, value_name = "N")]
+    warm_wallets: Option<usize>,
+    /// Keep the N most recently active wallets resident and fully prepared, never
+    /// evicted. Costs roughly 100-190 MiB of RAM each; 0 (the default) keeps the old
+    /// behaviour. This is what removes the 10-15s "reopen a synced wallet and wait
+    /// before you can send" — the wallet is still there, so there is nothing to rebuild.
+    #[arg(long, value_name = "N")]
+    warm_always: Option<usize>,
+    /// Ceiling on 1-minute load average per core, as a percent, above which the
+    /// background warm sweep stops starting new cold work. Recently active wallets are
+    /// never gated by it; progressively older ones get a progressively smaller share, so
+    /// dormant wallets are prepared out of genuinely idle capacity. Default 60.
+    #[arg(long, value_name = "PCT")]
+    warm_budget: Option<u64>,
+    /// Threads used to decode each shared shielded-block page.
+    #[arg(long, value_name = "N")]
+    page_decode_threads: Option<usize>,
+    /// Maximum decoded shielded-block pages retained in the shared cache.
+    #[arg(long, value_name = "N")]
+    page_cache_entries: Option<usize>,
+    /// Seconds a decoded page remains reusable.
+    #[arg(long, value_name = "SECONDS")]
+    page_cache_ttl: Option<u64>,
+    /// Keep syncing a wallet for this many seconds after its last API request.
+    #[arg(long, value_name = "SECONDS")]
+    active_sync_window: Option<u64>,
+    /// Evict a checkpoint from RAM after this many idle seconds.
+    #[arg(long, value_name = "SECONDS")]
+    idle_evict: Option<u64>,
+    /// Hard cap on wallet checkpoints resident in RAM.
+    #[arg(long, value_name = "N")]
+    max_resident_wallets: Option<usize>,
+    /// Defer optional subtree-index builds below this MemAvailable value.
+    #[arg(long, value_name = "MIB")]
+    subtree_free_floor_mb: Option<u64>,
 }
 
 // Oversubscribe worker threads (2x cores). The background sync loop does CPU-bound
@@ -109,10 +190,30 @@ struct Cli {
 // out at 15s during a 170-wallet rescan). With more workers than cores, a newly
 // runnable HTTP handler is always schedulable within a time slice, so status stays
 // responsive while scans grind in the background.
-#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
-async fn main() {
+fn main() {
     kaspa_core::log::try_init_logger("info");
     let cli = Cli::parse();
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let runtime_threads = cli.runtime_threads.filter(|n| *n > 0).unwrap_or_else(|| cores.saturating_mul(2).max(2));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(runtime_threads)
+        .thread_name("wallet-runtime")
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("cannot build Tokio runtime with {runtime_threads} threads: {e}");
+            std::process::exit(1);
+        });
+    runtime.block_on(run(cli));
+}
+
+async fn run(cli: Cli) {
+    log::info!(
+        "wallet runtime threads: {}",
+        cli.runtime_threads
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| { std::thread::available_parallelism().map(|n| n.get().saturating_mul(2).max(2)).unwrap_or(2) })
+    );
 
     // Size the rayon pool Halo2 proves in, before anything can touch it — `build_global`
     // is one-shot and silently loses to whichever code path initialises rayon first.
@@ -121,6 +222,47 @@ async fn main() {
             Ok(()) => log::info!("proving is capped at {n} thread(s) (--proof-threads); payments trade latency for headroom"),
             Err(e) => log::warn!("could not cap proving threads at {n}: {e}; using every core"),
         }
+    }
+
+    let mut resources = zkas_walletd::ResourceLimits::default();
+    if let Some(v) = cli.sync_wallets.filter(|v| *v > 0) {
+        resources.sync_wallets = v;
+    }
+    if let Some(v) = cli.sync_wallet_memory_mb.filter(|v| *v > 0) {
+        resources.sync_wallet_memory_mb = v;
+    }
+    if let Some(v) = cli.load_wallets.filter(|v| *v > 0) {
+        resources.load_wallets = v;
+    }
+    if let Some(v) = cli.warm_wallets.filter(|v| *v > 0) {
+        resources.warm_wallets = v;
+    }
+    if let Some(v) = cli.warm_always {
+        resources.warm_always = v;
+    }
+    if let Some(v) = cli.warm_budget.filter(|v| *v > 0) {
+        resources.warm_budget_pct = v;
+    }
+    if let Some(v) = cli.page_decode_threads.filter(|v| *v > 0) {
+        resources.page_decode_threads = v;
+    }
+    if let Some(v) = cli.page_cache_entries.filter(|v| *v > 0) {
+        resources.page_cache_entries = v;
+    }
+    if let Some(v) = cli.page_cache_ttl.filter(|v| *v > 0) {
+        resources.page_cache_ttl_secs = v;
+    }
+    if let Some(v) = cli.active_sync_window.filter(|v| *v > 0) {
+        resources.active_sync_secs = v;
+    }
+    if let Some(v) = cli.idle_evict.filter(|v| *v > 0) {
+        resources.idle_evict_secs = v;
+    }
+    if let Some(v) = cli.max_resident_wallets.filter(|v| *v > 0) {
+        resources.max_resident_wallets = v;
+    }
+    if let Some(v) = cli.subtree_free_floor_mb {
+        resources.subtree_free_floor_mb = v;
     }
 
     // Offline admin modes: operate on the wallet files directly and exit.
@@ -158,11 +300,54 @@ async fn main() {
         .or_else(|| std::env::var("ZKAS_WALLET_SECRET").ok())
         .or_else(|| std::env::var("FIRECASH_WALLET_SECRET").ok());
 
-    // The sender is held (never fired) so the daemon runs until the process dies.
-    let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // Fire `shutdown` on SIGINT/SIGTERM so the daemon can flush every resident wallet's
+    // checkpoint before exiting.
+    //
+    // This used to be `_shutdown_tx` — held and never fired, so the process simply died
+    // on Ctrl-C. A wallet checkpoints only every `CHECKPOINT_EVERY` blocks, so whatever
+    // it had scanned since then lived solely in RAM and was lost. For a wallet part-way
+    // through its FIRST scan that is the whole difference between the progress bar the
+    // user was watching and where it restarts: reported live 2026-08-07 as a wallet
+    // going from "syncing 80%" to "syncing 44%" across a restart. Nothing was corrupted
+    // and no funds were ever at risk — the work was simply thrown away and redone.
+    //
+    // Operators restart walletd routinely (deploys, config changes). Making that cost
+    // users their scan progress is not acceptable, so shutdown is now a real signal.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("cannot listen for SIGTERM ({e}); shutdown will not flush checkpoints");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => log::info!("SIGINT received — flushing wallet checkpoints before exit"),
+                _ = term.recv() => log::info!("SIGTERM received — flushing wallet checkpoints before exit"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            log::info!("interrupt received — flushing wallet checkpoints before exit");
+        }
+        let _ = shutdown_tx.send(());
+    });
+
+    // 0 is spelled "never" rather than "shut down immediately", which is the reading
+    // a user who types 0 to disable it expects.
+    let idle_timeout = cli.idle_timeout.filter(|m| *m > 0).map(|m| std::time::Duration::from_secs(m * 60));
 
     // Self-hosting mode: one flag gives TLS + bearer + a pairing QR, no proxy.
     if let Some(addr) = cli.serve_public {
+        // SelfHostConfig is shared with kaspad's embedded mode and stays custodial;
+        // a single-user self-host has no reason to disable its own seed endpoints.
+        if cli.no_custodial {
+            log::warn!("--no-custodial is ignored with --serve-public (self-host mode serves its owner's seed wallet)");
+        }
         let listen: SocketAddr = addr.parse().unwrap_or_else(|e| {
             log::error!("bad --serve-public {addr:?}: {e}");
             std::process::exit(1);
@@ -180,6 +365,8 @@ async fn main() {
             public_host: cli.public_host,
             wallet_secret,
             allow_default_token: cli.allow_default_token,
+            resources,
+            idle_timeout,
         };
         if let Err(e) = zkas_walletd::run_selfhost(sh, shutdown_rx).await {
             log::error!("{e}");
@@ -201,6 +388,7 @@ async fn main() {
     }
 
     let cfg = Config {
+        enable_multiparty: cli.enable_multiparty,
         rpc_server: cli.rpc_server,
         listen,
         wallet_dir,
@@ -212,6 +400,16 @@ async fn main() {
         tls: None,
         require_bearer: None,
         auto_consolidate: (!cli.no_auto_consolidate).then_some(cli.auto_consolidate),
+        build_shared_tree: true,
+        node_socks_proxy: None,
+        allow_custodial: !cli.no_custodial,
+        // 0 makes no sense (every prepare would 503); fall back to the default.
+        max_concurrent_proves: cli
+            .max_concurrent_proves
+            .filter(|n| *n > 0)
+            .unwrap_or_else(zkas_walletd::default_max_concurrent_proves),
+        resources,
+        idle_timeout,
     };
 
     if let Err(e) = serve(cfg, shutdown_rx).await {

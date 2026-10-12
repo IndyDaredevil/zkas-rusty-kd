@@ -119,6 +119,7 @@ pub struct HeaderProcessor {
     pub(super) block_version: ForkedParam<u16>,
     /// DAA score at which merged-mining (AuxPoW) PoW acceptance turns on.
     pub(super) merged_mining_activation: ForkActivation,
+    pub(super) security_fork_activation: ForkActivation,
 
     // DB
     db: Arc<DB>,
@@ -209,6 +210,7 @@ impl HeaderProcessor {
             toccata_logger: ForkLogger::new("header in context validation", false),
             block_version: params.block_version(),
             merged_mining_activation: params.merged_mining_activation,
+            security_fork_activation: params.security_fork_activation,
         }
     }
 
@@ -318,6 +320,11 @@ impl HeaderProcessor {
     // Runs partial header validation for trusted blocks (currently validates only header-in-isolation and computes GHOSTDAG).
     fn validate_trusted_header(&self, header: &Arc<Header>) -> BlockProcessResult<HeaderProcessingContext> {
         let block_level = self.validate_header_in_isolation(header)?;
+        // Trusted headers skip post-PoW validation, the only place the version is checked against
+        // its DAA score. Every honest header already passed that check on the serving node, so this
+        // only refuses a version no block at that score may carry: a version-gated rule must not be
+        // skippable through the pruning proof.
+        self.check_header_version_in_context(header)?;
         let mut ctx = self.build_processing_context(header, block_level);
         self.ghostdag(&mut ctx);
         Ok(ctx)

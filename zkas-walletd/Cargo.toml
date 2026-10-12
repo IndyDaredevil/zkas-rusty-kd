@@ -27,6 +27,7 @@ kaspa-rpc-core.workspace = true
 # The shielded engine: WalletDb (scan/witness/balance), the real Halo 2 payment
 # builder (circuit feature), coinbase-note reconstruction, and message sign/verify.
 kaspa-shielded-core = { workspace = true, features = ["circuit"] }
+zkas-gpu = { path = "../zkas-gpu" }
 # Canonical shielded-tx shape + its sighash context.
 kaspa-shielded-wallet.workspace = true
 zkas-wallet-engine.workspace = true
@@ -34,7 +35,7 @@ zkas-sdk.workspace = true
 
 axum = "0.7"
 tower-http = { version = "0.5.2", features = ["cors"] }
-tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "time", "sync"] }
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "time", "sync", "signal"] }
 # Parallel page decode: the per-block coinbase Sinsemilla commitment dominates scan CPU
 # (~1 ms/block serial — the measured ~900 blk/s ceiling); blocks are independent, so the
 # shared decode fans out across cores.
@@ -45,6 +46,7 @@ log.workspace = true
 clap.workspace = true
 # CSPRNG for fresh wallet seeds + message signing.
 rand.workspace = true
+rand10 = { package = "rand", version = "0.10" }
 # Seed-file encryption at rest (XChaCha20-Poly1305 with an Argon2-derived key).
 argon2.workspace = true
 chacha20poly1305.workspace = true

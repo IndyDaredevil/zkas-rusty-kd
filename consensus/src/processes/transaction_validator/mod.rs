@@ -25,7 +25,30 @@ pub struct TransactionValidator {
     coinbase_maturity: u64,
     ghostdag_k: KType,
     sig_cache: Cache<SigCacheKey, bool>,
+    /// Verdicts of Halo 2 bundle verification, keyed by transaction id.
+    ///
+    /// Verifying a shielded bundle is the most expensive per-byte operation in the system
+    /// — and it was repeated for every transaction at mempool admission, on every block
+    /// template build, and again at block validation, with nothing remembered in between.
+    /// A miner rebuilding a template about once a second re-verified the entire mempool
+    /// each time.
+    ///
+    /// Caching by txid is sound because the verdict is a pure function of bytes the txid
+    /// already commits to: the payload carries the bundle, and the sighash context is
+    /// version + subnetwork id + lock time + gas, every one of which is hashed into the
+    /// id. Two transactions with the same id therefore verify identically, forever.
+    ///
+    /// Only successes are cached. Caching failures let a stream of distinct garbage txids
+    /// evict the resident successes from this count-bounded, randomly evicting cache, so
+    /// every template build re-verified the mempool. Re-offers of one bad txid are stopped by
+    /// the relay flow's dedup and by the `InvalidShieldedProof` peer penalty instead.
+    /// `u8` rather than `bool` only because the cache requires `MemSizeEstimator`, which is
+    /// implemented for the integer primitives and not for `bool`. Always 1.
+    shielded_verify_cache: kaspa_database::prelude::Cache<kaspa_consensus_core::tx::TransactionId, u8>,
     toccata_activation: ForkActivation,
+    /// See `Params::security_fork_activation`. Defaults to never; set via
+    /// [`TransactionValidator::with_security_fork_activation`].
+    security_fork_activation: ForkActivation,
     mass_per_sig_op: u64,
     /// Per-network domain separator bound into the shielded-transaction sighash
     /// (the genesis hash). Prevents a shielded bundle valid on one network from
@@ -60,11 +83,21 @@ impl TransactionValidator {
             coinbase_maturity,
             ghostdag_k,
             sig_cache: Cache::with_counters(10_000, counters),
+            // Sized well under the sig cache: a shielded tx is ~123 KB at full size, so the
+            // population that matters here is the mempool and a template's worth of
+            // transactions, not every signature the node has ever seen.
+            shielded_verify_cache: kaspa_database::prelude::Cache::new(kaspa_database::prelude::CachePolicy::Count(2_000)),
             mass_calculator,
             toccata_activation,
+            security_fork_activation: ForkActivation::never(),
             mass_per_sig_op,
             shielded_network_domain,
         }
+    }
+
+    pub fn with_security_fork_activation(mut self, activation: ForkActivation) -> Self {
+        self.security_fork_activation = activation;
+        self
     }
 
     pub fn new_for_tests(
@@ -86,8 +119,13 @@ impl TransactionValidator {
             coinbase_maturity,
             ghostdag_k,
             sig_cache: Cache::with_counters(10_000, counters),
+            // Sized well under the sig cache: a shielded tx is ~123 KB at full size, so the
+            // population that matters here is the mempool and a template's worth of
+            // transactions, not every signature the node has ever seen.
+            shielded_verify_cache: kaspa_database::prelude::Cache::new(kaspa_database::prelude::CachePolicy::Count(2_000)),
             mass_calculator: MassCalculator::new(0, 0, 0),
             toccata_activation: ForkActivation::never(),
+            security_fork_activation: ForkActivation::never(),
             mass_per_sig_op: 0,
             shielded_network_domain: [0u8; 32],
         }

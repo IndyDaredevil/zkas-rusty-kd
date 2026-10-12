@@ -35,6 +35,18 @@ pub struct Config {
     /// Indicates whether this node is an archival node
     pub is_archival: bool,
 
+    /// Whether to fetch the shielded note history below the pruning point from peers.
+    ///
+    /// `None` means "follow `is_archival`", which is the right default in both directions: an
+    /// archival node claims to hold everything and would otherwise silently serve wallets a
+    /// partial balance, while an ordinary node should not spend ~234 MB and a verification pass
+    /// on history it does not intend to serve.
+    ///
+    /// Explicit `Some(true)` matters for a PRUNED wallet-serving node: the scan archive and the
+    /// selected-chain index both survive pruning by design, so such a node can hold and serve
+    /// complete note history without being archival. Without this flag it had no way to ask.
+    pub shielded_history: Option<bool>,
+
     /// Enable various sanity checks which might be compute-intensive (mostly performed during pruning)
     pub enable_sanity_checks: bool,
 
@@ -77,6 +89,33 @@ pub struct Config {
 }
 
 impl Config {
+    /// Whether this node should obtain shielded note history below its pruning point.
+    ///
+    /// **Defaults to ON for every node**, archival or not.
+    ///
+    /// It used to default to `is_archival`, on the reasoning that "a non-archival node should not
+    /// pay for history it will not serve". That reasoning priced the wrong thing. Measured on a
+    /// fresh pruned sync 2026-08-22 at 968,613 chain blocks, the shielded scan archive is
+    /// **499 MiB** (540 B mean per block) against a 1.5 GiB total database — a large SHARE of a
+    /// pruned node, but a small absolute cost, and roughly a twentieth of what `--archival`'s
+    /// block bodies ask for. Tying that decision to the archival one made history rare when it
+    /// needs to be ubiquitous.
+    ///
+    /// (An earlier note here said 232 MB / 2.35%. That was measured on an ARCHIVAL node at
+    /// 861,987 blocks; the archive has since roughly doubled with the chain, and the percentage
+    /// was never the right comparison for a pruned node.)
+    ///
+    /// The failure that default produced is not hypothetical. Every node that fast-syncs with
+    /// defaults holds no history below its own pruning point, so pre-pruning-point note data —
+    /// which is USER FUNDS DATA, and is not recoverable from the network once lost — survives
+    /// only on the handful of machines that happened to be running when those blocks were mined.
+    /// Defaulting on is what makes the network, rather than two servers, the place history lives.
+    ///
+    /// Turn it off explicitly (`--shielded-history=off`) for a node that will never serve wallets.
+    pub fn wants_shielded_history(&self) -> bool {
+        self.shielded_history.unwrap_or(true)
+    }
+
     pub fn new(params: Params) -> Self {
         Self::with_perf(params, PERF_PARAMS)
     }
@@ -87,6 +126,7 @@ impl Config {
             perf,
             process_genesis: true,
             is_archival: false,
+            shielded_history: None,
             enable_sanity_checks: false,
             utxoindex: false,
             unsafe_rpc: false,

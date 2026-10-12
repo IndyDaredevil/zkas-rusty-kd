@@ -240,22 +240,20 @@ fn configure_rocksdb(args: &Args) -> (RocksDbPreset, Option<usize>, Option<PathB
         RocksDbPreset::Default
     };
 
-    // Calculate cache budget for HDD preset
-    let cache_budget = if matches!(preset, RocksDbPreset::Hdd) {
-        if let Some(cache_mb) = args.rocksdb_cache_size {
-            let cache_bytes = cache_mb * 1024 * 1024;
-            info!("Custom RocksDB cache size: {} MB", cache_mb);
-            Some(cache_bytes)
-        } else {
-            let base_cache = 256 * 1024 * 1024;
-            let scaled_cache = (base_cache as f64 * args.ram_scale) as usize;
-            let min_cache = 64 * 1024 * 1024;
-            let final_cache = scaled_cache.max(min_cache);
-            info!("RocksDB cache size: {} MB (scaled by ram-scale)", final_cache / 1024 / 1024);
-            Some(final_cache)
-        }
+    // Block-cache budget (applies to BOTH presets now: the default preset also
+    // installs a bloom filter + LRU block cache, so the hot nullifier
+    // negative-lookup path stops walking SSTs on every miss).
+    let cache_budget = if let Some(cache_mb) = args.rocksdb_cache_size {
+        let cache_bytes = cache_mb * 1024 * 1024;
+        info!("Custom RocksDB cache size: {} MB", cache_mb);
+        Some(cache_bytes)
     } else {
-        None
+        let base_cache = 256 * 1024 * 1024;
+        let scaled_cache = (base_cache as f64 * args.ram_scale) as usize;
+        let min_cache = 64 * 1024 * 1024;
+        let final_cache = scaled_cache.max(min_cache);
+        info!("RocksDB cache size: {} MB (scaled by ram-scale)", final_cache / 1024 / 1024);
+        Some(final_cache)
     };
 
     // Setup WAL directory if specified
@@ -322,6 +320,31 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
             None => params,
         }
     };
+    // A fast-syncing node can prove an in-window anchor source only from headers it holds, and it
+    // holds the chain segment `finality_depth` deep below its pruning point. An anchor window deeper
+    // than that would drop honest anchors at import and wedge the node on its first such spend.
+    if params.max_shielded_anchor_age() >= params.finality_depth() {
+        println!(
+            "Invalid params: max_shielded_anchor_age ({}) must be below finality_depth ({}).",
+            params.max_shielded_anchor_age(),
+            params.finality_depth()
+        );
+        exit(1);
+    }
+    // After a reorg the reachability reindex root switches to the winning chain only once that chain
+    // is `DEFAULT_REINDEX_SLACK` taller. With a pruning depth below finality + that slack (possible
+    // only through an override file), pruning can delete a losing branch that still holds the reindex
+    // root, and the node then panics on every header. Shipped networks are far above this (mainnet
+    // 108,000 vs 43,200 + 16,384); warn so a test configuration does not get read as a code bug.
+    if params.pruning_depth() < params.finality_depth() + kaspa_consensus_core::config::constants::perf::DEFAULT_REINDEX_SLACK {
+        println!(
+            "WARNING: pruning_depth ({}) < finality_depth ({}) + reindex slack ({}): a deep reorg followed by pruning \
+             can corrupt reachability on this test configuration.",
+            params.pruning_depth(),
+            params.finality_depth(),
+            kaspa_consensus_core::config::constants::perf::DEFAULT_REINDEX_SLACK
+        );
+    }
 
     let config = Arc::new(
         ConfigBuilder::new(params).adjust_perf_params_to_consensus_params().apply_args(|config| args.apply_to_config(config)).build(),
@@ -347,20 +370,16 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
 
     // Consensus-divergence diagnostics (`--consensus-diag`). Must be initialised before the
     // consensus threads start, since the setting is read once and then latched.
-    kaspa_consensus::processes::shielded_diag::init(args.consensus_diag.as_ref().map(|d| {
-        if d.is_empty() { app_dir.join(network.to_prefixed()).join("consensus-diag") } else { PathBuf::from(d) }
-    }));
+    kaspa_consensus::processes::shielded_diag::init(
+        args.consensus_diag
+            .as_ref()
+            .map(|d| if d.is_empty() { app_dir.join(network.to_prefixed()).join("consensus-diag") } else { PathBuf::from(d) }),
+    );
     if let Some(d) = args.consensus_diag.as_ref() {
-        info!("Consensus divergence diagnostics ON; reports will be written to {}", if d.is_empty() { "<appdir>/consensus-diag" } else { d });
-    }
-
-    // Pinned anchor mappings must be loaded before consensus starts: the map is latched on
-    // first read, and the virtual processor reads it while validating the very first block.
-    if let Some(path) = args.shielded_anchor_overrides.as_ref() {
-        match kaspa_consensus::processes::shielded::load_anchor_overrides(std::path::Path::new(path)) {
-            Ok(n) => info!("Pinned {n} shielded anchor->source mappings from {path}"),
-            Err(e) => panic!("--shielded-anchor-overrides: {e}"),
-        }
+        info!(
+            "Consensus divergence diagnostics ON; reports will be written to {}",
+            if d.is_empty() { "<appdir>/consensus-diag" } else { d }
+        );
     }
 
     let consensus_db_dir = db_dir.join(CONSENSUS_DB);
@@ -576,7 +595,7 @@ Do you confirm? (y/n)";
 
     let connect_peers = args.connect_peers.iter().map(|x| x.normalize(config.default_p2p_port())).collect::<Vec<_>>();
     let add_peers = args.add_peers.iter().map(|x| x.normalize(config.default_p2p_port())).collect();
-    let p2p_server_addr = args.listen.unwrap_or(ContextualNetAddress::unspecified()).normalize(config.default_p2p_port());
+    let p2p_server_addr = args.listen.unwrap_or(ContextualNetAddress::unspecified()).normalize(config.default_listen_p2p_port());
     // connect_peers means no DNS seeding and no outbound/inbound peers
     let outbound_target = if connect_peers.is_empty() { args.outbound_target } else { 0 };
     let inbound_limit = if connect_peers.is_empty() { args.inbound_limit } else { 0 };
@@ -596,8 +615,16 @@ Do you confirm? (y/n)";
             match api_addr.parse::<std::net::SocketAddr>() {
                 Err(e) => warn!("--wallet-api {api_addr:?} is not a valid addr:port ({e}); skipping wallet API"),
                 Ok(listen) => {
-                    let net_str =
-                        if args.testnet { "testnet" } else if args.devnet { "devnet" } else if args.simnet { "simnet" } else { "mainnet" }.to_string();
+                    let net_str = if args.testnet {
+                        "testnet"
+                    } else if args.devnet {
+                        "devnet"
+                    } else if args.simnet {
+                        "simnet"
+                    } else {
+                        "mainnet"
+                    }
+                    .to_string();
                     let prefixed = network.to_prefixed();
                     let state_dir = app_dir.join(&prefixed).join("wallet-api");
                     let wallet_dir = app_dir.join(&prefixed).join("wallets").to_string_lossy().into_owned();
@@ -610,7 +637,13 @@ Do you confirm? (y/n)";
                     std::thread::Builder::new()
                         .name("wallet-api".to_string())
                         .spawn(move || {
-                            let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(8).enable_all().build() {
+                            let wallet_runtime_threads =
+                                std::thread::available_parallelism().map(|n| n.get().saturating_mul(2).max(2)).unwrap_or(2);
+                            let rt = match tokio::runtime::Builder::new_multi_thread()
+                                .worker_threads(wallet_runtime_threads)
+                                .enable_all()
+                                .build()
+                            {
                                 Ok(rt) => rt,
                                 Err(e) => {
                                     warn!("wallet API runtime failed to start: {e}");
@@ -630,6 +663,12 @@ Do you confirm? (y/n)";
                                 public_host,
                                 wallet_secret,
                                 allow_default_token: true,
+                                resources: zkas_walletd::ResourceLimits::default(),
+                                // The wallet API lives and dies with the node here, so
+                                // an idle bound would stop it while the node it is
+                                // attached to keeps running — a service that silently
+                                // disappears from under the node hosting it.
+                                idle_timeout: None,
                             };
                             if let Err(e) = rt.block_on(zkas_walletd::run_selfhost(cfg, rx)) {
                                 warn!("wallet API exited: {e}");
@@ -676,6 +715,69 @@ Do you confirm? (y/n)";
         cache_budget,
     ));
     let consensus_manager = Arc::new(ConsensusManager::new(consensus_factory));
+
+    // Say what shielded history this node holds, once, at startup. Until now nothing did unless
+    // `--verify-shielded-history` was passed, so an operator whose wallet was refused with
+    // "cannot serve complete shielded history" had no line in the log to compare against. Same
+    // numbers `GetShieldedTreeState` publishes (`history_from_daa_score` / `history_complete`).
+    {
+        let consensus = consensus_manager.consensus().unguarded_session_blocking();
+        match consensus.get_shielded_history_status() {
+            Ok((floor, complete)) => {
+                info!(
+                    "Shielded history: from DAA {floor}, complete={complete} (--shielded-history={}, archival={})",
+                    if config.wants_shielded_history() { "on" } else { "off" },
+                    args.archival
+                );
+                if !complete && config.wants_shielded_history() {
+                    info!(
+                        "Shielded history below DAA {floor} will be fetched from peers during IBD and verified before it \
+                         is served; wallets born before that DAA see a partial balance until the log says VERIFIED"
+                    );
+                } else if !complete {
+                    info!(
+                        "Shielded history below DAA {floor} is NOT fetched (--shielded-history=off); wallets born before \
+                         that DAA cannot be served from this node"
+                    );
+                }
+            }
+            Err(e) => warn!("Shielded history status could not be read at startup: {e}"),
+        }
+    }
+
+    // `--verify-shielded-history`: replay the archive against this node's own anchored frontier
+    // and report, before serving anything.
+    //
+    // The p2p backfill verifies itself, but the OFFLINE restore path (`zkas-scan-import`) has no
+    // such moment — a file can be truncated, stale, or from another chain, and the symptom would
+    // be wallets quietly reporting wrong balances rather than an error. This gives an operator a
+    // way to ask the question directly. Read-only: it never deletes on this path, because a human
+    // ran it deliberately and should decide what to do about the answer.
+    if args.verify_shielded_history {
+        use kaspa_consensus_core::api::ShieldedHistoryVerdict;
+        let consensus = consensus_manager.consensus().unguarded_session_blocking();
+        // Against the SINK, not the history base. The base is the lowest block this node can
+        // enumerate — on a full-history node that is genesis itself, so verifying "up to the base"
+        // would replay one block and prove nothing. The sink is the top of the archive, so this
+        // checks all of it.
+        let base = consensus.get_sink();
+        info!("Verifying the shielded archive against the anchored frontier at {base} (reads the whole archive)...");
+        let started = std::time::Instant::now();
+        match consensus.verify_shielded_history(base) {
+            Ok(ShieldedHistoryVerdict::Verified { blocks, leaves }) => {
+                info!("Shielded archive VERIFIED: {blocks} chain blocks, {leaves} note commitments, in {:?}", started.elapsed())
+            }
+            Ok(ShieldedHistoryVerdict::Mismatch { reason }) => warn!(
+                "Shielded archive does NOT match the chain: {reason}. Nothing was deleted. Wallets served from this \
+                 node may report wrong balances; re-import a verified export before serving them."
+            ),
+            Ok(ShieldedHistoryVerdict::Unverifiable { reason }) => {
+                warn!("Shielded archive could NOT be verified: {reason}. This is not a pass — the check did not run.")
+            }
+            Err(e) => warn!("Shielded archive verification failed to run: {e}"),
+        }
+    }
+
     let consensus_monitor = Arc::new(ConsensusMonitor::new(processing_counters.clone(), tick_service.clone()));
 
     let perf_monitor_builder = PerfMonitorBuilder::new()

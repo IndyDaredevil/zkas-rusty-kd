@@ -1,3 +1,21 @@
+# ============================================================================
+# OBSOLETE AS OF 2026-08-06 — DO NOT APPLY. Kept for the forensic record only.
+#
+# All 360 entries below sit at DAA 12,901-490,226. The mainnet pruning point has
+# since advanced to 788,249, so a freshly syncing node never validates any of
+# them. Verified the same day: a fresh --archival node synced 0 -> tip with ZERO
+# divergence reports and no pins applied.
+#
+# The underlying cause is also fixed at the source. Upgrade-1
+# (shielded_anchor_multi_activation, DAA 757,000) mixes the block hash into the
+# coinbase note seed, so sibling blocks can no longer mint identical notes and
+# produce a colliding tree root -- the collision that created these landmines.
+#
+# Applying these now can only do harm: it forces anchors to resolve to
+# non-canonical blocks for a range nobody validates. The override mechanism was
+# only ever proven for ONE curated entry (DAA 371,851); the bulk variant was
+# measured to CORRUPT shielded state (see the warning below).
+# ============================================================================
 # ZKas pinned anchor->source mappings (complete landmine set).
 # Each line: a shielded tree root a CANONICAL block produces, which the chain's
 # anchor index resolves to a NON-canonical block. The chain drops spends against

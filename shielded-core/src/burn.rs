@@ -229,23 +229,14 @@ mod tests {
     /// every peg-out would silently stop verifying — this test fails first instead.
     #[test]
     fn hashing_matches_the_shared_wire_contract() {
-        assert_eq!(
-            hex(&receipt_a().leaf_hash()),
-            "27d9600250d03d6eea797a5a9d4a6c8ba66209121a104c8108412dc968ba7302",
-        );
-        assert_eq!(
-            hex(&receipt_b().leaf_hash()),
-            "8d3b19448c8d4dd0a44fd1f75b82ff606ef048f2b121c95aeef6953a17ff271f",
-        );
+        assert_eq!(hex(&receipt_a().leaf_hash()), "27d9600250d03d6eea797a5a9d4a6c8ba66209121a104c8108412dc968ba7302",);
+        assert_eq!(hex(&receipt_b().leaf_hash()), "8d3b19448c8d4dd0a44fd1f75b82ff606ef048f2b121c95aeef6953a17ff271f",);
 
         let acc = BurnAccumulator::from_receipts([receipt_a(), receipt_b()]);
         assert_eq!(hex(&acc.root()), "4a457e6dd8976c5b52b7d7337244ef6478c87e916bdec6465d730ecd5e7fe5d3");
 
         // Empty-subtree hash at level 1, used when padding an odd level.
-        assert_eq!(
-            hex(&node_hash(&EMPTY_LEAF, &EMPTY_LEAF)),
-            "ae0798d0ecaed2b778eddebf18f071a561c53658c05e76cedecc27cafbdbc577",
-        );
+        assert_eq!(hex(&node_hash(&EMPTY_LEAF, &EMPTY_LEAF)), "ae0798d0ecaed2b778eddebf18f071a561c53658c05e76cedecc27cafbdbc577",);
     }
 
     fn hex(b: &[u8; 32]) -> String {
@@ -275,21 +266,14 @@ mod tests {
     fn every_branch_verifies_at_every_size() {
         for n in 1..=9u64 {
             let receipts: Vec<_> = (0..n)
-                .map(|i| ExitReceipt {
-                    v: 1_000 + i,
-                    recipient: [i as u8; 32],
-                    n: [(i as u8).wrapping_add(0x80); 32],
-                })
+                .map(|i| ExitReceipt { v: 1_000 + i, recipient: [i as u8; 32], n: [(i as u8).wrapping_add(0x80); 32] })
                 .collect();
             let acc = BurnAccumulator::from_receipts(receipts.clone());
             let root = acc.root();
             for (i, r) in receipts.iter().enumerate() {
                 let branch = acc.branch(i as u32).expect("in range");
                 assert_eq!(branch.len(), acc.depth() * 32, "branch length must equal depth (n={n}, i={i})");
-                assert!(
-                    BurnAccumulator::verify_branch(r, i as u32, &branch, &root),
-                    "receipt {i} of {n} must verify",
-                );
+                assert!(BurnAccumulator::verify_branch(r, i as u32, &branch, &root), "receipt {i} of {n} must verify",);
             }
             assert!(acc.branch(n as u32).is_none(), "out-of-range index must have no branch");
         }

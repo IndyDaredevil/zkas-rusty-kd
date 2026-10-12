@@ -1,0 +1,25 @@
+[package]
+name = "zkas-gpu"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Optional CUDA acceleration for Orchard trial decryption; falls back to the CPU"
+
+[dependencies]
+pasta_curves = { package = "zakura-pasta-curves", version = "=2.2.0" }
+group = "0.14"
+libloading = "0.8"
+log.workspace = true
+# The canary and the start-up self-test compute the Orchard KDF and the one ChaCha20
+# keystream byte the filter looks at, so this crate can check the device against a
+# host answer rather than against nothing. Same versions shielded-core pins.
+blake2b_simd = { workspace = true }
+chacha20 = "0.9"
+# Runtime, not just tests: the self-test needs random points.
+rand = "0.10"
+
+[dev-dependencies]
+kaspa-shielded-core = { workspace = true, features = ["circuit"] }
+# The `xover` example already used this; it was never declared, so `cargo test -p
+# zkas-gpu` did not build.
+rayon.workspace = true

@@ -22,8 +22,8 @@ use crate::{
     pruning::{PruningPointProof, PruningPointTrustedData, PruningPointsList, PruningProofMetadata},
     trusted::{ExternalGhostdagData, TrustedBlock},
     tx::{
-        MutableTransaction, ScriptPublicKey, Transaction, TransactionId, TransactionIndexType, TransactionOutpoint, TransactionQueryResult,
-        TransactionType, UtxoEntry,
+        MutableTransaction, ScriptPublicKey, Transaction, TransactionId, TransactionIndexType, TransactionOutpoint,
+        TransactionQueryResult, TransactionType, UtxoEntry,
     },
 };
 use kaspa_hashes::Hash;
@@ -37,7 +37,7 @@ pub mod stats;
 /// The shielded effects of one chain block, as applied by the §2.4 transition —
 /// see [`ConsensusApi::get_shielded_chain_block_data`]. Plain types only, so
 /// `kaspa-shielded-core` stays off this API boundary.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ShieldedChainBlockData {
     /// The chain block.
     pub hash: Hash,
@@ -51,6 +51,11 @@ pub struct ShieldedChainBlockData {
     /// The coinbase outputs in order: `(script_public_key bytes, value)`. A
     /// 43-byte script is a raw Orchard recipient minting a coinbase note.
     pub coinbase_outputs: Vec<(Vec<u8>, u64)>,
+    /// Consensus-computed coinbase note commitments, parallel to
+    /// `coinbase_outputs`. Empty when supplied by an older peer/archive; callers
+    /// must then derive them from the public output description.
+    #[serde(default)]
+    pub coinbase_commitments: Vec<[u8; 32]>,
     /// Accepted shielded actions in consensus applied order, one entry per accepted
     /// tx (parallel to `accepted_txids`): each entry is that tx's actions in **compact**
     /// form — concatenated 148-byte `CompactActionRecord`s (nullifier ‖ cmx ‖ epk ‖
@@ -64,6 +69,49 @@ pub struct ShieldedChainBlockData {
     /// The chain block's header timestamp (ms since epoch) — the display time of
     /// everything this block applied.
     pub timestamp: u64,
+}
+
+/// The outcome of checking backfilled shielded history against the chain.
+///
+/// History arrives from a peer, and the scan archive it lands in is never read by validation —
+/// so bad data cannot fork this node. What it *can* do is make wallets report a wrong balance
+/// and a wrong history, silently and with no way for the user to tell. That is the failure this
+/// verdict exists to prevent, which is why an unverified range is discarded rather than kept
+/// with a warning: a wallet cannot act on a log line.
+///
+/// The check is cryptographic, not reputational. Appending to the note-commitment tree is
+/// order-dependent and pure, so replaying every `cmx` from genesis reproduces this node's
+/// frontier at `base` only if the peer supplied exactly the right leaves in exactly the right
+/// order. That frontier is PoW-anchored (the pruning point's selected child commits the
+/// shielded state root in its coinbase, bound by `hash_merkle_root`), and this node learned it
+/// from the chain — never from the peer being checked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShieldedHistoryVerdict {
+    /// The replayed range reproduced the anchored frontier exactly. History is trustworthy.
+    Verified {
+        /// Chain blocks replayed, genesis through `base`.
+        blocks: u64,
+        /// Note commitments appended during the replay.
+        leaves: u64,
+    },
+    /// The replay did not reproduce the anchored frontier: records were omitted, reordered,
+    /// fabricated or truncated.
+    ///
+    /// Deliberately says nothing about deletion. Verifying and discarding are separate
+    /// operations because the right response depends on who asked: the p2p backfill purges the
+    /// range it just accepted, while an operator running a check on their own archive wants an
+    /// answer, not for a diagnostic to delete their history.
+    Mismatch {
+        /// Why the range failed, for the operator log.
+        reason: String,
+    },
+    /// Verification could not run — a gap in the local index, a missing record, or no
+    /// anchored frontier at `base`. NOT a pass: history is left in place but must be
+    /// treated as unverified, because the check never happened.
+    Unverifiable {
+        /// What prevented the check.
+        reason: String,
+    },
 }
 
 pub type BlockValidationFuture = BoxFuture<'static, BlockProcessResult<BlockStatus>>;
@@ -375,6 +423,13 @@ pub trait ConsensusApi: Send + Sync {
         None
     }
 
+    /// Whether a block at `daa_score` builds its coinbase through the miner accrual slot (security
+    /// fork). Then the red reward's script feeds the slot rule, so a cached template cannot be
+    /// re-pointed to another miner by rewriting one output; it has to be rebuilt.
+    fn miner_accrual_active(&self, _daa_score: u64) -> bool {
+        false
+    }
+
     fn calc_transaction_hash_merkle_root(&self, txs: &[Transaction]) -> Hash {
         unimplemented!()
     }
@@ -499,6 +554,13 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// Verify a shielded transaction's bundle (proof and signatures) without any consensus lock, and
+    /// remember a success, so the mempool's locked validation of the same transaction is a cache hit.
+    /// Context-free: it says nothing about anchors or nullifiers. A no-op for other transactions.
+    fn preverify_shielded_transaction(&self, _transaction: &Transaction) -> ConsensusResult<()> {
+        Ok(())
+    }
+
     /// The shielded turnstile totals as of `block`, as raw parts
     /// `(cumulative_coinbase, cumulative_fees, cumulative_burns)` in sompi — the
     /// public form of the PLAN §2.7 invariant `pool = minted - fees - burns`. Raw
@@ -520,6 +582,13 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// The miner reward a chain block carries forward (security fork; empty before it). The sink's
+    /// slot is what the next payout will pay, so callers that credit miners can show it as pending.
+    fn get_miner_accrual(&self, _block: Hash) -> ConsensusResult<crate::coinbase::MinerAccrual> {
+        // No accrual is the honest answer for a consensus that does not track one.
+        Ok(Default::default())
+    }
+
     /// The next `limit` selected-chain block hashes strictly after `low`, resolved
     /// through the retained chain index rather than a reachability walk.
     ///
@@ -534,6 +603,110 @@ pub trait ConsensusApi: Send + Sync {
     /// this node pruned its index before the retention change. Callers should treat that as
     /// "re-anchor" and fall back to the reachability path to obtain a precise error.
     fn get_shielded_chain_range(&self, _low: Hash, _limit: usize) -> ConsensusResult<Option<Vec<Hash>>> {
+        unimplemented!()
+    }
+
+    /// The last selected-chain block strictly below `daa` that still has a retained shielded
+    /// tree frontier — found by binary search over the chain index (DAA is non-decreasing
+    /// along the chain), so a wallet can place a birthday anywhere in history with ONE call
+    /// instead of walking thousands of metadata pages. `Ok(None)` = nothing below `daa` in
+    /// the retained index (older than this node's history base), or no frontier within reach.
+    fn get_shielded_frontier_block_below_daa(&self, _daa: u64) -> ConsensusResult<Option<Hash>> {
+        unimplemented!()
+    }
+
+    /// Serve a shielded-history backfill request: this node's scan records for the chain blocks
+    /// immediately BELOW `anchor` on its own selected chain, newest first, plus whether the walk
+    /// reached genesis.
+    ///
+    /// Exists because a freshly synced node holds per-note history only from its pruning point
+    /// forward — `PruningPointShieldedMetadata` carries aggregates (frontier, nullifier muhash,
+    /// supply) that cannot yield notes — so wallets querying it see a silently partial balance.
+    /// The requester verifies the result by replaying the `cmx` leaves into an empty tree and
+    /// comparing against the PoW-anchored pruning-point frontier, so no trust in the server is
+    /// required.
+    /// Ingest one chunk of backfilled shielded history: chain-index entries plus scan records
+    /// for blocks BELOW this node's own base.
+    ///
+    /// Restoring the records alone is NOT enough and was measured to fail: wallets reach history
+    /// through `get_shielded_chain_range`, which resolves the start block via
+    /// `selected_chain_store.get_by_hash()`. Without index entries a node holds the data and
+    /// still answers `cannot find header`. The index is the enumerator.
+    ///
+    /// The first call rebases: `init_with_pruning_point` numbers a synced node from ITS pruning
+    /// point as index 0, while the peer's indices are genesis-based, so local entries are shifted
+    /// up to make room below. Returns how many index entries and scan records were written.
+    ///
+    /// The scan archive is never read by consensus, so bad data cannot affect validation; the
+    /// caller still verifies the whole range by replaying its `cmx` leaves against the
+    /// PoW-anchored pruning-point frontier before advertising history as complete.
+    /// The oldest chain block this node can enumerate — the anchor a history backfill walks down
+    /// from. On a headers-proof-synced node this is its pruning point.
+    fn get_shielded_history_base(&self) -> Hash {
+        unimplemented!()
+    }
+
+    /// How far back this node can actually serve shielded note history, and whether that
+    /// reaches genesis.
+    ///
+    /// Returns `(daa_score_of_oldest_servable_block, complete)`.
+    ///
+    /// # Why a node must publish this
+    ///
+    /// IBD transfers a frontier and a nullifier MuHash — aggregates that cannot yield anyone's
+    /// notes — so a node that has not backfilled holds per-note history only from its pruning
+    /// point forward. Ask it for a wallet's balance and it answers with whatever it can see,
+    /// which is a PARTIAL balance reported as final. There is no symptom: the number is
+    /// plausible, the node says it is synced, and the user has no way to tell.
+    ///
+    /// That is not hypothetical on this chain. A wallet holding four tokens was observed reading
+    /// 2,038,348 / 1,902,767 / 1,902,767 / 0.00 across successive queries, every one of them
+    /// reported as synced. Publishing the floor is what lets a wallet say "this node cannot
+    /// answer for my birthday" instead of inventing a number.
+    ///
+    /// `complete` means the node can enumerate down to genesis. It is derived, not stored: a
+    /// backfill that fails verification is purged, so records that are present were verified.
+    fn get_shielded_history_status(&self) -> ConsensusResult<(u64, bool)> {
+        unimplemented!()
+    }
+
+    /// Ingest a backfilled chunk. `anchor` and `anchor_index` are the block the chunk was
+    /// requested below and its index in the SERVER's genesis-based numbering — together they are
+    /// what aligns the two index spaces, since the chunk itself never contains the anchor.
+    fn backfill_shielded_history(
+        &self,
+        _anchor: Hash,
+        _anchor_index: u64,
+        _records: &[(u64, ShieldedChainBlockData)],
+    ) -> ConsensusResult<(u64, u64)> {
+        unimplemented!()
+    }
+
+    fn get_shielded_history_indexed_below(
+        &self,
+        _anchor: Hash,
+        _max_blocks: usize,
+    ) -> ConsensusResult<(Vec<(u64, ShieldedChainBlockData)>, bool, u64)> {
+        unimplemented!()
+    }
+
+    /// Replay the scan archive from genesis up to and including `base`, and report whether it
+    /// reproduces this node's own frontier at `base`. Read-only — see [`ShieldedHistoryVerdict`].
+    ///
+    /// `base` must be a block whose frontier this node did NOT learn from the data being checked:
+    ///   - after a p2p backfill, the history base captured *before* it ran (the pruning point);
+    ///   - for an operator check of a whole archive, the chain tip.
+    fn verify_shielded_history(&self, _base: Hash) -> ConsensusResult<ShieldedHistoryVerdict> {
+        unimplemented!()
+    }
+
+    /// Delete every scan record and chain-index entry below `base`, restoring the index numbering
+    /// `init_with_pruning_point` produces. Returns the number of scan records discarded.
+    ///
+    /// The undo of a failed [`Self::verify_shielded_history`]. Separate from it on purpose: only
+    /// the caller knows whether the range under test was just accepted from a peer (discard it) or
+    /// is the node's own history being audited (never touch it).
+    fn purge_shielded_history_below(&self, _base: Hash) -> ConsensusResult<u64> {
         unimplemented!()
     }
 

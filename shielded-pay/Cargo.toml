@@ -36,4 +36,6 @@ clap.workspace = true
 log.workspace = true
 # CSPRNG for message signing (OsRng).
 rand.workspace = true
+# Zakura-generation shielded-core takes rand 0.10 RNGs (same pattern as zkas-walletd).
+rand10 = { package = "rand", version = "0.10" }
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread", "time", "sync"] }

@@ -67,6 +67,10 @@ pub struct BlockBodyProcessor {
     /// address (validated at body acceptance so a bad-address block never enters
     /// the DAG to stall a later merger's coinbase mint — see the R2 halt vector).
     pub(super) shielded_coinbase: bool,
+    pub(super) security_fork_activation: kaspa_consensus_core::config::params::ForkActivation,
+    pub(super) pre_fork_coinbase_outputs_limit: u64,
+    /// See `Params::coinbase_commitment_ban_activation`.
+    pub(super) coinbase_commitment_ban_activation: kaspa_consensus_core::config::params::ForkActivation,
 
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
@@ -121,6 +125,9 @@ impl BlockBodyProcessor {
             genesis: params.genesis.clone(),
             _ghostdag_k: params.ghostdag_k(),
             shielded_coinbase: params.shielded_coinbase,
+            security_fork_activation: params.security_fork_activation,
+            pre_fork_coinbase_outputs_limit: params.ghostdag_k() as u64 + 2,
+            coinbase_commitment_ban_activation: params.coinbase_commitment_ban_activation(),
 
             statuses_store: storage.statuses_store.clone(),
             _ghostdag_store: storage.ghostdag_store.clone(),

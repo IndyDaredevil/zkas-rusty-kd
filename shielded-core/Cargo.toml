@@ -21,11 +21,13 @@ circuit = ["orchard/circuit", "orchard/multicore", "dep:nonempty"]
 # Orchard primitives (Halo 2 / Pasta). `circuit` (halo2_proofs) is enabled via
 # this crate's `circuit` feature, which the consensus verifier turns on.
 # EXACT-pinned, not semver-ranged: these crates carry the consensus's entire
-# anti-counterfeiting guarantee, and 0.14.0 is specifically the release that fixes
-# the June-2026 Orchard proof-forgery bug. A caret range would let `cargo update`
+# anti-counterfeiting guarantee. zakura-orchard is a post-fix fork: its crate
+# postdates the June-2026 Orchard proof-forgery fix (halo2_gadgets 0.5.0 /
+# orchard 0.14.0), and `verify::CIRCUIT_VERSION` selects the fixed circuit.
+# `build.rs` bakes the exact crate identity into `verify::ORCHARD_CRATE`. A caret range would let `cargo update`
 # silently move us onto an unaudited (or regressed) release. Bump deliberately,
 # reading the changelog, never incidentally.
-orchard = { version = "=0.14.0", default-features = false, features = ["std"] }
+orchard = { package = "zakura-orchard", version = "=2.2.0", default-features = false, features = ["std", "weighted-merkle"] }
 # Must match the incrementalmerkletree version Orchard links, so that
 # `MerkleHashOrchard: incrementalmerkletree::Hashable` is the same trait.
 # `legacy-api` provides CommitmentTree / IncrementalWitness, the wallet-side
@@ -36,10 +38,14 @@ incrementalmerkletree = { version = "=0.8.2", features = ["legacy-api"] }
 serde = { workspace = true, features = ["derive"] }
 # Curve point handling for the encoding consensus rules (non-identity epk).
 # Versions are pinned to match what Orchard 0.14 links.
-group = "=0.13.0"
-pasta_curves = "=0.5.1"
+group = "0.14"
+pasta_curves = { package = "zakura-pasta-curves", version = "=2.2.0" }
 # Shielded-transaction sighash.
 blake2b_simd = { workspace = true }
+chacha20 = "0.9"
+# Trial decryption is ~99% of a scan and is per-action independent, so a page batch
+# is split across cores. Needed by the library now, not only the benches.
+rayon.workspace = true
 # Bridge burn-accumulator hashing. SHA-256 rather than the chain's usual blake2b
 # because the verifier is the Kaspa-side risc0 peg-out guest, whose shared ABI
 # hashes with SHA-256; the two implementations must agree byte-for-byte.
@@ -58,7 +64,8 @@ kaspa-seq-commit = { path = "../consensus/seq-commit", default-features = false 
 nonempty = { version = "0.11", default-features = false, optional = true }
 # RNG for RedPallas signing (message signatures + circuit proving). Non-optional:
 # `message` signing is available without the heavy `circuit` feature.
-rand = { workspace = true }
+rand = "0.10"
+rand_core = "0.10"
 # Note decryption for wallet scanning (the receive side). Must match the version
 # Orchard links so the OrchardDomain types agree.
 zcash_note_encryption = "0.4"
@@ -71,3 +78,7 @@ kaspa-addresses.workspace = true
 # Benchmarks only (`bench_concurrent_vs_sequential_proofs`): scoped rayon pools to
 # give each concurrent proof its own bounded thread count.
 rayon.workspace = true
+
+[[example]]
+name = "proof_corpus"
+required-features = ["circuit"]

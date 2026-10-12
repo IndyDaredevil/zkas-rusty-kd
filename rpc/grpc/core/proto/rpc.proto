@@ -245,6 +245,9 @@ message GetSinkResponseMessage {
 // tree positions once pruning has moved past genesis.
 message GetShieldedTreeStateRequestMessage {
   string blockHash = 1;                 // optional explicit chain block (hex); empty = finality point
+  uint64 belowDaaScore = 2;             // optional (0 = unset): when blockHash is empty, serve the nearest
+                                        // retained frontier at-or-before the last chain block whose DAA is
+                                        // strictly below this — places a wallet birthday in ONE call
 }
 
 message GetShieldedTreeStateResponseMessage {
@@ -253,6 +256,12 @@ message GetShieldedTreeStateResponseMessage {
   uint64 size = 3;                      // leaves summarised by the frontier
   string leaf = 4;                      // last frontier leaf (hex); zero hash when size == 0
   repeated string ommers = 5;           // frontier ommers (hex)
+  // DAA score of the oldest block this node can serve shielded history for. A wallet whose
+  // birthday is below this cannot be fully scanned here and must not treat a balance from
+  // this node as final. Zero when the node serves from genesis.
+  uint64 historyFromDaaScore = 6;
+  // Whether this node can enumerate shielded history to genesis.
+  bool historyComplete = 7;
   RPCError error = 1000;
 }
 
@@ -263,11 +272,13 @@ message GetShieldedTreeStateResponseMessage {
 message GetShieldedBlocksRequestMessage {
   string startHash = 1;                 // resume cursor (exclusive); must be a chain block
   uint64 limit = 2;                     // max chain blocks returned (0 = server default)
+  bool metadataOnly = 3;                // return headers/timestamps only
 }
 
 message RpcShieldedCoinbaseOutput {
   string scriptPublicKey = 1;           // hex; a 43-byte script is a raw Orchard recipient
   uint64 value = 2;
+  bytes commitment = 3;                 // optional 32-byte consensus-computed note commitment
 }
 
 message RpcShieldedChainBlock {
@@ -336,6 +347,8 @@ message GetShieldedCoinbaseRewardsResponseMessage {
   uint64 scannedBlocks = 3;             // chain blocks scanned by this call
   bool reorged = 4;                     // true: startHash reorged out; caller must rescan
   uint64 sinkBlueScore = 5;             // lets the caller hold back a maturity margin
+  bytes pendingRecipient = 6;           // security fork: requested recipient the sink's accrual slot pays, else empty
+  uint64 pendingValue = 7;              // amount carried in that slot
   RPCError error = 1000;
 }
 

@@ -164,8 +164,7 @@ impl SupplyLedger {
     /// already in the consumed-burns replay set. Given that, this is as safe as a coinbase mint: it
     /// adds exactly the value that an equal amount of mirror-ZKAS was destroyed for on Kaspa.
     pub fn peg_in(&mut self, value: u64) -> Result<(), TurnstileViolation> {
-        self.cumulative_pegged_in =
-            self.cumulative_pegged_in.checked_add(value as u128).ok_or(TurnstileViolation::Overflow)?;
+        self.cumulative_pegged_in = self.cumulative_pegged_in.checked_add(value as u128).ok_or(TurnstileViolation::Overflow)?;
         Ok(())
     }
 

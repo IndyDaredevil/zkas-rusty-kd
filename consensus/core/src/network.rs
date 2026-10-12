@@ -164,7 +164,7 @@ impl TryFrom<&NetworkTypeT> for Prefix {
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum NetworkIdError {
-    #[error("Invalid network name prefix: {0}. Expected 'zkas' (also accepted: 'kaspa' for merged-mining upstream nodes, or the legacy 'firecash').")]
+    #[error("Invalid network name prefix: {0}. The expected prefix is 'zkas' (or the legacy 'zkas').")]
     InvalidPrefix(String),
 
     #[error(transparent)]
@@ -248,9 +248,16 @@ impl NetworkId {
         // hence avoiding repeatedly failing P2P handshakes between nodes on different networks. RPC does not have
         // this reasoning so we keep it on the same port in order to simplify RPC client management (hence [`default_rpc_port`]
         // is defined on the [`NetworkType`] struct
-        // ZKas P2P = rpc + 1, in the distinct "8" block (see `default_rpc_port`).
+        // ZKas mainnet p2p is 16111: that is the port both seed nodes listen on, the port every
+        // operator example dials, and the port `seed.zkas.info` addresses are joined with
+        // (`ConnectionManager::dns_seed_single` appends this default to each seeded IP). It was
+        // 16811 ("rpc + 1 in the 8 block") until 2026-08-29, which made a node bootstrapping
+        // from the seeder dial a port nothing listens on and never connect - found the first
+        // time a node was started with no --connect at all. Testnet/simnet/devnet keep the
+        // 8-block ports. The RPC default (`default_rpc_port`, 16810) is deliberately unchanged:
+        // walletd, shielded-pay and the miner default to it.
         match self.network_type {
-            NetworkType::Mainnet => 16811,
+            NetworkType::Mainnet => 16111,
             NetworkType::Testnet => match self.suffix {
                 Some(10) => 16821,
                 Some(12) => 16831,
@@ -258,6 +265,27 @@ impl NetworkId {
             },
             NetworkType::Simnet => 16851,
             NetworkType::Devnet => 16861,
+        }
+    }
+
+    /// The port a node LISTENS on and ADVERTISES by default — distinct from
+    /// [`default_p2p_port`], which is the port ASSUMED for a remote peer given
+    /// without one (DNS-seeded IPs, bare `--connect`/`--addpeer`/`--externalip`).
+    ///
+    /// On mainnet the two differ on purpose. The assumed-remote port must stay
+    /// `16111` — that is where `seed.zkas.info` and the seed nodes are, and the DNS
+    /// seeder appends it to every bootstrap IP; moving it broke bootstrapping in
+    /// 2026-08. But `16111` is also Kaspa mainnet p2p, so a node that also *binds*
+    /// it cannot coexist with a Kaspa parent on one host. Listening on `16811`
+    /// (`rpc + 1`, the free "8" block) fixes that without touching bootstrap: the
+    /// node still dials the seeds on `16111`, and a peer learns this node's real
+    /// `16811` from the handshake/gossip, so inbound still works. On testnet/
+    /// simnet/devnet the p2p port is already in the 8-block with no Kaspa clash,
+    /// so listen == assumed there.
+    pub fn default_listen_p2p_port(&self) -> u16 {
+        match self.network_type {
+            NetworkType::Mainnet => 16811,
+            _ => self.default_p2p_port(),
         }
     }
 
@@ -283,16 +311,7 @@ impl NetworkId {
     }
 
     pub fn from_prefixed(prefixed: &str) -> Result<Self, NetworkIdError> {
-        // `kaspa-` accepted read-side for merged mining: bridges/tools talk to
-        // genuine upstream Kaspa nodes whose self-reported network name is
-        // e.g. "kaspa-mainnet" (twin of 7372571, which added the kaspa
-        // ADDRESS prefix but not the network-name prefix). Write-side
-        // identity (to_prefixed, p2p handshake, datadir) remains zkas-.
-        if let Some(stripped) = prefixed
-            .strip_prefix("zkas-")
-            .or_else(|| prefixed.strip_prefix("firecash-"))
-            .or_else(|| prefixed.strip_prefix("kaspa-"))
-        {
+        if let Some(stripped) = prefixed.strip_prefix("zkas-").or_else(|| prefixed.strip_prefix("firecash-")).or_else(|| prefixed.strip_prefix("kaspa-")) {
             Self::from_str(stripped)
         } else {
             Err(NetworkIdError::InvalidPrefix(prefixed.to_string()))

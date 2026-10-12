@@ -1,9 +1,25 @@
 # Non-custodial ZKas web wallet — design
 
+> **Status: IMPLEMENTED and live on mainnet.** The hosted wallet at `wallet.zkas.info`
+> is non-custodial today: the seed is generated in the browser, the daemon receives the
+> **viewing key only**, and signing happens on the user's device (web/desktop/mobile —
+> see the wallet repo's custody table). What follows is the original design document,
+> kept as the record of how and why.
+
 **Goal:** a web wallet at `wallet.zkas.info` where **the server cannot spend user
-coins.** Today's hosted `zkas-walletd` is *custodial* — it generates and stores each
-user's seed (plaintext), so a server compromise drains everyone. This document is the
-plan to remove that.
+coins.** The hosted `zkas-walletd` of the time was *custodial* — it generated and stored
+each user's seed (plaintext), so a server compromise would drain everyone. This document
+was the plan to remove that.
+
+> **Status (2026-09).** Phase 1 shipped and is what `wallet.zkas.info` runs: the device
+> signs, the hosted daemon proves with the viewing key only. Phase 2's *goal* — nothing
+> off the device sees the wallet — shipped in a different form than planned: instead of
+> in-browser WASM proving, the **full daemon runs natively inside the app**, on the
+> desktop (embedded `zkas_walletd` lib) and on Android in *Run on this phone* mode (the
+> `zkas-walletd-mobile` UniFFI library). Keys, scanning, witnessing and proving all stay
+> on the device; the server degrades to exactly the "dumb light-server" below — a node
+> serving compact blocks and the tree frontier. In-browser WASM proving for the web page
+> itself remains open.
 
 ## The enabling fact (why this is even possible on a shielded chain)
 
