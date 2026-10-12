@@ -955,6 +955,15 @@ impl ShareHandler {
                             match kaspa_api.pending_zkas_block(&h_fc) {
                                 Some(fc_block) => {
                                     let aux = crate::merged::assemble_aux_block(&block, &fc_block);
+                                    // The hash that lands on the zKAS chain. Before the
+                                    // security fork it equals the committed key (h_fc).
+                                    // From the fork the block's nonce is set from this
+                                    // SOLVED parent inside assemble_aux_block, so the
+                                    // hash is only known here — and it, not the key, is
+                                    // what every log line, metric and color check below
+                                    // must carry. The `H_fc:` label is kept verbatim:
+                                    // the reporter parses `DOUBLE! … H_fc:`.
+                                    let zkas_chain_hash = aux.header.hash;
                                     let prefix_z = self.log_prefix();
                                     info!(
                                         "{} {} {}",
@@ -962,7 +971,7 @@ impl ShareHandler {
                                         LogColors::block("[ZKAS]"),
                                         LogColors::block(&format!(
                                             "ZKAS BLOCK FOUND! H_fc: {}, Worker: {}, full_clear: {}",
-                                            h_fc, worker_name, meets_network_target
+                                            zkas_chain_hash, worker_name, meets_network_target
                                         ))
                                     );
                                     let kaspa_api_z = Arc::clone(&kaspa_api);
@@ -980,12 +989,12 @@ impl ShareHandler {
                                                 info!(
                                                     "{} {}",
                                                     LogColors::block("[ZKAS]"),
-                                                    LogColors::block(&format!("ZKAS BLOCK ACCEPTED BY NODE! H_fc: {}", h_fc))
+                                                    LogColors::block(&format!("ZKAS BLOCK ACCEPTED BY NODE! H_fc: {}", zkas_chain_hash))
                                                 );
                                                 // c.7 hook E: Z counts only on blue-confirm
-                                                // (K symmetry). The aux rides outside the header
-                                                // hash, so H_fc IS the chain hash to color-check.
-                                                let zkas_hash = h_fc.to_string();
+                                                // (K symmetry). Color-check the ASSEMBLED block's
+                                                // hash (post-nonce from the security fork).
+                                                let zkas_hash = zkas_chain_hash.to_string();
                                                 for _ in 0..BLOCK_CONFIRM_MAX_ATTEMPTS {
                                                     match kaspa_api_z.get_zkas_block_color(&zkas_hash).await {
                                                         Ok(true) => {
@@ -1055,7 +1064,7 @@ impl ShareHandler {
                                 }
                                 None => {
                                     warn!(
-                                        "{} merged stash missing for H_fc {} (evicted?); zkas settlement skipped",
+                                        "{} merged stash missing for merge key {} (evicted?); zkas settlement skipped",
                                         LogColors::block("[ZKAS]"),
                                         h_fc
                                     );

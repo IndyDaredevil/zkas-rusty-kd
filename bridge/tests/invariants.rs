@@ -83,3 +83,50 @@ fn parent_block_commitment_roundtrips_with_consensus_magic() {
         "parent coinbase payload must contain consensus MERGE_MINE_MAGIC"
     );
 }
+
+/// Security fork (zkas-v1.0.11) twin of `merge_mine_magic_matches_live_network`:
+/// the bound-form tag the DEPLOYED network verifies from the fork. Literal on
+/// purpose, for the same reason as the legacy pin above.
+#[test]
+fn merge_mine_magic_v1_matches_live_network() {
+    assert_eq!(kaspa_consensus_core::auxpow::MERGE_MINE_MAGIC_V1, *b"ZKM1");
+}
+
+/// The mainnet activation score this binary switches forms at must be the one
+/// the live network forks at. Upstream moved it twice before release
+/// (8,700,500 in 23767ef, 7,000,500 in 1e68493, 6,983,500 in the tagged
+/// 01ac186); a bridge built against either unreleased commit keeps every
+/// constant-based test green and loses every merged block between the two
+/// scores. Literal on purpose: do NOT "fix" it unless the live network's
+/// nodes run a release with a different score.
+#[test]
+fn mainnet_security_fork_score_matches_live_network() {
+    use kaspa_consensus_core::config::params::MAINNET_PARAMS;
+    assert_eq!(MAINNET_PARAMS.security_fork_activation.daa_score(), 6_983_500);
+}
+
+/// ZKM1 twin of `embedded_commitment_magic_matches_consensus_constant`: the
+/// bound payload carries the v1 constant exactly once, followed immediately by
+/// the commitment as ASCII lowercase hex, and carries NO legacy magic (the
+/// bound rule refuses a parent that has one).
+#[test]
+fn embedded_bound_commitment_magic_matches_consensus_constant() {
+    use kaspa_consensus_core::auxpow::MERGE_MINE_MAGIC_V1;
+    let commitment = Hash::from_bytes([0xAB; 32]);
+    let prefix = [1u8, 2, 3];
+    let suffix = [9u8];
+    let payload = AuxPow::embed_commitment_v1(&prefix, commitment, &suffix);
+
+    let occurrences: Vec<usize> =
+        payload.windows(MERGE_MINE_MAGIC_V1.len()).enumerate().filter(|(_, w)| *w == MERGE_MINE_MAGIC_V1).map(|(i, _)| i).collect();
+    assert_eq!(occurrences.len(), 1, "v1 magic must appear exactly once in the coinbase payload");
+    assert_eq!(payload.windows(MERGE_MINE_MAGIC.len()).filter(|w| *w == MERGE_MINE_MAGIC).count(), 0, "no legacy magic beside it");
+
+    let at = occurrences[0];
+    let hex = commitment.to_string();
+    assert_eq!(
+        &payload[at + 4..at + 4 + hex.len()],
+        hex.as_bytes(),
+        "the commitment (ASCII lowercase hex) must immediately follow the magic"
+    );
+}

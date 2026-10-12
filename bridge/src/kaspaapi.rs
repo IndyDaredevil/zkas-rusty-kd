@@ -55,10 +55,28 @@ fn sanitize_coinbase_tag_suffix(suffix: &str) -> Option<String> {
     // (insert '_' after the first byte) rather than reject, so the operator
     // keeps the rest of their tag. Derived from the consensus constant so a
     // future magic rename cannot drift past this guard.
-    let magic = std::str::from_utf8(&kaspa_consensus_core::auxpow::MERGE_MINE_MAGIC).expect("MERGE_MINE_MAGIC is ASCII");
-    let broken = format!("{}_{}", &magic[..1], &magic[1..]);
-    while out.contains(magic) {
-        out = out.replace(magic, &broken);
+    //
+    // Security fork: the same holds for MERGE_MINE_MAGIC_V1 (`ZKM1`) — a second
+    // window makes `committed_hash_v1` return None — and a parent carrying ZKMM
+    // at all is refused by the bound rule. The tag is also sent verbatim as the
+    // zKAS template's own extra_data, where the node refuses a commitment under
+    // either tag from the ban score. So both magics are broken, always. The
+    // loop runs to a fixed point because breaking one could, in principle,
+    // assemble the other.
+    use kaspa_consensus_core::auxpow::{MERGE_MINE_MAGIC, MERGE_MINE_MAGIC_V1};
+    loop {
+        let mut changed = false;
+        for magic in [&MERGE_MINE_MAGIC, &MERGE_MINE_MAGIC_V1] {
+            let magic = std::str::from_utf8(magic).expect("merge-mining magics are ASCII");
+            let broken = format!("{}_{}", &magic[..1], &magic[1..]);
+            while out.contains(magic) {
+                out = out.replace(magic, &broken);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
 
     if out.is_empty() { None } else { Some(out) }
@@ -873,21 +891,23 @@ impl KaspaApi {
     pub async fn get_block_template(&self, wallet_addr: &str, _remote_app: &str, _canxium_addr: &str) -> Result<Block> {
         // MERGED decoration (KAS-primary): when a fresh ZKas template is
         // available within budget, the Kaspa template request carries
-        // `coinbase_tag || ZKMM || hex(H_fc)` as extra_data, making every
+        // `coinbase_tag || ZKMM || hex(H_fc)` (legacy) or, for a zKAS template at
+        // or past the security fork, `coinbase_tag || ZKM1 || hex(commitment)`
+        // (bound) as extra_data — chosen per zKAS template by its own DAA score
+        // in `merged::merge_extra_data`, never by wall clock — making every
         // solved parent simultaneously a worker-paid Kaspa candidate and an
         // AuxPoW proof for the ZKas block. Any zkas miss ⇒ plain extra_data —
         // the job is never late and never blocked on the enhancement.
         let extra_data = match self.current_zkas_template().await {
             Some((h_fc, fc_block)) => {
                 debug!(
-                    "merged: committing to H_fc {} (zkas bits 0x{:x}) in Kaspa template extra_data",
-                    h_fc, fc_block.header.bits
+                    "merged: committing to merge key {} (zkas daa {}, bits 0x{:x}) in Kaspa template extra_data",
+                    h_fc, fc_block.header.daa_score, fc_block.header.bits
                 );
                 // Stash insert moved to current_zkas_template's fetch-success
                 // branch (once per distinct template, not per request).
-                let _ = &fc_block;
                 crate::merged_obs::MERGED_OBS.record_template(true); // c.7 hook C
-                kaspa_consensus_core::auxpow::AuxPow::embed_commitment(&self.coinbase_tag, h_fc, &[])
+                crate::merged::merge_extra_data(&self.coinbase_tag, &fc_block)
             }
             None => {
                 crate::merged_obs::MERGED_OBS.record_template(false); // c.7 hook C
@@ -1130,7 +1150,11 @@ impl KaspaApi {
             Ok(Ok(block)) => {
                 crate::merged_obs::MERGED_OBS
                     .record_zkas_tpl_ok(crate::merged_obs::epoch_ms(), c7_fetch_t0.elapsed().as_micros() as u64);
-                let h_fc = block.header.hash;
+                // The merge key: the block hash before the security fork, the
+                // bound commitment from it (the final hash does not exist until
+                // the parent is solved). Derived from the template's own DAA
+                // score, so a cached template keeps one form for its whole life.
+                let h_fc = crate::merged::merge_key(&block);
                 // Stash HERE, exactly once per distinct zkas template — not in
                 // get_block_template (which runs ~21x/sec fleet-wide and was
                 // flooding MergedPending's cap-4096 ring with duplicate keys,
@@ -1143,7 +1167,22 @@ impl KaspaApi {
                 Some((h_fc, block))
             }
             Ok(Err(e)) => {
-                debug!("zkas template fetch failed (serving plain): {e}");
+                // From the tag-ban score the node refuses a template whose
+                // extra_data carries a merge-mining commitment. The sanitizer
+                // makes that unreachable from the tag; if it happens anyway the
+                // zKAS leg is dead until fixed, so say so loudly (once a minute)
+                // instead of serving plain jobs in silence.
+                let msg = format!("{e:#}");
+                if msg.contains("belongs in the Kaspa coinbase") {
+                    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let now = crate::merged_obs::epoch_ms() / 1000;
+                    let last = LAST.load(std::sync::atomic::Ordering::Relaxed);
+                    if now.saturating_sub(last) >= 60 && LAST.compare_exchange(last, now, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).is_ok() {
+                        error!("zkas node REFUSED the template request (coinbase tag carries a merge-mining commitment): {msg} -- zKAS leg is down; fix coinbase_tag_suffix");
+                    }
+                } else {
+                    debug!("zkas template fetch failed (serving plain): {msg}");
+                }
                 None
             }
             Err(_) => {
@@ -1165,12 +1204,20 @@ impl KaspaApi {
         Some(crate::hasher::calculate_target(fc_block.header.bits as u64))
     }
 
-    /// The ZKas chain hash for a merged parent (its committed H_fc): the aux
-    /// rides outside the header hash, so the block that lands on the ZKas
-    /// chain keeps exactly this hash — the right handle for color checks and
-    /// block-facing stats. `None` for plain jobs.
+    /// The ZKas chain hash for a SOLVED merged parent — the right handle for
+    /// color checks and block-facing stats. Before the security fork it is the
+    /// committed H_fc itself (the aux rides outside the header hash). From the
+    /// fork the committed value is a commitment, not a block hash: the hash is
+    /// computed from the stashed block with its nonce set from this parent, so
+    /// an unsolved parent names a block that never exists. `None` for plain
+    /// jobs, and for a post-fork parent whose stash entry is gone (nothing to
+    /// name rather than a phantom).
     pub fn merged_chain_hash(&self, parent_block: &Block) -> Option<kaspa_hashes::Hash> {
-        crate::merged::committed_h_fc(parent_block)
+        let key = crate::merged::committed_h_fc(parent_block)?;
+        match self.pending_fc.lock().get(&key) {
+            Some(fc_block) => Some(crate::merged::chain_hash(parent_block, &fc_block)),
+            None => crate::merged::committed_h_fc_legacy(parent_block),
+        }
     }
 
     /// One-shot claim of a merged solution (invariant 5). `true` for plain
@@ -1481,11 +1528,61 @@ mod coinbase_tag_tests {
     //! user-configurable tag suffix (config / CLI / live settings endpoint)
     //! must never be able to smuggle a second magic into the coinbase.
     use super::{build_coinbase_tag_bytes, STRATUM_COINBASE_TAG_BYTES};
-    use kaspa_consensus_core::auxpow::{AuxPow, MERGE_MINE_MAGIC};
+    use kaspa_consensus_core::auxpow::{AuxPow, MERGE_MINE_MAGIC, MERGE_MINE_MAGIC_V1};
     use kaspa_hashes::Hash;
 
     fn magic_windows(bytes: &[u8]) -> usize {
         bytes.windows(MERGE_MINE_MAGIC.len()).filter(|w| *w == MERGE_MINE_MAGIC).count()
+    }
+
+    fn magic_v1_windows(bytes: &[u8]) -> usize {
+        bytes.windows(MERGE_MINE_MAGIC_V1.len()).filter(|w| *w == MERGE_MINE_MAGIC_V1).count()
+    }
+
+    /// Security fork twin of `suffix_cannot_smuggle_merge_mine_magic`: no
+    /// suffix can put EITHER magic into the tag. Includes the cross cases
+    /// where breaking one magic could assemble the other, and the
+    /// stripped-char join ("ZK!M1").
+    #[test]
+    fn suffix_cannot_smuggle_either_merge_mine_magic() {
+        for suffix in [
+            "ZKM1", "xZKM1y", "ZKM1ZKM1", "poolZKM1", "ZKM1 ZKM1", "ZK!M1", "ZKM11", "ZKMMZKM1", "ZKM1ZKMM", "ZZKM1KMM", "ZZKMMKM1",
+            "ZKZKM1M1", "ZKZKMMM1", "Z_KM1", "ZKMZKM11",
+        ] {
+            let tag = build_coinbase_tag_bytes(Some(suffix));
+            assert_eq!(
+                (magic_windows(&tag), magic_v1_windows(&tag)),
+                (0, 0),
+                "suffix {suffix:?} produced tag containing a magic: {:?}",
+                String::from_utf8_lossy(&tag)
+            );
+        }
+        assert_eq!(magic_v1_windows(STRATUM_COINBASE_TAG_BYTES), 0, "base tag must not contain the v1 magic");
+    }
+
+    /// Production framing for the bound form (worst-case suffix, post-guard)
+    /// through the validator's own extraction: exactly one `ZKM1`, no `ZKMM`
+    /// (the bound rule refuses a parent that carries one), and the tag alone
+    /// — which is what the zKAS template request sends as ITS extra_data —
+    /// is not a commitment under either tag.
+    #[test]
+    fn production_bound_extra_data_roundtrips_through_consensus_extraction() {
+        use kaspa_consensus_core::{header::Header, subnets::SUBNETWORK_ID_COINBASE, tx::Transaction};
+
+        let tag = build_coinbase_tag_bytes(Some("xZKM1yZKMMz"));
+        assert!(!AuxPow::payload_carries_commitment(&tag), "the zKAS template's own extra_data must carry no commitment");
+        let commitment = Hash::from_bytes([0xAB; 32]);
+        let payload = AuxPow::embed_commitment_v1(&tag, commitment, &[]);
+        assert_eq!((magic_windows(&payload), magic_v1_windows(&payload)), (0, 1));
+
+        let coinbase = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, payload);
+        let aux = AuxPow {
+            parent_header: Header::from_precomputed_hash(Hash::from_bytes([0x11; 32]), vec![]),
+            parent_coinbase: coinbase,
+            coinbase_merkle_branch: vec![],
+        };
+        assert_eq!(aux.committed_hash_v1(), Some(commitment));
+        assert_eq!(aux.committed_hash(), None);
     }
 
     /// Adversarial suffixes cannot produce a tag containing the magic: bare,

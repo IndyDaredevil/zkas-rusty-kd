@@ -168,7 +168,7 @@ fn log_bridge_configuration(config: &BridgeConfig) {
     // engine version), so banner and engine cannot disagree. Only the build
     // ordinal below is hand-bumped per release -- it is the release checklist
     // item, and the tag must match it. Convention: vE.N.G.B.
-    const BRIDGE_BUILD: u32 = 6;
+    const BRIDGE_BUILD: u32 = 7;
     let bridge_release = format!("v{}.{}", env!("CARGO_PKG_VERSION"), BRIDGE_BUILD);
     tracing::info!("----------------------------------");
     tracing::info!("RC merged bridge {} (engine {})", bridge_release, env!("CARGO_PKG_VERSION"));
@@ -311,6 +311,9 @@ async fn main() -> Result<(), anyhow::Error> {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             tracing::info!("MERGED MINING ENABLED: zkas node {}", node.trim());
             tracing::info!("MERGED MINING ENABLED: zkas treasury {}", pay.trim());
+            // Security fork: name the genesis and activation score this binary
+            // binds merged blocks to (aborts here on an invalid ZKAS_NETWORK).
+            tracing::info!("{}", kaspa_stratum_bridge::merged::fork_config_summary());
             Some(kaspa_stratum_bridge::MergedZkasConfig { node_address: node.trim().to_string(), pay_address: pay.trim().to_string() })
         }
         (Ok(_), Err(_)) | (Err(_), Ok(_)) => {
