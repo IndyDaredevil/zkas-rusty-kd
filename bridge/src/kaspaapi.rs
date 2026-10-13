@@ -203,6 +203,17 @@ pub struct KaspaApi {
     zkas_template_cache: Arc<tokio::sync::Mutex<Option<(kaspa_hashes::Hash, Block, Instant)>>>,
     /// Single-permit gate so at most one zkas template RPC is in flight.
     zkas_rpc_gate: Arc<tokio::sync::Semaphore>,
+    /// zKAS-driven job trigger (v2.0.1.7): the zkas push task sends `()` here
+    /// after it has swapped a NEW zKAS template into the cache, and every
+    /// stratum instance's template listener fires its job callback on it —
+    /// the zKAS twin of the Kaspa node's NewBlockTemplate push. Without this
+    /// the zKAS template only advanced when a Kaspa-driven job build found
+    /// its cached copy older than `ZKAS_TEMPLATE_TTL` (the hub existed since
+    /// WS1 c.3 but nothing ever subscribed to it).
+    zkas_job_trigger: broadcast::Sender<()>,
+    /// The zkas push task is process-wide: started once, by whichever stratum
+    /// instance starts its listener first.
+    zkas_push_started: std::sync::atomic::AtomicBool,
 }
 
 /// The attached ZKas enhancement: node client, its notification hub, and the
@@ -365,6 +376,8 @@ impl KaspaApi {
             pending_fc: Arc::new(Mutex::new(crate::merged::MergedPending::new(4096))),
             zkas_template_cache: Arc::new(tokio::sync::Mutex::new(None)),
             zkas_rpc_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            zkas_job_trigger: broadcast::channel(16).0,
+            zkas_push_started: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Optional ZKas enhancement: attach in the BACKGROUND, retrying
@@ -1145,6 +1158,14 @@ impl KaspaApi {
             return cache.as_ref().map(|(h, b, _)| (*h, b.clone()));
         };
         let _permit = _permit.ok()?;
+        self.fetch_and_store_zkas_template().await
+    }
+
+    /// One bounded zKAS template fetch; on success the template is stashed
+    /// (once per distinct merge key) and becomes the cached current template.
+    /// The caller holds the `zkas_rpc_gate` permit. Shared by the job path
+    /// (TTL fallback) and the zkas push task.
+    async fn fetch_and_store_zkas_template(&self) -> Option<(kaspa_hashes::Hash, Block)> {
         let c7_fetch_t0 = Instant::now(); // c.7 hook B
         match tokio::time::timeout(ZKAS_FETCH_BUDGET, self.get_zkas_block_template()).await {
             Ok(Ok(block)) => {
@@ -1190,6 +1211,103 @@ impl KaspaApi {
                 None
             }
         }
+    }
+
+    /// zKAS push (v2.0.1.7): the zKAS twin of the Kaspa NewBlockTemplate
+    /// listener. Waits for the zkas leg to attach, subscribes to ITS
+    /// notification hub, and on every new-template push fetches the template
+    /// OFF the job path, swaps it into the cache, and — only when the merge
+    /// key actually changed — fires `zkas_job_trigger` so every instance
+    /// issues jobs carrying the new commitment at once.
+    ///
+    /// Invariant 6 holds: nothing here can delay or block a Kaspa job. A
+    /// failed or slow fetch leaves the cache as it was, and the job path's
+    /// TTL fallback (`current_zkas_template`) is unchanged — it now covers
+    /// gaps in the push stream exactly as the ticker covers gaps on the
+    /// Kaspa side.
+    async fn run_zkas_push_task(self: Arc<Self>, mut shutdown_rx: Option<watch::Receiver<bool>>) {
+        let stopped = |s: &Option<watch::Receiver<bool>>| s.as_ref().is_some_and(|s| *s.borrow());
+        loop {
+            // Wait for the leg (attached in the background, possibly minutes later).
+            let leg = loop {
+                if stopped(&shutdown_rx) {
+                    return;
+                }
+                if let Some(leg) = self.zkas_leg() {
+                    break leg;
+                }
+                sleep(Duration::from_secs(1)).await;
+            };
+            let mut rx = leg.hub.subscribe(HubScope::NewBlockTemplate);
+            info!("zkas push listener ACTIVE: zKAS NewBlockTemplate notifications now drive jobs (TTL {:?} is the fallback)", ZKAS_TEMPLATE_TTL);
+            let mut pushes: u64 = 0;
+            let mut jobs: u64 = 0;
+            let mut window = Instant::now();
+            loop {
+                let got = tokio::select! {
+                    _ = async {
+                        match shutdown_rx.as_mut() {
+                            Some(s) => { let _ = s.changed().await; }
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        if stopped(&shutdown_rx) {
+                            return;
+                        }
+                        continue;
+                    }
+                    r = rx.recv() => r,
+                    // No push for 30 s while attached: say so once per window. The
+                    // TTL fallback keeps the leg mining; this line is how a silent
+                    // push stream becomes visible.
+                    _ = sleep(Duration::from_secs(30)) => {
+                        warn!("zkas push listener: no zKAS template notification for 30s; jobs are on the {:?} TTL fallback", ZKAS_TEMPLATE_TTL);
+                        continue;
+                    }
+                };
+                match got {
+                    Ok(Notification::NewBlockTemplate(_)) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Edge trigger: drain a burst into one fetch.
+                        while rx.try_recv().is_ok() {}
+                        pushes += 1;
+                        let before = self.zkas_template_cache.lock().await.as_ref().map(|(h, _, _)| *h);
+                        // Single-flight with the job path; bounded so a wedged
+                        // fetch cannot back the push stream up.
+                        let fetched = match tokio::time::timeout(ZKAS_FETCH_BUDGET, self.zkas_rpc_gate.acquire()).await {
+                            Ok(Ok(_permit)) => self.fetch_and_store_zkas_template().await,
+                            _ => None,
+                        };
+                        if let Some((key, _)) = fetched
+                            && before != Some(key)
+                        {
+                            jobs += 1;
+                            // No receivers yet (no stratum instance listening) is not an error.
+                            let _ = self.zkas_job_trigger.send(());
+                        }
+                        if window.elapsed() >= Duration::from_secs(300) {
+                            info!("zkas push listener: {} notifications -> {} zKAS-driven job pushes in the last {:.0}s", pushes, jobs, window.elapsed().as_secs_f64());
+                            pushes = 0;
+                            jobs = 0;
+                            window = Instant::now();
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Closed) => {
+                        warn!("zkas push listener: notification channel closed; waiting for the zkas leg again");
+                        sleep(Duration::from_secs(1)).await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Start the process-wide zkas push task exactly once.
+    fn ensure_zkas_push_task(self: &Arc<Self>, shutdown_rx: Option<watch::Receiver<bool>>) {
+        if self.zkas_push_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        tokio::spawn(Arc::clone(self).run_zkas_push_task(shutdown_rx));
     }
 
     /// The ZKas (easier) target for a merged parent, looked up via its
@@ -1247,7 +1365,9 @@ impl KaspaApi {
         F: FnMut() + Send + 'static,
     {
         let rx = self.hub.subscribe(HubScope::NewBlockTemplate);
-        tokio::spawn(run_template_listener(rx, block_wait_time, None, block_cb));
+        self.ensure_zkas_push_task(None);
+        let zk = self.zkas_job_trigger.subscribe();
+        tokio::spawn(run_template_listener_with_trigger(rx, Some(zk), block_wait_time, None, block_cb));
         Ok(())
     }
 
@@ -1261,7 +1381,9 @@ impl KaspaApi {
         F: FnMut() + Send + 'static,
     {
         let rx = self.hub.subscribe(HubScope::NewBlockTemplate);
-        tokio::spawn(run_template_listener(rx, block_wait_time, Some(shutdown_rx), block_cb));
+        self.ensure_zkas_push_task(Some(shutdown_rx.clone()));
+        let zk = self.zkas_job_trigger.subscribe();
+        tokio::spawn(run_template_listener_with_trigger(rx, Some(zk), block_wait_time, Some(shutdown_rx), block_cb));
         Ok(())
     }
 }
@@ -1288,8 +1410,31 @@ impl KaspaApi {
 /// branch did nothing — and running the sync probe in N instances' loops
 /// would multiply redundant RPC load under fan-out. Connectivity is observed
 /// once, centrally (hub health + the existing stats/status threads).
+///
+/// Production now starts listeners through
+/// [`run_template_listener_with_trigger`]; this trigger-less form is kept as
+/// the unit-test surface for the Kaspa-only semantics above.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn run_template_listener<F>(
+    rx: broadcast::Receiver<Notification>,
+    block_wait_time: Duration,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+    block_cb: F,
+) where
+    F: FnMut() + Send + 'static,
+{
+    run_template_listener_with_trigger(rx, None, block_wait_time, shutdown_rx, block_cb).await
+}
+
+/// [`run_template_listener`] plus an optional second edge trigger: the zKAS
+/// job trigger (`KaspaApi::zkas_job_trigger`). A trigger fires the same
+/// callback a Kaspa push fires. It does NOT reset the ticker — the ticker is
+/// the fallback for a silent KASPA stream, and zKAS activity says nothing
+/// about that. A lagged trigger is one callback (edge semantics); a closed
+/// one is dropped and the listener carries on exactly as before.
+pub(crate) async fn run_template_listener_with_trigger<F>(
     mut rx: broadcast::Receiver<Notification>,
+    mut zk_trigger: Option<broadcast::Receiver<()>>,
     block_wait_time: Duration,
     mut shutdown_rx: Option<watch::Receiver<bool>>,
     mut block_cb: F,
@@ -1340,6 +1485,24 @@ pub(crate) async fn run_template_listener<F>(
                     Err(broadcast::error::RecvError::Closed) => {
                         warn!("Block template notification channel closed");
                         break;
+                    }
+                }
+            }
+            trig = async {
+                match zk_trigger.as_mut() {
+                    Some(t) => t.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match trig {
+                    Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if let Some(t) = zk_trigger.as_mut() {
+                            while t.try_recv().is_ok() {}
+                        }
+                        block_cb();
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        zk_trigger = None;
                     }
                 }
             }
@@ -1492,6 +1655,56 @@ mod listener_tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let n = count.load(Ordering::SeqCst);
         assert!(n >= 3, "expected several ticker callbacks, got {n}");
+    }
+
+    /// zKAS push (v2.0.1.7): the zkas job trigger fires the SAME callback a
+    /// Kaspa push fires, with no Kaspa notification and no ticker involved,
+    /// and a burst of triggers collapses to edge semantics (at least one
+    /// callback, never one per queued trigger beyond the burst).
+    #[tokio::test]
+    async fn zkas_trigger_fires_callback_without_kaspa_push() {
+        let (_tx, rx) = async_channel::unbounded::<Notification>();
+        let hub = NotificationHub::start(rx, "test", DEFAULT_HUB_CAPACITY);
+        let (trig_tx, trig_rx) = broadcast::channel::<()>(16);
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        // Long block_wait_time so the ticker cannot masquerade as a trigger.
+        tokio::spawn(run_template_listener_with_trigger(
+            hub.subscribe(HubScope::NewBlockTemplate),
+            Some(trig_rx),
+            Duration::from_secs(3600),
+            None,
+            move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        // Interval's first tick fires immediately; absorb it before triggering.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let baseline = count.load(Ordering::SeqCst);
+
+        trig_tx.send(()).unwrap();
+        timeout(Duration::from_secs(2), async {
+            while count.load(Ordering::SeqCst) <= baseline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a zkas trigger fires the job callback");
+        let after_one = count.load(Ordering::SeqCst);
+        assert_eq!(after_one, baseline + 1, "one trigger, one callback");
+
+        // The trigger sender going away must not stop the listener: a Kaspa
+        // push still fires the callback afterwards.
+        drop(trig_tx);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        _tx.send(template_notification()).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            while count.load(Ordering::SeqCst) <= after_one {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("kaspa pushes still drive jobs after the zkas trigger closes");
     }
 
     /// Shutdown signal terminates the listener promptly.
