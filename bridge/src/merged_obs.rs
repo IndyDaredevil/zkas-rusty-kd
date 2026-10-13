@@ -33,8 +33,15 @@ pub fn epoch_ms() -> u64 {
 /// once, in whichever arm finished second).
 #[derive(Default)]
 pub struct ShareOutcome {
-    zkas_accepted: AtomicBool,
-    kas_accepted: AtomicBool,
+    // ONE atomic for both arms (bit 0 = KAS accepted, bit 1 = zKAS accepted).
+    // Two separate flags with store-then-load let two arms finishing in the
+    // same instant BOTH read the other's flag as set (double counted twice)
+    // or, under Relaxed ordering, both read it as unset (double missed) —
+    // the flake `double_counted_exactly_once_under_concurrency` reproduces
+    // (1 failure in 65 loaded runs, 2026-10-12; first CI failure in 40 runs).
+    // `fetch_or` makes the two accepts totally ordered: exactly one arm sees
+    // the other's bit already set.
+    accepted: std::sync::atomic::AtomicU8,
     // Critique item 2: a double inherently has TWO hashes (parent on KAS,
     // H_fc on ZKAS). Each arm deposits its hash at accept time so the
     // second finisher — whichever leg that is — can emit the double event
@@ -44,6 +51,9 @@ pub struct ShareOutcome {
 }
 
 impl ShareOutcome {
+    const KAS: u8 = 0b01;
+    const ZKAS: u8 = 0b10;
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -51,17 +61,19 @@ impl ShareOutcome {
     /// KAS arm: deposits the parent hash; returns true iff the sibling zKAS
     /// accept already landed (this call completes the double).
     pub fn record_kas_accept(&self, hash: &str) -> bool {
+        // Deposit BEFORE publishing the bit, so the arm that completes the
+        // double always finds the sibling's hash already in place.
         *self.kas_hash.lock() = hash.to_string();
-        self.kas_accepted.store(true, Relaxed);
-        self.zkas_accepted.load(Relaxed)
+        let prev = self.accepted.fetch_or(Self::KAS, std::sync::atomic::Ordering::SeqCst);
+        prev & Self::KAS == 0 && prev & Self::ZKAS != 0
     }
 
     /// zKAS arm: deposits H_fc; returns true iff the sibling KAS accept
     /// already landed (this call completes the double).
     pub fn record_zkas_accept(&self, hash: &str) -> bool {
         *self.zkas_hash.lock() = hash.to_string();
-        self.zkas_accepted.store(true, Relaxed);
-        self.kas_accepted.load(Relaxed)
+        let prev = self.accepted.fetch_or(Self::ZKAS, std::sync::atomic::Ordering::SeqCst);
+        prev & Self::ZKAS == 0 && prev & Self::KAS != 0
     }
 
     /// Both deposited hashes (kas, zkas). Valid once the double completes;
@@ -426,9 +438,10 @@ mod tests {
 
     #[test]
     fn double_counted_exactly_once_under_concurrency() {
-        // 200 rounds of racing both arms on threads: exactly one arm must
-        // report the double, every time.
-        for _ in 0..200 {
+        // 20,000 rounds of racing both arms on threads: exactly one arm must
+        // report the double, every time. (At 200 rounds the two-flag version
+        // passed 64 of 65 loaded runs; at this count it failed 4 of 5, each time with 2.)
+        for _ in 0..20_000 {
             let s = Arc::new(ShareOutcome::new());
             let s1 = Arc::clone(&s);
             let s2 = Arc::clone(&s);
