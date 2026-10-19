@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-132 (2026-10-19)
+### Last entry: BL-133 (2026-10-19)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -4663,3 +4663,100 @@ test and a 0.28 s run on the right machine. Reading tells you where to measure; 
 measurement is what you send. And a checklist from outside is worth one ordering
 decision and two corrections — which is to say, worth running, as long as every claim
 in it is tested against the tree before it is repeated.
+**BL-133 · 2026-10-19 · upstream/audit/record — CH2 r9→r12: `consensus/mod.rs` history path (H1, medium-low), `zakura-orchard` 2.2.0→4.0.0-rc2 (D1, strategic), walletd by surface (W1–W6; BL-116's n=0 closed), `zkas-api` + `gateway` (G1–G6, nothing above low); every §7 area of the scope now read at least by surface; two recollection corrections (second Kron; sizing by `wc -l`)**
+CONTINUES BL-132. Same session, same clones (audit clone + sandbox twin at `zkas-v1.0.11`
+= 01ac1865; `zakura-core/common` sandbox clone, main @ 50f287a6).
+CH2 r9 (207 ln, 93e694872fa6b677900397ff4bfa78d028238bde69104345818c1a71ac1dd13d) §3h —
+`consensus/mod.rs` sized by read, not by `wc -l`: of +1,317 added lines 436 are comments,
+56 blank, ~130 tests, fifteen small RPC getters; the logic is `backfill_shielded_history`
+(1023–1283) and `verify_shielded_history` (1285–1605). Backfill refuses out-of-order scores,
+header disagreement, duplicate/collided hashes, commitment/output count mismatch and
+non-148-byte action blobs BEFORE any write, and bounds the peer's anchor index by the anchor's
+own blue score from a LOCAL header. Verification replays genesis..=base: coinbase commitments
+RE-DERIVED from outputs with the validation function and fork gate; cmx → fresh tree; every
+nullifier → MuHash; result must equal the frontier and accumulator this node holds from PoW,
+never from the peer under test; empty base frontier = Unverifiable, not Verified; past
+pruning points (PoW-chained headers) pin the score sequence. Comments record the bugs each
+check closed (34 min / 0 bytes; the 41-leaf gap discarding 404,928 records; `chunks_exact`
+padding; forged outputs paired with real commitments) and one retraction of their own
+handshake-starvation claim with the measurement (1413–1423). **H1 (medium-low, wallet-
+restore completeness):** a `CompactActionRecord` is nullifier ‖ cmx ‖ epk ‖ 52 ciphertext
+bytes (`wallet.rs:158–167`); the replay binds the first two only; epk/ciphertext are stored and
+served as the peer supplied them — a history peer can corrupt them, the archive still
+verifies, and a wallet restoring from it fails trial-decryption on those notes and never
+learns it owns them (notes remain in the tree; an honest rescan recovers; honest and corrupt
+archives are indistinguishable). Same class as the team's own per-block-split note (830–847).
+Kron exposure: none (own_base = genesis, no peer history). Fix shape: per-block commitment
+over compact records (consensus change) or full action bytes on restore. CH2 Q7.
+H2: chain index below pp rebuilt from peer data, bounded by local blue score, re-checked by
+verification — serving paths only, reviewed. H3: the scope's "7–8k consensus-relevant lines"
+over-counts this file by ~3×.
+CH2 r10 (222 ln, 3ed7131a7e95da9cf7527688e1c2a71ad7ea1d3fb5fa2c3e5df91583f5dca7ae) §3i —
+zakura-core/common: v2.2.0 (b6cf4cef, 09-30) → 3.0.0 merge (0b13ab9e, 10-13; 44 commits) →
+main (119 since 2.2.0). NO verifier/soundness change in the range (halo2_proofs: MSRV
+1.91→1.97, prover compilation restructure "proof bytes unchanged" #600/#601; halo2_gadgets
+drops ~5k lines of SHA-256; orchard adds `verifier-fingerprint` #559 for comparison with an
+independent verifier). **D1 (strategic):** ZKas pins `CIRCUIT_VERSION = FixedPostNu6_2`
+(`verify.rs:587`); orchard 3.0.0 #553 makes `ProvingKey::build` reject every version except
+`PostNu6_3` and removes pre-NU6.3 PROVING while keeping verification — on ≥3.0.0 a ZKas
+node verifies but no ZKas wallet/walletd/shielded-pay can create a proof. 2.2.0 is where
+ZKas STOPS unless (a) hard fork to PostNu6_3 (new vk, new fingerprint, wallet fleet re-
+shipped — the F-02 class of coordination already deferred) or (b) a ZKas-maintained fork of
+the crate. 4.0.0-rc makes `ProvingKey`/`VerifyingKey` opaque and removes `unstable-voting-
+circuits` (#591) — the surface A2's fingerprint path reached into; whether #362's
+`pinned_description()` survives: unread. The A1/B/A2/#18 identity work is what makes an
+accidental bump loud. Scope Q3 → CH2 Q8 ("which path, what timeline"). Also §3h's
+second-Kron sentence withdrawn (operator: that plan was cancelled; the unit was never built).
+CH2 r11 (238 ln, f820201a6ab112e074167fbf415b0b4155c058c428adc7393250a913065e289e) §3j —
+walletd by surface (lib.rs 12,975 ln; routes 11843–11912, token 697–774, files/seed-at-rest
+777–935, `require_custodial` 488–500, reveal 7781–7792, CORS 11843–11880, CLI main.rs 13–132).
+**W1 (VERIFIED; closes BL-116's "n=0, unverified"):** `--no-custodial` gates `reveal` AND
+`send`/`send_many`/`consolidate`/`create`/`import`/`sign` (403) — the flag that closes the
+seed path also disables spending and auto-consolidation; unusable for the treasury. The
+daemon's "a compromise leaks visibility, never coins" (lib.rs:14–21) holds only in non-
+custodial mode. **W2 (medium for a custodial deployment):** one bearer token is the whole
+authority — `reveal` returns `seed_hex` on token alone; `send`/`sign` likewise; no second
+factor, no spend limit, NO scoped read-only token: `/status`, `/balance`, `/history` take the
+same token. Kron's reporter polls `/history` with the treasury token (zkas-reporter-r6.ps1
+`Get-WalletHistory`) = BL-116, mechanism now confirmed from source. Upstream ask with the
+best value/size in the audit: scoped read-only tokens, or `--disable-reveal`, or the wallet
+secret as a second factor on reveal/send (CH2 Q9). **W3:** seeds PLAINTEXT at rest unless
+`--wallet-secret`/`ZKAS_WALLET_SECRET` (then XChaCha20-Poly1305 under argon2; main.rs:57–58
+warns); Kron sets it via the DPAPI blob → env (BL-055 era); loaded wallets are decrypted in
+memory. **W4:** token entropy unenforced (1–128 chars `[A-Za-z0-9_-]`); mitigation is a
+constant delay on miss (5888–5900), correct behind a proxy; Kron's token length known only
+to the operator. **W5 (right defaults):** bind 127.0.0.1:8501; token required unless
+`--allow-default-token` (off); CORS no origins unless configured; PNA only with a bearer;
+`--serve-public` = TLS + minted bearer. **W6:** the standing WAIT on moving the treasury to
+device signing stands; mitigations are local (token → DPAPI; drop or re-home the history
+poll) and upstream (W2). Not read: prepare/proof building, bundle/*, warm/scan, selfhost.rs.
+CH2 r12 (259 ln, fbc471ca97989512f6c362a876ecd30477a2ebfb52f814521edfdeaa21d3c6b5) §3k —
+`zkas-api` (explorer backend, 26 GET + 1 POST, read-only, bind 127.0.0.1:8500, CORS Any):
+G1 no rate/concurrency limit and `POST /transactions/search` scans the ring once per id
+(availability only); G2 `merged.rs` probes every peer's Kaspa port on a timer (doc note);
+G3 `geo.rs` offline RIR lookup — no third party learns the node's peers (positive).
+`gateway` (merchant invoices, FVK-only, detection via a non-custodial walletd watch wallet,
+blue-score confirmation): G4 custody model right and stated, constant-time API key, HMAC-
+SHA256 webhooks with tolerance, 16-byte OsRng invoice ids as capability URLs; G5 unauthed
+`GET /invoices/:id` returns `orderId`+`metadata` to any id holder (doc note for integrators);
+G6 `redirect_url` unvalidated → `location.href` (merchant-key compromise → `javascript:` on
+the payer's checkout; one-line https allowlist). Neither crate runs on Kron.
+CH2-4 cross-check artifacts from BL-132 unchanged. CH2 question list now 1–9.
+INCIDENT-CLASS NOTES (II.2, not promoted): (a) "the second Kron's rebuild is a from-genesis
+sync — that's the measurement" asserted from the overview summary; the operator: the plan
+was cancelled, no code ever ran on it. Recollection stale on STATE; the empirical pre-fork-
+history test has no instrument on hand (needs ~81 GB). (b) `consensus/mod.rs` sized "an
+evening", then "1–2 hours", from +1,373 lines; the read took three minutes by the operator's
+message stamps (17:49→17:52). `wc -l` is not a read-time instrument; the function list is.
+(c) I wrote "cut 18:0x" with no clock; the stamps said 17:52 (II.1).
+OPEN: send SCOPE-r7 + CH2-r12 (scope Q1–6, CH2 Q1–9 — Q8/D1 and Q9/W2 are the two with
+money behind them); upstream PR candidates in merge order: scoped read-only wallet token
+(W2), batch verifier on the consensus path (§3g, ~5×), the two missing tests (§3e: CH2-3,
+F-02 sibling), G6 allowlist; unread: `purge_*` in consensus/mod.rs, walletd proof/scan
+paths, AuxPoW v1 end-to-end vs bridge v2.0.1.7; project-files ENGINEERING-LEDGER.md
+delete-then-add owed (IN pin follows this merge).
+**Lesson:** the day's two highest-leverage findings were not in consensus code at all —
+one is a dependency's roadmap (D1) and one is a bearer token's reach (W2) — and both were
+visible only after the consensus review had cleared the ground under them. An audit that
+stops at consensus answers the question the team asked; this one also answers the ones
+the operator needed.
