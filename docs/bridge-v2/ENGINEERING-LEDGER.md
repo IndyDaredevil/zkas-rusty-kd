@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-129 (2026-10-10)
+### Last entry: BL-131 (2026-10-19)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -4418,3 +4418,149 @@ live DAA against the 1 BPS estimate. Registry: P0 item, two sub-items, deadlines
 pre-approval and the lineage that made #18 a one-paragraph ask instead of a
 pitch; and a patch that prints a constant proves only that the check passed,
 which the panic already proved.
+**BL-130 · 2026-10-19 · upstream/audit/record — ZKas security-audit scope measured and chapter two begun: zkas-rusty is a squashed copy of rusty-kaspa @ 98a4ccd8 (06-24) with 24 of 26 later upstream commits absent on every branch; SCOPE r1→r6 and CH2 r1→r2 cut, re-anchored on zkas-v1.0.11 after a stale-anchor incident; the security fork closes the two highest pre-fork findings**
+TRIGGER: dev-channel reply (Ronnie, 15:22 EDT screenshot) that ZKas needs no audit
+because "if Kaspa and Zcash are safe, 99.9% ZKas is safe too." Question posed to
+the session: what would an audit take; then "why can't we do it"; then do it.
+BASE (MacBook/zsh clone `~/audit-2026-10-19/zkas-rusty` + upstream remote; sandbox
+clone corroborates): `git merge-base origin/HEAD upstream/master` EMPTY — no shared
+history. ZKas root `33903e04` (06-24, subject = upstream `(#1064)`) is a squashed
+import whose tree is BYTE-IDENTICAL to upstream `98a4ccd8` (`git diff --shortstat`
+prints nothing). `main` = 499 commits (498 after root; 13 merges, all ZKas-internal;
+455 first-parent); 502 across all five origin branches. Tags zkas-v1.0.1…v1.0.11.
+DELTA from 98a4ccd8 → zkas-v1.0.11 (01ac1865, the security-fork release, Kron's
+current node): 137 upstream files modified +16,344/−1,331; 150 added +50,983;
+0 deleted/renamed. (v1.0.8: 128 M +11,349/−1,258; 129 A +39,509.) Hot files at
+v1.0.11: consensus/mod.rs +1373/−35 · virtual_processor/processor.rs +1183/−9 ·
+coinbase.rs +997/−66 · ibd/flow.rs +723/−13 · utxo_validation.rs +567/−34 ·
+params.rs +531/−55 · pow_hashers.rs +449/−0 (FishHash, DEAD on the consensus
+path: 4 non-test refs outside the file, all re-export/comment/description) ·
+convert/header.rs +199/−3 · tx_validation_in_isolation.rs +197/−7.
+UPSTREAM DRIFT: 26 commits on kaspanet/rusty-kaspa master since base (tip 4edcbbcc
+#1065, fetched 10-19). Patch-id (`git patch-id --stable`) over all 502 ZKas commits
+vs the 26: EXACTLY TWO present (#1067 `append_r0_groth16_verifier_dynamic_image_id`,
+#1085 `fix(wasm): sighash type mapping`); 24 absent on every branch (gate proves
+absence of the exact patch; a hand-port with shifted context reads 0 — stated beside
+the gate, II.5). Node-relevant absent, from reads not titles: **#1138** (2a47b249,
+09-22) wire-decode hardening — `MAX_BLOCK_BODY_SIZE = 2 MiB` rejects oversized
+Block/BlockBody messages with `ConversionError::Size` before parsing (+ convert/tx.rs
++64/0, messages.rs +52/0, connection_handler, mempool frontier, topological_sort,
+IBD streams); ZKas has NO wire-level body cap at either tag and its bodies carry
+proofs, so the constant cannot be copied — not a cherry-pick. **#1137** (34 ln)
+reject coinbase txs at mempool entry — nothing under mining/src/mempool/ rejects a
+coinbase at either tag (isolation validator only checks a coinbase is well-formed).
+**#1136** IBD 20 MiB header chunking in flows/v10 — ZKas speaks v10 (`PROTOCOL_VERSION
+= 10`, flow_context.rs), applies. **#1142** accepted_id_digests→SeqCommit — hand
+merge against the +1183 processor.rs. Toccata cleanup ×7 = refactor drift. #1074
+READ and demoted (26 consensus-core lines: a `pub`, two `Add` impls, `to_grams`,
+comments; no rule change). No upstream merge/sync commit anywhere in the 502.
+RELEASES: zkas-v1.0.8 (09-01) and v1.0.11 (10-11) each four platform zips, 59–72 MB,
+NO checksum file, NO signature (GitHub REST read, MacBook); workflows ci/deploy/
+musl-toolchain carry no release hashing or signing (one sha256sum hashes a toolchain
+preset). DEPS: shielded-core pins `zakura-orchard` =1.0.1 at v1.0.8 and 2.2.0 at
+v1.0.11/main (crates.io, exact); crates.io metadata names publisher ebfull for 0.0.0–
+3.0.0, GitHub trusted publishing from zakura-core/common for 4.0.0-rc0..rc2; crate
+is at 3.0.0 (10-13) / 4.0.0-rc2 (10-19 03:00Z) — eleven releases since 1.0.1.
+WHITEPAPER (18 pp, 5,201 w, zkas.info 09-04 print): threat model (§3, names the
+economic seams and "assumes it inherits latent bugs from the code it forks"),
+transition (§6.2 five steps), anchor rule (§7), turnstile (§8.1 integer ledger,
+§8.2 per-bundle binding sig as the only aggregate check). No parameters, encodings,
+per-version rules, pruning behaviour, merged-mining validation — a design paper, not
+a spec. §3's "degrades to a halt, not a counterfeit" is contradicted by its own §8.2
+for proof-soundness failures (= BL-100 turnstile verdict); posed as a question, not
+a verdict (V.2). Code answers one gap: `shielded_anchor_depth = 600 × BPS`
+(params.rs:238) with `shielded_anchor_depth < max_shielded_anchor_age <
+pruning_depth − finality_depth` asserted at construction (:201).
+CHAPTER TWO (sandbox clone, files read at the tag, nothing run). r1 at v1.0.8 —
+twelve findings; the two ranked highest: **CH2-1** anchor→source-block index is
+consensus-relevant and NOT derivable from the chain before an activation (the
+code's own comment, shielded.rs:446–500: sibling blocks carry identical roots,
+index is last-write-wins; mainnet measurement 34/39,228 anchors disagree live vs
+fresh sync; one wedges every fresh node at DAA 371,851); repair at that tag =
+`load_anchor_overrides` from a `zkas-anchor-dump` file. **CH2-2** fast-sync
+anchor-source attestations trusted from the serving peer, not under the PoW-
+committed state root. Also: dropped shielded txs still recorded as accepted
+(CH2-3); full proof verification spent on spends then dropped (CH2-4, mass
+rules unread); AuxPoW witness outside H_fc but handled (native-first; in-
+isolation PoW failure does not poison the hash) with `parent_coinbase` unbounded
+(CH2-5); `pegin.rs` dormant mint path, 0 call sites (CH2-6); dev-fee accrual
+consensus state validated by coinbase-hash equality + pool-delta invariant
+(CH2-8); coinbase commits `state_root_at(selected_parent)` (CH2-9); invariant is
+integer-only (CH2-10 = BL-100); liveness principle (CH2-11, comment records a
+live chain freeze from the opposite rule); 113 comment lines cite an internal
+`PLAN §2.x` and findings `F-01..F-05, F-08, F-09` (+F-07 in p2p) — the spec and
+incident register exist off-repo (CH2-12). r2 at v1.0.11 (fork): CH2-1 and
+CH2-2 FIXED post-fork — spends name `anchor_block`, judged against an append-only
+anchor log (MMR of (block,parent,root,blue_score)) whose commitment is folded
+into `shielded_state_root_v1 = H(root_v0 ‖ dev_accrued ‖ anchor_window ‖ miner
+slot)`, personalized `zkas_state_root1`; override map GONE (0 hits). CH2-5 FIXED:
+`MAX_AUX_POW_SERIALIZED_LEN` 256 KiB, `MAX_AUX_POW_NESTING` 4 (closes a decode
+recursion r1 missed), `validate_structure`. CH2-8 SUPERSEDED: dev fee ENDS at the
+fork (`dev_fee_end_activation` = 6,983,500); miner rewards accrue in a carried
+`MinerAccrual` slot, differential-tested against an independent model. Survive:
+CH2-3, CH2-4, CH2-6, CH2-7, pre-fork history (how a fresh archival sync validates
+mainnet < DAA 757,000 with the override gone — open question), and `shielded_
+coinbase_seed_activation` (F-02) = `never()` on mainnet. Mainnet gates read from
+params.rs MAINNET_PARAMS: multi-producer 757,000 · dev-fee accrual 757,000 ·
+security fork 6,983,500 · merged mining always.
+ARTIFACTS (cut sandbox-side, landed `~/audit-2026-10-19/`, each readback
+byte-identical; project-doc copies under claude/): SCOPE r1 140 ln acc597ba3678030a
+f9c87e35ef374f2304c719ca2bd4639ac2282bcf8bf5366f → r2 149 774c208e0e7c08b430b562b
+b5ab033605a2037b2fe2b7b1b4851b2333ffdc012 (V.1 pass: five objections resolved) →
+r3 173 6e99086287de46ec3187f72d66a826078d863e71015484bf3ee830a7d640f55d → r4 173
+5077bda9e3d34e7f9db27332fed4fba3ed0eaa5abf0833cdf0029161ff5599d8 (crates.io) →
+r5 178 e6a1066ceab13e624c58fc291bc679101d9367937e8c246b0807b8cebfe575a2 (count
+correction, I-47) → **r6 179 38355f986fd67da3240221994c540ac7eedaf3c52c1d40a7ab377
+f3b07aeecaa** (re-anchored v1.0.11; SEND COPY). CH2 r1 111 0267e159cb98a8267b876c
+f0136e3ef878c6b8eb92db418c7298bde39852a00b (v1.0.8 record) → **r2 79 64b76725f93f3
+27d1292f4bf03532d439f60c8a0e85aacdf0fda68ae1d33f3f1** (SEND COPY). r1–r5 and
+CH2-r1 superseded, retained as record. Twelve consensus-relevant fences shipped and
+pasted back; outputs are the evidence base above. Not sent to the team yet;
+recipients named: Ronnie, Leo, Odie.
+OPEN: send r6 + CH2-r2 (six scope questions + four CH2 questions); chapter two
+next pass = shielded-core internals (`apply_chain_block_to`, nullifier set, tree,
+turnstile.rs), pruning-point export/import, mempool shielded admission; zakura-
+orchard 2.2.0→3.0.0 delta vs Kron's node; #1138-class body cap sized for ZKas.
+**Lesson:** the audit's first chapter was one afternoon of git on a laptop, and
+its strongest line is the project's own code comment stating that consensus-
+relevant state was not derivable from the chain — measured, not argued. The
+"99.9%" claim fails on composition, and the team's own fork already concedes it:
+the security fork's state root v1 exists to commit "the values a syncing node
+previously had to take on trust."
+
+**BL-131 · 2026-10-19 · record — two recollection incidents inside BL-130's session (I-47, I-48); BL-100's lineage stands; incident-id series collision noted**
+**I-47 (II.2/II.6):** `git rev-list --count origin/main` was carried as **49** from
+one paste and rode SCOPE r1–r4 ("48 commits after the root"); the sandbox clone
+read **499**, the MacBook re-read 499; 502 across all branches had agreed with 499
+all along. Root cause: a counter read once and never re-read before reuse; the
+patch-id total was the second instrument and was not compared. Cost: four
+revisions carrying a wrong order of magnitude; corrected forward in r5 §1 with the
+correction stated in the document (IV.8). Rule cited: II.2 — any id, status or
+COUNT is read from a rail at the moment it is used; II.6 — a second document
+restating it added no evidence.
+**I-48 (II.2):** the audit anchored on `zkas-v1.0.8` as "the release Kron runs" from
+the ledger-derived memory summary, not from a rail; NODE-CUTOVER-v1.0.11-r2 (10-11,
+project mount) and the operator ("yes") place Kron on v1.0.11, the security-fork
+release that changes exactly the reviewed code. Cost: CH2-r1 reviewed pre-fork
+rules (dev-fee accrual, override file) that v1.0.11 retires; recovered by CH2-r2
+(tag-to-tag re-test) and SCOPE r6 (re-measured). Rule cited: II.2 — recollection
+is a hypothesis about which rail to read; the project mount held the answer.
+LINEAGE (no correction owed): SCOPE r3 §6 narrowed the shielded-dependency wording
+to "per PRs A1/B/A2" after reading `zakura-orchard =1.0.1` at the tag. The ledger
+already carries the full lineage at BL-100 (orchard 0.14.0 pinned from birth at
+cf89920; → zakura-orchard 1.0.1 at d749389; tarball ⟷ repo identical; A2 fingerprint
+1bee049a…). The narrowing was against the memory summary, not against BL-100;
+BL-100 stands as written.
+RECORD DEFECT (noted, not fixed; operator to decide): the incident-id series
+reached **I-46 at BL-121** (S28, 09-11), but BL-128 reuses **I-32** and BL-129
+reuses **I-33/I-34**. This entry continues from the highest in the file (I-47,
+I-48) and leaves BL-128/129's ids as written (IV.1); a forward note is the
+correction (IV.8).
+LEDGER RAILS at cut: mount copy (project doc, created 10-10) = repo
+`merged-v2.0.1.6` @7bd978a = `merged-fork-v1.0.11` @99611dc = `merged-fix-double-
+race`: all **4,420 ln, 6a84e0c5ede53fb6bcb6c14a1bf45673174c3aefcb884983ffc7cd5e62
+0d8558, Last entry BL-129**. Kron/MacBook working trees UNREAD; if an unlanded
+append exists there, these ids shift by its count before merge (IV.8).
+**Lesson:** two incidents, one cause: a value that was true once was reused as if
+it were a rail. The count cost four revisions; the anchor cost a chapter. Both
+were caught by a second instrument that existed the whole time.
