@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-131 (2026-10-19)
+### Last entry: BL-132 (2026-10-19)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -4564,3 +4564,102 @@ append exists there, these ids shift by its count before merge (IV.8).
 **Lesson:** two incidents, one cause: a value that was true once was reused as if
 it were a rail. The count cost four revisions; the anchor cost a chapter. Both
 were caught by a second instrument that existed the whole time.
+**BL-132 · 2026-10-19 · upstream/audit/record — chapter two completed through the scope's first-read list at zkas-v1.0.11 (CH2 r3→r8; SCOPE r7 clean re-anchor); CH2-4 MEASURED and closed on the MacBook; the reorg walk, startup self-check, coinbase.rs, pow_hashers.rs and the test file read in full; an outside checklist (Gemini) evaluated — one real contribution, two corrections**
+CONTINUES BL-130. Same session, same clone (`~/audit-2026-10-19/zkas-rusty`, sandbox twin).
+SCOPE r7 (182 ln, 8a8a0184cabd1266a9d1782d1b5d9c765b902bb3bf580fa905d3d487189df7ef): the
+scope document rewritten fresh against `zkas-v1.0.11` (01ac1865, the node Kron runs)
+with no revision history — operator instruction ("without the revisions noise from
+changing from our mistake starting at v1.0.8"). Numbers re-measured at the tag: 137
+upstream files modified +16,344/−1,331; 150 added +50,983; hot-file table at v1.0.11
+(consensus/mod.rs +1373, processor.rs +1183, coinbase.rs +997, ibd/flow.rs +723,
+utxo_validation.rs +567, params.rs +531 …); ten `zakura-*` crates all 2.2.0 from
+crates.io; `v1.0.8` appears only in the release-assets comparison. r6 (179 ln,
+38355f98…) was the patched intermediate; r1–r6 retained as record, r7 is the send copy.
+CH2 r3 (99 ln, 0a56bad6…7613) §3b: `shielded-core` read — `apply_chain_block_to` IS the
+whitepaper's §6.2 (a nullifier repeated within one bundle drops the whole tx,
+`nullifier.rs:133–141`); `turnstile.rs` is integer arithmetic and its `reconcile()` is
+documented "not a consensus entry point", no caller (= BL-100 at code level);
+`verify_bundle_with_vk` does the three checks + April-2026 identity-point rules, proof
+verified BEFORE the cheap signature checks (N4, low); the sighash is ZKas's own BLAKE2b
+construction, not ZIP-244, and its comment records a burn-field malleability bug the team
+found and fixed without a fork (N5 → question); pruning-point import refuses an unbound
+import, ceilings before streaming, cross-checks counts; pre-fork "peer pairs and scores
+are outside every root" now explicit and bounded. r4 (116 ln, 4ad8fe1a…9a2d) §3c:
+`coinbase.rs` in full (1,563 ln; 530 rules) — template and validator build from the same
+three selected-parent inputs then compare tx hashes (C1); `accrue_miner_rewards` is a
+pure conserving fold whose output bound matches the `k + 4` isolation cap (C2); a merged
+block cannot overstate its subsidy — checked at body acceptance with the canonical-
+Orchard-payout "R2 halt guard" (C4); accrual overflow is a reject in the builder and an
+`unwrap()` panic in the validator, unreachable (C3); no finding above low. r5 (127 ln,
+e09492b7…343b) §3d: `pow_hashers.rs` — upstream kHeavyHash untouched (hunks never touch
+its lines); the +449 is a FishHashPlus/KarlsenHashV2 port from rusty-karlsen with ZERO
+constructors or kernel calls outside the file and its tests (grep over the tree); the
+miner crate's `description` names the wrong algorithm; CH2-7 settled: delete or
+feature-gate. r6 (154 ln, 8a48736a…04a8) §3e: `virtual_processor/tests.rs` as a coverage
+map — 49 `#[tokio::test]`s, all ZKas's (my `#[test]` count had read 0 — wrong attribute);
+`reorg_nullifier_revert_is_visible_to_rejoining_spend` is a regression test for a
+recorded consensus-divergence bug; four untested areas named (CH2-3, CH2-4, pre-757,000
+history, F-02 sibling case, plus no full-pipeline aux-mined block). r7 (168 ln,
+81b786a8…0b5c) §3f: the reorg walk (`processor.rs:1380–1530`) — down-walk reverts
+committed in their own batch BEFORE the up-walk (`:1424`), up-walk re-applies committed
+inline per block (`:1475–1477`); both because RocksDB deletes/writes staged in a batch are
+invisible to store reads (F-01, twice — the second instance diagnosed live 2026-07-31 as
+the DAA 371,851 wedge, `:1470–1474`); sequential on one thread, rayon only within a
+block; rollback horizon inherited from Kaspa finality; N7: the crash-consistency comment
+at `:1392–1396` predates the per-block commits — a crash between inline re-applies and
+the virtual-state commit followed by a different winning tip leaves non-selected
+nullifiers in the global set; F-09 resets the shielded-stable flag on a shielded
+disqualification. r8 (191 ln, 97996a9c…b386): startup self-check read
+(`processor.rs:773–808`; sets `SHIELDED_STATE_DIVERGED`, refuses `getBlockTemplate`
+via `service.rs:405`, no panic, no repair, once per consensus instance in its own thread,
+upgradable read lock for the scan); CH2-4 measured and CLOSED (below); Q4 retired.
+CH2-4 MEASUREMENT (the only surviving item a block producer could exploit for free).
+Rule read: mainnet `mass_per_tx_byte = 1` + `SHIELDED_MASS_PER_ACTION = 1,000` compute,
+transient 4×bytes; block limits compute 500,000 / transient 1,000,000 post-Toccata; mempool
+drops the standard sub-block cap for shielded txs. A 2-action bundle = 9,149 B → compute
+11,149, transient 36,596 → **~27 two-action bundles (54 actions) or ~8 eight-action
+bundles (64 actions) per block** is the ceiling. Instrument: one `#[test]` added at the
+tag in a worktree (`CH2-4-timing-test-r1.patch`, 55 ln, 73f279b01c7e811274c7c01ee7a80f69
+dbb876360eaf7b4b1621c0d0ca0fe72c; `git apply --check` clean at 01ac1865, 44 insertions),
+real 2-action proof, `verify_bundle` ×10 and `verify_bundles_batched` at 1/10/35/70.
+MacBook (`cargo test --release -p kaspa-shielded-core --features circuit
+ch2_4_verification_timing -- --nocapture`): pk 78 ms · prove 73 ms · vk 39 ms ·
+**single 2.26 ms/bundle** · batched 10/35/70 = 5.3/14.5/**26.7 ms** (0.19 ms/action).
+Sandbox 2-core cross-check: 9.74 ms single, 103.6 ms at 70 (same shape, 4.3× slower).
+Consensus verifies per tx with `verify_bundle` (rayon across a block's txs; the batch
+verifier has no consensus caller), so the worst block ≈ 35 bundles ≈ **79 ms** single-
+threaded on a laptop, ≈15 ms if batched — a load factor, not an exhaustion lever.
+Residual notes: batch path unused (~5× saving available); per-mass cost ≈ 0.20 µs/mass
+vs an ESTIMATED few × less for a transparent input (not measured here). Sandbox run was
+a cross-check only — the operator asked why it ran there rather than on the MacBook
+(answer: unattended; wrong for a timing number) and the patch was shipped for the MacBook
+the same turn (IV.2).
+OUTSIDE CHECKLIST (Gemini, three pastes). Evaluated against the work: its delta-isolation
+step (`git diff upstream/tag..HEAD`) fails on this repo (no shared history); its A
+(transaction-struct/sighash) assumed fields were added to Kaspa's `Transaction` — they
+were not (bundle in payload, `TX_VERSION_SHIELDED = 2`; txid covers the payload on both
+id paths, `hashing/tx.rs:34–50, 207–217`); its B answered by the single call site
+`tx_validation_in_utxo_context.rs:30–43` (errors mapped, nothing silent; a build without
+`shielded-circuit` rejects all shielded txs); its D (Toccata script precompiles) does not
+fit — `crypto/txscript` is +80 lines over 7 files and verification is a version-gated
+validator path, not a precompile. One real contribution: ordering the reorg trace up the
+list (done, §3f). Two corrections sent back: "one atomic db_tx across revert and apply"
+is the shape that BROKE (F-01); its stated rationale for the non-atomic design (lock
+contention / memory) is invented — the code's reason is read visibility, and RocksDB
+batches already have a WAL. Its "permanently unbootable on mismatch" does not hold
+(node boots, refuses templates). Its automatic-repair suggestion is feasible with
+retained per-block diffs and is folded into Q7's wording.
+EXPECTED-OUTPUT MISSES this entry (III.2, same class as I-34, not promoted to incidents):
+commit stat "146 insertions" (was 147: the header line is a deletion AND an insertion);
+patch "45 insertions" (was 44: counted the `+++` header); `#[test]` count 0 (tokio
+attribute). All caught by the operator's pasted output within the turn.
+OPEN: send SCOPE-r7 + CH2-r8 (six scope questions, six CH2 questions); `consensus/
+mod.rs` (+1,373) next unread hot file; `zakura-orchard` 2.2.0→3.0.0 delta if Q3 is not
+answered; project-files delete-then-add of ENGINEERING-LEDGER.md still owed from BL-131
+(IN 4566 dc7525c5…74d0) and will need re-doing after this merge.
+**Lesson:** the two findings ranked highest in the morning were closed by the afternoon's
+reading of the fork, and the one that could have been exploited was closed by a 44-line
+test and a 0.28 s run on the right machine. Reading tells you where to measure; the
+measurement is what you send. And a checklist from outside is worth one ordering
+decision and two corrections — which is to say, worth running, as long as every claim
+in it is tested against the tree before it is repeated.
