@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-133 (2026-10-19)
+### Last entry: BL-134 (2026-10-19)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -4760,3 +4760,121 @@ one is a dependency's roadmap (D1) and one is a bearer token's reach (W2) — an
 visible only after the consensus review had cleared the ground under them. An audit that
 stops at consensus answers the question the team asked; this one also answers the ones
 the operator needed.
+**BL-134 · 2026-10-19 · upstream/audit/record — DRIFT: `main` is 82 commits past `zkas-v1.0.11` (the node Kron runs), a 2026-10-16/17 hardening sweep that closes at least nine remote-kill classes, N7, and two RUSTSEC advisories, none released; the sweep cites a third-party audit; CH2 r13/r14/r15 cut (§3l–§3p: H4, A1–A4, M1, W7–W9, S1–S4); `cargo audit` on the tag (13 advisories, one on a Kron listener, that one fixed on `main`); incident I-49 (read rail was `main`, labelled tag); corrections to BL-132 and BL-133 under IV.8**
+CONTINUES BL-133. Same session. Instruments: sandbox clone of `firecash/zkas-rusty` at
+`main` = 9d9433b (fetched 2026-10-19), tag `zkas-v1.0.11` = 01ac1865; audit clone on the
+MacBook (`~/audit-2026-10-19/zkas-rusty`) for the reproduction fences.
+CH2 r13 (301 ln, 23b686dfad8657916906cfa55c92e6e9c6dbab561541b4c7121f0f70f939bd6b) §3l–§3n:
+history purge/serve (callers IBD + CLI only, no RPC; purge is the inverse of backfill in one
+batch; serving clamped 4,000 / burst 8 / 100 ms per connection; **H4 low**: requester's 32 MiB
+per-record ceiling vs an honest bound of ~1.9 MB derived from `mergeset_size_limit` 180 × ~70
+actions × 148 B, written before verified, up to 4 h — a disk/write-amplification lever on a
+backfilling node, Kron not exposed); AuxPoW v1 end-to-end (A1: bridge `merged.rs` on
+`merged-fork-v1.0.11` calls the same `bound_commitment`/`embed_commitment_v1`/`nonce_binding`
+the verifier reads, round-trip test `security_fork_round_trip_passes_the_node_verifier`; A2:
+the parent is never checked to be a Kaspa block, by design — aux work = native work; A3: a
+stripped witness cannot poison a hash, `StatusInvalid` only after post-PoW validation; A4 →
+Q10: pre-fork witnesses are non-canonical and the block level derives from whichever a node
+holds); mempool admission (M1 positive: verdict cached by txid, invalid proof →
+`MisbehavingPeer`). r14 (315 ln, 12d7724d9e27848eaa8efd411600c9daa2e4e0935d6fc7543331f70000a3de28)
+§3o: walletd device-signing path — W7 (positive: FVK-authenticated `prepare`, 24-byte OsRng
+single-use session, 5-min TTL, index bounds in two layers, `apply_signature` verifies before
+the binding signature, `submit_guarded`, parked not deleted), W8 (low: `prepare` on a
+loopback daemon needs only an FVK — minutes of proving per call, bounded by the per-FVK guard
+and the semaphore), W9 (note: self-host pairing prints the bearer to stdout; `allow_custodial:
+true`). Both landed byte-identical on the MacBook (`~/audit-2026-10-19/`), both in the project
+files. The operator's direction after r14: not coverage for its own sake — "the most value
+added work and … as complete an audit as possible without the ZKas team's feedback." Plan
+agreed: (1) turn Q3/Q6/F-02-sibling into tests, (2) `cargo audit` + reproducible build,
+(3) the sighash construction as a real review, (4) the pruning-proof comparison behind Q10.
+**DRIFT (the day's finding), ZKAS-DRIFT-v1.0.11-to-main-r1 (171 ln,
+501972824114e08b72500f46aa38d5879d4c87473d0781343438f3e3b40eeb68; landed, project files).**
+Setting up (1) exposed that the sandbox tree's HEAD is `main`, 82 commits (10 merges; 78
+files +4,831/−442) past the tag, all dated 2026-10-11→17, 75 of them a sweep merged through
+`rc-integration` from `rc-polarity/panic/bounds/controls/trust/atomicity` and
+`r2-hardening/walletd/tests/overflow`. Classified K 13 · B 16 · T 4 · P 3 · A 10 · C 7 · W 4 ·
+X 15. Nine remote-kill classes present at v1.0.11 (all end in `process::exit(1)`,
+`core/src/panic.rs:29`; `overflow-checks = true`, `Cargo.toml:394`), each re-verified at the
+tag by `git show zkas-v1.0.11:<path>`: **K1** a relayed header with a junk merged-mining
+witness (v0 parent coinbase with a `ComputeBudget` input) kills the node in the header
+store's serialize `expect` (`serde_impl.rs:158`; `a99e035`: "one relayed header killed every
+node that accepted it, for no proof of work") — **live on Kron from any connected peer,
+outbound included**; K2 handshake `timestamp = i64::MIN` overflow (`flow_context.rs:818`;
+`1da1e6a`) — live iff the router forwards 16811 (`--externalip` set, `disable-upnp`, not on
+any rail); K3 bech32 checksum-valid garbage on every address-taking RPC (`f7da1f4`,
+`4ff8505`); K4 shielded address in `GetMempoolEntriesByAddresses` (`service.rs:708`) or a
+`UtxosChanged` subscription + disconnect on a `--utxoindex` node (`1da1e6a`) — Kron has
+`utxoindex = true`, gated by the H7 firewall scope on 16810; K5–K7 IBD/export-time
+(`04acc43`, `437b131`, `300d9ac`, `f5ae885`); K8 wRPC JSON only (`68e7108`, off on Kron);
+K9 walletd allocation/overflow panics (`fc77a4c`, `be66098`, `132cf04`, `db78a70`) — fatal
+only when walletd is embedded; Kron's is standalone. Also at the tag: `P2P_MAX_MESSAGE_SIZE`
+1 GiB enforced after gzip (`connection_handler.rs:45`; `aa39ede` → 256 MB + bounded
+handshakes), h2 0.4.6 / rustls 0.23.39 in the lockfile (RUSTSEC-2026-0258/-0285; `bd09d2c`),
+per-connection outgoing backlog unbounded in bytes (`15b12b5`), proof serving unbounded
+(`293b27f`, "enough to OOM a 7 GB node"). **N7 is real and closed on `main`** (`10eed6f`:
+nullifier cursor, prefix 99; startup and per-walk reconcile; self-check rebuilds from diffs
+and writes only on a snapshot match; three deterministic crash-window tests). Fresh-sync
+proof work floor added (`6b565e4`, `329eeb9`, `65aa38d`: half of 0x37f1d1fdbca54646cbbf at
+pruning point 584ca71c…, blue score 6,955,203). `9c3362a` closes the BL-063 config-key trap
+(five args now honour the config file). **The sweep's commit bodies cite an external audit**
+— "the third-party audit's POC collection (`regression/f2_bech32_closure.rs`)" (`d5c8511`),
+"as the audit proposed" (`15c205b`), "owner decision (see report)" (`e51bcc7`, `437b131`,
+`e80ec7f`) — not in the tree. No tag past v1.0.11 on the remote. The document's asks: a
+v1.0.12 release with the K-class fixes in its notes; the audit report and POCs; CI status on
+`main` before anyone builds from it. Recommendation for Kron: nothing to the binary (K1 is a
+clean exit on the write path, datadir unharmed; 72 unreleased commits ahead of their CI is
+the larger risk); one firewall read owed for K2/K7.
+CORRECTIONS (IV.8). BL-132 §3e "four untested areas" — N7's crash windows are tested on
+`main` (49 `#[tokio::test]`s at the tag, 54 on `main`), untested at the tag; the claim stands
+for the tag only. BL-132 Q6 — answered: at v1.0.11 the self-check latches; on `main` it
+rebuilds. BL-133 H4 — narrowed, not closed, by `38c7e21` (server-side byte budget; the
+requester's per-record ceiling stands). BL-133/CH2 Q10 — partly answered by `329eeb9`'s own
+scope statement ("one solution can back a header and the block it is aux parent for");
+narrows to the forged-tail case the team states is open.
+**INCIDENT I-49 (II.2, promoted).** CH2-r13 §3l/§3n and r14 §3o were read with `sed -n` on
+the sandbox checkout (= `main` 9d9433b) and labelled v1.0.11. Cost: one r15 cut. Re-verified
+at the tag the same hour: every mechanism cited exists there; walletd line numbers are
+`main`'s (tag: `wallet_prepare` 9739, `wallet_submit` 10316, `bearer_guard` 10551,
+`PREPARED_TTL` 4945); `MAX_HISTORY_CHUNK_BYTES` 256 MiB at the tag (192 on `main`);
+`MIN_HISTORY_CHUNK_BYTES` absent at the tag. Root cause: a working tree is a rail with a
+ref; the ref was not read before the file was. Rule: source reads for a tagged artifact go
+through `git show <tag>:<path>` or a worktree checked out at the tag, never the default
+checkout. The §3m files (both `auxpow.rs`, `pre_ghostdag_validation.rs`,
+`body_validation_in_context.rs`, `header_processor/processor.rs`) are byte-identical
+between tag and `main` (`git diff --stat`), so §3m stands as written.
+DEPS (plan item 2, dependency half): ZKAS-DEPS-AUDIT-v1.0.11-r1 (39 ln,
+4fb59fc5a86f1c945fdc6c8ab4e8b9e7c93918410f405bbcf15afb04de178228; raw cargo-audit JSON
+22306b33ba003d20d90036c75ff21a6043eac675c0e3439837ca92611f2b0838). `cargo audit 0.22.2`
+(advisory DB 1,338, 2026-10-17) over `git show zkas-v1.0.11:Cargo.lock` (851 crates) in the
+sandbox: 13 vulnerabilities in 7 crates. Reaching a Kron listener: h2 0.4.6 only (p2p + gRPC
+via tonic; `bd09d2c` on `main`). Fixed on `main`, not exposed on Kron: four rustls 0.23.39
+advisories (plaintext gRPC/p2p, no wRPC, no `--serve-public`). Neither fixed nor reachable:
+five quinn-proto (QUIC via `reqwest`, which only `gateway/service` links), crossbeam-epoch,
+ruint (risc0), tracing-subscriber 0.2 (upstream's stratum bridge). Unsound `faster-hex`
+function called nowhere at the tag (0 grep hits). `bincode 1.3.3` unmaintained
+(RUSTSEC-2025-0141) under every stored header and p2p flow — the K1 path. Our bridge's
+lockfile and the reproducible-build check are MacBook items, not done.
+CH2 r15 (333 ln, dbc0222c7d3a0e80b3a51f2fab832098fae802c93947ff8f836b5c25f361ea9b; supersedes
+r14 as send copy; r13/r14 retained): §3p the sighash construction read at the tag — S1 the
+preimage (BLAKE2b-256, `zkas_tx_sighash0`, genesis ‖ flags ‖ value_balance ‖ anchor ‖ n ‖
+actions (fixed-width) ‖ conditional burn/anchor_block ‖ length-prefixed tx_context =
+version ‖ subnetwork ‖ lock_time ‖ gas); S2 injective (flag-gated optionals, length-prefixed
+variables, fixed-width rest); S3 the unbound fields are the ones consensus forbids a shielded
+tx to have (no transparent I/O, `tx_validation_in_isolation.rs:43–46`; fee = value_balance
+≥ 0); S4 no third-party txid malleability found (trailing bytes refused, proof length pinned,
+one implementation node and wallet). Q4 narrowed to "did the third-party audit cover it";
+I-49 line references corrected to the tag; §3e/§3f/§3l/§3m and Q6/Q10 narrowed per DRIFT.
+Message to the team drafted in two variants (release ask only; with the audit-report and
+lockfile asks), no attachments, adversary-passed (V.1): every K1 mechanism sentence
+attributed to the team's own commit body; "no tag past v1.0.11" phrased as "I don't see".
+OPEN: send — the drafted message (operator's choice of variant) first; then SCOPE-r7 + CH2-r15 +
+DRIFT-r1 + DEPS-AUDIT-r1 when files are shared; Kron firewall read
+(DRIFT §6); MacBook cross-check of `cargo audit` (fence in DEPS-AUDIT §3); reproducible build vs the
+v1.0.11 release zip; our bridge's lockfile; plan item (1) minus N7 — CH2-3 and F-02-sibling
+tests at the tag; (4) pruning-proof comparison; project-files delete-then-add of ENGINEERING-LEDGER.md owed (IN pin follows
+this merge).
+**Lesson:** the audit's largest finding was not in any file I set out to read; it was in the
+distance between the ref I thought I was reading and the ref I was. The same read, done
+right, would have shown the drift on the first `git log`; done wrong, it showed it on the
+eighty-second commit. Either way the instrument was `git log <tag>..main`, and it costs two
+seconds. It goes first from now on.
