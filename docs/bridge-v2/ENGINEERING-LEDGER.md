@@ -2,7 +2,7 @@
 ### Standing, append-only record of bugs fixed, major corrections, and lessons learned.
 ### Convention: new entries appended at session close with the next BL-### id.
 ### Session-state docs reference this file; do not duplicate its content there.
-### Last entry: BL-135 (2026-10-19)
+### Last entry: BL-136 (2026-10-19)
 
 Format per entry: **Codebase/Domain · Symptom · Root cause · Fix · Lesson**
 
@@ -5017,3 +5017,84 @@ Kron or a day of disk.
 own errors against them (the watchdog, the §3e untested list, the "fails on main" inference). An audit that
 finds nothing new but retires its own unverified claims is still moving, and the two highest-leverage things
 left — the team's audit report and the unaudited bridge — are both outside the tree I spent the day reading.
+**BL-136 · 2026-10-19 · bridge/audit/record — the bridge audited: its miner-facing base is byte-identical to the ZKas-provided bridge (so one read covered both) and reads sound; the ours-only merged layer yields BR-1 (low, post-fork: the one-shot claim was keyed on the template, dropping a valid second block), fixed with a test and green on the MacBook; the CH2-3 acceptance-data characterization test written and green at the tag (I-51's owed item), pinning accepted ⊇ applied for dropped shielded spends; three worktrees left in a known state**
+CONTINUES BL-135. Same session. Rails: sandbox worktrees `wt-tag` (zkas-v1.0.11 = 01ac186) and
+`wt-br1` (merged-fork-v1.0.11 = 6b644ad); MacBook `~/audit-2026-10-19/{wt-v1011,wt-br1}`; the kd read
+clone's own tree stayed on `main` and clean (an earlier `git checkout <ref> -- bridge` into it was
+reverted — read through the ref, never into the checkout; I-49's cousin, not promoted).
+WHICH BRIDGE. The operator asked whether the ZKas-provided bridge, not ours, should be the object.
+Instrument: per-file sha of `bridge/src/*` at upstream zkas-v1.0.11 vs ours at merged-fork-v1.0.11.
+IDENTICAL: stratum_listener.rs (64 KiB line cap, accept loop), jsonrpc_event.rs (sanitized
+serde_json parse), stratum_context.rs, hasher.rs. DIFFER: share_handler.rs (380 ln — and the submit
+guards `params.len() < 3` :337 and the bounded nonce index :435 are upstream's, present at the tag
+line-for-line; ours adds the merged/double/aux submission branch), client_handler.rs (35),
+prom.rs (613), kaspaapi.rs (843), main.rs (79), lib.rs (20). OURS-ONLY: merged.rs, merged_obs.rs,
+notification_hub.rs. So the miner-facing input surface is one codebase and the first pass covered
+both at once; what is ours alone is the merged layer, which nobody upstream will ever read.
+BRIDGE FIRST PASS (shared base, read via `git show`). Lockfile: the bridge is a workspace member, so
+`cargo audit` over the fleet branch's Cargo.lock (a0c4930f…, 848 deps) returns the node's 13; the one
+that reaches the bridge binary is h2 0.4.6 via kaspa-grpc-client (a CLIENT to loopback nodes — the
+advisory is server-side frame queueing; low). quinn/rustls/reqwest are other members' (bridge
+Cargo.toml has none). tracing-subscriber 0.3.22 for the bridge itself (the 0.2.25 advisory is
+ark-relations'). Stratum input: line cap enforced before append; JSON parse cannot panic on malformed
+input; submit indexing guarded (`len() < 3` gate; nonce idx = `if len >= 5 {4} else {2}`; `parts[0]`
+of a `split` is always present). One latent non-miner underflow: `extranonce2_len = 16 -
+extranonce.len()` if the bridge ever set a >16-char extranonce (server-side value). Unread: the
+remaining non-indexing unwraps (share_handler 5, client_handler 2, stratum_listener 1), prom.rs's
+request handling (the scraper listener; BL-045's fix is in it), merged_obs.rs (777), notification_hub.rs
+(334, the v2.0.1.7 push listener — the newest code on Kron).
+**BR-1 (low, correctness; ours only; post-fork).** `MergedPending::claim_solution` keyed the one-shot
+claim on the merge key. Pre-fork merge key = H_fc = the block hash, so one claim per key was "one
+block, submitted once." From the fork the merge key is the template's bound commitment and the chain
+hash is computed PER SOLVED PARENT (`chain_hash`/`assemble_aux_block` set nonce = parent hash and
+re-finalize, CH2 §3m A2): two parents solving one template are two distinct, both-valid zKAS blocks;
+the second was refused by the claim and never submitted, logged only at `debug!` ("duplicate solution
+for already-claimed H_fc"). The Kaspa leg still settled (invariant 4). The invariant-5 comment at
+kaspaapi.rs:1340–1349 is pre-fork reasoning v2.0.1.7 did not revisit. Cost at current rates: two
+Kaspa solves inside one ~1 s template lifetime at ~20 zKAS blocks/day ≈ 2e-4 per block — under one
+block a year; wrong regardless, and worse on a pool with real hashrate. n=0 observed (debug-level
+trace). FIX: `solved: HashMap<merge key, HashSet<chain hash>>`; `claim_solution(h_fc, chain_hash)`
+claims the BLOCK (same chain hash twice = duplicate; a second parent = fresh claim; eviction drops the
+key); `claim_network_solution` derives the chain hash from the stashed template (falls back to the key
+when the stash is gone, as before); the refusal logs at `info` with both hashes. Test:
+`a_second_parent_for_the_same_template_is_a_second_claim`; the two existing claim tests updated to the
+signature with their assertions unchanged. r1 of the patch VOID — its log hunk called
+`merged_chain_hash`, an inherent KaspaApi method, through the `Arc<dyn KaspaApiTrait>` handle
+(E0599); the compiler is the arbiter, my read of the call site did not check the handle's type. r2
+derives the chain hash via the trait's `pending_zkas_block`. **Patch BR-1-claim-per-chain-hash-r2
+(130 ln, cd3f40c99c36b14661e00dcc249305f8b783039adc681e0f0b8c9c820408006f), applies clean to
+merged-fork-v1.0.11 @ 6b644ad (3 files, +53/−11); MacBook: merged::tests 6/6 then the full crate 54 +
+120 + 6 passed, 0 failed.** Operator decision: stays a patch file in ~/audit-2026-10-19/ and applied in
+`wt-br1`; not branched, not deployed — rides the next bridge version (v2.0.1.8 under FLEET-DEPLOY).
+MacBook mechanics worth recording: the ledger clone is a blobless SPARSE checkout (`.github`,
+`bridge`, `docs/bridge-v2` after `sparse-checkout add bridge`); a worktree inherits it, and the
+bridge needs the whole workspace to build — `git sparse-checkout disable` in the worktree
+materialized 1,432 files (6.97 MiB) in seconds. The main checkout stays sparse.
+**CH2-3 CHARACTERIZATION TEST (I-51's owed item).** Prediction from the push site
+(`utxo_validation.rs:255–268`: `accepted_transactions` is built from every body-validated tx before
+the shielded transition partitions): a spend dropped for an immature anchor is NOT applied (fee not
+re-minted) AND IS listed in the merging block's acceptance data. Test
+`dropped_shielded_spend_is_still_listed_in_acceptance_data`, placed after
+`immature_shielded_anchor_spend_is_dropped_not_fatal` and reusing its setup; asserts both halves on
+one chain; its doc comment and failure message say it characterizes CURRENT behaviour and is the
+test that flips if the team decides acceptance data should track the applied set. **Patch
+CH2-3-acceptance-data-test-r1 (95 ln, 4282a37ef0bcb4ceed4c17277594d0087394c21b4b5e7653ca91d4107b517197),
+applies clean to zkas-v1.0.11 @ 01ac186 (+84); MacBook `cargo test --release -p kaspa-consensus
+dropped_shielded…`: 1 passed, 0.24 s.** So the r12 table's "CH2-3 survives" is now run evidence, and
+the ask to the team is one sentence: is acceptance data meant to list spends the transition dropped
+(indexers read GetShieldedBlocks for shielded state), or is this test the regression test for a fix?
+WORKTREE STATE (MacBook): `wt-v1011` at 01ac186 with CH2-4 timing (73f279b0…) and CH2-3 (4282a37e…)
+applied; `wt-br1` at 6b644ad, sparse disabled, BR-1 r2 (cd3f40c9…) applied; nothing committed on
+either. Sandbox: `wt-tag`, `wt-br1` mirrors.
+OPEN: send — the message (variant 2; "the audit report the commits cite"; add the simpa-dead note and
+the CH2-3 sentence above); BR-1 rides the next bridge version; the rest of the ours-only bridge
+(notification_hub.rs first — newest code on Kron — then merged_obs.rs, then prom.rs's handler); the
+remaining non-indexing bridge unwraps; the from-genesis sync for Q1 on v1.0.12 when it exists.
+Estimate of a complete informal audit of v1.0.11: ~62% — CH2-3 moved from read to run; the bridge's
+miner-facing surface moved from unaudited to first-pass clean; the merged layer gave the day its one
+finding that is ours to fix.
+**Lesson:** the only finding of the night was in the one place no one else would look — our own 1,600
+lines on top of a shared base — and it was a correct pre-fork invariant that the fork quietly made
+wrong. The shared base was fine; the seam was ours. And the compiler caught in one error what my read
+of a call site missed: a `dyn Trait` handle does not carry the concrete type's methods, however
+plainly the method is named three lines up.
